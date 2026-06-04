@@ -53,3 +53,9 @@ pub const ACCOUNTS: [AccountProfile; 5] = [
         codex_account_hash: "835bbc4d",
     },
 ];
+
+pub fn profile_for_settings_id(settings_id: &str) -> Option<&'static AccountProfile> {
+    ACCOUNTS
+        .iter()
+        .find(|account| account.opencode_wrapper == settings_id)
+}

@@ -9,21 +9,56 @@ pub fn invoke(subcommand: &str, params: Value) -> Output {
     invoke_with_host(subcommand, params, json!({}))
 }
 
+#[allow(dead_code)]
+pub fn invoke_with_env(subcommand: &str, params: Value, env: &[(&str, &str)]) -> Output {
+    let request = request_envelope(subcommand, params, json!({}));
+    invoke_with_request_and_env(subcommand, request, env)
+}
+
 pub fn invoke_with_host(subcommand: &str, params: Value, host_overrides: Value) -> Output {
     let request = request_envelope(subcommand, params, host_overrides);
     invoke_with_request(subcommand, request)
+}
+
+#[allow(dead_code)]
+pub fn invoke_with_host_and_env(
+    subcommand: &str,
+    params: Value,
+    host_overrides: Value,
+    env: &[(&str, &str)],
+) -> Output {
+    let request = request_envelope(subcommand, params, host_overrides);
+    invoke_with_request_and_env(subcommand, request, env)
 }
 
 pub fn invoke_with_request(subcommand: &str, request_json: Value) -> Output {
     invoke_raw_stdin(subcommand, request_json.to_string().as_bytes())
 }
 
+#[allow(dead_code)]
+pub fn invoke_with_request_and_env(
+    subcommand: &str,
+    request_json: Value,
+    env: &[(&str, &str)],
+) -> Output {
+    invoke_raw_stdin_with_env(subcommand, request_json.to_string().as_bytes(), env)
+}
+
 pub fn invoke_raw_stdin(subcommand: &str, stdin_bytes: &[u8]) -> Output {
+    invoke_raw_stdin_with_env(subcommand, stdin_bytes, &[])
+}
+
+pub fn invoke_raw_stdin_with_env(
+    subcommand: &str,
+    stdin_bytes: &[u8],
+    env: &[(&str, &str)],
+) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-runner-opencode"))
         .arg(subcommand)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .envs(env.iter().copied())
         .spawn()
         .unwrap();
 

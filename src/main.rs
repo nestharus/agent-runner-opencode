@@ -1,6 +1,6 @@
 //! Declared roles: facade
 
-use std::io::{Read, Write};
+use std::io::Read;
 
 fn main() {
     let mut stdin = Vec::new();
@@ -10,10 +10,6 @@ fn main() {
     }
 
     let args = std::env::args().collect::<Vec<_>>();
-    let (stdout, exit_code) = agent_runner_opencode::handle_invocation(&args, &stdin);
-    if let Err(err) = std::io::stdout().write_all(&stdout) {
-        eprintln!("failed to write stdout: {err}");
-        std::process::exit(1);
-    }
+    let exit_code = agent_runner_opencode::write_invocation(&args, &stdin, &mut std::io::stdout());
     std::process::exit(exit_code);
 }

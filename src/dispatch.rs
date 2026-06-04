@@ -14,12 +14,20 @@ use crate::envelope::{
     failure_response, success_response, ProviderFailure, RequestEnvelope, CONTRACT,
 };
 use crate::schema::{describe_result, schema_response};
+use crate::{launch, policy, terminal};
 use serde_json::Value;
+use std::io::Write;
 
 pub fn handle_invocation(args: &[String], stdin: &[u8]) -> (Vec<u8>, i32) {
-    match handle_invocation_result(args, stdin) {
-        Ok(response) => (canonical_json_bytes(&response), 0),
-        Err(failure) => failure_output(failure),
+    let mut stdout = Vec::new();
+    let exit_code = write_invocation(args, stdin, &mut stdout);
+    (stdout, exit_code)
+}
+
+pub fn write_invocation<W: Write>(args: &[String], stdin: &[u8], writer: &mut W) -> i32 {
+    match write_invocation_result(args, stdin, writer) {
+        Ok(exit_code) => exit_code,
+        Err(failure) => write_failure_output(writer, failure),
     }
 }
 
@@ -59,17 +67,18 @@ pub fn handle_decoded_invocation(
         "schema" => schema_response(request),
         "discovery.models" => Ok(success_response(&request.request_id, discovery::models())),
         "discovery.accounts" => Ok(success_response(&request.request_id, discovery::accounts())),
-        // PHASE6-TODO(cluster-A): replace with real launch handler
-        "launch" => Err(not_implemented_in_this_build(request.request_id, "launch")),
-        // PHASE6-TODO(cluster-A): replace with real policy.evaluate handler
-        "policy.evaluate" => Err(not_implemented_in_this_build(
+        "launch" => Err(ProviderFailure::invalid_request(
             request.request_id,
-            "policy.evaluate",
+            "launch_requires_streaming_writer",
+            "launch must be invoked through the streaming dispatch branch",
         )),
-        // PHASE6-TODO(cluster-A): replace with real terminal.classify handler
-        "terminal.classify" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "terminal.classify",
+        "policy.evaluate" => Ok(success_response(
+            &request.request_id,
+            policy::evaluate_params(request.params, &request.request_id)?,
+        )),
+        "terminal.classify" => Ok(success_response(
+            &request.request_id,
+            terminal::classify_params(request.params, &request.request_id)?,
         )),
         // PHASE6-TODO(cluster-B): replace with real session.locate_transcript handler
         "session.locate_transcript" => Err(not_implemented_in_this_build(
@@ -190,10 +199,23 @@ pub fn handle_decoded_invocation(
     }
 }
 
-fn handle_invocation_result(args: &[String], stdin: &[u8]) -> Result<Value, ProviderFailure> {
+fn write_invocation_result<W: Write>(
+    args: &[String],
+    stdin: &[u8],
+    writer: &mut W,
+) -> Result<i32, ProviderFailure> {
     let request = decode_request(stdin)?;
     let subcommand = subcommand_from_args(args, &request.request_id)?;
-    handle_decoded_invocation(request, subcommand)
+    if subcommand == "launch" {
+        return launch::stream(&request.request_id, &request.host, request.params, writer);
+    }
+    let response = handle_decoded_invocation(request, subcommand)?;
+    writer
+        .write_all(&canonical_json_bytes(&response))
+        .map_err(|err| {
+            ProviderFailure::internal("unknown", "stdout_write_failed", err.to_string())
+        })?;
+    Ok(0)
 }
 
 fn parse_raw_request(stdin: &[u8]) -> Result<Value, serde_json::Error> {
@@ -287,4 +309,13 @@ fn failure_output(failure: ProviderFailure) -> (Vec<u8>, i32) {
     let exit_code = failure.exit_code;
     let response = failure_response(&failure);
     (canonical_json_bytes(&response), exit_code)
+}
+
+fn write_failure_output<W: Write>(writer: &mut W, failure: ProviderFailure) -> i32 {
+    let (stdout, exit_code) = failure_output(failure);
+    if let Err(err) = writer.write_all(&stdout) {
+        eprintln!("failed to write stdout: {err}");
+        return 1;
+    }
+    exit_code
 }
