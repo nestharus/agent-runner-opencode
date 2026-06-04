@@ -14,7 +14,7 @@ use crate::envelope::{
     failure_response, success_response, ProviderFailure, RequestEnvelope, CONTRACT,
 };
 use crate::schema::{describe_result, schema_response};
-use crate::{launch, policy, quota, session, terminal};
+use crate::{launch, migration, policy, quota, rotation, session, settings, setup, terminal};
 use serde_json::Value;
 use std::io::Write;
 
@@ -112,80 +112,62 @@ pub fn handle_decoded_invocation(
             &request.request_id,
             quota::refresh_auth_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real settings.list handler
-        "settings.list" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "settings.list",
+        "settings.list" => Ok(success_response(
+            &request.request_id,
+            settings::list_params(&request.host, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real settings.get handler
-        "settings.get" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "settings.get",
+        "settings.get" => Ok(success_response(
+            &request.request_id,
+            settings::get_params(&request.host, request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real settings.create handler
-        "settings.create" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "settings.create",
+        "settings.create" => Ok(success_response(
+            &request.request_id,
+            settings::create_params(&request.host, request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real settings.update handler
-        "settings.update" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "settings.update",
+        "settings.update" => Ok(success_response(
+            &request.request_id,
+            settings::update_params(&request.host, request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real settings.delete handler
-        "settings.delete" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "settings.delete",
+        "settings.delete" => Ok(success_response(
+            &request.request_id,
+            settings::delete_params(&request.host, request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real settings.validate handler
-        "settings.validate" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "settings.validate",
+        "settings.validate" => Ok(success_response(
+            &request.request_id,
+            settings::validate_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real settings.migrate handler
-        "settings.migrate" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "settings.migrate",
+        "settings.migrate" => Ok(success_response(
+            &request.request_id,
+            settings::migrate_params(&request.host, request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real setup.detect handler
-        "setup.detect" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "setup.detect",
+        "setup.detect" => Ok(success_response(
+            &request.request_id,
+            setup::detect_params(&request.host, request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real setup.install_plan handler
-        "setup.install_plan" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "setup.install_plan",
+        "setup.install_plan" => Ok(success_response(
+            &request.request_id,
+            setup::install_plan_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real setup.sync_plan handler
-        "setup.sync_plan" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "setup.sync_plan",
+        "setup.sync_plan" => Ok(success_response(
+            &request.request_id,
+            setup::sync_plan_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real setup_brain.turn handler
-        "setup_brain.turn" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "setup_brain.turn",
+        "setup_brain.turn" => Err(setup::brain_unsupported(request.request_id)),
+        "rotation.assess" => Ok(success_response(
+            &request.request_id,
+            rotation::assess_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real rotation.assess handler
-        "rotation.assess" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "rotation.assess",
+        "rotation.materialize" => Ok(success_response(
+            &request.request_id,
+            rotation::materialize_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real rotation.materialize handler
-        "rotation.materialize" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "rotation.materialize",
+        "migration.plan" => Ok(success_response(
+            &request.request_id,
+            migration::plan_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-D): replace with real migration.plan handler
-        "migration.plan" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "migration.plan",
-        )),
-        // PHASE6-TODO(cluster-D): replace with real migration.apply handler
-        "migration.apply" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "migration.apply",
+        "migration.apply" => Ok(success_response(
+            &request.request_id,
+            migration::apply_params(&request.host, request.params, &request.request_id)?,
         )),
         unknown => Err(unknown_subcommand_failure(request.request_id, unknown)),
     }
@@ -279,14 +261,6 @@ fn validate_request_envelope(request: RequestEnvelope) -> Result<RequestEnvelope
         ));
     }
     Ok(request)
-}
-
-fn not_implemented_in_this_build(request_id: String, subcommand: &str) -> ProviderFailure {
-    ProviderFailure::internal(
-        request_id,
-        "not_implemented",
-        format!("{subcommand} is not implemented in this foundation build"),
-    )
 }
 
 fn unknown_subcommand_failure(request_id: String, subcommand: &str) -> ProviderFailure {

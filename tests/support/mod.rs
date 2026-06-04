@@ -31,6 +31,34 @@ pub fn invoke_with_host_and_env(
     invoke_with_request_and_env(subcommand, request, env)
 }
 
+#[allow(dead_code)]
+pub fn invoke_validated(subcommand: &str, params: Value, request_schema: &str) -> Output {
+    invoke_validated_with_host(subcommand, params, json!({}), request_schema)
+}
+
+#[allow(dead_code)]
+pub fn invoke_validated_with_host(
+    subcommand: &str,
+    params: Value,
+    host_overrides: Value,
+    request_schema: &str,
+) -> Output {
+    let request = validated_request_envelope(subcommand, params, host_overrides, request_schema);
+    invoke_with_request(subcommand, request)
+}
+
+#[allow(dead_code)]
+pub fn invoke_validated_with_host_and_env(
+    subcommand: &str,
+    params: Value,
+    host_overrides: Value,
+    request_schema: &str,
+    env: &[(&str, &str)],
+) -> Output {
+    let request = validated_request_envelope(subcommand, params, host_overrides, request_schema);
+    invoke_with_request_and_env(subcommand, request, env)
+}
+
 pub fn invoke_with_request(subcommand: &str, request_json: Value) -> Output {
     invoke_raw_stdin(subcommand, request_json.to_string().as_bytes())
 }
@@ -79,6 +107,21 @@ pub fn request_envelope(subcommand: &str, params: Value, host_overrides: Value) 
         "host": host_context(host_overrides),
         "params": params
     })
+}
+
+pub fn validated_request_envelope(
+    subcommand: &str,
+    params: Value,
+    host_overrides: Value,
+    request_schema: &str,
+) -> Value {
+    let request = request_envelope(subcommand, params, host_overrides);
+    assert_valid_request_envelope(&request, request_schema);
+    request
+}
+
+pub fn assert_valid_request_envelope(request: &Value, request_schema: &str) {
+    assert_valid(request, request_schema);
 }
 
 pub fn host_context(host_overrides: Value) -> Value {
