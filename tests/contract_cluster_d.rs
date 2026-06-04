@@ -443,6 +443,111 @@ fn contract_setup_detect_missing_dependency_diagnostics() {
 }
 
 #[test]
+fn contract_setup_install_sync_plan_missing_prerequisite() {
+    let host = HostRoots::new("agent-runner-opencode-setup-plan-missing-prerequisite");
+    let empty_path = unique_temp_dir("agent-runner-opencode-empty-path");
+    fs::create_dir_all(&empty_path).expect("create empty PATH fixture");
+    let home = HomeFixture::new("agent-runner-opencode-setup-plan-missing-home");
+    let path = empty_path.to_string_lossy().into_owned();
+    let data_root = host.data_root().to_string_lossy().into_owned();
+    let profile_root = host.config_root().join("missing-profile-root");
+    let profile_root = profile_root.to_string_lossy().into_owned();
+
+    let detect = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.detect",
+            json!({ "data_root": data_root, "profile_root": profile_root }),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupDetectRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupDetectResponse",
+        "setup.schema.json#/$defs/SetupDetectResult",
+    );
+    assert_eq!(
+        detect["installed"], false,
+        "fixture must start with missing opencode/chatgpt-usage/wrapper prerequisites; detect={detect}"
+    );
+
+    let install = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.install_plan",
+            json!({
+                "target": "local",
+                "data_root": data_root,
+                "profile_root": profile_root
+            }),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupInstallPlanRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupInstallPlanResponse",
+        "setup.schema.json#/$defs/SetupInstallPlanResult",
+    );
+    assert_setup_auth_sentinel_absent(&install);
+    assert!(
+        !install["steps"]
+            .as_array()
+            .expect("install steps")
+            .is_empty(),
+        "missing prerequisites must produce install/repair steps; install={install}"
+    );
+    for needle in [
+        "verify_tool",
+        "opencode --version",
+        "chatgpt-usage",
+        "verify_wrappers",
+        "opencode1",
+        "prepare_provider_settings",
+        "opencode.settings/v1",
+    ] {
+        assert!(
+            json_contains_string(&install["steps"], needle),
+            "setup.install_plan missing-prerequisite plan must include {needle}; install={install}"
+        );
+    }
+
+    let sync = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.sync_plan",
+            json!({
+                "desired_profiles": ["opencode1", "opencode2", "opencode3", "opencode4", "opencode5"],
+                "settings_schema_id": "opencode.settings/v1",
+                "data_root": data_root,
+                "profile_root": profile_root
+            }),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    assert_setup_auth_sentinel_absent(&sync);
+    assert!(
+        !sync["operations"]
+            .as_array()
+            .expect("sync operations")
+            .is_empty(),
+        "missing prerequisites must produce sync repair operations; sync={sync}"
+    );
+    for needle in [
+        "ensure_profile",
+        "opencode1",
+        "opencode5",
+        "opencode.settings/v1",
+    ] {
+        assert!(
+            json_contains_string(&sync["operations"], needle),
+            "setup.sync_plan missing-prerequisite plan must include {needle}; sync={sync}"
+        );
+    }
+    assert!(sync["diagnostics"].as_array().is_some());
+
+    fs::remove_dir_all(&empty_path).expect("remove empty PATH fixture");
+}
+
+#[test]
 fn contract_setup_brain_unsupported() {
     let describe = success_result(
         invoke("describe", json!({})),
