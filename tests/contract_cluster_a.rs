@@ -7,8 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use support::{
-    assert_stderr_diagnostics_only, assert_valid, invoke, invoke_with_env, invoke_with_host_and_env,
-    json_stdout, CONTRACT,
+    assert_stderr_diagnostics_only, assert_valid, invoke, invoke_with_env,
+    invoke_with_host_and_env, json_stdout, CONTRACT,
 };
 
 const OBSERVED_AT_UNIX_MS: u64 = 1_780_565_973_556;
@@ -736,7 +736,9 @@ fn fixture_session_id() -> &'static str {
 fn json_contains_string(value: &Value, needle: &str) -> bool {
     match value {
         Value::String(value) => value == needle,
-        Value::Array(values) => values.iter().any(|value| json_contains_string(value, needle)),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_string(value, needle)),
         Value::Object(values) => values
             .iter()
             .any(|(key, value)| key == needle || json_contains_string(value, needle)),

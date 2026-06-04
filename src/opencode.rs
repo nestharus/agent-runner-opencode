@@ -6,9 +6,13 @@
 //!     contract: opencode sessionID extraction
 //!   - component: src/opencode.rs
 //!     contract: opencode event type and part metadata
+//!   - component: src/opencode.rs
+//!     contract: opencode export native session JSON
 
+use crate::account::AccountProfile;
 use serde::Deserialize;
 use serde_json::Value;
+use std::process::Command;
 
 #[derive(Default)]
 pub struct EventParser {
@@ -23,6 +27,48 @@ pub struct OpencodeEventMetadata {
     pub session_id: Option<String>,
     pub timestamp: Option<u64>,
     pub part: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OpencodeExport {
+    pub info: OpencodeExportInfo,
+    #[serde(default)]
+    pub messages: Vec<OpencodeMessage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OpencodeExportInfo {
+    pub id: String,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OpencodeMessage {
+    pub info: OpencodeMessageInfo,
+    #[serde(default)]
+    pub parts: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OpencodeMessageInfo {
+    pub id: String,
+    pub role: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: Option<String>,
+    pub time: Option<OpencodeMessageTime>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OpencodeMessageTime {
+    pub created: Option<u64>,
+    pub completed: Option<u64>,
+}
+
+#[derive(Debug)]
+pub enum OpencodeExportError {
+    Spawn(String),
+    Failed { status: Option<i32>, stderr: String },
+    InvalidJson(String),
 }
 
 impl EventParser {
@@ -46,6 +92,33 @@ impl EventParser {
 
 pub fn first_session_id(events: &[OpencodeEventMetadata]) -> Option<String> {
     events.iter().find_map(|event| event.session_id.clone())
+}
+
+pub fn export(
+    session_id: &str,
+    account: &AccountProfile,
+) -> Result<OpencodeExport, OpencodeExportError> {
+    let output = Command::new(account.opencode_wrapper)
+        .arg("export")
+        .arg(session_id)
+        .output()
+        .map_err(|err| OpencodeExportError::Spawn(err.to_string()))?;
+    if !output.status.success() {
+        return Err(OpencodeExportError::Failed {
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+    parse_export_stdout(&output.stdout)
+}
+
+pub fn parse_export_stdout(stdout: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {
+    let start = stdout
+        .iter()
+        .position(|byte| *byte == b'{')
+        .ok_or_else(|| OpencodeExportError::InvalidJson("missing JSON object".to_string()))?;
+    serde_json::from_slice(&stdout[start..])
+        .map_err(|err| OpencodeExportError::InvalidJson(err.to_string()))
 }
 
 fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {

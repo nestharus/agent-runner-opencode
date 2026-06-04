@@ -14,7 +14,7 @@ use crate::envelope::{
     failure_response, success_response, ProviderFailure, RequestEnvelope, CONTRACT,
 };
 use crate::schema::{describe_result, schema_response};
-use crate::{launch, policy, terminal};
+use crate::{launch, policy, session, terminal};
 use serde_json::Value;
 use std::io::Write;
 
@@ -80,30 +80,25 @@ pub fn handle_decoded_invocation(
             &request.request_id,
             terminal::classify_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-B): replace with real session.locate_transcript handler
-        "session.locate_transcript" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "session.locate_transcript",
+        "session.locate_transcript" => Ok(success_response(
+            &request.request_id,
+            session::locate_transcript_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-B): replace with real session.read_turns handler
-        "session.read_turns" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "session.read_turns",
+        "session.read_turns" => Ok(success_response(
+            &request.request_id,
+            session::read_turns_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-B): replace with real session.capture handler
-        "session.capture" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "session.capture",
+        "session.capture" => Ok(success_response(
+            &request.request_id,
+            session::capture_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-B): replace with real session.export handler
-        "session.export" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "session.export",
+        "session.export" => Ok(success_response(
+            &request.request_id,
+            session::export_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-B): replace with real session.replace handler
-        "session.replace" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "session.replace",
+        "session.replace" => Ok(success_response(
+            &request.request_id,
+            session::replace_params(request.params, &request.request_id)?,
         )),
         // PHASE6-TODO(cluster-C): replace with real quota.source handler
         "quota.source" => Err(not_implemented_in_this_build(

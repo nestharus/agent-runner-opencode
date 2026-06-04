@@ -9,6 +9,7 @@ pub mod launch;
 pub mod opencode;
 pub mod policy;
 pub mod schema;
+pub mod session;
 pub mod terminal;
 
 pub use dispatch::handle_invocation;
