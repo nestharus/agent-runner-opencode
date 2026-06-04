@@ -49,12 +49,18 @@ pub fn stream<W: Write>(
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
     let params = parse_launch_params(params, request_id)?;
-    let argv = match launch_argv(&params, request_id)? {
-        LaunchArgv::Accepted(argv) => argv,
-        LaunchArgv::Rejected(reason) => return stream_policy_rejection(request_id, writer, reason),
+    let effective = match launch_argv(&params, request_id)? {
+        PolicyLaunch::Accepted(effective) => effective,
+        PolicyLaunch::Rejected(reason) => {
+            return stream_policy_rejection(request_id, writer, reason)
+        }
     };
-    let stdin = launch_stdin(params.stdin.as_ref(), request_id)?;
-    let mut child = match spawn_child(&argv, &params, stdin.as_ref()) {
+    let mut child = match spawn_child(
+        &effective.argv,
+        &params.working_directory,
+        &effective.env,
+        effective.stdin.as_ref(),
+    ) {
         Ok(child) => child,
         Err(err) => return stream_spawn_error(request_id, writer, err),
     };
@@ -71,17 +77,30 @@ fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, 
     })
 }
 
-enum LaunchArgv {
-    Accepted(Vec<String>),
+struct EffectiveLaunch {
+    argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    stdin: Option<Vec<u8>>,
+    _prompt: Option<String>,
+}
+
+enum PolicyLaunch {
+    Accepted(EffectiveLaunch),
     Rejected(String),
 }
 
-fn launch_argv(params: &LaunchParams, request_id: &str) -> Result<LaunchArgv, ProviderFailure> {
-    let policy_params = policy_params_for_launch(params);
+fn launch_argv(params: &LaunchParams, request_id: &str) -> Result<PolicyLaunch, ProviderFailure> {
+    let policy_params = policy_params_for_launch(params, request_id)?;
     let result = policy::evaluate(policy_params, request_id)?;
     if result.get("accepted").and_then(Value::as_bool) != Some(true) {
-        return Ok(LaunchArgv::Rejected(policy_rejection_reason(&result)));
+        return Ok(PolicyLaunch::Rejected(policy_rejection_reason(&result)));
     }
+    Ok(PolicyLaunch::Accepted(effective_launch(
+        result, request_id,
+    )?))
+}
+
+fn effective_launch(result: Value, request_id: &str) -> Result<EffectiveLaunch, ProviderFailure> {
     let argv = result["argv"]
         .as_array()
         .unwrap_or(&Vec::new())
@@ -96,7 +115,39 @@ fn launch_argv(params: &LaunchParams, request_id: &str) -> Result<LaunchArgv, Pr
             "policy.evaluate returned no launch argv",
         ));
     }
-    Ok(LaunchArgv::Accepted(argv))
+    Ok(EffectiveLaunch {
+        argv,
+        env: effective_env_from_policy(&result, request_id)?,
+        stdin: result
+            .get("stdin")
+            .and_then(Value::as_str)
+            .map(|stdin| stdin.as_bytes().to_vec()),
+        _prompt: result
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn effective_env_from_policy(
+    result: &Value,
+    request_id: &str,
+) -> Result<BTreeMap<String, String>, ProviderFailure> {
+    let Some(env) = result.get("env").and_then(Value::as_object) else {
+        return Ok(BTreeMap::new());
+    };
+    env.iter()
+        .map(|(key, value)| {
+            let value = value.as_str().ok_or_else(|| {
+                ProviderFailure::invalid_request(
+                    request_id,
+                    "invalid_policy_env",
+                    "policy.evaluate returned a non-string env value",
+                )
+            })?;
+            Ok((key.clone(), value.to_string()))
+        })
+        .collect()
 }
 
 fn policy_rejection_reason(result: &Value) -> String {
@@ -107,7 +158,10 @@ fn policy_rejection_reason(result: &Value) -> String {
     format!("policy.evaluate rejected launch params; diagnostics={diagnostics}")
 }
 
-fn policy_params_for_launch(params: &LaunchParams) -> policy::PolicyEvaluateParams {
+fn policy_params_for_launch(
+    params: &LaunchParams,
+    request_id: &str,
+) -> Result<policy::PolicyEvaluateParams, ProviderFailure> {
     serde_json::from_value(json!({
         "settings_id": params.settings_id,
         "mode": params.mode,
@@ -115,19 +169,33 @@ fn policy_params_for_launch(params: &LaunchParams) -> policy::PolicyEvaluatePara
         "launch": {
             "argv": params.argv,
             "env": params.env,
-            "stdin": null,
+            "stdin": policy_stdin_for_launch(params.stdin.as_ref(), request_id)?,
         }
     }))
-    .expect("launch params already satisfy policy params")
+    .map_err(|err| {
+        ProviderFailure::invalid_request(
+            request_id,
+            "invalid_launch_policy_params",
+            format!("launch params could not be evaluated by policy: {err}"),
+        )
+    })
 }
 
-fn launch_stdin(
+fn policy_stdin_for_launch(
     input: Option<&BytePayload>,
     request_id: &str,
-) -> Result<Option<Vec<u8>>, ProviderFailure> {
-    input
-        .map(|payload| decode_byte_payload(payload, request_id))
-        .transpose()
+) -> Result<Option<String>, ProviderFailure> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    let bytes = decode_byte_payload(input, request_id)?;
+    String::from_utf8(bytes).map(Some).map_err(|err| {
+        ProviderFailure::invalid_request(
+            request_id,
+            "invalid_stdin_utf8",
+            format!("launch stdin must be UTF-8 at the policy boundary: {err}"),
+        )
+    })
 }
 
 fn decode_byte_payload(
@@ -153,13 +221,14 @@ fn decode_byte_payload(
 
 fn spawn_child(
     argv: &[String],
-    params: &LaunchParams,
+    working_directory: &str,
+    env: &BTreeMap<String, String>,
     stdin: Option<&Vec<u8>>,
 ) -> std::io::Result<Child> {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
-        .current_dir(&params.working_directory)
+        .current_dir(working_directory)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(if stdin.is_some() {
@@ -167,12 +236,13 @@ fn spawn_child(
         } else {
             Stdio::null()
         });
-    if let Some(env) = params.env.as_ref() {
-        command.envs(
-            env.iter()
-                .filter(|(key, _)| !key.starts_with("OPENAI_API_KEY")),
-        );
-    }
+    command.env_clear();
+    command.envs(std::env::vars().filter(|(key, _)| !policy::is_forbidden_env_key(key)));
+    command.envs(
+        env.iter()
+            .filter(|(key, _)| !policy::is_forbidden_env_key(key))
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
     configure_process_group(&mut command);
     let mut child = command.spawn()?;
     write_child_stdin(&mut child, stdin)?;
@@ -246,8 +316,8 @@ fn run_supervision_loop<W: Write>(
     writer: &mut W,
 ) -> Result<(), ProviderFailure> {
     while !state.is_complete() {
-        enforce_deadline(child, state)?;
         capture_child_exit(child, state)?;
+        enforce_deadline(child, state)?;
         match receiver.recv_timeout(state.wait_duration()) {
             Ok(message) => state.handle_drain_message(message, writer)?,
             Err(mpsc::RecvTimeoutError::Timeout) => state.heartbeat(writer)?,

@@ -89,13 +89,14 @@ fn probe_account(account: &AccountProfile, request_id: &str) -> Result<Value, Pr
     if output.status != 0 {
         return Ok(unavailable_result(command_failure_detail(&output)));
     }
-    let windows = codex::parse_chatgpt_usage_windows(&output.stdout).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "quota_probe_parse_failed",
-            format!("chatgpt-usage output is invalid: {err}"),
-        )
-    })?;
+    let windows = match codex::parse_chatgpt_usage_windows(&output.stdout) {
+        Ok(windows) => windows,
+        Err(err) => {
+            return Ok(unavailable_result(format!(
+                "chatgpt-usage output is invalid: {err}"
+            )));
+        }
+    };
     Ok(json!({
         "available": true,
         "checked_at_unix_ms": now_unix_ms(),

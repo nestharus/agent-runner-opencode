@@ -29,7 +29,8 @@ pub fn apply_params(
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     ensure_confirmation(&params, request_id)?;
-    let artifact_root = artifact_root(host, &params, request_id)?;
+    let config_root = config_root(host, request_id)?;
+    let artifact_root = artifact_root(&config_root, &params, request_id)?;
     fs::create_dir_all(&artifact_root).map_err(|err| {
         ProviderFailure::internal(
             request_id,
@@ -40,6 +41,7 @@ pub fn apply_params(
     let actions = planned_actions(&params);
     let summary = artifact_summary(&params, &actions);
     let path = artifact_root.join("opencode-provider-migration-summary.json");
+    ensure_canonical_contained(&path, &config_root, request_id)?;
     write_artifact(&path, &summary, request_id)?;
     let bytes = fs::read(&path).map_err(|err| {
         ProviderFailure::internal(
@@ -102,17 +104,22 @@ fn ensure_confirmation(params: &Value, request_id: &str) -> Result<(), ProviderF
 }
 
 fn artifact_root(
-    host: &HostContext,
+    config_root: &Path,
     params: &Value,
     request_id: &str,
 ) -> Result<PathBuf, ProviderFailure> {
-    let config_root = config_root(host, request_id)?;
-    let allowed_roots = provider_owned_artifact_roots(&config_root);
+    let allowed_roots = provider_owned_artifact_roots(config_root);
     if let Some(root) = string_param(params, "artifact_root") {
-        let requested = requested_artifact_root(&config_root, root, request_id)?;
-        ensure_provider_owned_artifact_root(&requested, &allowed_roots, request_id)?;
+        let requested = requested_artifact_root(config_root, root, request_id)?;
+        ensure_provider_owned_artifact_root(&requested, &allowed_roots, config_root, request_id)?;
         return Ok(requested);
     }
+    ensure_provider_owned_artifact_root(
+        &allowed_roots[0],
+        &allowed_roots,
+        config_root,
+        request_id,
+    )?;
     Ok(allowed_roots[0].clone())
 }
 
@@ -158,34 +165,31 @@ fn requested_artifact_root(
 fn ensure_provider_owned_artifact_root(
     requested: &Path,
     allowed_roots: &[PathBuf],
+    config_root: &Path,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     let requested = normalized_absolute_path(requested, request_id)?;
     for root in allowed_roots {
         let root = normalized_absolute_path(root, request_id)?;
-        if requested.starts_with(&root)
-            && existing_artifact_ancestor_is_contained(&requested, &root, request_id)?
-        {
+        if requested.starts_with(&root) {
+            ensure_canonical_contained(&requested, config_root, request_id)?;
             return Ok(());
         }
     }
     Err(invalid_artifact_root(request_id))
 }
 
-fn existing_artifact_ancestor_is_contained(
+fn ensure_canonical_contained(
     requested: &Path,
-    root: &Path,
+    config_root: &Path,
     request_id: &str,
-) -> Result<bool, ProviderFailure> {
-    let Some(existing) = existing_ancestor(requested) else {
-        return Ok(false);
-    };
-    if !existing.starts_with(root) {
-        return Ok(true);
+) -> Result<(), ProviderFailure> {
+    let canonical_root = canonical_path(config_root, request_id)?;
+    let canonical_requested = canonical_create_path(requested, request_id)?;
+    if canonical_requested.starts_with(canonical_root) {
+        return Ok(());
     }
-    let root_existing = existing_ancestor(root).ok_or_else(|| invalid_artifact_root(request_id))?;
-    Ok(canonical_path(existing, request_id)?
-        .starts_with(canonical_path(root_existing, request_id)?))
+    Err(invalid_artifact_root(request_id))
 }
 
 fn normalized_absolute_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
@@ -210,6 +214,24 @@ fn canonical_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFail
             format!("failed to canonicalize migration artifact root: {err}"),
         )
     })
+}
+
+fn canonical_create_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
+    let existing = existing_ancestor(path).ok_or_else(|| invalid_artifact_root(request_id))?;
+    let mut canonical = canonical_path(existing, request_id)?;
+    let suffix = path
+        .strip_prefix(existing)
+        .map_err(|_| invalid_artifact_root(request_id))?;
+    for component in suffix.components() {
+        match component {
+            Component::Normal(part) => canonical.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(invalid_artifact_root(request_id));
+            }
+        }
+    }
+    Ok(canonical)
 }
 
 fn existing_ancestor(path: &Path) -> Option<&Path> {

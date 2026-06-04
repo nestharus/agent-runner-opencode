@@ -137,6 +137,7 @@ fn export_native(
     let native = opencode::export(session_id, account)
         .map_err(|err| export_failure(request_id, session_id, err))?;
     validate_export_session_id(&native, session_id, request_id)?;
+    validate_export_message_sessions(&native, session_id, request_id)?;
     Ok(native)
 }
 
@@ -156,6 +157,39 @@ fn validate_export_session_id(
             native.info.id
         ),
     ))
+}
+
+fn validate_export_message_sessions(
+    native: &OpencodeExport,
+    expected: &str,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    for message in &native.messages {
+        match message.info.session_id.as_deref() {
+            Some(session_id) if session_id == expected => {}
+            Some(session_id) => {
+                return Err(ProviderFailure::invalid_request(
+                    request_id,
+                    "session_record_id_mismatch",
+                    format!(
+                        "opencode message {} belongs to session {session_id} instead of {expected}",
+                        message.info.id
+                    ),
+                ));
+            }
+            None => {
+                return Err(ProviderFailure::invalid_request(
+                    request_id,
+                    "session_record_missing_session_id",
+                    format!(
+                        "opencode message {} is missing info.sessionID",
+                        message.info.id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn export_failure(request_id: &str, session_id: &str, err: OpencodeExportError) -> ProviderFailure {
@@ -274,6 +308,9 @@ fn text_parts(message: &OpencodeMessage) -> Vec<Value> {
 }
 
 fn text_part(part: &Value) -> Option<Value> {
+    if part.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
     let text = part.get("text").and_then(Value::as_str)?;
     Some(json!({
         "type": "text",

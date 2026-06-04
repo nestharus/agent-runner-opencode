@@ -13,7 +13,7 @@ use crate::encoding::canonical_json_bytes;
 use crate::envelope::{
     failure_response, success_response, ProviderFailure, RequestEnvelope, CONTRACT,
 };
-use crate::schema::{describe_result, schema_response};
+use crate::schema::{describe_result, schema_result_params};
 use crate::{launch, migration, policy, quota, rotation, session, settings, setup, terminal};
 use serde_json::Value;
 use std::io::Write;
@@ -71,7 +71,10 @@ pub fn handle_decoded_invocation(
             )?;
             Ok(success_response(&request.request_id, describe_result()))
         }
-        "schema" => schema_response(request),
+        "schema" => Ok(success_response(
+            &request.request_id,
+            schema_result_params(request.params, &request.request_id)?,
+        )),
         "discovery.models" => Ok(success_response(&request.request_id, discovery::models())),
         "discovery.accounts" => Ok(success_response(&request.request_id, discovery::accounts())),
         "launch" => Err(ProviderFailure::invalid_request(

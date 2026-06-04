@@ -1,6 +1,7 @@
 //! Declared roles: formatter, parser, validator
 
-use crate::envelope::{success_response, ProviderFailure, RequestEnvelope, CONTRACT};
+use crate::account::{AccountProfile, ACCOUNTS};
+use crate::envelope::{ProviderFailure, CONTRACT};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -13,10 +14,10 @@ pub struct SchemaParams {
     pub schema_id: String,
 }
 
-pub fn schema_response(request: RequestEnvelope) -> Result<Value, ProviderFailure> {
-    let params = parse_schema_params(request.params, &request.request_id)?;
-    validate_schema_id(&request.request_id, &params.schema_id)?;
-    Ok(success_response(&request.request_id, schema_result()))
+pub fn schema_result_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
+    let params = parse_schema_params(params, request_id)?;
+    validate_schema_id(request_id, &params.schema_id)?;
+    Ok(schema_result())
 }
 
 pub fn validate_schema_id(request_id: &str, schema_id: &str) -> Result<(), ProviderFailure> {
@@ -79,34 +80,34 @@ pub fn opencode_settings_schema() -> Value {
             },
             "account": {
                 "type": "string",
-                "enum": ["opencode1", "opencode2", "opencode3", "opencode4", "opencode5"],
-                "default": "opencode1",
+                "enum": account_values(account_wrapper),
+                "default": default_account_value(account_wrapper),
                 "description": "Pinned OpenCode wrapper profile; quota and auth are attributed through the paired codex auth path."
             },
             "opencode_wrapper": {
                 "type": "string",
-                "enum": ["opencode1", "opencode2", "opencode3", "opencode4", "opencode5"],
+                "enum": account_values(account_wrapper),
                 "description": "Resolved wrapper command for the selected account."
             },
             "opencode_index": {
                 "type": "integer",
-                "minimum": 1,
-                "maximum": 5,
+                "minimum": account_index_min(),
+                "maximum": account_index_max(),
                 "description": "Resolved one-based wrapper index for the selected account."
             },
             "codex_auth_path": {
                 "type": "string",
-                "enum": ["~/.codex/auth.json", "~/.codex5/auth.json", "~/.codex2/auth.json", "~/.codex3/auth.json", "~/.codex4/auth.json"],
+                "enum": account_values(codex_auth_path),
                 "description": "Paired codex auth path used for quota attribution."
             },
             "codex_account_tag": {
                 "type": "string",
-                "enum": ["codex1", "codex5", "codex2", "codex3", "codex4"],
+                "enum": account_values(codex_account_tag),
                 "description": "Human-readable tag for the paired codex account."
             },
             "codex_account_hash": {
                 "type": "string",
-                "enum": ["781db66f", "27f8ea6e", "60238f0b", "9d764739", "835bbc4d"],
+                "enum": account_values(codex_account_hash),
                 "description": "Stable short fingerprint for the paired codex account."
             },
             "model": {
@@ -139,7 +140,7 @@ pub fn opencode_settings_schema() -> Value {
                 "additionalProperties": false,
                 "properties": {
                     "source": { "type": "string", "enum": ["codex_auth"], "default": "codex_auth" },
-                    "auth_path": { "type": "string", "enum": ["~/.codex/auth.json", "~/.codex5/auth.json", "~/.codex2/auth.json", "~/.codex3/auth.json", "~/.codex4/auth.json"] }
+                    "auth_path": { "type": "string", "enum": account_values(codex_auth_path) }
                 }
             },
             "extra_env": {
@@ -149,6 +150,46 @@ pub fn opencode_settings_schema() -> Value {
             }
         }
     })
+}
+
+fn account_values(field: fn(&AccountProfile) -> &'static str) -> Vec<&'static str> {
+    ACCOUNTS.iter().map(field).collect()
+}
+
+fn account_wrapper(account: &AccountProfile) -> &'static str {
+    account.opencode_wrapper
+}
+
+fn codex_auth_path(account: &AccountProfile) -> &'static str {
+    account.codex_auth_path
+}
+
+fn codex_account_tag(account: &AccountProfile) -> &'static str {
+    account.codex_account_tag
+}
+
+fn codex_account_hash(account: &AccountProfile) -> &'static str {
+    account.codex_account_hash
+}
+
+fn default_account_value(field: fn(&AccountProfile) -> &'static str) -> &'static str {
+    field(&ACCOUNTS[0])
+}
+
+fn account_index_min() -> u8 {
+    ACCOUNTS
+        .iter()
+        .map(|account| account.opencode_index)
+        .min()
+        .expect("account profile constant is non-empty")
+}
+
+fn account_index_max() -> u8 {
+    ACCOUNTS
+        .iter()
+        .map(|account| account.opencode_index)
+        .max()
+        .expect("account profile constant is non-empty")
 }
 
 fn parse_schema_params(params: Value, request_id: &str) -> Result<SchemaParams, ProviderFailure> {

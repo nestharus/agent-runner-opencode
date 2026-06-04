@@ -154,8 +154,8 @@ fn forbidden_argv_diagnostics(input: Option<&[String]>) -> Vec<Value> {
         .collect()
 }
 
-fn is_forbidden_env_key(key: &str) -> bool {
-    key.starts_with("OPENAI_API_KEY")
+pub(crate) fn is_forbidden_env_key(key: &str) -> bool {
+    key.starts_with("OPENAI_API_KEY") || key.starts_with("OPENAI_BASE_URL")
 }
 
 fn is_forbidden_launch_arg(arg: &str) -> bool {

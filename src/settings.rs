@@ -201,11 +201,15 @@ fn write_store(
     store: &SettingsStore,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let path = store_path(host, request_id)?;
+    let config_root = config_root(host, request_id)?;
+    let path = store_path_from_root(&config_root);
     let parent = path.parent().expect("settings store always has parent");
+    ensure_store_path_contained(parent, &config_root, request_id)?;
     fs::create_dir_all(parent)
         .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
     let tmp = parent.join(format!(".{STORE_FILE}.{}.tmp", std::process::id()));
+    ensure_store_path_contained(&tmp, &config_root, request_id)?;
+    ensure_store_path_contained(&path, &config_root, request_id)?;
     write_store_temp(&tmp, store, request_id)?;
     fs::rename(&tmp, &path)
         .map_err(|err| store_io_failure(request_id, "settings_store_rename_failed", err))
@@ -232,6 +236,10 @@ fn write_store_temp(
 }
 
 fn store_path(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
+    Ok(store_path_from_root(&config_root(host, request_id)?))
+}
+
+fn config_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
     let Some(root) = host
         .config_root
         .as_deref()
@@ -243,7 +251,75 @@ fn store_path(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderF
             "settings store requires host.config_root",
         ));
     };
-    Ok(PathBuf::from(root).join(STORE_DIR).join(STORE_FILE))
+    Ok(PathBuf::from(root))
+}
+
+fn store_path_from_root(config_root: &Path) -> PathBuf {
+    config_root.join(STORE_DIR).join(STORE_FILE)
+}
+
+fn ensure_store_path_contained(
+    path: &Path,
+    config_root: &Path,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let canonical_root = canonical_store_path(config_root, request_id)?;
+    let canonical_target = canonical_store_create_path(path, request_id)?;
+    if canonical_target.starts_with(canonical_root) {
+        return Ok(());
+    }
+    Err(ProviderFailure::invalid_request(
+        request_id,
+        "settings_store_outside_provider_root",
+        "settings store path must stay under host.config_root",
+    ))
+}
+
+fn canonical_store_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
+    fs::canonicalize(path).map_err(|err| {
+        ProviderFailure::internal(
+            request_id,
+            "settings_store_canonicalize_failed",
+            format!("failed to canonicalize provider settings path: {err}"),
+        )
+    })
+}
+
+fn canonical_store_create_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
+    let existing = path
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| {
+            ProviderFailure::invalid_request(
+                request_id,
+                "settings_store_outside_provider_root",
+                "settings store path must have an existing host.config_root ancestor",
+            )
+        })?;
+    let mut canonical = canonical_store_path(existing, request_id)?;
+    let suffix = path.strip_prefix(existing).map_err(|_| {
+        ProviderFailure::invalid_request(
+            request_id,
+            "settings_store_outside_provider_root",
+            "settings store path must stay under host.config_root",
+        )
+    })?;
+    for component in suffix.components() {
+        match component {
+            std::path::Component::Normal(part) => canonical.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::RootDir => {
+                return Err(ProviderFailure::invalid_request(
+                    request_id,
+                    "settings_store_outside_provider_root",
+                    "settings store path must stay under host.config_root",
+                ));
+            }
+        }
+    }
+    Ok(canonical)
 }
 
 fn store_io_failure(request_id: &str, code: &'static str, err: std::io::Error) -> ProviderFailure {
