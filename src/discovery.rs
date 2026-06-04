@@ -1,6 +1,7 @@
 //! Declared roles: formatter, accessor
 
 use crate::account::{AccountProfile, ACCOUNTS};
+use crate::models::{ModelAlias, MODEL_ALIASES, PROVIDER_MODEL};
 use serde_json::{json, Value};
 
 pub fn models() -> Value {
@@ -18,23 +19,14 @@ pub fn accounts() -> Value {
 }
 
 fn model_aliases() -> Vec<Value> {
-    [
-        ("gpt-none", "none"),
-        ("gpt-low", "low"),
-        ("gpt-medium", "medium"),
-        ("gpt-high", "high"),
-        ("gpt-xhigh", "xhigh"),
-    ]
-    .into_iter()
-    .map(model_alias_json)
-    .collect()
+    MODEL_ALIASES.iter().map(model_alias_json).collect()
 }
 
-fn model_alias_json((name, effort): (&str, &str)) -> Value {
+fn model_alias_json(model: &ModelAlias) -> Value {
     json!({
-        "name": name,
-        "provider_model": "openai/gpt-5.5",
-        "provider_args": ["-m", "openai/gpt-5.5", "--variant", effort],
+        "name": model.name,
+        "provider_model": PROVIDER_MODEL,
+        "provider_args": ["-m", PROVIDER_MODEL, "--variant", model.effort],
     })
 }
 

@@ -2,6 +2,7 @@
 
 use crate::account::{AccountProfile, ACCOUNTS};
 use crate::envelope::{ProviderFailure, CONTRACT};
+use crate::models::{alias_names, DEFAULT_MODEL_ALIAS};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -112,8 +113,8 @@ pub fn opencode_settings_schema() -> Value {
             },
             "model": {
                 "type": "string",
-                "enum": ["gpt-none", "gpt-low", "gpt-medium", "gpt-high", "gpt-xhigh"],
-                "default": "gpt-high",
+                "enum": alias_names(),
+                "default": DEFAULT_MODEL_ALIAS,
                 "description": "Provider model alias mapped to openai/gpt-5.5 with the matching effort variant."
             },
             "working_directory": {

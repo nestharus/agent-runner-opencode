@@ -8,6 +8,7 @@ pub mod encoding;
 pub mod envelope;
 pub mod launch;
 pub mod migration;
+pub mod models;
 pub mod opencode;
 pub mod policy;
 pub mod quota;

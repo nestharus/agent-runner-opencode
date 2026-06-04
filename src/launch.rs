@@ -431,10 +431,9 @@ impl LaunchState {
         bytes: &[u8],
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
-        self.stdout.extend_from_slice(bytes);
-        self.stream_bytes("stdout", bytes, writer)?;
-        let events = self.parser.ingest(bytes);
-        self.capture_session(first_session_id(&events), writer)
+        self.record_stdout(bytes);
+        self.project_stdout_bytes(bytes, writer)?;
+        self.capture_session_from_stdout(bytes, writer)
     }
 
     fn stderr_bytes<W: Write>(
@@ -442,7 +441,31 @@ impl LaunchState {
         bytes: &[u8],
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
+        self.record_stderr(bytes);
+        self.project_stderr_bytes(bytes, writer)
+    }
+
+    fn record_stdout(&mut self, bytes: &[u8]) {
+        self.stdout.extend_from_slice(bytes);
+    }
+
+    fn record_stderr(&mut self, bytes: &[u8]) {
         self.stderr.extend_from_slice(bytes);
+    }
+
+    fn project_stdout_bytes<W: Write>(
+        &mut self,
+        bytes: &[u8],
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        self.stream_bytes("stdout", bytes, writer)
+    }
+
+    fn project_stderr_bytes<W: Write>(
+        &mut self,
+        bytes: &[u8],
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
         self.stream_bytes("stderr", bytes, writer)
     }
 
@@ -480,6 +503,31 @@ impl LaunchState {
         Ok(())
     }
 
+    fn capture_session_from_stdout<W: Write>(
+        &mut self,
+        bytes: &[u8],
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        let session = self.session_from_stdout(bytes);
+        self.capture_session(session, writer)
+    }
+
+    fn session_from_stdout(&mut self, bytes: &[u8]) -> Option<String> {
+        first_session_id(&self.parser.ingest(bytes))
+    }
+
+    fn capture_session_from_parser_tail<W: Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        let session = self.session_from_parser_tail();
+        self.capture_session(session, writer)
+    }
+
+    fn session_from_parser_tail(&mut self) -> Option<String> {
+        first_session_id(&self.parser.finish())
+    }
+
     fn marker<W: Write>(&mut self, name: String, writer: &mut W) -> Result<(), ProviderFailure> {
         self.write_event(
             json!({
@@ -514,27 +562,26 @@ impl LaunchState {
     }
 
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
-        let events = self.parser.finish();
-        self.capture_session(first_session_id(&events), writer)?;
-        let status = self.final_status.clone().unwrap_or(ProcessStatus::Unknown);
-        let signal = classify(&self.stdout, &self.stderr, &status, now_unix_ms());
-        let mut event = json!({
-            "contract": CONTRACT,
-            "request_id": self.request_id,
-            "seq": self.seq,
-            "time_unix_ms": now_unix_ms(),
-            "kind": "exit",
-            "status": process_status_json(&status),
-            "terminal_signal": signal,
-        });
-        if let Some(session_id) = self.session_id.as_ref() {
-            event["session"] = json!({
-                "provider_session_id": session_id,
-                "source": "opencode.run.format_json",
-            });
-        }
+        self.capture_session_from_parser_tail(writer)?;
+        let status = self.finished_status();
+        let signal = self.terminal_signal_for(&status);
+        let event = self.exit_event(&status, signal);
         self.write_event(event, writer)?;
-        Ok(exit_code_for_status(&status))
+        Ok(provider_exit_code(&status))
+    }
+
+    fn finished_status(&self) -> ProcessStatus {
+        self.final_status.clone().unwrap_or(ProcessStatus::Unknown)
+    }
+
+    fn terminal_signal_for(&self, status: &ProcessStatus) -> Value {
+        classify(&self.stdout, &self.stderr, status, now_unix_ms())
+    }
+
+    fn exit_event(&self, status: &ProcessStatus, signal: Value) -> Value {
+        let mut event = launch_exit_event(&self.request_id, self.seq, status, signal);
+        attach_session_to_exit(&mut event, self.session_id.as_deref());
+        event
     }
 
     fn write_event<W: Write>(
@@ -587,6 +634,31 @@ fn process_status_from_exit(status: ExitStatus) -> ProcessStatus {
         return ProcessStatus::Exited { code };
     }
     signal_status(status)
+}
+
+fn launch_exit_event(request_id: &str, seq: u64, status: &ProcessStatus, signal: Value) -> Value {
+    json!({
+        "contract": CONTRACT,
+        "request_id": request_id,
+        "seq": seq,
+        "time_unix_ms": now_unix_ms(),
+        "kind": "exit",
+        "status": process_status_json(status),
+        "terminal_signal": signal,
+    })
+}
+
+fn attach_session_to_exit(event: &mut Value, session_id: Option<&str>) {
+    if let Some(session_id) = session_id {
+        event["session"] = json!({
+            "provider_session_id": session_id,
+            "source": "opencode.run.format_json",
+        });
+    }
+}
+
+fn provider_exit_code(status: &ProcessStatus) -> i32 {
+    exit_code_for_status(status)
 }
 
 #[cfg(unix)]

@@ -94,17 +94,119 @@ fn command_output_evidence(program: &str, args: &[&str]) -> Value {
     let mut argv = vec![program.to_string()];
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
     match shell::run(&argv) {
-        Ok(output) => json!({
-            "present": true,
-            "status": output.status,
-            "stdout": bounded_text(&String::from_utf8_lossy(&output.stdout), 500),
-            "stderr": bounded_text(&String::from_utf8_lossy(&output.stderr), 500),
-        }),
+        Ok(output) => command_success_evidence(output),
         Err(err) => json!({
             "present": false,
-            "error": bounded_text(&err.to_string(), 300),
+            "error": redacted_excerpt(&err.to_string(), 300),
         }),
     }
+}
+
+fn command_success_evidence(output: shell::ShellOutput) -> Value {
+    let stdout = sanitized_command_output(&output.stdout, 500);
+    let stderr = sanitized_command_output(&output.stderr, 500);
+    json!({
+        "present": true,
+        "status": output.status,
+        "ready": output.status == 0,
+        "stdout_present": stdout.present,
+        "stderr_present": stderr.present,
+        "stdout_bytes": stdout.byte_len,
+        "stderr_bytes": stderr.byte_len,
+        "stdout": stdout.excerpt,
+        "stderr": stderr.excerpt,
+        "redacted": stdout.redacted || stderr.redacted,
+    })
+}
+
+struct SanitizedOutput {
+    present: bool,
+    byte_len: usize,
+    excerpt: String,
+    redacted: bool,
+}
+
+fn sanitized_command_output(bytes: &[u8], max_len: usize) -> SanitizedOutput {
+    let text = String::from_utf8_lossy(bytes);
+    let (redacted, changed) = redact_sensitive_text(&text);
+    SanitizedOutput {
+        present: !bytes.is_empty(),
+        byte_len: bytes.len(),
+        excerpt: bounded_text(redacted.trim(), max_len),
+        redacted: changed,
+    }
+}
+
+fn redacted_excerpt(text: &str, max_len: usize) -> String {
+    let (redacted, _) = redact_sensitive_text(text);
+    bounded_text(redacted.trim(), max_len)
+}
+
+fn redact_sensitive_text(text: &str) -> (String, bool) {
+    let mut changed = false;
+    let lines = text
+        .lines()
+        .map(|line| {
+            if line_contains_secret(line) {
+                changed = true;
+                "[redacted]".to_string()
+            } else {
+                printable_line(line)
+            }
+        })
+        .collect::<Vec<_>>();
+    (lines.join("\n"), changed)
+}
+
+fn line_contains_secret(line: &str) -> bool {
+    let lowered = line.to_ascii_lowercase();
+    secret_keyword_present(&lowered) || token_shaped_fragment_present(line)
+}
+
+fn secret_keyword_present(lowered: &str) -> bool {
+    [
+        "api_key",
+        "authorization",
+        "bearer",
+        "credential",
+        "password",
+        "private_key",
+        "refresh",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn token_shaped_fragment_present(line: &str) -> bool {
+    line.split(|ch: char| !is_token_fragment_char(ch))
+        .any(is_token_shaped_fragment)
+}
+
+fn is_token_fragment_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+' | '/' | '=')
+}
+
+fn is_token_shaped_fragment(fragment: &str) -> bool {
+    fragment.len() >= 32
+        || fragment.starts_with("sk-")
+        || fragment.starts_with("eyJ")
+        || fragment.starts_with("ghp_")
+        || fragment.starts_with("gho_")
+        || fragment.starts_with("xox")
+}
+
+fn printable_line(line: &str) -> String {
+    line.chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 fn profile_evidence(data_root: Option<&str>, profile_root: Option<&str>) -> Vec<Value> {

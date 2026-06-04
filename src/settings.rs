@@ -11,6 +11,7 @@
 use crate::account::ACCOUNTS;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CATEGORY_CONFLICT};
+use crate::models::{default_model_effort, effort_values, DEFAULT_MODEL_ALIAS, PROVIDER_MODEL};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -491,7 +492,7 @@ fn require_model(values: &Value, diagnostics: &mut Vec<Value>) {
     let provider_model = values
         .pointer("/model/provider_model")
         .and_then(Value::as_str);
-    if provider_model != Some("openai/gpt-5.5") {
+    if provider_model != Some(PROVIDER_MODEL) {
         diagnostics.push(diagnostic(
             "error",
             "values.model.provider_model",
@@ -500,7 +501,8 @@ fn require_model(values: &Value, diagnostics: &mut Vec<Value>) {
         ));
     }
     let variant = values.pointer("/model/variant").and_then(Value::as_str);
-    if !matches!(variant, Some("none" | "low" | "medium" | "high" | "xhigh")) {
+    let valid_efforts = effort_values();
+    if !variant.is_some_and(|variant| valid_efforts.contains(&variant)) {
         diagnostics.push(diagnostic(
             "error",
             "values.model.variant",
@@ -669,9 +671,9 @@ fn migrated_values(provider: &str) -> Value {
         "profile": account.opencode_wrapper,
         "wrapper": account.opencode_wrapper,
         "model": {
-            "name": "gpt-high",
-            "provider_model": "openai/gpt-5.5",
-            "variant": "high"
+            "name": DEFAULT_MODEL_ALIAS,
+            "provider_model": PROVIDER_MODEL,
+            "variant": default_model_effort()
         },
         "quota": {
             "source": "codex",
