@@ -425,6 +425,79 @@ fn contract_policy_evaluate() {
 }
 
 #[test]
+fn contract_policy_evaluate_rejects_forbidden() {
+    let forbidden_env_key = "OPENAI_API_KEY_CONTRACT_FORBIDDEN";
+    let forbidden_flag = "--variant";
+
+    let output = invoke_with_env(
+        "policy.evaluate",
+        json!({
+            "settings_id": "opencode1",
+            "mode": "agent",
+            "model": model_request("low"),
+            "launch": {
+                "argv": [forbidden_flag, "high", "reply with the single word: ok"],
+                "env": {
+                    "OPENAI_API_KEY_CONTRACT_FORBIDDEN": "SENTINEL_POLICY_FORBIDDEN_ENV_DO_NOT_LEAK",
+                    "CONTRACT_ALLOWED_ENV": "allowed"
+                },
+                "working_directory": env!("CARGO_MANIFEST_DIR")
+            }
+        }),
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "policy.evaluate rejection is a successful policy decision envelope; exit {:?}; stderr: {}\nstdout: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let response = json_stdout(&output);
+    assert_valid(
+        &response,
+        "policy.schema.json#/$defs/PolicyEvaluateResponse",
+    );
+    assert_valid(
+        &response["result"],
+        "policy.schema.json#/$defs/PolicyEvaluateResult",
+    );
+
+    let result = &response["result"];
+    assert_eq!(
+        result["accepted"], false,
+        "forbidden launch inputs must be rejected by policy.evaluate"
+    );
+    let diagnostics = result["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic["severity"] == "error"
+                && diagnostic["code"] == "forbidden_flag"
+                && diagnostic.to_string().contains(forbidden_flag)
+        }),
+        "policy diagnostics must name forbidden launch flag {forbidden_flag}; diagnostics={diagnostics:?}"
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic["severity"] == "error"
+                && diagnostic["code"] == "forbidden_env"
+                && diagnostic.to_string().contains(forbidden_env_key)
+        }),
+        "policy diagnostics must name forbidden env key {forbidden_env_key}; diagnostics={diagnostics:?}"
+    );
+    let env = result["env"].as_object().expect("result.env object");
+    assert!(
+        !env.contains_key(forbidden_env_key),
+        "forbidden env key must be omitted from the effective env"
+    );
+    assert_eq!(
+        env.get("CONTRACT_ALLOWED_ENV").and_then(Value::as_str),
+        Some("allowed"),
+        "allowed env keys should remain visible in the effective env"
+    );
+}
+
+#[test]
 fn contract_terminal_classify_status_only() {
     for (status, expected) in [
         (json!({ "kind": "exited", "code": 0 }), "clean_exit"),

@@ -8,8 +8,9 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use support::{assert_valid, invoke_with_env, invoke_with_host_and_env, json_stdout};
+use support::{assert_valid, invoke, invoke_with_env, invoke_with_host_and_env, json_stdout};
 
 const CANONICAL_FORMAT: &str = "oulipoly.canonical_transcript/v1";
 const OPENCODE_EXPORT_RAW: &str = include_str!("fixtures/opencode_export.json");
@@ -162,6 +163,30 @@ fn contract_session_export_canonical() {
     assert_eq!(
         second["sha256"], first["sha256"],
         "canonical export sha256 must be deterministic for the same native export"
+    );
+}
+
+#[test]
+#[ignore = "live opencode auth/network session export proof; run explicitly when external dependencies are available"]
+fn integration_session_export_live() {
+    let session_id = live_opencode_session_id();
+    let result = success_result(
+        invoke("session.export", session_params(&session_id)),
+        "session.schema.json#/$defs/SessionExportResponse",
+        "session.schema.json#/$defs/SessionExportResult",
+    );
+
+    assert_eq!(result["canonical_format"], CANONICAL_FORMAT);
+    let decoded = decode_base64(result["data_base64"].as_str().expect("data_base64 string"));
+    assert_eq!(
+        sha256_hex(&decoded),
+        result["sha256"].as_str().expect("sha256 string"),
+        "live session.export sha256 must be computed over decoded data_base64 bytes"
+    );
+    assert_eq!(
+        canonical_record_count(&decoded),
+        result["turn_count"].as_u64().expect("turn_count integer") as usize,
+        "live canonical record count must match turn_count"
     );
 }
 
@@ -319,6 +344,34 @@ fn parse_native_export(raw: &str) -> Value {
         .find('{')
         .expect("opencode export fixture should contain a JSON object");
     serde_json::from_str(&raw[json_start..]).expect("opencode export JSON body should parse")
+}
+
+fn live_opencode_session_id() -> String {
+    let output = Command::new("opencode1")
+        .arg("run")
+        .arg("--format")
+        .arg("json")
+        .arg("-m")
+        .arg("openai/gpt-5.5")
+        .arg("--variant")
+        .arg("low")
+        .arg("reply with the single word: ok")
+        .output()
+        .expect("spawn live opencode1 run");
+    assert!(
+        output.status.success(),
+        "live opencode1 run failed; exit {:?}; stderr: {}; stdout: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|event| event["sessionID"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("live opencode1 run did not emit sessionID; stdout: {stdout}"))
 }
 
 fn fixture_session_id() -> &'static str {

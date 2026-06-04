@@ -1,13 +1,12 @@
 //! Declared roles: adapter, parser, accessor
 //! adapter_declarations:
 //!   - component: src/opencode.rs
-//!     contract: opencode run --format json metadata events
-//!   - component: src/opencode.rs
-//!     contract: opencode sessionID extraction
-//!   - component: src/opencode.rs
-//!     contract: opencode event type and part metadata
-//!   - component: src/opencode.rs
-//!     contract: opencode export native session JSON
+//!     role: adapter
+//!     Translates:
+//!       - opencode run --format json event stream
+//!       - opencode sessionID launch marker metadata
+//!       - opencode event type/timestamp/part metadata
+//!       - opencode export native session JSON
 
 use crate::account::AccountProfile;
 use serde::Deserialize;

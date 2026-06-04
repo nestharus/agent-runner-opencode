@@ -387,6 +387,62 @@ fn contract_setup_detect_install_sync() {
 }
 
 #[test]
+fn contract_setup_detect_missing_dependency_diagnostics() {
+    let host = HostRoots::new("agent-runner-opencode-setup-missing-dependency");
+    let empty_path = unique_temp_dir("agent-runner-opencode-empty-path");
+    fs::create_dir_all(&empty_path).expect("create empty PATH fixture");
+    let home = HomeFixture::new("agent-runner-opencode-setup-missing-home");
+    let path = empty_path.to_string_lossy().into_owned();
+    let data_root = host.data_root().to_string_lossy().into_owned();
+
+    let detect = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.detect",
+            json!({ "data_root": data_root }),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupDetectRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupDetectResponse",
+        "setup.schema.json#/$defs/SetupDetectResult",
+    );
+
+    assert_eq!(
+        detect["installed"], false,
+        "setup.detect must report not installed when required tools and wrappers are absent"
+    );
+    assert!(
+        !detect["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .is_empty(),
+        "missing setup prerequisites must produce warnings"
+    );
+    assert_eq!(detect["binary"]["opencode"]["present"], false);
+    assert_eq!(detect["binary"]["chatgpt-usage"]["present"], false);
+    assert!(
+        detect["profiles"]
+            .as_array()
+            .expect("profiles array")
+            .iter()
+            .any(|profile| profile["wrapper_present"] == false),
+        "missing wrappers should be reflected in profile readiness evidence; detect={detect}"
+    );
+    assert!(
+        json_contains_string(&detect["binary"], "opencode"),
+        "missing dependency diagnostics/evidence must name opencode; detect={detect}"
+    );
+    assert!(
+        json_contains_string(&detect["binary"], "chatgpt-usage")
+            || json_contains_string(&detect["profiles"], "chatgpt-usage")
+            || json_contains_string(&detect["auth"], "chatgpt-usage"),
+        "missing dependency diagnostics/evidence must name chatgpt-usage; detect={detect}"
+    );
+
+    fs::remove_dir_all(&empty_path).expect("remove empty PATH fixture");
+}
+
+#[test]
 fn contract_setup_brain_unsupported() {
     let describe = success_result(
         invoke("describe", json!({})),

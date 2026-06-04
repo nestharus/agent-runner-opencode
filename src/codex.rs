@@ -1,9 +1,10 @@
 //! Declared roles: adapter, parser
 //! adapter_declarations:
 //!   - component: src/codex.rs
-//!     contract: chatgpt-usage windows stdout JSON
-//!   - component: src/codex.rs
-//!     contract: chatgpt-usage argv auth-path boundary
+//!     role: adapter
+//!     Translates:
+//!       - chatgpt-usage rolling-window stdout JSON
+//!       - chatgpt-usage auth-path argv boundary
 
 use crate::shell::{self, ShellOutput};
 use chrono::DateTime;

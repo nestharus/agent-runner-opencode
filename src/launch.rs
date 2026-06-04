@@ -1,4 +1,12 @@
 //! Declared roles: orchestration, adapter, formatter, parser, mapper
+//! adapter_declarations:
+//!   - component: src/launch.rs
+//!     role: adapter
+//!     Translates:
+//!       - opencode process lifecycle to contract/v1 launch NDJSON
+//!       - opencode stdout/stderr bytes to LaunchStdoutEvent/LaunchStderrEvent
+//!       - opencode sessionID metadata to LaunchMarkerEvent
+//!       - process terminal status to LaunchExitEvent
 
 use crate::encoding::{decode_base64, encode_base64, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};

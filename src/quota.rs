@@ -1,4 +1,11 @@
-//! Declared roles: orchestration, mapper
+//! Declared roles: orchestration, adapter, mapper
+//! adapter_declarations:
+//!   - component: src/quota.rs
+//!     role: adapter
+//!     Translates:
+//!       - codex auth source profile to QuotaSourceResult
+//!       - chatgpt-usage rolling windows to QuotaProbeWindow
+//!       - codex CLI-owned auth refresh boundary to QuotaRefreshAuthResult
 
 use crate::account::{profile_for_settings_id, AccountProfile};
 use crate::codex::{self, ChatgptUsageWindow};

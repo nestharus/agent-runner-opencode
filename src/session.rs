@@ -1,4 +1,4 @@
-//! Declared roles: orchestration, mapper
+//! Declared roles: orchestration, adapter, mapper
 //! intrinsic_surface_declarations:
 //!   - component: src/session.rs
 //!     role: intrinsic-surface
@@ -7,6 +7,16 @@
 //!       - opencode export to provider session responses
 //!       - canonical transcript byte serialization
 //!       - session replace unsupported boundary
+//!
+//! adapter_declarations:
+//!   - component: src/session.rs
+//!     role: adapter
+//!     Translates:
+//!       - opencode export native session JSON to SessionReadTurnsResult
+//!       - opencode launch sessionID evidence to SessionCaptureResult
+//!       - opencode export native session JSON to oulipoly.canonical_transcript/v1
+//!       - opencode absent transcript path to SessionLocateTranscriptResult
+//!       - opencode unsupported transcript import to SessionReplaceResult boundary
 
 use crate::account::profile_for_settings_id;
 use crate::encoding::{encode_base64, sha256_hex};
