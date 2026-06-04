@@ -25,8 +25,8 @@ pub struct OpencodeEventMetadata {
     pub event_type: String,
     #[serde(rename = "sessionID")]
     pub session_id: Option<String>,
-    pub timestamp: Option<u64>,
-    pub part: Option<Value>,
+    pub timestamp: u64,
+    pub part: Value,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -135,5 +135,13 @@ fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
 }
 
 fn parse_event_line(line: &[u8]) -> Option<OpencodeEventMetadata> {
-    serde_json::from_slice(line).ok()
+    let event: OpencodeEventMetadata = serde_json::from_slice(line).ok()?;
+    is_pinned_native_event(&event).then_some(event)
+}
+
+fn is_pinned_native_event(event: &OpencodeEventMetadata) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "step_start" | "text" | "step_finish"
+    ) && event.part.is_object()
 }

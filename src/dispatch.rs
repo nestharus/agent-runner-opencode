@@ -63,7 +63,14 @@ pub fn handle_decoded_invocation(
     subcommand: &str,
 ) -> Result<Value, ProviderFailure> {
     match subcommand {
-        "describe" => Ok(success_response(&request.request_id, describe_result())),
+        "describe" => {
+            validate_empty_params(
+                &request.params,
+                &request.request_id,
+                "invalid_describe_params",
+            )?;
+            Ok(success_response(&request.request_id, describe_result()))
+        }
         "schema" => schema_response(request),
         "discovery.models" => Ok(success_response(&request.request_id, discovery::models())),
         "discovery.accounts" => Ok(success_response(&request.request_id, discovery::accounts())),
@@ -222,6 +229,21 @@ fn validate_params_present(raw: &Value, request_id: &str) -> Result<(), Provider
         request_id,
         "missing_params",
         "request envelope must include params",
+    ))
+}
+
+fn validate_empty_params(
+    params: &Value,
+    request_id: &str,
+    code: &'static str,
+) -> Result<(), ProviderFailure> {
+    if params.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(());
+    }
+    Err(ProviderFailure::invalid_request(
+        request_id,
+        code,
+        "params must be an empty object for this subcommand",
     ))
 }
 

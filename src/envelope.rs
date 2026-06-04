@@ -8,9 +8,8 @@ pub const CONTRACT: &str = "oulipoly.provider/v1";
 
 pub const CATEGORY_UNSUPPORTED: &str = "unsupported";
 pub const CATEGORY_INVALID_REQUEST: &str = "invalid_request";
-pub const CATEGORY_NOT_FOUND: &str = "not_found";
 pub const CATEGORY_CONFLICT: &str = "conflict";
-pub const CATEGORY_INTERNAL: &str = "internal";
+pub const CATEGORY_FAILED: &str = "failed";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +85,7 @@ impl ProviderFailure {
     ) -> Self {
         provider_failure(
             request_id,
-            CATEGORY_INTERNAL,
+            CATEGORY_FAILED,
             code,
             message,
             json!({}),

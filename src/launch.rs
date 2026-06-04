@@ -1,6 +1,5 @@
 //! Declared roles: orchestration, adapter, formatter, parser, mapper
 
-use crate::account::profile_for_settings_id;
 use crate::encoding::{decode_base64, encode_base64, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 use crate::opencode::{first_session_id, EventParser};
@@ -50,7 +49,10 @@ pub fn stream<W: Write>(
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
     let params = parse_launch_params(params, request_id)?;
-    let argv = launch_argv(&params, request_id)?;
+    let argv = match launch_argv(&params, request_id)? {
+        LaunchArgv::Accepted(argv) => argv,
+        LaunchArgv::Rejected(reason) => return stream_policy_rejection(request_id, writer, reason),
+    };
     let stdin = launch_stdin(params.stdin.as_ref(), request_id)?;
     let mut child = match spawn_child(&argv, &params, stdin.as_ref()) {
         Ok(child) => child,
@@ -69,34 +71,40 @@ fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, 
     })
 }
 
-fn launch_argv(params: &LaunchParams, request_id: &str) -> Result<Vec<String>, ProviderFailure> {
-    let account = profile_for_settings_id(&params.settings_id).ok_or_else(|| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "unknown_settings_id",
-            format!("unknown opencode settings_id: {}", params.settings_id),
-        )
-    })?;
+enum LaunchArgv {
+    Accepted(Vec<String>),
+    Rejected(String),
+}
+
+fn launch_argv(params: &LaunchParams, request_id: &str) -> Result<LaunchArgv, ProviderFailure> {
     let policy_params = policy_params_for_launch(params);
     let result = policy::evaluate(policy_params, request_id)?;
-    Ok(result["argv"]
+    if result.get("accepted").and_then(Value::as_bool) != Some(true) {
+        return Ok(LaunchArgv::Rejected(policy_rejection_reason(&result)));
+    }
+    let argv = result["argv"]
         .as_array()
         .unwrap_or(&Vec::new())
         .iter()
         .filter_map(Value::as_str)
         .map(ToOwned::to_owned)
-        .chain(std::iter::empty::<String>())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .enumerate()
-        .map(|(index, arg)| {
-            if index == 0 {
-                account.opencode_wrapper.to_string()
-            } else {
-                arg
-            }
-        })
-        .collect())
+        .collect::<Vec<_>>();
+    if argv.is_empty() {
+        return Err(ProviderFailure::invalid_request(
+            request_id,
+            "empty_policy_argv",
+            "policy.evaluate returned no launch argv",
+        ));
+    }
+    Ok(LaunchArgv::Accepted(argv))
+}
+
+fn policy_rejection_reason(result: &Value) -> String {
+    let diagnostics = result
+        .get("diagnostics")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    format!("policy.evaluate rejected launch params; diagnostics={diagnostics}")
 }
 
 fn policy_params_for_launch(params: &LaunchParams) -> policy::PolicyEvaluateParams {
@@ -283,6 +291,17 @@ fn stream_spawn_error<W: Write>(
     state.final_status = Some(ProcessStatus::SpawnError {
         reason: err.to_string(),
     });
+    state.mark_drains_done();
+    state.finish(writer)
+}
+
+fn stream_policy_rejection<W: Write>(
+    request_id: &str,
+    writer: &mut W,
+    reason: String,
+) -> Result<i32, ProviderFailure> {
+    let mut state = LaunchState::new(request_id, None);
+    state.final_status = Some(ProcessStatus::SpawnError { reason });
     state.mark_drains_done();
     state.finish(writer)
 }

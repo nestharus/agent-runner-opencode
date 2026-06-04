@@ -5,7 +5,11 @@ use crate::envelope::{HostContext, ProviderFailure};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+
+const PROVIDER_DIR: &str = "agent-runner-opencode";
+const MIGRATION_DIR: &str = "migration";
+const LEGACY_PROVIDER_ARTIFACT_DIR: &str = "provider-owned-migration-artifacts";
 
 pub fn plan_params(params: Value, _request_id: &str) -> Result<Value, ProviderFailure> {
     Ok(json!({
@@ -102,9 +106,17 @@ fn artifact_root(
     params: &Value,
     request_id: &str,
 ) -> Result<PathBuf, ProviderFailure> {
+    let config_root = config_root(host, request_id)?;
+    let allowed_roots = provider_owned_artifact_roots(&config_root);
     if let Some(root) = string_param(params, "artifact_root") {
-        return Ok(PathBuf::from(root));
+        let requested = requested_artifact_root(&config_root, root, request_id)?;
+        ensure_provider_owned_artifact_root(&requested, &allowed_roots, request_id)?;
+        return Ok(requested);
     }
+    Ok(allowed_roots[0].clone())
+}
+
+fn config_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
     let Some(config_root) = host
         .config_root
         .as_deref()
@@ -116,7 +128,116 @@ fn artifact_root(
             "migration.apply requires params.artifact_root or host.config_root",
         ));
     };
-    Ok(PathBuf::from(config_root).join("opencode-provider-migration-artifacts"))
+    Ok(PathBuf::from(config_root))
+}
+
+fn provider_owned_artifact_roots(config_root: &Path) -> Vec<PathBuf> {
+    vec![
+        config_root.join(PROVIDER_DIR).join(MIGRATION_DIR),
+        config_root.join(LEGACY_PROVIDER_ARTIFACT_DIR),
+    ]
+}
+
+fn requested_artifact_root(
+    config_root: &Path,
+    root: &str,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let path = PathBuf::from(root);
+    let requested = if path.is_absolute() {
+        path
+    } else {
+        config_root.join(path)
+    };
+    if has_parent_component(&requested) || is_forbidden_live_route_path(&requested) {
+        return Err(invalid_artifact_root(request_id));
+    }
+    Ok(requested)
+}
+
+fn ensure_provider_owned_artifact_root(
+    requested: &Path,
+    allowed_roots: &[PathBuf],
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let requested = normalized_absolute_path(requested, request_id)?;
+    for root in allowed_roots {
+        let root = normalized_absolute_path(root, request_id)?;
+        if requested.starts_with(&root)
+            && existing_artifact_ancestor_is_contained(&requested, &root, request_id)?
+        {
+            return Ok(());
+        }
+    }
+    Err(invalid_artifact_root(request_id))
+}
+
+fn existing_artifact_ancestor_is_contained(
+    requested: &Path,
+    root: &Path,
+    request_id: &str,
+) -> Result<bool, ProviderFailure> {
+    let Some(existing) = existing_ancestor(requested) else {
+        return Ok(false);
+    };
+    if !existing.starts_with(root) {
+        return Ok(true);
+    }
+    let root_existing = existing_ancestor(root).ok_or_else(|| invalid_artifact_root(request_id))?;
+    Ok(canonical_path(existing, request_id)?
+        .starts_with(canonical_path(root_existing, request_id)?))
+}
+
+fn normalized_absolute_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str())
+            }
+            Component::CurDir => {}
+            Component::ParentDir => return Err(invalid_artifact_root(request_id)),
+        }
+    }
+    Ok(normalized)
+}
+
+fn canonical_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
+    fs::canonicalize(path).map_err(|err| {
+        ProviderFailure::internal(
+            request_id,
+            "migration_artifact_root_canonicalize_failed",
+            format!("failed to canonicalize migration artifact root: {err}"),
+        )
+    })
+}
+
+fn existing_ancestor(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|ancestor| ancestor.exists())
+}
+
+fn has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn is_forbidden_live_route_path(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("providers.toml")
+        || path
+            .components()
+            .any(|component| component.as_os_str() == "models")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("gpt-") && name.ends_with(".toml"))
+}
+
+fn invalid_artifact_root(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "artifact_root_outside_provider_root",
+        "migration.apply artifact_root must stay under a provider-owned migration root",
+    )
 }
 
 fn artifact_summary(params: &Value, actions: &[Value]) -> Value {
