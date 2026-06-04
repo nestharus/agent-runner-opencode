@@ -14,7 +14,7 @@ use crate::envelope::{
     failure_response, success_response, ProviderFailure, RequestEnvelope, CONTRACT,
 };
 use crate::schema::{describe_result, schema_response};
-use crate::{launch, policy, session, terminal};
+use crate::{launch, policy, quota, session, terminal};
 use serde_json::Value;
 use std::io::Write;
 
@@ -100,20 +100,17 @@ pub fn handle_decoded_invocation(
             &request.request_id,
             session::replace_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-C): replace with real quota.source handler
-        "quota.source" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "quota.source",
+        "quota.source" => Ok(success_response(
+            &request.request_id,
+            quota::source_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-C): replace with real quota.probe handler
-        "quota.probe" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "quota.probe",
+        "quota.probe" => Ok(success_response(
+            &request.request_id,
+            quota::probe_params(request.params, &request.request_id)?,
         )),
-        // PHASE6-TODO(cluster-C): replace with real quota.refresh_auth handler
-        "quota.refresh_auth" => Err(not_implemented_in_this_build(
-            request.request_id,
-            "quota.refresh_auth",
+        "quota.refresh_auth" => Ok(success_response(
+            &request.request_id,
+            quota::refresh_auth_params(request.params, &request.request_id)?,
         )),
         // PHASE6-TODO(cluster-D): replace with real settings.list handler
         "settings.list" => Err(not_implemented_in_this_build(
