@@ -188,6 +188,10 @@ fn contract_launch_resume_emits_submitted_user_turn_marker_after_export_confirms
     );
     assert_eq!(marker["value"]["source"].as_str(), Some("opencode.export"));
     assert_eq!(marker["value"]["message_id"].as_str(), Some("msg-user"));
+    assert_eq!(
+        marker["value"]["delivery_nonce"].as_str(),
+        Some("5169694d-de0f-40d1-890c-6e28e55bab27")
+    );
 }
 
 #[test]

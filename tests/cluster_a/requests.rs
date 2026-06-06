@@ -137,7 +137,7 @@ pub fn resume_session_id() -> &'static str {
 }
 
 pub fn resume_payload() -> &'static str {
-    "[OULIPOLY NOTIFICATIONS]\nkind: agent_bash_complete\nhandle: h-s11-external\n"
+    "[OULIPOLY NOTIFICATIONS]\nkind: agent_bash_complete\nhandle: h-s11-external\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\n[END OULIPOLY NOTIFICATIONS]\n"
 }
 
 pub fn host_candidate_argv(effort: &str) -> Vec<&str> {

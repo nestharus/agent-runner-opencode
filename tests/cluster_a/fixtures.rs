@@ -375,7 +375,7 @@ exit 0\n"
 pub fn fake_wrapper_resume_confirming_export_script() -> &'static str {
     "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
-  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"[OULIPOLY NOTIFICATIONS]\\nkind: agent_bash_complete\\nhandle: h-s11-external\\n\"}]}]}'\n\
+  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]}]}'\n\
   exit 0\n\
 fi\n\
 {\n\

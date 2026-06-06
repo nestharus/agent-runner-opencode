@@ -38,6 +38,8 @@ const POLICY_MANAGED_FLAGS_WITH_VALUE: &[&str] = &["--format", "-m", "--variant"
 const POLICY_MANAGED_FLAGS_WITHOUT_VALUE: &[&str] = &["--dangerously-skip-permissions"];
 const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
 const SUBMITTED_USER_TURN_SOURCE: &str = "opencode.export";
+const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
+const DELIVERY_NONCE_SUFFIX: char = ']';
 
 #[derive(Deserialize)]
 struct LaunchParams {
@@ -112,6 +114,7 @@ struct ResumeConfirmation {
     settings_id: String,
     session_id: String,
     prompt: String,
+    delivery_nonce: Option<String>,
 }
 
 enum PolicyLaunch {
@@ -195,10 +198,12 @@ fn resume_confirmation(
 ) -> Option<ResumeConfirmation> {
     let session_id = known_provider_session_id(params)?;
     let prompt = submitted_resume_payload(argv, stdin, prompt)?;
+    let delivery_nonce = delivery_nonce_from_prompt(&prompt);
     Some(ResumeConfirmation {
         settings_id: params.settings_id.clone(),
         session_id: session_id.to_string(),
         prompt,
+        delivery_nonce,
     })
 }
 
@@ -917,12 +922,16 @@ fn submitted_user_turn_marker_value(confirmation: &ResumeConfirmation) -> Option
         .messages
         .iter()
         .find(|message| submitted_user_message_matches(message, confirmation))?;
-    Some(json!({
+    let mut marker = json!({
         "provider_session_id": confirmation.session_id.as_str(),
         "prompt_sha256": sha256_hex(confirmation.prompt.as_bytes()),
         "source": SUBMITTED_USER_TURN_SOURCE,
         "message_id": message.info.id.as_str(),
-    }))
+    });
+    if let Some(delivery_nonce) = confirmation.delivery_nonce.as_deref() {
+        marker["delivery_nonce"] = json!(delivery_nonce);
+    }
+    Some(marker)
 }
 
 fn submitted_user_message_matches(
@@ -931,7 +940,17 @@ fn submitted_user_message_matches(
 ) -> bool {
     message.info.role.as_str() == "user"
         && message.info.session_id.as_deref() == Some(confirmation.session_id.as_str())
-        && message_has_exact_text_part(message, &confirmation.prompt)
+        && message_confirms_resume_payload(message, confirmation)
+}
+
+fn message_confirms_resume_payload(
+    message: &OpencodeMessage,
+    confirmation: &ResumeConfirmation,
+) -> bool {
+    if let Some(delivery_nonce) = confirmation.delivery_nonce.as_deref() {
+        return message_contains_delivery_nonce(message, delivery_nonce);
+    }
+    message_has_exact_text_part(message, &confirmation.prompt)
 }
 
 fn message_has_exact_text_part(message: &OpencodeMessage, prompt: &str) -> bool {
@@ -940,6 +959,49 @@ fn message_has_exact_text_part(message: &OpencodeMessage, prompt: &str) -> bool 
             .and_then(Value::as_str)
             .is_some_and(|text| text == prompt)
     })
+}
+
+fn message_contains_delivery_nonce(message: &OpencodeMessage, delivery_nonce: &str) -> bool {
+    let marker = delivery_marker(delivery_nonce);
+    message_string_fields_contain(message, &marker)
+}
+
+fn message_string_fields_contain(message: &OpencodeMessage, needle: &str) -> bool {
+    let mut joined_strings = String::new();
+    for part in &message.parts {
+        if value_string_fields_contain(part, needle, &mut joined_strings) {
+            return true;
+        }
+    }
+    joined_strings.contains(needle)
+}
+
+fn value_string_fields_contain(value: &Value, needle: &str, joined_strings: &mut String) -> bool {
+    match value {
+        Value::String(text) => {
+            joined_strings.push_str(text);
+            text.contains(needle)
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_string_fields_contain(value, needle, joined_strings)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_string_fields_contain(value, needle, joined_strings)),
+        _ => false,
+    }
+}
+
+fn delivery_nonce_from_prompt(prompt: &str) -> Option<String> {
+    let start = prompt.find(DELIVERY_NONCE_PREFIX)? + DELIVERY_NONCE_PREFIX.len();
+    let tail = &prompt[start..];
+    let end = tail.find(DELIVERY_NONCE_SUFFIX)?;
+    let nonce = tail[..end].trim();
+    (!nonce.is_empty()).then(|| nonce.to_string())
+}
+
+fn delivery_marker(delivery_nonce: &str) -> String {
+    format!("{DELIVERY_NONCE_PREFIX}{delivery_nonce}{DELIVERY_NONCE_SUFFIX}")
 }
 
 fn invalid_launch_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
