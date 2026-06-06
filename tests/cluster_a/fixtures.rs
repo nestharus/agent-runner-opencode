@@ -510,6 +510,79 @@ printf '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timesta
 exit 0\n"
 }
 
+pub fn fake_wrapper_resume_invalid_export_script() -> &'static str {
+    "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '%s' '{\"messages\":[{\"role\":\"user\",\"content\":\"unterminated'\n\
+  exit 0\n\
+fi\n\
+{\n\
+  printf 'argv0=%s\\n' \"$0\"\n\
+  for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
+} > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
+printf '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000001,\"part\":{\"type\":\"step-start\",\"sessionID\":\"ses_resume_contract\"}}\\n'\n\
+exit 0\n"
+}
+
+pub fn write_opencode_sqlite_resume_confirmation(xdg_home: &Path) {
+    let db_path = opencode_sqlite_db_path(xdg_home);
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create opencode db dir");
+    let conn = rusqlite::Connection::open(&db_path).expect("open opencode sqlite fixture");
+    create_opencode_sqlite_tables(&conn);
+    insert_opencode_sqlite_resume_message(&conn);
+}
+
+fn opencode_sqlite_db_path(xdg_home: &Path) -> PathBuf {
+    xdg_home.join("opencode").join("opencode.db")
+}
+
+fn create_opencode_sqlite_tables(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        "CREATE TABLE message (
+            id TEXT,
+            session_id TEXT,
+            time_created INTEGER,
+            time_updated INTEGER,
+            data TEXT
+        );
+        CREATE TABLE part (
+            id TEXT,
+            message_id TEXT,
+            session_id TEXT,
+            time_created INTEGER,
+            time_updated INTEGER,
+            data TEXT
+        );",
+    )
+    .expect("create opencode sqlite tables");
+}
+
+fn insert_opencode_sqlite_resume_message(conn: &rusqlite::Connection) {
+    conn.execute(
+        "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "msg-user",
+            resume_session_id(),
+            1_780_000_000_000_i64,
+            1_780_000_000_000_i64,
+            json!({"role":"user","time":{"created":1_780_000_000_000_u64}}).to_string(),
+        ],
+    )
+    .expect("insert opencode sqlite message");
+    conn.execute(
+        "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            "part-sqlite-text",
+            "msg-user",
+            resume_session_id(),
+            1_780_000_000_000_i64,
+            1_780_000_000_000_i64,
+            json!({"type":"text","text":resume_payload()}).to_string(),
+        ],
+    )
+    .expect("insert opencode sqlite part");
+}
+
 pub fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

@@ -923,7 +923,7 @@ fn submitted_user_turn_marker_value(confirmation: &ResumeConfirmation) -> Option
 
 fn export_for_resume_confirmation(confirmation: &ResumeConfirmation) -> Option<OpencodeExport> {
     let account = profile_for_settings_id(&confirmation.settings_id)?;
-    opencode::export(&confirmation.session_id, account).ok()
+    opencode::export_with_sqlite_fallback(&confirmation.session_id, account).ok()
 }
 
 fn export_session_matches_confirmation(
