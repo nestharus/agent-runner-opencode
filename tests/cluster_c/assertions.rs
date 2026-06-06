@@ -540,15 +540,30 @@ impl HomeFixture {
     pub fn write_unreadable_paired_auth(&self, bytes: &[u8]) -> PathBuf {
         let auth_path = self.write_paired_auth(bytes);
         #[cfg(unix)]
-        {
-            let mut permissions = fs::metadata(&auth_path)
-                .expect("unreadable auth metadata")
-                .permissions();
-            permissions.set_mode(0o000);
-            fs::set_permissions(&auth_path, permissions).expect("chmod unreadable auth");
-        }
+        make_path_unreadable(&auth_path);
         auth_path
     }
+}
+
+#[cfg(unix)]
+pub fn make_path_unreadable(path: &Path) {
+    set_path_permissions(path, permissions_with_mode(path_permissions(path), 0o000));
+}
+
+#[cfg(unix)]
+pub fn path_permissions(path: &Path) -> fs::Permissions {
+    fs::metadata(path).expect("path metadata").permissions()
+}
+
+#[cfg(unix)]
+pub fn permissions_with_mode(mut permissions: fs::Permissions, mode: u32) -> fs::Permissions {
+    permissions.set_mode(mode);
+    permissions
+}
+
+#[cfg(unix)]
+pub fn set_path_permissions(path: &Path, permissions: fs::Permissions) {
+    fs::set_permissions(path, permissions).expect("chmod path");
 }
 
 impl Drop for HomeFixture {
@@ -621,11 +636,12 @@ pub fn write_fake_chatgpt_usage_script(script_path: &Path, script: String) {
 
 #[cfg(unix)]
 pub fn make_fake_chatgpt_usage_executable(script_path: &Path) {
-    let mut permissions = fs::metadata(script_path)
-        .expect("fake chatgpt-usage metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(script_path, permissions).expect("chmod fake chatgpt-usage");
+    make_path_executable(script_path);
+}
+
+#[cfg(unix)]
+pub fn make_path_executable(path: &Path) {
+    set_path_permissions(path, permissions_with_mode(path_permissions(path), 0o755));
 }
 
 #[cfg(not(unix))]
@@ -724,11 +740,22 @@ pub fn unique_temp_dir(prefix: &str) -> PathBuf {
 }
 
 pub fn unique_temp_dir_name(prefix: &str) -> String {
-    let nanos = SystemTime::now()
+    formatted_temp_dir_name(prefix, current_time_nanos(), current_process_id())
+}
+
+pub fn current_time_nanos() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
-        .as_nanos();
-    format!("{prefix}-{}-{nanos}", std::process::id())
+        .as_nanos()
+}
+
+pub fn current_process_id() -> u32 {
+    std::process::id()
+}
+
+pub fn formatted_temp_dir_name(prefix: &str, nanos: u128, process_id: u32) -> String {
+    format!("{prefix}-{process_id}-{nanos}")
 }
 
 pub fn prepend_path(dir: &Path) -> String {
@@ -759,6 +786,17 @@ pub fn file_bytes(path: &Path) -> Vec<u8> {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    hex_bytes(&sha256_digest(bytes))
+}
+
+pub fn sha256_digest(bytes: &[u8]) -> Vec<u8> {
+    Sha256::digest(bytes).to_vec()
+}
+
+pub fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(hex_byte).collect()
+}
+
+pub fn hex_byte(byte: &u8) -> String {
+    format!("{byte:02x}")
 }

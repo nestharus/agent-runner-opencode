@@ -316,14 +316,32 @@ pub fn write_executable(path: &Path, script: &str) {
     fs::write(path, script)
         .unwrap_or_else(|err| panic!("{}", write_executable_write_error(path, &err)));
     #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(path)
-            .unwrap_or_else(|err| panic!("{}", write_executable_metadata_error(path, &err)))
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)
-            .unwrap_or_else(|err| panic!("{}", write_executable_chmod_error(path, &err)));
-    }
+    make_executable(path);
+}
+
+#[cfg(unix)]
+pub fn make_executable(path: &Path) {
+    let permissions = permissions_with_mode(path_permissions(path), 0o755);
+    set_path_permissions(path, permissions);
+}
+
+#[cfg(unix)]
+pub fn path_permissions(path: &Path) -> fs::Permissions {
+    fs::metadata(path)
+        .unwrap_or_else(|err| panic!("{}", write_executable_metadata_error(path, &err)))
+        .permissions()
+}
+
+#[cfg(unix)]
+pub fn permissions_with_mode(mut permissions: fs::Permissions, mode: u32) -> fs::Permissions {
+    permissions.set_mode(mode);
+    permissions
+}
+
+#[cfg(unix)]
+pub fn set_path_permissions(path: &Path, permissions: fs::Permissions) {
+    fs::set_permissions(path, permissions)
+        .unwrap_or_else(|err| panic!("{}", write_executable_chmod_error(path, &err)));
 }
 
 pub fn write_executable_write_error(path: &Path, err: &std::io::Error) -> String {
@@ -343,11 +361,22 @@ pub fn unique_temp_dir(prefix: &str) -> PathBuf {
 }
 
 pub fn unique_temp_dir_name(prefix: &str) -> String {
-    let nanos = SystemTime::now()
+    formatted_temp_dir_name(prefix, current_time_nanos(), current_process_id())
+}
+
+pub fn current_time_nanos() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
-        .as_nanos();
-    format!("{prefix}-{}-{nanos}", std::process::id())
+        .as_nanos()
+}
+
+pub fn current_process_id() -> u32 {
+    std::process::id()
+}
+
+pub fn formatted_temp_dir_name(prefix: &str, nanos: u128, process_id: u32) -> String {
+    format!("{prefix}-{process_id}-{nanos}")
 }
 
 pub fn prepend_path(dir: &Path) -> String {
