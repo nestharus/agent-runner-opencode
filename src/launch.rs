@@ -6,7 +6,7 @@
 //!       - opencode process lifecycle to contract/v1 launch NDJSON
 //!       - opencode stdout/stderr bytes to LaunchStdoutEvent/LaunchStderrEvent
 //!       - opencode sessionID metadata to LaunchMarkerEvent
-//!       - declared params.env entries, including account XDG_DATA_HOME, to env-cleared child env
+//!       - declared params.env entries and host-linkage env to env-cleared child env
 //!       - process terminal status to LaunchExitEvent
 
 use crate::encoding::{decode_base64, encode_base64, now_unix_ms};
@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);
-const LAUNCH_ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME"];
+const BASE_LAUNCH_ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME"];
+// Step-6a host-linkage contract: these runner bindings must survive env_clear.
+const HOST_LINKAGE_ENV_KEYS: &[&str] = &["OULIPOLY_DATA_DIR", "OULIPOLY_PARENT_INVOCATION"];
 
 #[derive(Deserialize)]
 struct LaunchParams {
@@ -265,8 +267,9 @@ fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
 }
 
 fn pass_through_env() -> BTreeMap<String, String> {
-    LAUNCH_ENV_PASSTHROUGH_KEYS
+    BASE_LAUNCH_ENV_PASSTHROUGH_KEYS
         .iter()
+        .chain(HOST_LINKAGE_ENV_KEYS.iter())
         .filter_map(|key| pass_through_env_entry(key))
         .collect()
 }

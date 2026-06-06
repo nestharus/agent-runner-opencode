@@ -334,6 +334,8 @@ pub fn env_probe_opencode_script() -> String {
 {\n\
   printf 'declared=%s\\n' \"${DECLARED_CHILD_ENV-}\"\n\
   printf 'xdg=%s\\n' \"${XDG_DATA_HOME-}\"\n\
+  printf 'oulipoly_data=%s\\n' \"${OULIPOLY_DATA_DIR-<unset>}\"\n\
+  printf 'oulipoly_parent=%s\\n' \"${OULIPOLY_PARENT_INVOCATION-<unset>}\"\n\
   if [ \"${UNDECLARED_PARENT_ENV+x}\" = x ]; then\n\
     printf 'undeclared=%s\\n' \"$UNDECLARED_PARENT_ENV\"\n\
   else\n\

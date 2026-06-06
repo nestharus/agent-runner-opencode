@@ -254,6 +254,7 @@ pub fn assert_declared_env_log(wrapper_log_path: &Path) {
     let wrapper_log = declared_env_log_text(wrapper_log_path);
     assert_declared_child_env_logged(&wrapper_log);
     assert_declared_xdg_data_home_logged(&wrapper_log);
+    assert_oulipoly_linkage_logged(&wrapper_log);
     assert_undeclared_child_env_unset(&wrapper_log);
     assert_ambient_secret_absent(&wrapper_log);
     assert_openai_api_key_unset(&wrapper_log);
@@ -270,6 +271,17 @@ pub fn assert_declared_xdg_data_home_logged(wrapper_log: &str) {
     assert!(
         wrapper_log.contains("xdg=/tmp/declared-opencode-data-home"),
         "declared XDG_DATA_HOME must reach child; log={wrapper_log:?}"
+    );
+}
+
+pub fn assert_oulipoly_linkage_logged(wrapper_log: &str) {
+    assert!(
+        wrapper_log.contains("oulipoly_data=/tmp/real-oulipoly-data"),
+        "OULIPOLY_DATA_DIR must reach env-cleared launch child; log={wrapper_log:?}"
+    );
+    assert!(
+        wrapper_log.contains("oulipoly_parent=parent-invocation-token"),
+        "OULIPOLY_PARENT_INVOCATION must reach env-cleared launch child; log={wrapper_log:?}"
     );
 }
 

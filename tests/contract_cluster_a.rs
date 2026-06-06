@@ -70,6 +70,8 @@ fn contract_launch_env_uses_declared_boundary() {
         ),
         &[
             ("PATH", path.as_str()),
+            ("OULIPOLY_DATA_DIR", "/tmp/real-oulipoly-data"),
+            ("OULIPOLY_PARENT_INVOCATION", "parent-invocation-token"),
             ("UNDECLARED_PARENT_ENV", "ambient-secret-do-not-leak"),
             ("OPENAI_API_KEY", "ambient-openai-secret-do-not-leak"),
         ],
