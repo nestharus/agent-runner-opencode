@@ -3,6 +3,7 @@
 mod cluster_a;
 mod support;
 
+use agent_runner_opencode::encoding::sha256_hex;
 use cluster_a::*;
 use serde_json::json;
 use support::{invoke, invoke_with_env, invoke_with_host_and_env, json_stdout};
@@ -52,6 +53,193 @@ fn contract_launch_stream_accepts_policy_effective_argv() {
 }
 
 #[test]
+fn contract_launch_resume_forwards_session_and_arg_payload() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let mut params = resume_launch_params_with_arg_payload();
+    params["env"] = json!({
+        "PATH": path,
+        "AGENT_RUNNER_OPENCODE_WRAPPER_LOG": log_path
+    });
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch resume arg payload");
+    let wrapper_log = wrapper_log_text(fake_wrapper.log_path());
+    assert!(wrapper_log.contains("arg=--session"), "{wrapper_log}");
+    assert!(
+        wrapper_log.contains(&format!("arg={}", resume_session_id())),
+        "{wrapper_log}"
+    );
+    assert!(
+        wrapper_log.contains(&format!("arg={}", resume_payload())),
+        "{wrapper_log}"
+    );
+}
+
+#[test]
+fn contract_launch_resume_places_session_before_notification_arg_when_prompt_metadata_differs() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let mut params = resume_launch_params_with_arg_payload();
+    params["model"]["inputs"]["prompt"] = json!("metadata prompt differs from argv payload");
+    params["env"] = json!({
+        "PATH": path,
+        "AGENT_RUNNER_OPENCODE_WRAPPER_LOG": log_path
+    });
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(
+        &output,
+        "launch resume arg payload with mismatched prompt metadata",
+    );
+    let wrapper_log = wrapper_log_text(fake_wrapper.log_path());
+    let argv = wrapper_log_args(&wrapper_log);
+    let session_flag = argv_arg_index(&argv, OPENCODE_SESSION_FLAG_FOR_TEST);
+    let payload = argv_arg_index_containing(&argv, "[OULIPOLY NOTIFICATIONS]");
+    assert!(
+        session_flag < payload,
+        "--session must be before notification payload; argv={argv:?}"
+    );
+}
+
+const OPENCODE_SESSION_FLAG_FOR_TEST: &str = "--session";
+
+fn wrapper_log_args(wrapper_log: &str) -> Vec<&str> {
+    wrapper_log
+        .lines()
+        .filter_map(|line| line.strip_prefix("arg="))
+        .collect()
+}
+
+fn argv_arg_index(argv: &[&str], needle: &str) -> usize {
+    argv.iter()
+        .position(|arg| *arg == needle)
+        .unwrap_or_else(|| panic!("argv missing {needle:?}: {argv:?}"))
+}
+
+fn argv_arg_index_containing(argv: &[&str], needle: &str) -> usize {
+    argv.iter()
+        .position(|arg| arg.contains(needle))
+        .unwrap_or_else(|| panic!("argv missing arg containing {needle:?}: {argv:?}"))
+}
+
+#[test]
+fn contract_launch_resume_forwards_session_and_stdin_payload() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let mut params = resume_launch_params_with_stdin_payload();
+    params["env"] = json!({
+        "PATH": path,
+        "AGENT_RUNNER_OPENCODE_WRAPPER_LOG": log_path
+    });
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch resume stdin payload");
+    let wrapper_log = wrapper_log_text(fake_wrapper.log_path());
+    assert!(wrapper_log.contains("arg=--session"), "{wrapper_log}");
+    assert!(
+        wrapper_log.contains(&format!("arg={}", resume_session_id())),
+        "{wrapper_log}"
+    );
+    assert!(
+        wrapper_log.contains(&format!("stdin={}", resume_payload())),
+        "{wrapper_log}"
+    );
+}
+
+#[test]
+fn contract_launch_resume_emits_submitted_user_turn_marker_after_export_confirms_payload() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(
+        fake_wrapper_resume_confirming_export_script().to_string(),
+    );
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let mut params = resume_launch_params_with_arg_payload();
+    params["env"] = json!({
+        "PATH": path,
+        "AGENT_RUNNER_OPENCODE_WRAPPER_LOG": log_path
+    });
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch resume confirmed payload");
+    let events = launch_events_from_output(&output, "launch resume confirmed payload stdout");
+    assert_monotonic_launch_events(&events);
+    let marker = events
+        .iter()
+        .find(|event| event["kind"] == "marker" && event["name"] == "oulipoly.submitted_user_turn")
+        .unwrap_or_else(|| panic!("missing submitted user turn marker; events={events:?}"));
+    assert_eq!(
+        marker["value"]["provider_session_id"].as_str(),
+        Some(resume_session_id())
+    );
+    assert_eq!(
+        marker["value"]["prompt_sha256"].as_str(),
+        Some(sha256_hex(resume_payload().as_bytes()).as_str())
+    );
+    assert_eq!(marker["value"]["source"].as_str(), Some("opencode.export"));
+    assert_eq!(marker["value"]["message_id"].as_str(), Some("msg-user"));
+}
+
+#[test]
+fn contract_launch_resume_does_not_emit_submitted_user_turn_marker_when_export_lacks_payload() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(
+        fake_wrapper_resume_unconfirmed_export_script().to_string(),
+    );
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let mut params = resume_launch_params_with_arg_payload();
+    params["env"] = json!({
+        "PATH": path,
+        "AGENT_RUNNER_OPENCODE_WRAPPER_LOG": log_path
+    });
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch resume unconfirmed payload");
+    let events = launch_events_from_output(&output, "launch resume unconfirmed payload stdout");
+    assert!(
+        !events.iter().any(|event| {
+            event["kind"] == "marker" && event["name"] == "oulipoly.submitted_user_turn"
+        }),
+        "unconfirmed export must not emit submitted user turn marker; events={events:?}"
+    );
+}
+
+#[test]
+fn contract_launch_resume_rejects_empty_payload_without_spawning_child() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let mut params = resume_launch_params_without_payload();
+    params["env"] = json!({
+        "PATH": path,
+        "AGENT_RUNNER_OPENCODE_WRAPPER_LOG": log_path
+    });
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "empty resume payload must fail before spawning opencode"
+    );
+    let response = json_stdout(&output);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "empty_resume_payload");
+}
+
+#[test]
 fn contract_launch_env_uses_declared_boundary() {
     let fake_wrapper = FakeOpencodeWrapper::with_script(env_probe_opencode_script());
     let path = prepend_path(fake_wrapper.dir());
@@ -72,6 +260,10 @@ fn contract_launch_env_uses_declared_boundary() {
             ("PATH", path.as_str()),
             ("OULIPOLY_DATA_DIR", "/tmp/real-oulipoly-data"),
             ("OULIPOLY_PARENT_INVOCATION", "parent-invocation-token"),
+            (
+                "AGENT_BASH_AGENT_RUNNER_BIN",
+                "/tmp/target-release/oulipoly-agent-runner",
+            ),
             ("UNDECLARED_PARENT_ENV", "ambient-secret-do-not-leak"),
             ("OPENAI_API_KEY", "ambient-openai-secret-do-not-leak"),
         ],

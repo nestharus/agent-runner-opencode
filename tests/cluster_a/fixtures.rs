@@ -336,6 +336,7 @@ pub fn env_probe_opencode_script() -> String {
   printf 'xdg=%s\\n' \"${XDG_DATA_HOME-}\"\n\
   printf 'oulipoly_data=%s\\n' \"${OULIPOLY_DATA_DIR-<unset>}\"\n\
   printf 'oulipoly_parent=%s\\n' \"${OULIPOLY_PARENT_INVOCATION-<unset>}\"\n\
+  printf 'agent_runner_bin=%s\\n' \"${AGENT_BASH_AGENT_RUNNER_BIN-<unset>}\"\n\
   if [ \"${UNDECLARED_PARENT_ENV+x}\" = x ]; then\n\
     printf 'undeclared=%s\\n' \"$UNDECLARED_PARENT_ENV\"\n\
   else\n\
@@ -354,9 +355,49 @@ exit 0\n"
 pub fn fake_wrapper_log_script() -> &'static str {
     "#!/bin/sh\n\
 {\n\
+   printf 'argv0=%s\\n' \"$0\"\n\
+   for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
+} > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\""
+}
+
+pub fn fake_wrapper_log_stdin_script() -> &'static str {
+    "#!/bin/sh\n\
+{\n\
   printf 'argv0=%s\\n' \"$0\"\n\
   for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
-} > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\""
+  printf 'stdin='\n\
+  /bin/cat\n\
+  printf '\\n'\n\
+} > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
+exit 0\n"
+}
+
+pub fn fake_wrapper_resume_confirming_export_script() -> &'static str {
+    "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"[OULIPOLY NOTIFICATIONS]\\nkind: agent_bash_complete\\nhandle: h-s11-external\\n\"}]}]}'\n\
+  exit 0\n\
+fi\n\
+{\n\
+  printf 'argv0=%s\\n' \"$0\"\n\
+  for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
+} > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
+printf '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000001,\"part\":{\"type\":\"step-start\",\"sessionID\":\"ses_resume_contract\"}}\\n'\n\
+exit 0\n"
+}
+
+pub fn fake_wrapper_resume_unconfirmed_export_script() -> &'static str {
+    "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"different prompt\"}]}]}'\n\
+  exit 0\n\
+fi\n\
+{\n\
+  printf 'argv0=%s\\n' \"$0\"\n\
+  for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
+} > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
+printf '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000001,\"part\":{\"type\":\"step-start\",\"sessionID\":\"ses_resume_contract\"}}\\n'\n\
+exit 0\n"
 }
 
 pub fn shell_single_quote(value: &str) -> String {

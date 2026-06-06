@@ -13,6 +13,34 @@ pub fn launch_params(effort: &str) -> Value {
     })
 }
 
+pub fn resume_launch_params_with_arg_payload() -> Value {
+    let mut params = launch_params("low");
+    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["argv"] = json!([resume_payload()]);
+    params["model"]["inputs"]["prompt"] = json!(resume_payload());
+    params
+}
+
+pub fn resume_launch_params_with_stdin_payload() -> Value {
+    let mut params = launch_params("low");
+    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["argv"] = json!([]);
+    params["stdin"] = json!({
+        "encoding": "utf8",
+        "data": resume_payload(),
+    });
+    params["model"]["inputs"]["prompt"] = json!(resume_payload());
+    params
+}
+
+pub fn resume_launch_params_without_payload() -> Value {
+    let mut params = launch_params("low");
+    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["argv"] = json!([]);
+    params["model"]["inputs"]["prompt"] = json!("");
+    params
+}
+
 pub fn launch_params_with_policy_effective_argv(effort: &str) -> Value {
     let mut params = launch_params(effort);
     params["argv"] = json!(policy_effective_argv(effort));
@@ -102,6 +130,14 @@ pub fn model_request(effort: &str) -> Value {
             "named": {}
         }
     })
+}
+
+pub fn resume_session_id() -> &'static str {
+    "ses_resume_contract"
+}
+
+pub fn resume_payload() -> &'static str {
+    "[OULIPOLY NOTIFICATIONS]\nkind: agent_bash_complete\nhandle: h-s11-external\n"
 }
 
 pub fn host_candidate_argv(effort: &str) -> Vec<&str> {

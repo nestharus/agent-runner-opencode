@@ -283,6 +283,10 @@ pub fn assert_oulipoly_linkage_logged(wrapper_log: &str) {
         wrapper_log.contains("oulipoly_parent=parent-invocation-token"),
         "OULIPOLY_PARENT_INVOCATION must reach env-cleared launch child; log={wrapper_log:?}"
     );
+    assert!(
+        wrapper_log.contains("agent_runner_bin=/tmp/target-release/oulipoly-agent-runner"),
+        "AGENT_BASH_AGENT_RUNNER_BIN must reach env-cleared launch child; log={wrapper_log:?}"
+    );
 }
 
 pub fn assert_undeclared_child_env_unset(wrapper_log: &str) {

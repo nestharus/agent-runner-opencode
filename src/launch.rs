@@ -9,9 +9,10 @@
 //!       - declared params.env entries and host-linkage env to env-cleared child env
 //!       - process terminal status to LaunchExitEvent
 
-use crate::encoding::{decode_base64, encode_base64, now_unix_ms};
+use crate::account::profile_for_settings_id;
+use crate::encoding::{decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
-use crate::opencode::{first_session_id, EventParser};
+use crate::opencode::{self, first_session_id, EventParser, OpencodeMessage};
 use crate::policy;
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use serde::Deserialize;
@@ -26,7 +27,17 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);
 const BASE_LAUNCH_ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME"];
 // Step-6a host-linkage contract: these runner bindings must survive env_clear.
-const HOST_LINKAGE_ENV_KEYS: &[&str] = &["OULIPOLY_DATA_DIR", "OULIPOLY_PARENT_INVOCATION"];
+const HOST_LINKAGE_ENV_KEYS: &[&str] = &[
+    "OULIPOLY_DATA_DIR",
+    "OULIPOLY_PARENT_INVOCATION",
+    "AGENT_BASH_AGENT_RUNNER_BIN",
+];
+const OPENCODE_SESSION_FLAG: &str = "--session";
+const OPENCODE_RUN_ARG: &str = "run";
+const POLICY_MANAGED_FLAGS_WITH_VALUE: &[&str] = &["--format", "-m", "--variant"];
+const POLICY_MANAGED_FLAGS_WITHOUT_VALUE: &[&str] = &["--dangerously-skip-permissions"];
+const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
+const SUBMITTED_USER_TURN_SOURCE: &str = "opencode.export";
 
 #[derive(Deserialize)]
 struct LaunchParams {
@@ -37,8 +48,7 @@ struct LaunchParams {
     working_directory: String,
     env: Option<BTreeMap<String, String>>,
     stdin: Option<BytePayload>,
-    #[serde(rename = "session")]
-    _session: Option<Value>,
+    session: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -76,7 +86,13 @@ pub fn stream<W: Write>(
         Ok(child) => child,
         Err(err) => return stream_spawn_error(request_id, writer, err),
     };
-    stream_child(request_id, host, &mut child, writer)
+    stream_child(
+        request_id,
+        host,
+        &mut child,
+        effective.resume_confirmation,
+        writer,
+    )
 }
 
 fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, ProviderFailure> {
@@ -88,6 +104,14 @@ struct EffectiveLaunch {
     env: BTreeMap<String, String>,
     stdin: Option<Vec<u8>>,
     _prompt: Option<String>,
+    resume_confirmation: Option<ResumeConfirmation>,
+}
+
+#[derive(Clone)]
+struct ResumeConfirmation {
+    settings_id: String,
+    session_id: String,
+    prompt: String,
 }
 
 enum PolicyLaunch {
@@ -102,13 +126,17 @@ fn launch_argv(params: &LaunchParams, request_id: &str) -> Result<PolicyLaunch, 
         return Ok(PolicyLaunch::Rejected(policy_rejection_reason(&result)));
     }
     Ok(PolicyLaunch::Accepted(effective_launch(
-        result, request_id,
+        params, result, request_id,
     )?))
 }
 
-fn effective_launch(result: Value, request_id: &str) -> Result<EffectiveLaunch, ProviderFailure> {
+fn effective_launch(
+    params: &LaunchParams,
+    result: Value,
+    request_id: &str,
+) -> Result<EffectiveLaunch, ProviderFailure> {
     let argv = validated_policy_argv(&result, request_id)?;
-    project_effective_launch(&result, argv, request_id)
+    project_effective_launch(params, &result, argv, request_id)
 }
 
 fn validated_policy_argv(result: &Value, request_id: &str) -> Result<Vec<String>, ProviderFailure> {
@@ -118,16 +146,177 @@ fn validated_policy_argv(result: &Value, request_id: &str) -> Result<Vec<String>
 }
 
 fn project_effective_launch(
+    params: &LaunchParams,
     result: &Value,
     argv: Vec<String>,
     request_id: &str,
 ) -> Result<EffectiveLaunch, ProviderFailure> {
+    let stdin = policy_stdin(result);
+    let prompt = policy_prompt(result);
+    let argv = resume_argv(
+        params,
+        argv,
+        stdin.as_deref(),
+        prompt.as_deref(),
+        request_id,
+    )?;
+    let resume_confirmation =
+        resume_confirmation(params, stdin.as_deref(), prompt.as_deref(), &argv);
     Ok(EffectiveLaunch {
         argv,
         env: effective_env_from_policy(result, request_id)?,
-        stdin: policy_stdin(result),
-        _prompt: policy_prompt(result),
+        stdin,
+        _prompt: prompt,
+        resume_confirmation,
     })
+}
+
+fn resume_argv(
+    params: &LaunchParams,
+    mut argv: Vec<String>,
+    stdin: Option<&[u8]>,
+    prompt: Option<&str>,
+    request_id: &str,
+) -> Result<Vec<String>, ProviderFailure> {
+    let Some(session_id) = known_provider_session_id(params) else {
+        return Ok(argv);
+    };
+    require_resume_payload_reaches_child(&argv, stdin, prompt, request_id)?;
+    let insert_at = resume_session_insert_index(&argv);
+    upsert_session_arg(&mut argv, session_id, insert_at);
+    Ok(argv)
+}
+
+fn resume_confirmation(
+    params: &LaunchParams,
+    stdin: Option<&[u8]>,
+    prompt: Option<&str>,
+    argv: &[String],
+) -> Option<ResumeConfirmation> {
+    let session_id = known_provider_session_id(params)?;
+    let prompt = submitted_resume_payload(argv, stdin, prompt)?;
+    Some(ResumeConfirmation {
+        settings_id: params.settings_id.clone(),
+        session_id: session_id.to_string(),
+        prompt,
+    })
+}
+
+fn known_provider_session_id(params: &LaunchParams) -> Option<&str> {
+    params
+        .session
+        .as_ref()
+        .and_then(|session| session.get("known_provider_session_id"))
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.trim().is_empty())
+}
+
+fn require_resume_payload_reaches_child(
+    argv: &[String],
+    stdin: Option<&[u8]>,
+    prompt: Option<&str>,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if submitted_resume_payload(argv, stdin, prompt).is_some() {
+        return Ok(());
+    }
+    Err(empty_resume_payload_failure(request_id))
+}
+
+fn submitted_resume_payload(
+    argv: &[String],
+    stdin: Option<&[u8]>,
+    prompt: Option<&str>,
+) -> Option<String> {
+    stdin_payload_text(stdin)
+        .or_else(|| prompt_arg_payload(argv, prompt))
+        .or_else(|| argv_payload_after_resume_session_insert_index(argv).map(str::to_string))
+}
+
+fn stdin_payload_text(stdin: Option<&[u8]>) -> Option<String> {
+    let bytes = stdin?;
+    if bytes_are_empty_payload(bytes) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok().map(str::to_string)
+}
+
+fn bytes_are_empty_payload(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).map_or(bytes.is_empty(), |text| text.trim().is_empty())
+}
+
+fn prompt_arg_payload(argv: &[String], prompt: Option<&str>) -> Option<String> {
+    let prompt = nonempty_prompt(prompt)?;
+    argv.iter()
+        .any(|arg| arg == prompt)
+        .then(|| prompt.to_string())
+}
+
+fn nonempty_prompt(prompt: Option<&str>) -> Option<&str> {
+    prompt.filter(|prompt| !prompt.trim().is_empty())
+}
+
+fn argv_payload_after_resume_session_insert_index(argv: &[String]) -> Option<&str> {
+    let mut index = resume_session_insert_index(argv);
+    while index < argv.len() {
+        if argv[index] == OPENCODE_SESSION_FLAG {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if !argv[index].trim().is_empty() {
+            return Some(&argv[index]);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn resume_session_insert_index(argv: &[String]) -> usize {
+    policy_managed_opencode_prefix_end(argv).unwrap_or(argv.len())
+}
+
+fn policy_managed_opencode_prefix_end(argv: &[String]) -> Option<usize> {
+    let mut index = argv.iter().position(|arg| arg == OPENCODE_RUN_ARG)? + 1;
+    while index < argv.len() {
+        let arg = argv[index].as_str();
+        if POLICY_MANAGED_FLAGS_WITH_VALUE.contains(&arg) {
+            index = index.saturating_add(2);
+        } else if POLICY_MANAGED_FLAGS_WITHOUT_VALUE.contains(&arg) {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    Some(index.min(argv.len()))
+}
+
+fn upsert_session_arg(argv: &mut Vec<String>, session_id: &str, insert_at: usize) {
+    if let Some(index) = argv.iter().position(|arg| arg == OPENCODE_SESSION_FLAG) {
+        set_existing_session_arg(argv, index, session_id);
+    } else {
+        insert_session_arg(argv, insert_at, session_id);
+    }
+}
+
+fn set_existing_session_arg(argv: &mut Vec<String>, index: usize, session_id: &str) {
+    if index + 1 < argv.len() {
+        argv[index + 1] = session_id.to_string();
+    } else {
+        argv.insert(index + 1, session_id.to_string());
+    }
+}
+
+fn insert_session_arg(argv: &mut Vec<String>, insert_at: usize, session_id: &str) {
+    argv.insert(insert_at, OPENCODE_SESSION_FLAG.to_string());
+    argv.insert(insert_at + 1, session_id.to_string());
+}
+
+fn empty_resume_payload_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "empty_resume_payload",
+        "resume launch has a known provider session but no non-empty prompt payload reaches child argv or stdin",
+    )
 }
 
 fn effective_env_from_policy(
@@ -297,9 +486,10 @@ fn stream_child<W: Write>(
     request_id: &str,
     host: &HostContext,
     child: &mut Child,
+    resume_confirmation: Option<ResumeConfirmation>,
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, host.deadline_unix_ms);
+    let mut state = LaunchState::new(request_id, host.deadline_unix_ms, resume_confirmation);
     let receiver = start_drains(child);
     run_supervision_loop(child, &receiver, &mut state, writer)?;
     state.finish(writer)
@@ -423,7 +613,7 @@ fn stream_spawn_error<W: Write>(
     writer: &mut W,
     err: std::io::Error,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, None);
+    let mut state = LaunchState::new(request_id, None, None);
     state.final_status = Some(spawn_error_status(err));
     state.mark_drains_done();
     state.finish(writer)
@@ -434,7 +624,7 @@ fn stream_policy_rejection<W: Write>(
     writer: &mut W,
     reason: String,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, None);
+    let mut state = LaunchState::new(request_id, None, None);
     state.final_status = Some(policy_rejection_status(reason));
     state.mark_drains_done();
     state.finish(writer)
@@ -450,12 +640,17 @@ struct LaunchState {
     stderr: Vec<u8>,
     parser: EventParser,
     session_id: Option<String>,
+    resume_confirmation: Option<ResumeConfirmation>,
     deadline_unix_ms: Option<u64>,
     next_heartbeat: Instant,
 }
 
 impl LaunchState {
-    fn new(request_id: &str, deadline_unix_ms: Option<u64>) -> Self {
+    fn new(
+        request_id: &str,
+        deadline_unix_ms: Option<u64>,
+        resume_confirmation: Option<ResumeConfirmation>,
+    ) -> Self {
         Self {
             request_id: request_id.to_string(),
             seq: 1,
@@ -466,6 +661,7 @@ impl LaunchState {
             stderr: Vec::new(),
             parser: EventParser::default(),
             session_id: None,
+            resume_confirmation,
             deadline_unix_ms,
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
         }
@@ -602,7 +798,19 @@ impl LaunchState {
     }
 
     fn marker<W: Write>(&mut self, name: String, writer: &mut W) -> Result<(), ProviderFailure> {
-        self.write_event(marker_event(&self.request_id, self.seq, name), writer)
+        self.marker_with_value(name, json!(true), writer)
+    }
+
+    fn marker_with_value<W: Write>(
+        &mut self,
+        name: String,
+        value: Value,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        self.write_event(
+            marker_event(&self.request_id, self.seq, name, value),
+            writer,
+        )
     }
 
     fn heartbeat<W: Write>(&mut self, writer: &mut W) -> Result<(), ProviderFailure> {
@@ -615,11 +823,27 @@ impl LaunchState {
 
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
         self.capture_session_from_parser_tail(writer)?;
+        self.confirm_submitted_user_turn(writer)?;
         let status = self.finished_status();
         let signal = self.terminal_signal_for(&status);
         let event = self.exit_event(&status, signal);
         self.write_event(event, writer)?;
         Ok(provider_exit_code(&status))
+    }
+
+    fn confirm_submitted_user_turn<W: Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        let Some(marker_value) = self.submitted_user_turn_marker_value() else {
+            return Ok(());
+        };
+        self.marker_with_value(SUBMITTED_USER_TURN_MARKER.to_string(), marker_value, writer)
+    }
+
+    fn submitted_user_turn_marker_value(&self) -> Option<Value> {
+        let confirmation = self.resume_confirmation.as_ref()?;
+        submitted_user_turn_marker_value(confirmation)
     }
 
     fn finished_status(&self) -> ProcessStatus {
@@ -681,6 +905,41 @@ impl LaunchState {
         self.stdout_done = true;
         self.stderr_done = true;
     }
+}
+
+fn submitted_user_turn_marker_value(confirmation: &ResumeConfirmation) -> Option<Value> {
+    let account = profile_for_settings_id(&confirmation.settings_id)?;
+    let native = opencode::export(&confirmation.session_id, account).ok()?;
+    if native.info.id.as_str() != confirmation.session_id.as_str() {
+        return None;
+    }
+    let message = native
+        .messages
+        .iter()
+        .find(|message| submitted_user_message_matches(message, confirmation))?;
+    Some(json!({
+        "provider_session_id": confirmation.session_id.as_str(),
+        "prompt_sha256": sha256_hex(confirmation.prompt.as_bytes()),
+        "source": SUBMITTED_USER_TURN_SOURCE,
+        "message_id": message.info.id.as_str(),
+    }))
+}
+
+fn submitted_user_message_matches(
+    message: &OpencodeMessage,
+    confirmation: &ResumeConfirmation,
+) -> bool {
+    message.info.role.as_str() == "user"
+        && message.info.session_id.as_deref() == Some(confirmation.session_id.as_str())
+        && message_has_exact_text_part(message, &confirmation.prompt)
+}
+
+fn message_has_exact_text_part(message: &OpencodeMessage, prompt: &str) -> bool {
+    message.parts.iter().any(|part| {
+        part.get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text == prompt)
+    })
 }
 
 fn invalid_launch_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
@@ -949,7 +1208,7 @@ fn stream_bytes_event(request_id: &str, seq: u64, kind: &str, bytes: &[u8]) -> V
     })
 }
 
-fn marker_event(request_id: &str, seq: u64, name: String) -> Value {
+fn marker_event(request_id: &str, seq: u64, name: String, value: Value) -> Value {
     json!({
         "contract": CONTRACT,
         "request_id": request_id,
@@ -957,7 +1216,7 @@ fn marker_event(request_id: &str, seq: u64, name: String) -> Value {
         "time_unix_ms": now_unix_ms(),
         "kind": "marker",
         "name": name,
-        "value": true,
+        "value": value,
     })
 }
 
