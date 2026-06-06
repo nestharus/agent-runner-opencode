@@ -142,8 +142,16 @@ pub fn wrapper_log_args(wrapper_log: &str) -> Vec<&str> {
 }
 
 pub fn wrapper_log_arg_lines(wrapper_log: &str) -> Vec<&str> {
-    wrapper_log
-        .lines()
+    arg_log_lines(wrapper_log_lines(wrapper_log))
+}
+
+pub fn wrapper_log_lines(wrapper_log: &str) -> Vec<&str> {
+    wrapper_log.lines().collect()
+}
+
+pub fn arg_log_lines(lines: Vec<&str>) -> Vec<&str> {
+    lines
+        .into_iter()
         .filter(|line| is_wrapper_log_arg_line(line))
         .collect()
 }
@@ -371,10 +379,24 @@ pub fn write_fake_wrapper(wrapper_path: &Path, script: String) {
 
 #[cfg(unix)]
 pub fn make_executable(path: &Path) {
-    let mut permissions = fs::metadata(path)
+    set_path_permissions(path, permissions_with_mode(path_permissions(path), 0o755));
+}
+
+#[cfg(unix)]
+pub fn path_permissions(path: &Path) -> fs::Permissions {
+    fs::metadata(path)
         .expect("fake wrapper metadata")
-        .permissions();
-    permissions.set_mode(0o755);
+        .permissions()
+}
+
+#[cfg(unix)]
+pub fn permissions_with_mode(mut permissions: fs::Permissions, mode: u32) -> fs::Permissions {
+    permissions.set_mode(mode);
+    permissions
+}
+
+#[cfg(unix)]
+pub fn set_path_permissions(path: &Path, permissions: fs::Permissions) {
     fs::set_permissions(path, permissions).expect("chmod fake wrapper");
 }
 
@@ -497,11 +519,22 @@ pub fn unique_temp_dir(prefix: &str) -> PathBuf {
 }
 
 pub fn unique_temp_dir_name(prefix: &str) -> String {
-    let nanos = SystemTime::now()
+    formatted_temp_dir_name(prefix, current_time_nanos(), current_process_id())
+}
+
+pub fn current_time_nanos() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
-        .as_nanos();
-    format!("{prefix}-{}-{nanos}", std::process::id())
+        .as_nanos()
+}
+
+pub fn current_process_id() -> u32 {
+    std::process::id()
+}
+
+pub fn formatted_temp_dir_name(prefix: &str, nanos: u128, process_id: u32) -> String {
+    format!("{prefix}-{process_id}-{nanos}")
 }
 
 pub fn prepend_path(dir: &Path) -> String {
