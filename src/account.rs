@@ -57,5 +57,13 @@ pub const ACCOUNTS: [AccountProfile; 5] = [
 pub fn profile_for_settings_id(settings_id: &str) -> Option<&'static AccountProfile> {
     ACCOUNTS
         .iter()
-        .find(|account| account.opencode_wrapper == settings_id)
+        .find(|account| settings_id_matches_account(settings_id, account))
+}
+
+fn settings_id_matches_account(settings_id: &str, account: &AccountProfile) -> bool {
+    account.opencode_wrapper == settings_id || account_one_provider_alias(settings_id, account)
+}
+
+fn account_one_provider_alias(settings_id: &str, account: &AccountProfile) -> bool {
+    settings_id == "opencode" && account.opencode_index == 1
 }

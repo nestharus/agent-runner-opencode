@@ -146,6 +146,18 @@ fn contract_policy_evaluate_accepts_host_candidate_argv() {
 }
 
 #[test]
+fn contract_policy_evaluate_accepts_account_one_provider_name_settings_id() {
+    let mut params = policy_evaluate_params_with_host_candidate_argv();
+    params["settings_id"] = json!("opencode");
+
+    let output = invoke_with_env("policy.evaluate", params, &[]);
+
+    assert_output_success(&output, "policy.evaluate account-one settings id");
+    let response = json_stdout(&output);
+    assert_policy_accepts(&response);
+}
+
+#[test]
 fn contract_policy_evaluate_rejects_forbidden() {
     let forbidden_env_key = "OPENAI_API_KEY_CONTRACT_FORBIDDEN";
     let forbidden_flag = "--variant";
