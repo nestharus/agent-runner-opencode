@@ -333,10 +333,16 @@ pub fn env_probe_opencode_script() -> String {
     "#!/bin/sh\n\
 {\n\
   printf 'declared=%s\\n' \"${DECLARED_CHILD_ENV-}\"\n\
+  printf 'xdg=%s\\n' \"${XDG_DATA_HOME-}\"\n\
   if [ \"${UNDECLARED_PARENT_ENV+x}\" = x ]; then\n\
     printf 'undeclared=%s\\n' \"$UNDECLARED_PARENT_ENV\"\n\
   else\n\
     printf 'undeclared=<unset>\\n'\n\
+  fi\n\
+  if [ \"${OPENAI_API_KEY+x}\" = x ]; then\n\
+    printf 'openai=%s\\n' \"$OPENAI_API_KEY\"\n\
+  else\n\
+    printf 'openai=<unset>\\n'\n\
   fi\n\
 } > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
 exit 0\n"

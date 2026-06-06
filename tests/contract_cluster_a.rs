@@ -65,11 +65,13 @@ fn contract_launch_env_uses_declared_boundary() {
                 ("PATH", path.as_str()),
                 ("AGENT_RUNNER_OPENCODE_WRAPPER_LOG", log_path),
                 ("DECLARED_CHILD_ENV", "declared-child-value"),
+                ("XDG_DATA_HOME", "/tmp/declared-opencode-data-home"),
             ],
         ),
         &[
             ("PATH", path.as_str()),
             ("UNDECLARED_PARENT_ENV", "ambient-secret-do-not-leak"),
+            ("OPENAI_API_KEY", "ambient-openai-secret-do-not-leak"),
         ],
     );
     assert_declared_env_boundary(&output, fake_wrapper.log_path());

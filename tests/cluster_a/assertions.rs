@@ -253,14 +253,23 @@ pub fn assert_declared_env_boundary(output: &std::process::Output, wrapper_log_p
 pub fn assert_declared_env_log(wrapper_log_path: &Path) {
     let wrapper_log = declared_env_log_text(wrapper_log_path);
     assert_declared_child_env_logged(&wrapper_log);
+    assert_declared_xdg_data_home_logged(&wrapper_log);
     assert_undeclared_child_env_unset(&wrapper_log);
     assert_ambient_secret_absent(&wrapper_log);
+    assert_openai_api_key_unset(&wrapper_log);
 }
 
 pub fn assert_declared_child_env_logged(wrapper_log: &str) {
     assert!(
         wrapper_log.contains("declared=declared-child-value"),
         "declared params.env value must reach child; log={wrapper_log:?}"
+    );
+}
+
+pub fn assert_declared_xdg_data_home_logged(wrapper_log: &str) {
+    assert!(
+        wrapper_log.contains("xdg=/tmp/declared-opencode-data-home"),
+        "declared XDG_DATA_HOME must reach child; log={wrapper_log:?}"
     );
 }
 
@@ -275,6 +284,17 @@ pub fn assert_ambient_secret_absent(wrapper_log: &str) {
     assert!(
         !wrapper_log.contains("ambient-secret-do-not-leak"),
         "undeclared parent env value leaked into child log; log={wrapper_log:?}"
+    );
+}
+
+pub fn assert_openai_api_key_unset(wrapper_log: &str) {
+    assert!(
+        wrapper_log.contains("openai=<unset>"),
+        "ambient OPENAI_API_KEY must not reach child; log={wrapper_log:?}"
+    );
+    assert!(
+        !wrapper_log.contains("ambient-openai-secret-do-not-leak"),
+        "ambient OPENAI_API_KEY value leaked into child log; log={wrapper_log:?}"
     );
 }
 

@@ -6,6 +6,7 @@
 //!       - opencode process lifecycle to contract/v1 launch NDJSON
 //!       - opencode stdout/stderr bytes to LaunchStdoutEvent/LaunchStderrEvent
 //!       - opencode sessionID metadata to LaunchMarkerEvent
+//!       - declared params.env entries, including account XDG_DATA_HOME, to env-cleared child env
 //!       - process terminal status to LaunchExitEvent
 
 use crate::encoding::{decode_base64, encode_base64, now_unix_ms};
