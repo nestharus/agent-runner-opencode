@@ -12,7 +12,7 @@
 use crate::account::profile_for_settings_id;
 use crate::encoding::{decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
-use crate::opencode::{self, first_session_id, EventParser, OpencodeMessage};
+use crate::opencode::{self, first_session_id, EventParser, OpencodeExport, OpencodeMessage};
 use crate::policy;
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use serde::Deserialize;
@@ -913,25 +913,60 @@ impl LaunchState {
 }
 
 fn submitted_user_turn_marker_value(confirmation: &ResumeConfirmation) -> Option<Value> {
-    let account = profile_for_settings_id(&confirmation.settings_id)?;
-    let native = opencode::export(&confirmation.session_id, account).ok()?;
-    if native.info.id.as_str() != confirmation.session_id.as_str() {
+    let native = export_for_resume_confirmation(confirmation)?;
+    if !export_session_matches_confirmation(&native, confirmation) {
         return None;
     }
-    let message = native
-        .messages
+    let message = submitted_user_turn_message(&native.messages, confirmation)?;
+    Some(submitted_user_turn_marker(confirmation, message))
+}
+
+fn export_for_resume_confirmation(confirmation: &ResumeConfirmation) -> Option<OpencodeExport> {
+    let account = profile_for_settings_id(&confirmation.settings_id)?;
+    opencode::export(&confirmation.session_id, account).ok()
+}
+
+fn export_session_matches_confirmation(
+    native: &OpencodeExport,
+    confirmation: &ResumeConfirmation,
+) -> bool {
+    native.info.id.as_str() == confirmation.session_id.as_str()
+}
+
+fn submitted_user_turn_message<'a>(
+    messages: &'a [OpencodeMessage],
+    confirmation: &ResumeConfirmation,
+) -> Option<&'a OpencodeMessage> {
+    messages
         .iter()
-        .find(|message| submitted_user_message_matches(message, confirmation))?;
-    let mut marker = json!({
+        .find(|message| submitted_user_message_matches(message, confirmation))
+}
+
+fn submitted_user_turn_marker(
+    confirmation: &ResumeConfirmation,
+    message: &OpencodeMessage,
+) -> Value {
+    let marker = submitted_user_turn_marker_base(confirmation, message);
+    marker_with_delivery_nonce(marker, confirmation.delivery_nonce.as_deref())
+}
+
+fn submitted_user_turn_marker_base(
+    confirmation: &ResumeConfirmation,
+    message: &OpencodeMessage,
+) -> Value {
+    json!({
         "provider_session_id": confirmation.session_id.as_str(),
         "prompt_sha256": sha256_hex(confirmation.prompt.as_bytes()),
         "source": SUBMITTED_USER_TURN_SOURCE,
         "message_id": message.info.id.as_str(),
-    });
-    if let Some(delivery_nonce) = confirmation.delivery_nonce.as_deref() {
+    })
+}
+
+fn marker_with_delivery_nonce(mut marker: Value, delivery_nonce: Option<&str>) -> Value {
+    if let Some(delivery_nonce) = delivery_nonce {
         marker["delivery_nonce"] = json!(delivery_nonce);
     }
-    Some(marker)
+    marker
 }
 
 fn submitted_user_message_matches(
@@ -967,29 +1002,44 @@ fn message_contains_delivery_nonce(message: &OpencodeMessage, delivery_nonce: &s
 }
 
 fn message_string_fields_contain(message: &OpencodeMessage, needle: &str) -> bool {
-    let mut joined_strings = String::new();
-    for part in &message.parts {
-        if value_string_fields_contain(part, needle, &mut joined_strings) {
-            return true;
-        }
-    }
-    joined_strings.contains(needle)
+    let fields = message_string_fields(message);
+    string_fields_contain_needle(&fields, needle)
+        || text_contains_needle(&joined_string_fields(&fields), needle)
 }
 
-fn value_string_fields_contain(value: &Value, needle: &str, joined_strings: &mut String) -> bool {
+fn message_string_fields(message: &OpencodeMessage) -> Vec<&str> {
+    message.parts.iter().flat_map(value_string_fields).collect()
+}
+
+fn value_string_fields(value: &Value) -> Vec<&str> {
     match value {
-        Value::String(text) => {
-            joined_strings.push_str(text);
-            text.contains(needle)
-        }
-        Value::Array(values) => values
-            .iter()
-            .any(|value| value_string_fields_contain(value, needle, joined_strings)),
-        Value::Object(values) => values
-            .values()
-            .any(|value| value_string_fields_contain(value, needle, joined_strings)),
-        _ => false,
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(values) => array_string_fields(values),
+        Value::Object(values) => object_string_fields(values),
+        _ => Vec::new(),
     }
+}
+
+fn array_string_fields(values: &[Value]) -> Vec<&str> {
+    values.iter().flat_map(value_string_fields).collect()
+}
+
+fn object_string_fields(values: &serde_json::Map<String, Value>) -> Vec<&str> {
+    values.values().flat_map(value_string_fields).collect()
+}
+
+fn string_fields_contain_needle(fields: &[&str], needle: &str) -> bool {
+    fields
+        .iter()
+        .any(|field| text_contains_needle(field, needle))
+}
+
+fn joined_string_fields(fields: &[&str]) -> String {
+    fields.concat()
+}
+
+fn text_contains_needle(text: &str, needle: &str) -> bool {
+    text.contains(needle)
 }
 
 fn delivery_nonce_from_prompt(prompt: &str) -> Option<String> {

@@ -11,6 +11,12 @@ pub const FAKE_LAUNCH_STDERR: &[u8] = b"fake wrapper stderr bytes\n";
 
 pub const SLOW_WRAPPER_SLEEP_SECONDS: u64 = 2;
 
+pub const SUBMITTED_USER_TURN_MARKER_FOR_TEST: &str = "oulipoly.submitted_user_turn";
+
+pub const OPENCODE_SESSION_FLAG_FOR_TEST: &str = "--session";
+
+pub const NOTIFICATION_PAYLOAD_NEEDLE_FOR_TEST: &str = "[OULIPOLY NOTIFICATIONS]";
+
 pub struct NumberedFixtureEvent {
     pub line_number: usize,
     pub event: Value,
@@ -131,6 +137,69 @@ pub fn wrapper_log_text(wrapper_log_path: &Path) -> String {
         .expect("selected opencodeN wrapper should record its invocation")
 }
 
+pub fn wrapper_log_args(wrapper_log: &str) -> Vec<&str> {
+    wrapper_log_arg_values(wrapper_log_arg_lines(wrapper_log))
+}
+
+pub fn wrapper_log_arg_lines(wrapper_log: &str) -> Vec<&str> {
+    wrapper_log
+        .lines()
+        .filter(|line| is_wrapper_log_arg_line(line))
+        .collect()
+}
+
+pub fn is_wrapper_log_arg_line(line: &str) -> bool {
+    line.starts_with("arg=")
+}
+
+pub fn wrapper_log_arg_values(lines: Vec<&str>) -> Vec<&str> {
+    lines.into_iter().map(wrapper_log_arg_value).collect()
+}
+
+pub fn wrapper_log_arg_value(line: &str) -> &str {
+    line.strip_prefix("arg=").expect("wrapper arg log line")
+}
+
+pub fn argv_arg_index(argv: &[&str], needle: &str) -> usize {
+    required_argv_arg_index(optional_argv_arg_index(argv, needle), needle, argv)
+}
+
+pub fn optional_argv_arg_index(argv: &[&str], needle: &str) -> Option<usize> {
+    argv.iter().position(|arg| *arg == needle)
+}
+
+pub fn argv_arg_index_containing(argv: &[&str], needle: &str) -> usize {
+    required_argv_arg_index(
+        optional_argv_arg_index_containing(argv, needle),
+        needle,
+        argv,
+    )
+}
+
+pub fn optional_argv_arg_index_containing(argv: &[&str], needle: &str) -> Option<usize> {
+    argv.iter().position(|arg| arg.contains(needle))
+}
+
+pub fn required_argv_arg_index(index: Option<usize>, needle: &str, argv: &[&str]) -> usize {
+    index.unwrap_or_else(|| missing_argv_arg_index(needle, argv))
+}
+
+pub fn missing_argv_arg_index(needle: &str, argv: &[&str]) -> ! {
+    panic!("argv missing {needle:?}: {argv:?}")
+}
+
+pub fn argv_index_before(left: usize, right: usize) -> bool {
+    left < right
+}
+
+pub fn wrapper_arg_log_line(value: &str) -> String {
+    format!("arg={value}")
+}
+
+pub fn wrapper_stdin_log_line(value: &str) -> String {
+    format!("stdin={value}")
+}
+
 pub fn wrapper_log_has_selected_wrapper(wrapper_log: &str) -> bool {
     wrapper_log
         .lines()
@@ -148,6 +217,25 @@ pub fn declared_env_log_text(wrapper_log_path: &Path) -> String {
 
 pub fn has_heartbeat_event(events: &[Value]) -> bool {
     events.iter().any(|event| event["kind"] == "heartbeat")
+}
+
+pub fn expected_submitted_user_turn_marker(events: &[Value]) -> &Value {
+    submitted_user_turn_marker(events)
+        .unwrap_or_else(|| panic!("missing submitted user turn marker; events={events:?}"))
+}
+
+pub fn submitted_user_turn_marker(events: &[Value]) -> Option<&Value> {
+    events
+        .iter()
+        .find(|event| is_submitted_user_turn_marker(event))
+}
+
+pub fn has_submitted_user_turn_marker(events: &[Value]) -> bool {
+    submitted_user_turn_marker(events).is_some()
+}
+
+pub fn is_submitted_user_turn_marker(event: &Value) -> bool {
+    event["kind"] == "marker" && event["name"] == SUBMITTED_USER_TURN_MARKER_FOR_TEST
 }
 
 pub fn policy_result(response: &Value) -> &Value {

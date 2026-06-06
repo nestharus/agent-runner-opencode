@@ -1,6 +1,8 @@
 // declared_role: formatter, mapper
 #![allow(unused_imports)]
 
+use agent_runner_opencode::encoding::sha256_hex;
+
 use super::*;
 
 pub fn launch_params(effort: &str) -> Value {
@@ -21,6 +23,20 @@ pub fn resume_launch_params_with_arg_payload() -> Value {
     params
 }
 
+pub fn resume_launch_params_with_arg_payload_env(path: &str, log_path: &str) -> Value {
+    launch_params_with_wrapper_env(resume_launch_params_with_arg_payload(), path, log_path)
+}
+
+pub fn resume_launch_params_with_arg_payload_prompt_env(
+    prompt: &str,
+    path: &str,
+    log_path: &str,
+) -> Value {
+    let mut params = resume_launch_params_with_arg_payload();
+    params["model"]["inputs"]["prompt"] = json!(prompt);
+    launch_params_with_wrapper_env(params, path, log_path)
+}
+
 pub fn resume_launch_params_with_stdin_payload() -> Value {
     let mut params = launch_params("low");
     params["session"] = json!({ "known_provider_session_id": resume_session_id() });
@@ -33,6 +49,10 @@ pub fn resume_launch_params_with_stdin_payload() -> Value {
     params
 }
 
+pub fn resume_launch_params_with_stdin_payload_env(path: &str, log_path: &str) -> Value {
+    launch_params_with_wrapper_env(resume_launch_params_with_stdin_payload(), path, log_path)
+}
+
 pub fn resume_launch_params_without_payload() -> Value {
     let mut params = launch_params("low");
     params["session"] = json!({ "known_provider_session_id": resume_session_id() });
@@ -41,10 +61,26 @@ pub fn resume_launch_params_without_payload() -> Value {
     params
 }
 
+pub fn resume_launch_params_without_payload_env(path: &str, log_path: &str) -> Value {
+    launch_params_with_wrapper_env(resume_launch_params_without_payload(), path, log_path)
+}
+
 pub fn launch_params_with_policy_effective_argv(effort: &str) -> Value {
     let mut params = launch_params(effort);
     params["argv"] = json!(policy_effective_argv(effort));
     params
+}
+
+pub fn launch_params_with_policy_effective_argv_env(
+    effort: &str,
+    path: &str,
+    log_path: &str,
+) -> Value {
+    launch_params_with_wrapper_env(
+        launch_params_with_policy_effective_argv(effort),
+        path,
+        log_path,
+    )
 }
 
 pub fn policy_evaluate_params() -> Value {
@@ -68,6 +104,21 @@ pub fn policy_evaluate_params_with_host_candidate_argv() -> Value {
 pub fn policy_evaluate_params_with_host_candidate_command(command: &str) -> Value {
     let mut params = policy_evaluate_params();
     params["launch"]["argv"] = json!(host_candidate_argv_for_command(command, "low"));
+    params
+}
+
+pub fn policy_evaluate_account_one_provider_name_settings_id_params() -> Value {
+    policy_evaluate_params_with_settings_id(policy_evaluate_params_with_host_candidate_argv())
+}
+
+pub fn policy_evaluate_account_one_plain_host_command_params() -> Value {
+    policy_evaluate_params_with_settings_id(policy_evaluate_params_with_host_candidate_command(
+        "opencode",
+    ))
+}
+
+pub fn policy_evaluate_params_with_settings_id(mut params: Value) -> Value {
+    params["settings_id"] = json!("opencode");
     params
 }
 
@@ -121,6 +172,18 @@ pub fn launch_params_with_env(effort: &str, env: &[(&str, &str)]) -> Value {
     params
 }
 
+pub fn launch_params_with_wrapper_env(mut params: Value, path: &str, log_path: &str) -> Value {
+    params["env"] = wrapper_env(path, log_path);
+    params
+}
+
+pub fn wrapper_env(path: &str, log_path: &str) -> Value {
+    json!({
+        "PATH": path,
+        "AGENT_RUNNER_OPENCODE_WRAPPER_LOG": log_path
+    })
+}
+
 pub fn model_request(effort: &str) -> Value {
     json!({
         "name": format!("gpt-{effort}"),
@@ -138,6 +201,10 @@ pub fn resume_session_id() -> &'static str {
 
 pub fn resume_payload() -> &'static str {
     "[OULIPOLY NOTIFICATIONS]\nkind: agent_bash_complete\nhandle: h-s11-external\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\n[END OULIPOLY NOTIFICATIONS]\n"
+}
+
+pub fn resume_payload_sha256() -> String {
+    sha256_hex(resume_payload().as_bytes())
 }
 
 pub fn host_candidate_argv(effort: &str) -> Vec<&str> {

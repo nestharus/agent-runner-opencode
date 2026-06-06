@@ -384,6 +384,120 @@ pub fn assert_output_success(output: &std::process::Output, label: &str) {
     );
 }
 
+pub fn assert_resume_arg_payload_wrapper_log(wrapper_log_path: &Path) {
+    let wrapper_log = wrapper_log_text(wrapper_log_path);
+    assert_wrapper_log_arg_value(&wrapper_log, OPENCODE_SESSION_FLAG_FOR_TEST);
+    assert_wrapper_log_arg_value(&wrapper_log, resume_session_id());
+    assert_wrapper_log_arg_value(&wrapper_log, resume_payload());
+}
+
+pub fn assert_resume_stdin_payload_wrapper_log(wrapper_log_path: &Path) {
+    let wrapper_log = wrapper_log_text(wrapper_log_path);
+    assert_wrapper_log_arg_value(&wrapper_log, OPENCODE_SESSION_FLAG_FOR_TEST);
+    assert_wrapper_log_arg_value(&wrapper_log, resume_session_id());
+    assert_wrapper_log_stdin_value(&wrapper_log, resume_payload());
+}
+
+pub fn assert_wrapper_log_arg_value(wrapper_log: &str, value: &str) {
+    let expected = wrapper_arg_log_line(value);
+    assert!(wrapper_log.contains(&expected), "{wrapper_log}");
+}
+
+pub fn assert_wrapper_log_stdin_value(wrapper_log: &str, value: &str) {
+    let expected = wrapper_stdin_log_line(value);
+    assert!(wrapper_log.contains(&expected), "{wrapper_log}");
+}
+
+pub fn assert_session_before_notification_payload(wrapper_log_path: &Path) {
+    let wrapper_log = wrapper_log_text(wrapper_log_path);
+    let argv = wrapper_log_args(&wrapper_log);
+    assert_argv_session_before_notification_payload(&argv);
+}
+
+pub fn assert_argv_session_before_notification_payload(argv: &[&str]) {
+    let session_flag = argv_arg_index(argv, OPENCODE_SESSION_FLAG_FOR_TEST);
+    let payload = argv_arg_index_containing(argv, NOTIFICATION_PAYLOAD_NEEDLE_FOR_TEST);
+    assert!(
+        argv_index_before(session_flag, payload),
+        "--session must be before notification payload; argv={argv:?}"
+    );
+}
+
+pub fn assert_submitted_user_turn_marker(events: &[Value]) {
+    let marker = expected_submitted_user_turn_marker(events);
+    assert_submitted_user_turn_marker_value(marker);
+}
+
+pub fn assert_submitted_user_turn_marker_value(marker: &Value) {
+    assert_submitted_user_turn_provider_session(marker);
+    assert_submitted_user_turn_prompt_hash(marker);
+    assert_submitted_user_turn_source(marker);
+    assert_submitted_user_turn_message_id(marker);
+    assert_submitted_user_turn_delivery_nonce(marker);
+}
+
+pub fn assert_submitted_user_turn_provider_session(marker: &Value) {
+    assert_eq!(
+        marker["value"]["provider_session_id"].as_str(),
+        Some(resume_session_id())
+    );
+}
+
+pub fn assert_submitted_user_turn_prompt_hash(marker: &Value) {
+    let expected = resume_payload_sha256();
+    assert_eq!(
+        marker["value"]["prompt_sha256"].as_str(),
+        Some(expected.as_str())
+    );
+}
+
+pub fn assert_submitted_user_turn_source(marker: &Value) {
+    assert_eq!(marker["value"]["source"].as_str(), Some("opencode.export"));
+}
+
+pub fn assert_submitted_user_turn_message_id(marker: &Value) {
+    assert_eq!(marker["value"]["message_id"].as_str(), Some("msg-user"));
+}
+
+pub fn assert_submitted_user_turn_delivery_nonce(marker: &Value) {
+    assert_eq!(
+        marker["value"]["delivery_nonce"].as_str(),
+        Some("5169694d-de0f-40d1-890c-6e28e55bab27")
+    );
+}
+
+pub fn assert_no_submitted_user_turn_marker(events: &[Value]) {
+    assert!(
+        !has_submitted_user_turn_marker(events),
+        "unconfirmed export must not emit submitted user turn marker; events={events:?}"
+    );
+}
+
+pub fn assert_empty_resume_payload_rejected(
+    output: &std::process::Output,
+    wrapper_log_path: &Path,
+) {
+    assert_empty_resume_payload_status(output);
+    assert_empty_resume_payload_did_not_spawn(wrapper_log_path);
+    assert_empty_resume_payload_response(&json_stdout(output));
+}
+
+pub fn assert_empty_resume_payload_status(output: &std::process::Output) {
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+}
+
+pub fn assert_empty_resume_payload_did_not_spawn(wrapper_log_path: &Path) {
+    assert!(
+        !wrapper_log_path.exists(),
+        "empty resume payload must fail before spawning opencode"
+    );
+}
+
+pub fn assert_empty_resume_payload_response(response: &Value) {
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "empty_resume_payload");
+}
+
 pub fn assert_policy_accepts(response: &Value) {
     assert_policy_response_shape(response);
     assert_policy_response_secret_absent(response);
