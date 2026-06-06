@@ -37,6 +37,12 @@ pub fn policy_evaluate_params_with_host_candidate_argv() -> Value {
     params
 }
 
+pub fn policy_evaluate_params_with_host_candidate_command(command: &str) -> Value {
+    let mut params = policy_evaluate_params();
+    params["launch"]["argv"] = json!(host_candidate_argv_for_command(command, "low"));
+    params
+}
+
 pub fn forbidden_policy_evaluate_params(forbidden_flag: &str, forbidden_env_key: &str) -> Value {
     let mut env = serde_json::Map::new();
     env.insert(
@@ -99,8 +105,12 @@ pub fn model_request(effort: &str) -> Value {
 }
 
 pub fn host_candidate_argv(effort: &str) -> Vec<&str> {
+    host_candidate_argv_for_command("opencode1", effort)
+}
+
+pub fn host_candidate_argv_for_command<'a>(command: &'a str, effort: &'a str) -> Vec<&'a str> {
     vec![
-        "opencode1",
+        command,
         "run",
         "--dangerously-skip-permissions",
         "-m",

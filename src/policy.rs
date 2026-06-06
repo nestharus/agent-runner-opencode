@@ -176,10 +176,17 @@ fn stripped_policy_launch_args<'a>(
 }
 
 fn allowed_launch_prefixes(wrapper: &str, effort: &str) -> Vec<Vec<String>> {
-    vec![
+    let mut prefixes = vec![
         host_candidate_prefix(wrapper, effort),
         policy_effective_prefix(wrapper, effort),
-    ]
+    ];
+    if wrapper == "opencode1" {
+        prefixes.extend([
+            host_candidate_prefix("opencode", effort),
+            policy_effective_prefix("opencode", effort),
+        ]);
+    }
+    prefixes
 }
 
 fn host_candidate_prefix(wrapper: &str, effort: &str) -> Vec<String> {
