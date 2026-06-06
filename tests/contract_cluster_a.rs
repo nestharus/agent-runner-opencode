@@ -4,6 +4,7 @@ mod cluster_a;
 mod support;
 
 use cluster_a::*;
+use serde_json::json;
 use support::{invoke, invoke_with_env, invoke_with_host_and_env, json_stdout};
 
 #[test]
@@ -30,6 +31,23 @@ fn contract_launch_stream() {
         ),
         &[("PATH", path.as_str())],
     );
+    assert_contract_launch_stream_output(&output, fake_wrapper.log_path(), fixture_session_id);
+}
+
+#[test]
+fn contract_launch_stream_accepts_policy_effective_argv() {
+    let fake_wrapper = FakeOpencodeWrapper::new();
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let fixture_session_id = fixture_session_id();
+    let mut params = launch_params_with_policy_effective_argv("low");
+    params["env"] = json!({
+        "PATH": path,
+        "AGENT_RUNNER_OPENCODE_WRAPPER_LOG": log_path
+    });
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
     assert_contract_launch_stream_output(&output, fake_wrapper.log_path(), fixture_session_id);
 }
 
@@ -110,6 +128,19 @@ fn contract_policy_evaluate() {
         &[("OPENAI_API_KEY", "SENTINEL_DO_NOT_LEAK")],
     );
     assert_output_success(&output, "policy.evaluate");
+    let response = json_stdout(&output);
+    assert_policy_accepts(&response);
+}
+
+#[test]
+fn contract_policy_evaluate_accepts_host_candidate_argv() {
+    let output = invoke_with_env(
+        "policy.evaluate",
+        policy_evaluate_params_with_host_candidate_argv(),
+        &[],
+    );
+
+    assert_output_success(&output, "policy.evaluate host candidate argv");
     let response = json_stdout(&output);
     assert_policy_accepts(&response);
 }

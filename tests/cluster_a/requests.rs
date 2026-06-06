@@ -13,6 +13,12 @@ pub fn launch_params(effort: &str) -> Value {
     })
 }
 
+pub fn launch_params_with_policy_effective_argv(effort: &str) -> Value {
+    let mut params = launch_params(effort);
+    params["argv"] = json!(policy_effective_argv(effort));
+    params
+}
+
 pub fn policy_evaluate_params() -> Value {
     json!({
         "settings_id": "opencode1",
@@ -23,6 +29,12 @@ pub fn policy_evaluate_params() -> Value {
             "working_directory": env!("CARGO_MANIFEST_DIR")
         }
     })
+}
+
+pub fn policy_evaluate_params_with_host_candidate_argv() -> Value {
+    let mut params = policy_evaluate_params();
+    params["launch"]["argv"] = json!(host_candidate_argv("low"));
+    params
 }
 
 pub fn forbidden_policy_evaluate_params(forbidden_flag: &str, forbidden_env_key: &str) -> Value {
@@ -84,6 +96,34 @@ pub fn model_request(effort: &str) -> Value {
             "named": {}
         }
     })
+}
+
+pub fn host_candidate_argv(effort: &str) -> Vec<&str> {
+    vec![
+        "opencode1",
+        "run",
+        "--dangerously-skip-permissions",
+        "-m",
+        "openai/gpt-5.5",
+        "--variant",
+        effort,
+        "reply with the single word: ok",
+    ]
+}
+
+pub fn policy_effective_argv(effort: &str) -> Vec<&str> {
+    vec![
+        "opencode1",
+        "run",
+        "--format",
+        "json",
+        "--dangerously-skip-permissions",
+        "-m",
+        "openai/gpt-5.5",
+        "--variant",
+        effort,
+        "reply with the single word: ok",
+    ]
 }
 
 pub fn terminal_classify_params(status: Value, stdout: &str, stderr: &str) -> Value {

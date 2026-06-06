@@ -101,9 +101,7 @@ fn effective_argv(wrapper: &str, params: &PolicyEvaluateParams) -> Vec<String> {
         "--variant".to_string(),
         model_effort(params).to_string(),
     ];
-    if let Some(prompt_args) = params.launch.argv.as_ref() {
-        argv.extend(prompt_args.iter().cloned());
-    }
+    argv.extend(policy_launch_args(wrapper, params));
     argv
 }
 
@@ -133,8 +131,17 @@ fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, S
 
 fn diagnostics_for_policy(params: &PolicyEvaluateParams) -> Vec<Value> {
     let mut diagnostics = forbidden_env_diagnostics(params.launch.env.as_ref());
-    diagnostics.extend(forbidden_argv_diagnostics(params.launch.argv.as_deref()));
+    diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(
+        account_wrapper(params),
+        params,
+    )));
     diagnostics
+}
+
+fn account_wrapper(params: &PolicyEvaluateParams) -> &str {
+    profile_for_settings_id(&params.settings_id)
+        .map(|account| account.opencode_wrapper)
+        .unwrap_or("opencode1")
 }
 
 fn forbidden_env_diagnostics(input: Option<&BTreeMap<String, String>>) -> Vec<Value> {
@@ -144,11 +151,65 @@ fn forbidden_env_diagnostics(input: Option<&BTreeMap<String, String>>) -> Vec<Va
         .collect()
 }
 
-fn forbidden_argv_diagnostics(input: Option<&[String]>) -> Vec<Value> {
+fn forbidden_argv_diagnostics(input: &[String]) -> Vec<Value> {
     forbidden_launch_args(input)
         .into_iter()
         .map(forbidden_arg_diagnostic)
         .collect()
+}
+
+fn policy_launch_args(wrapper: &str, params: &PolicyEvaluateParams) -> Vec<String> {
+    let argv = params.launch.argv.as_deref().unwrap_or_default();
+    stripped_policy_launch_args(wrapper, params, argv)
+        .unwrap_or(argv)
+        .to_vec()
+}
+
+fn stripped_policy_launch_args<'a>(
+    wrapper: &str,
+    params: &PolicyEvaluateParams,
+    argv: &'a [String],
+) -> Option<&'a [String]> {
+    allowed_launch_prefixes(wrapper, model_effort(params))
+        .into_iter()
+        .find_map(|prefix| strip_launch_prefix(argv, &prefix))
+}
+
+fn allowed_launch_prefixes(wrapper: &str, effort: &str) -> Vec<Vec<String>> {
+    vec![
+        host_candidate_prefix(wrapper, effort),
+        policy_effective_prefix(wrapper, effort),
+    ]
+}
+
+fn host_candidate_prefix(wrapper: &str, effort: &str) -> Vec<String> {
+    vec![
+        wrapper.to_string(),
+        "run".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "-m".to_string(),
+        "openai/gpt-5.5".to_string(),
+        "--variant".to_string(),
+        effort.to_string(),
+    ]
+}
+
+fn policy_effective_prefix(wrapper: &str, effort: &str) -> Vec<String> {
+    vec![
+        wrapper.to_string(),
+        "run".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "-m".to_string(),
+        "openai/gpt-5.5".to_string(),
+        "--variant".to_string(),
+        effort.to_string(),
+    ]
+}
+
+fn strip_launch_prefix<'a>(argv: &'a [String], prefix: &[String]) -> Option<&'a [String]> {
+    argv.starts_with(prefix).then(|| &argv[prefix.len()..])
 }
 
 pub(crate) fn is_forbidden_env_key(key: &str) -> bool {
@@ -217,10 +278,9 @@ fn forbidden_env_keys(input: Option<&BTreeMap<String, String>>) -> Vec<&String> 
         .collect()
 }
 
-fn forbidden_launch_args(input: Option<&[String]>) -> Vec<&String> {
+fn forbidden_launch_args(input: &[String]) -> Vec<&String> {
     input
-        .into_iter()
-        .flatten()
+        .iter()
         .filter(|arg| is_forbidden_launch_arg(arg))
         .collect()
 }
