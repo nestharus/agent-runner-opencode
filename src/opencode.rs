@@ -1,4 +1,4 @@
-//! Declared roles: adapter, parser, accessor
+//! Declared roles: orchestration, parser, accessor, filter, predicate, mapper, validator, formatter
 //! adapter_declarations:
 //!   - component: src/opencode.rs
 //!     role: adapter
@@ -9,9 +9,9 @@
 //!       - opencode export native session JSON
 
 use crate::account::AccountProfile;
+use crate::shell;
 use serde::Deserialize;
 use serde_json::Value;
-use std::process::Command;
 
 #[derive(Default)]
 pub struct EventParser {
@@ -74,10 +74,7 @@ impl EventParser {
     pub fn ingest(&mut self, bytes: &[u8]) -> Vec<OpencodeEventMetadata> {
         self.pending.extend_from_slice(bytes);
         let lines = drain_complete_lines(&mut self.pending);
-        lines
-            .iter()
-            .filter_map(|line| parse_event_line(line))
-            .collect()
+        parse_event_lines(&lines)
     }
 
     pub fn finish(&mut self) -> Vec<OpencodeEventMetadata> {
@@ -97,27 +94,18 @@ pub fn export(
     session_id: &str,
     account: &AccountProfile,
 ) -> Result<OpencodeExport, OpencodeExportError> {
-    let output = Command::new(account.opencode_wrapper)
+    let output = shell::command(account.opencode_wrapper)
         .arg("export")
         .arg(session_id)
         .output()
-        .map_err(|err| OpencodeExportError::Spawn(err.to_string()))?;
-    if !output.status.success() {
-        return Err(OpencodeExportError::Failed {
-            status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
-    }
+        .map_err(export_spawn_error)?;
+    validate_export_status(&output)?;
     parse_export_stdout(&output.stdout)
 }
 
 pub fn parse_export_stdout(stdout: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {
-    let start = stdout
-        .iter()
-        .position(|byte| *byte == b'{')
-        .ok_or_else(|| OpencodeExportError::InvalidJson("missing JSON object".to_string()))?;
-    serde_json::from_slice(&stdout[start..])
-        .map_err(|err| OpencodeExportError::InvalidJson(err.to_string()))
+    let start = export_json_start(stdout)?;
+    parse_export_json(&stdout[start..])
 }
 
 fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
@@ -126,16 +114,12 @@ fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
         None => return Vec::new(),
     };
     let drained = pending.drain(..split_at).collect::<Vec<_>>();
-    drained
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.trim_ascii().is_empty())
-        .map(Vec::from)
-        .collect()
+    non_empty_lines(&drained)
 }
 
 fn parse_event_line(line: &[u8]) -> Option<OpencodeEventMetadata> {
-    let event: OpencodeEventMetadata = serde_json::from_slice(line).ok()?;
-    is_pinned_native_event(&event).then_some(event)
+    let event = parse_native_event(line)?;
+    pinned_native_event(event)
 }
 
 fn is_pinned_native_event(event: &OpencodeEventMetadata) -> bool {
@@ -143,4 +127,92 @@ fn is_pinned_native_event(event: &OpencodeEventMetadata) -> bool {
         event.event_type.as_str(),
         "step_start" | "text" | "step_finish"
     ) && event.part.is_object()
+}
+
+fn parse_event_lines(lines: &[Vec<u8>]) -> Vec<OpencodeEventMetadata> {
+    let parsed = parse_native_event_lines(lines);
+    let parsed = valid_native_events(parsed);
+    pinned_native_events(parsed)
+}
+
+fn parse_native_event_lines(lines: &[Vec<u8>]) -> Vec<Option<OpencodeEventMetadata>> {
+    lines.iter().map(|line| parse_native_event(line)).collect()
+}
+
+fn valid_native_events(events: Vec<Option<OpencodeEventMetadata>>) -> Vec<OpencodeEventMetadata> {
+    events.into_iter().flatten().collect()
+}
+
+fn pinned_native_events(events: Vec<OpencodeEventMetadata>) -> Vec<OpencodeEventMetadata> {
+    events.into_iter().filter(is_pinned_native_event).collect()
+}
+
+fn export_spawn_error(err: std::io::Error) -> OpencodeExportError {
+    OpencodeExportError::Spawn(err.to_string())
+}
+
+fn validate_export_status(output: &std::process::Output) -> Result<(), OpencodeExportError> {
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(export_failed_error(output))
+}
+
+fn export_failed_error(output: &std::process::Output) -> OpencodeExportError {
+    OpencodeExportError::Failed {
+        status: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    }
+}
+
+fn export_json_start(stdout: &[u8]) -> Result<usize, OpencodeExportError> {
+    stdout
+        .iter()
+        .position(|byte| *byte == b'{')
+        .ok_or_else(missing_export_json_error)
+}
+
+fn parse_export_json(bytes: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {
+    serde_json::from_slice(bytes).map_err(invalid_export_json_error)
+}
+
+fn missing_export_json_error() -> OpencodeExportError {
+    OpencodeExportError::InvalidJson("missing JSON object".to_string())
+}
+
+fn invalid_export_json_error(err: serde_json::Error) -> OpencodeExportError {
+    OpencodeExportError::InvalidJson(err.to_string())
+}
+
+fn non_empty_lines(drained: &[u8]) -> Vec<Vec<u8>> {
+    let lines = byte_lines(drained);
+    let lines = select_non_empty_lines(lines);
+    owned_byte_lines(lines)
+}
+
+fn byte_lines(drained: &[u8]) -> Vec<&[u8]> {
+    drained.split(|byte| *byte == b'\n').collect()
+}
+
+fn select_non_empty_lines(lines: Vec<&[u8]>) -> Vec<&[u8]> {
+    lines
+        .into_iter()
+        .filter(|line| is_non_empty_line(line))
+        .collect()
+}
+
+fn is_non_empty_line(line: &[u8]) -> bool {
+    !line.trim_ascii().is_empty()
+}
+
+fn owned_byte_lines(lines: Vec<&[u8]>) -> Vec<Vec<u8>> {
+    lines.into_iter().map(Vec::from).collect()
+}
+
+fn parse_native_event(line: &[u8]) -> Option<OpencodeEventMetadata> {
+    serde_json::from_slice(line).ok()
+}
+
+fn pinned_native_event(event: OpencodeEventMetadata) -> Option<OpencodeEventMetadata> {
+    is_pinned_native_event(&event).then_some(event)
 }

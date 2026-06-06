@@ -1,4 +1,4 @@
-//! Declared roles: mapper, validator
+//! Declared roles: mapper, validator, predicate, filter, formatter
 
 use crate::encoding::sha256_hex;
 use crate::envelope::ProviderFailure;
@@ -9,12 +9,7 @@ pub fn assess_params(params: Value, _request_id: &str) -> Result<Value, Provider
     let met = requirements_met(&requirements);
     let facts_allow = facts_allow_rotation(&params);
     let allowed = met && facts_allow;
-    Ok(json!({
-        "allowed": allowed,
-        "score": score(&requirements, facts_allow),
-        "reason": assess_reason(allowed, met, facts_allow),
-        "requirements": requirements,
-    }))
+    Ok(assess_result(allowed, &requirements, met, facts_allow))
 }
 
 pub fn materialize_params(params: Value, _request_id: &str) -> Result<Value, ProviderFailure> {
@@ -65,10 +60,7 @@ fn score(requirements: &[Value], facts_allow: bool) -> u64 {
     if requirements.is_empty() {
         return u64::from(facts_allow) * 100;
     }
-    let met = requirements
-        .iter()
-        .filter(|requirement| requirement.get("met").and_then(Value::as_bool) == Some(true))
-        .count() as u64;
+    let met = met_requirement_count(requirements);
     (met * 100) / requirements.len() as u64
 }
 
@@ -90,9 +82,13 @@ fn host_state_plan(params: &Value) -> Value {
     let source_session_id = string_field(params, "source_session_id", "source-session");
     let target_session_id = string_field(params, "target_session_id", "target-session");
     let transition_reason = transition_reason(params);
-    let artifact_path = format!("provider-owned://rotation/{chain_id}/host-state-plan.json");
-    let artifact_sha = sha256_hex(
-        format!("{chain_id}:{source_provider}:{target_provider}:{source_session_id}:{target_session_id}").as_bytes(),
+    let artifact_path = host_state_artifact_path(&chain_id);
+    let artifact_sha = host_state_artifact_sha(
+        &chain_id,
+        &source_provider,
+        &target_provider,
+        &source_session_id,
+        &target_session_id,
     );
     json!({
         "schema_version": 1,
@@ -126,4 +122,46 @@ fn string_field(params: &Value, key: &str, fallback: &str) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(fallback)
         .to_string()
+}
+
+fn assess_result(
+    allowed: bool,
+    requirements: &[Value],
+    requirements_met: bool,
+    facts_allow: bool,
+) -> Value {
+    json!({
+        "allowed": allowed,
+        "score": score(requirements, facts_allow),
+        "reason": assess_reason(allowed, requirements_met, facts_allow),
+        "requirements": requirements,
+    })
+}
+
+fn met_requirement_count(requirements: &[Value]) -> u64 {
+    requirements
+        .iter()
+        .filter(|requirement| requirement_met(requirement))
+        .count() as u64
+}
+
+fn requirement_met(requirement: &Value) -> bool {
+    requirement.get("met").and_then(Value::as_bool) == Some(true)
+}
+
+fn host_state_artifact_path(chain_id: &str) -> String {
+    format!("provider-owned://rotation/{chain_id}/host-state-plan.json")
+}
+
+fn host_state_artifact_sha(
+    chain_id: &str,
+    source_provider: &str,
+    target_provider: &str,
+    source_session_id: &str,
+    target_session_id: &str,
+) -> String {
+    sha256_hex(
+        format!("{chain_id}:{source_provider}:{target_provider}:{source_session_id}:{target_session_id}")
+            .as_bytes(),
+    )
 }

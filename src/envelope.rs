@@ -1,4 +1,4 @@
-//! Declared roles: formatter, validator
+//! Declared roles: formatter, validator, mapper
 
 use serde::Deserialize;
 use serde_json::{json, Value};

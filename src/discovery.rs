@@ -1,4 +1,4 @@
-//! Declared roles: formatter, accessor
+//! Declared roles: formatter, accessor, mapper
 
 use crate::account::{AccountProfile, ACCOUNTS};
 use crate::models::{ModelAlias, MODEL_ALIASES, PROVIDER_MODEL};

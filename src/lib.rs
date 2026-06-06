@@ -1,4 +1,4 @@
-//! Declared roles: facade
+//! Declared roles: accessor
 
 pub mod account;
 pub mod codex;

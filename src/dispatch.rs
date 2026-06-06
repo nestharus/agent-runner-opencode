@@ -37,16 +37,8 @@ pub fn subcommand_from_args<'a>(
 ) -> Result<&'a str, ProviderFailure> {
     match args {
         [_, subcommand] => Ok(subcommand.as_str()),
-        [_] => Err(ProviderFailure::unsupported(
-            request_id,
-            "missing_subcommand",
-            "provider invocation requires exactly one subcommand argument",
-        )),
-        _ => Err(ProviderFailure::invalid_request(
-            request_id,
-            "invalid_argv",
-            "provider invocation accepts exactly one subcommand argument",
-        )),
+        [_] => Err(missing_subcommand_failure(request_id)),
+        _ => Err(invalid_argv_failure(request_id)),
     }
 }
 
@@ -77,11 +69,7 @@ pub fn handle_decoded_invocation(
         )),
         "discovery.models" => Ok(success_response(&request.request_id, discovery::models())),
         "discovery.accounts" => Ok(success_response(&request.request_id, discovery::accounts())),
-        "launch" => Err(ProviderFailure::invalid_request(
-            request.request_id,
-            "launch_requires_streaming_writer",
-            "launch must be invoked through the streaming dispatch branch",
-        )),
+        "launch" => Err(launch_requires_streaming_writer_failure(request.request_id)),
         "policy.evaluate" => Ok(success_response(
             &request.request_id,
             policy::evaluate_params(request.params, &request.request_id)?,
@@ -90,79 +78,21 @@ pub fn handle_decoded_invocation(
             &request.request_id,
             terminal::classify_params(request.params, &request.request_id)?,
         )),
-        "session.locate_transcript" => Ok(success_response(
-            &request.request_id,
-            session::locate_transcript_params(request.params, &request.request_id)?,
-        )),
-        "session.read_turns" => Ok(success_response(
-            &request.request_id,
-            session::read_turns_params(request.params, &request.request_id)?,
-        )),
-        "session.capture" => Ok(success_response(
-            &request.request_id,
-            session::capture_params(request.params, &request.request_id)?,
-        )),
-        "session.export" => Ok(success_response(
-            &request.request_id,
-            session::export_params(request.params, &request.request_id)?,
-        )),
-        "session.replace" => Ok(success_response(
-            &request.request_id,
-            session::replace_params(request.params, &request.request_id)?,
-        )),
-        "quota.source" => Ok(success_response(
-            &request.request_id,
-            quota::source_params(request.params, &request.request_id)?,
-        )),
-        "quota.probe" => Ok(success_response(
-            &request.request_id,
-            quota::probe_params(request.params, &request.request_id)?,
-        )),
-        "quota.refresh_auth" => Ok(success_response(
-            &request.request_id,
-            quota::refresh_auth_params(request.params, &request.request_id)?,
-        )),
-        "settings.list" => Ok(success_response(
-            &request.request_id,
-            settings::list_params(&request.host, &request.request_id)?,
-        )),
-        "settings.get" => Ok(success_response(
-            &request.request_id,
-            settings::get_params(&request.host, request.params, &request.request_id)?,
-        )),
-        "settings.create" => Ok(success_response(
-            &request.request_id,
-            settings::create_params(&request.host, request.params, &request.request_id)?,
-        )),
-        "settings.update" => Ok(success_response(
-            &request.request_id,
-            settings::update_params(&request.host, request.params, &request.request_id)?,
-        )),
-        "settings.delete" => Ok(success_response(
-            &request.request_id,
-            settings::delete_params(&request.host, request.params, &request.request_id)?,
-        )),
-        "settings.validate" => Ok(success_response(
-            &request.request_id,
-            settings::validate_params(request.params, &request.request_id)?,
-        )),
-        "settings.migrate" => Ok(success_response(
-            &request.request_id,
-            settings::migrate_params(&request.host, request.params, &request.request_id)?,
-        )),
-        "setup.detect" => Ok(success_response(
-            &request.request_id,
-            setup::detect_params(&request.host, request.params, &request.request_id)?,
-        )),
-        "setup.install_plan" => Ok(success_response(
-            &request.request_id,
-            setup::install_plan_params(request.params, &request.request_id)?,
-        )),
-        "setup.sync_plan" => Ok(success_response(
-            &request.request_id,
-            setup::sync_plan_params(request.params, &request.request_id)?,
-        )),
-        "setup_brain.turn" => Err(setup::brain_unsupported(request.request_id)),
+        "session.locate_transcript"
+        | "session.read_turns"
+        | "session.capture"
+        | "session.export"
+        | "session.replace" => handle_capability(subcommand, request, session::handle),
+        "quota.source" | "quota.probe" | "quota.refresh_auth" => {
+            handle_capability(subcommand, request, quota::handle)
+        }
+        "settings.list" | "settings.get" | "settings.create" | "settings.update"
+        | "settings.delete" | "settings.validate" | "settings.migrate" => {
+            handle_capability(subcommand, request, settings::handle)
+        }
+        "setup.detect" | "setup.install_plan" | "setup.sync_plan" | "setup_brain.turn" => {
+            handle_capability(subcommand, request, setup::handle)
+        }
         "rotation.assess" => Ok(success_response(
             &request.request_id,
             rotation::assess_params(request.params, &request.request_id)?,
@@ -196,9 +126,7 @@ fn write_invocation_result<W: Write>(
     let response = handle_decoded_invocation(request, subcommand)?;
     writer
         .write_all(&canonical_json_bytes(&response))
-        .map_err(|err| {
-            ProviderFailure::internal("unknown", "stdout_write_failed", err.to_string())
-        })?;
+        .map_err(stdout_write_failure)?;
     Ok(0)
 }
 
@@ -228,11 +156,7 @@ fn validate_params_present(raw: &Value, request_id: &str) -> Result<(), Provider
     if raw.get("params").is_some() {
         return Ok(());
     }
-    Err(ProviderFailure::invalid_request(
-        request_id,
-        "missing_params",
-        "request envelope must include params",
-    ))
+    Err(missing_params_failure(request_id))
 }
 
 fn validate_empty_params(
@@ -243,49 +167,39 @@ fn validate_empty_params(
     if params.as_object().is_some_and(serde_json::Map::is_empty) {
         return Ok(());
     }
-    Err(ProviderFailure::invalid_request(
-        request_id,
-        code,
-        "params must be an empty object for this subcommand",
-    ))
+    Err(empty_params_failure(request_id, code))
 }
 
 fn parse_request_envelope(
     raw: Value,
     request_id: &str,
 ) -> Result<RequestEnvelope, ProviderFailure> {
-    serde_json::from_value(raw).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "invalid_envelope",
-            format!("request envelope does not match the provider contract: {err}"),
-        )
-    })
+    serde_json::from_value(raw).map_err(|err| invalid_envelope_failure(request_id, err))
 }
 
 fn validate_request_envelope(request: RequestEnvelope) -> Result<RequestEnvelope, ProviderFailure> {
     if request.contract != CONTRACT {
-        return Err(ProviderFailure::invalid_request(
+        return Err(unsupported_contract_failure(
             request.request_id,
-            "unsupported_contract",
-            format!("unsupported contract version: {}", request.contract),
+            &request.contract,
         ));
     }
     if request.request_id.trim().is_empty() {
-        return Err(ProviderFailure::invalid_request(
-            "unknown",
-            "invalid_request_id",
-            "request_id must be a non-empty string",
-        ));
+        return Err(invalid_request_id_failure());
     }
     if request.host.app.trim().is_empty() {
-        return Err(ProviderFailure::invalid_request(
-            request.request_id,
-            "invalid_host",
-            "host.app must be a non-empty string",
-        ));
+        return Err(invalid_host_failure(request.request_id));
     }
     Ok(request)
+}
+
+fn handle_capability(
+    subcommand: &str,
+    request: RequestEnvelope,
+    handle: fn(&str, RequestEnvelope) -> Result<Value, ProviderFailure>,
+) -> Result<Value, ProviderFailure> {
+    let request_id = request.request_id.clone();
+    Ok(success_response(&request_id, handle(subcommand, request)?))
 }
 
 fn unknown_subcommand_failure(request_id: String, subcommand: &str) -> ProviderFailure {
@@ -293,6 +207,14 @@ fn unknown_subcommand_failure(request_id: String, subcommand: &str) -> ProviderF
         request_id,
         "unknown_subcommand",
         format!("unknown provider subcommand: {subcommand}"),
+    )
+}
+
+fn launch_requires_streaming_writer_failure(request_id: String) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "launch_requires_streaming_writer",
+        "launch must be invoked through the streaming dispatch branch",
     )
 }
 
@@ -305,8 +227,80 @@ fn failure_output(failure: ProviderFailure) -> (Vec<u8>, i32) {
 fn write_failure_output<W: Write>(writer: &mut W, failure: ProviderFailure) -> i32 {
     let (stdout, exit_code) = failure_output(failure);
     if let Err(err) = writer.write_all(&stdout) {
-        eprintln!("failed to write stdout: {err}");
+        report_stdout_write_failure(err);
         return 1;
     }
     exit_code
+}
+
+fn missing_subcommand_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::unsupported(
+        request_id,
+        "missing_subcommand",
+        "provider invocation requires exactly one subcommand argument",
+    )
+}
+
+fn invalid_argv_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_argv",
+        "provider invocation accepts exactly one subcommand argument",
+    )
+}
+
+fn stdout_write_failure(err: std::io::Error) -> ProviderFailure {
+    ProviderFailure::internal("unknown", "stdout_write_failed", err.to_string())
+}
+
+fn missing_params_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "missing_params",
+        "request envelope must include params",
+    )
+}
+
+fn empty_params_failure(request_id: &str, code: &'static str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        code,
+        "params must be an empty object for this subcommand",
+    )
+}
+
+fn invalid_envelope_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_envelope",
+        format!("request envelope does not match the provider contract: {err}"),
+    )
+}
+
+fn unsupported_contract_failure(request_id: String, contract: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "unsupported_contract",
+        format!("unsupported contract version: {contract}"),
+    )
+}
+
+fn invalid_request_id_failure() -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        "unknown",
+        "invalid_request_id",
+        "request_id must be a non-empty string",
+    )
+}
+
+fn invalid_host_failure(request_id: String) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_host",
+        "host.app must be a non-empty string",
+    )
+}
+
+fn report_stdout_write_failure(err: std::io::Error) {
+    eprintln!("failed to write stdout: {err}");
 }

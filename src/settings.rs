@@ -1,4 +1,4 @@
-//! Declared roles: accessor, validator, mapper
+//! Declared roles: accessor, validator, mapper, parser, predicate, filter, orchestration, formatter
 //! intrinsic_surface_declarations:
 //!   - component: src/settings.rs
 //!     role: intrinsic-surface
@@ -10,7 +10,7 @@
 
 use crate::account::ACCOUNTS;
 use crate::encoding::{now_unix_ms, sha256_hex};
-use crate::envelope::{HostContext, ProviderFailure, CATEGORY_CONFLICT};
+use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
 use crate::models::{default_model_effort, effort_values, DEFAULT_MODEL_ALIAS, PROVIDER_MODEL};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -56,6 +56,25 @@ struct SettingsMigrateParams {
     legacy: Value,
 }
 
+pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+    let RequestEnvelope {
+        host,
+        params,
+        request_id,
+        ..
+    } = request;
+    match subcommand {
+        "settings.list" => list_params(&host, &request_id),
+        "settings.get" => get_params(&host, params, &request_id),
+        "settings.create" => create_params(&host, params, &request_id),
+        "settings.update" => update_params(&host, params, &request_id),
+        "settings.delete" => delete_params(&host, params, &request_id),
+        "settings.validate" => validate_params(params, &request_id),
+        "settings.migrate" => migrate_params(&host, params, &request_id),
+        unknown => Err(unknown_settings_subcommand_failure(request_id, unknown)),
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct SettingsStore {
     records: Vec<SettingsRecord>,
@@ -71,9 +90,7 @@ struct SettingsRecord {
 
 pub fn list_params(host: &HostContext, request_id: &str) -> Result<Value, ProviderFailure> {
     let store = read_store(host, request_id)?;
-    Ok(json!({
-        "records": store.records.iter().map(record_summary).collect::<Vec<_>>(),
-    }))
+    Ok(settings_list_result(&store.records))
 }
 
 pub fn get_params(
@@ -85,7 +102,7 @@ pub fn get_params(
         parse_params(params, request_id, "invalid_settings_get_params")?;
     let store = read_store(host, request_id)?;
     let record = find_record(&store, &params.id, request_id)?;
-    Ok(json!({ "record": record_json(record) }))
+    Ok(settings_get_result(record))
 }
 
 pub fn create_params(
@@ -99,9 +116,9 @@ pub fn create_params(
     let diagnostics = validate_values(&values);
     let mut store = read_store(host, request_id)?;
     let record = new_record(params.display_name, values);
-    store.records.push(record.clone());
+    insert_record(&mut store, record.clone());
     write_store(host, &store, request_id)?;
-    Ok(json!({ "record": record_json(&record), "diagnostics": diagnostics }))
+    Ok(settings_record_result(&record, diagnostics))
 }
 
 pub fn update_params(
@@ -113,14 +130,12 @@ pub fn update_params(
         parse_params(params, request_id, "invalid_settings_update_params")?;
     let mut store = read_store(host, request_id)?;
     let index = record_index(&store, &params.id, request_id)?;
-    ensure_version(&store.records[index], &params.version, request_id)?;
+    ensure_version(indexed_record(&store, index), &params.version, request_id)?;
     let values = sanitize_value(&params.values);
     let diagnostics = validate_values(&values);
-    store.records[index].version = version_token(&params.id, &values);
-    store.records[index].values = values;
-    let record = store.records[index].clone();
+    let record = update_record(&mut store, index, &params.id, values);
     write_store(host, &store, request_id)?;
-    Ok(json!({ "record": record_json(&record), "diagnostics": diagnostics }))
+    Ok(settings_record_result(&record, diagnostics))
 }
 
 pub fn delete_params(
@@ -132,10 +147,10 @@ pub fn delete_params(
         parse_params(params, request_id, "invalid_settings_delete_params")?;
     let mut store = read_store(host, request_id)?;
     let index = record_index(&store, &params.id, request_id)?;
-    ensure_version(&store.records[index], &params.version, request_id)?;
-    store.records.remove(index);
+    ensure_version(indexed_record(&store, index), &params.version, request_id)?;
+    remove_record(&mut store, index);
     write_store(host, &store, request_id)?;
-    Ok(json!({ "deleted": true, "id": params.id }))
+    Ok(settings_delete_result(params.id))
 }
 
 pub fn validate_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
@@ -143,7 +158,8 @@ pub fn validate_params(params: Value, request_id: &str) -> Result<Value, Provide
         parse_params(params, request_id, "invalid_settings_validate_params")?;
     let values = sanitize_value(&params.values);
     let diagnostics = validate_values(&values);
-    Ok(json!({ "valid": diagnostics.is_empty(), "diagnostics": diagnostics }))
+    let valid = settings_valid(&diagnostics);
+    Ok(settings_validate_result(valid, diagnostics))
 }
 
 pub fn migrate_params(
@@ -159,12 +175,57 @@ pub fn migrate_params(
     if !params.dry_run {
         write_migrated_settings(host, &params.legacy, request_id)?;
     }
-    Ok(json!({
+    let requires_user_input = settings_requires_user_input(&diagnostics);
+    Ok(settings_migrate_result(
+        actions,
+        warnings,
+        requires_user_input,
+        diagnostics,
+    ))
+}
+
+fn settings_list_result(records: &[SettingsRecord]) -> Value {
+    json!({
+        "records": records.iter().map(record_summary).collect::<Vec<_>>(),
+    })
+}
+
+fn settings_get_result(record: &SettingsRecord) -> Value {
+    json!({ "record": record_json(record) })
+}
+
+fn settings_record_result(record: &SettingsRecord, diagnostics: Vec<Value>) -> Value {
+    json!({ "record": record_json(record), "diagnostics": diagnostics })
+}
+
+fn settings_delete_result(id: String) -> Value {
+    json!({ "deleted": true, "id": id })
+}
+
+fn settings_valid(diagnostics: &[Value]) -> bool {
+    diagnostics.is_empty()
+}
+
+fn settings_validate_result(valid: bool, diagnostics: Vec<Value>) -> Value {
+    json!({ "valid": valid, "diagnostics": diagnostics })
+}
+
+fn settings_migrate_result(
+    actions: Vec<Value>,
+    warnings: Vec<Value>,
+    requires_user_input: bool,
+    diagnostics: Vec<Value>,
+) -> Value {
+    json!({
         "actions": actions,
         "warnings": warnings,
-        "requires_user_input": diagnostics.iter().any(is_error_diagnostic),
+        "requires_user_input": requires_user_input,
         "diagnostics": diagnostics,
-    }))
+    })
+}
+
+fn settings_requires_user_input(diagnostics: &[Value]) -> bool {
+    diagnostics.iter().any(is_error_diagnostic)
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(
@@ -172,29 +233,33 @@ fn parse_params<T: for<'de> Deserialize<'de>>(
     request_id: &str,
     code: &'static str,
 ) -> Result<T, ProviderFailure> {
-    serde_json::from_value(params).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            code,
-            format!("settings params are invalid: {err}"),
-        )
-    })
+    serde_json::from_value(params)
+        .map_err(|err| invalid_settings_params_failure(request_id, code, err))
 }
 
 fn read_store(host: &HostContext, request_id: &str) -> Result<SettingsStore, ProviderFailure> {
     let path = store_path(host, request_id)?;
-    if !path.exists() {
+    read_store_path(&path, request_id)
+}
+
+fn read_store_path(path: &Path, request_id: &str) -> Result<SettingsStore, ProviderFailure> {
+    if !store_path_exists(path) {
         return Ok(SettingsStore::default());
     }
-    let bytes = fs::read(&path)
-        .map_err(|err| store_io_failure(request_id, "settings_store_read_failed", err))?;
-    serde_json::from_slice(&bytes).map_err(|err| {
-        ProviderFailure::internal(
-            request_id,
-            "settings_store_parse_failed",
-            format!("provider settings store is invalid JSON: {err}"),
-        )
-    })
+    let bytes = read_store_bytes(path, request_id)?;
+    parse_store_bytes(&bytes, request_id)
+}
+
+fn store_path_exists(path: &Path) -> bool {
+    path.exists()
+}
+
+fn read_store_bytes(path: &Path, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
+    fs::read(path).map_err(|err| store_io_failure(request_id, "settings_store_read_failed", err))
+}
+
+fn parse_store_bytes(bytes: &[u8], request_id: &str) -> Result<SettingsStore, ProviderFailure> {
+    serde_json::from_slice(bytes).map_err(|err| settings_store_parse_failure(request_id, err))
 }
 
 fn write_store(
@@ -208,7 +273,7 @@ fn write_store(
     ensure_store_path_contained(parent, &config_root, request_id)?;
     fs::create_dir_all(parent)
         .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
-    let tmp = parent.join(format!(".{STORE_FILE}.{}.tmp", std::process::id()));
+    let tmp = store_temp_path(parent);
     ensure_store_path_contained(&tmp, &config_root, request_id)?;
     ensure_store_path_contained(&path, &config_root, request_id)?;
     write_store_temp(&tmp, store, request_id)?;
@@ -221,16 +286,22 @@ fn write_store_temp(
     store: &SettingsStore,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let bytes = serde_json::to_vec(store).map_err(|err| {
-        ProviderFailure::internal(
-            request_id,
-            "settings_store_serialize_failed",
-            format!("failed to serialize provider settings store: {err}"),
-        )
-    })?;
+    let bytes = serialize_store(store, request_id)?;
+    write_store_temp_bytes(path, &bytes, request_id)
+}
+
+fn serialize_store(store: &SettingsStore, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
+    serde_json::to_vec(store).map_err(|err| settings_store_serialize_failure(request_id, err))
+}
+
+fn write_store_temp_bytes(
+    path: &Path,
+    bytes: &[u8],
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
     let mut file = fs::File::create(path)
         .map_err(|err| store_io_failure(request_id, "settings_store_temp_create_failed", err))?;
-    file.write_all(&bytes)
+    file.write_all(bytes)
         .map_err(|err| store_io_failure(request_id, "settings_store_temp_write_failed", err))?;
     file.sync_all()
         .map_err(|err| store_io_failure(request_id, "settings_store_temp_sync_failed", err))
@@ -241,18 +312,26 @@ fn store_path(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderF
 }
 
 fn config_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    let Some(root) = host
-        .config_root
-        .as_deref()
-        .filter(|root| !root.trim().is_empty())
-    else {
-        return Err(ProviderFailure::invalid_request(
-            request_id,
-            "missing_config_root",
-            "settings store requires host.config_root",
-        ));
+    let Some(root) = host_config_root(host) else {
+        return Err(missing_config_root_failure(request_id));
     };
     Ok(PathBuf::from(root))
+}
+
+fn host_config_root(host: &HostContext) -> Option<&str> {
+    non_empty_config_root(raw_host_config_root(host))
+}
+
+fn raw_host_config_root(host: &HostContext) -> Option<&str> {
+    host.config_root.as_deref()
+}
+
+fn non_empty_config_root(root: Option<&str>) -> Option<&str> {
+    root.filter(|root| non_empty_text(root))
+}
+
+fn non_empty_text(value: &str) -> bool {
+    !value.trim().is_empty()
 }
 
 fn store_path_from_root(config_root: &Path) -> PathBuf {
@@ -266,61 +345,93 @@ fn ensure_store_path_contained(
 ) -> Result<(), ProviderFailure> {
     let canonical_root = canonical_store_path(config_root, request_id)?;
     let canonical_target = canonical_store_create_path(path, request_id)?;
+    validate_store_path_contained(&canonical_target, &canonical_root, request_id)
+}
+
+fn validate_store_path_contained(
+    canonical_target: &Path,
+    canonical_root: &Path,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
     if canonical_target.starts_with(canonical_root) {
         return Ok(());
     }
-    Err(ProviderFailure::invalid_request(
-        request_id,
-        "settings_store_outside_provider_root",
-        "settings store path must stay under host.config_root",
-    ))
+    Err(settings_store_outside_provider_root_failure(request_id))
 }
 
 fn canonical_store_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    fs::canonicalize(path).map_err(|err| {
-        ProviderFailure::internal(
-            request_id,
-            "settings_store_canonicalize_failed",
-            format!("failed to canonicalize provider settings path: {err}"),
-        )
-    })
+    fs::canonicalize(path).map_err(|err| settings_store_canonicalize_failure(request_id, err))
 }
 
 fn canonical_store_create_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    let existing = path
-        .ancestors()
-        .find(|ancestor| ancestor.exists())
-        .ok_or_else(|| {
-            ProviderFailure::invalid_request(
-                request_id,
-                "settings_store_outside_provider_root",
-                "settings store path must have an existing host.config_root ancestor",
-            )
-        })?;
+    let existing = existing_store_ancestor_path(path, request_id)?;
     let mut canonical = canonical_store_path(existing, request_id)?;
-    let suffix = path.strip_prefix(existing).map_err(|_| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "settings_store_outside_provider_root",
-            "settings store path must stay under host.config_root",
-        )
-    })?;
-    for component in suffix.components() {
-        match component {
-            std::path::Component::Normal(part) => canonical.push(part),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir
-            | std::path::Component::Prefix(_)
-            | std::path::Component::RootDir => {
-                return Err(ProviderFailure::invalid_request(
-                    request_id,
-                    "settings_store_outside_provider_root",
-                    "settings store path must stay under host.config_root",
-                ));
-            }
-        }
-    }
+    append_store_suffix(
+        &mut canonical,
+        store_path_suffix(path, existing, request_id)?,
+        request_id,
+    )?;
     Ok(canonical)
+}
+
+fn existing_store_ancestor_path<'a>(
+    path: &'a Path,
+    request_id: &str,
+) -> Result<&'a Path, ProviderFailure> {
+    existing_store_ancestor(path).ok_or_else(|| settings_store_missing_ancestor_failure(request_id))
+}
+
+fn store_path_suffix<'a>(
+    path: &'a Path,
+    existing: &'a Path,
+    request_id: &str,
+) -> Result<&'a Path, ProviderFailure> {
+    path.strip_prefix(existing)
+        .map_err(|_| settings_store_outside_provider_root_failure(request_id))
+}
+
+fn append_store_suffix(
+    canonical: &mut PathBuf,
+    suffix: &Path,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    for component in suffix.components() {
+        push_store_component(canonical, component, request_id)?;
+    }
+    Ok(())
+}
+
+fn push_store_component(
+    canonical: &mut PathBuf,
+    component: std::path::Component<'_>,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    ensure_store_component_pushable(component, request_id)?;
+    push_valid_store_component(canonical, component);
+    Ok(())
+}
+
+fn ensure_store_component_pushable(
+    component: std::path::Component<'_>,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if is_store_component_pushable(component) {
+        return Ok(());
+    }
+    Err(settings_store_outside_provider_root_failure(request_id))
+}
+
+fn is_store_component_pushable(component: std::path::Component<'_>) -> bool {
+    matches!(
+        component,
+        std::path::Component::Normal(_) | std::path::Component::CurDir
+    )
+}
+
+fn push_valid_store_component(canonical: &mut PathBuf, component: std::path::Component<'_>) {
+    if let std::path::Component::Normal(part) = component {
+        canonical.push(part);
+    }
 }
 
 fn store_io_failure(request_id: &str, code: &'static str, err: std::io::Error) -> ProviderFailure {
@@ -336,17 +447,11 @@ fn find_record<'a>(
     id: &str,
     request_id: &str,
 ) -> Result<&'a SettingsRecord, ProviderFailure> {
-    store
-        .records
-        .iter()
-        .find(|record| record.id == id)
-        .ok_or_else(|| {
-            ProviderFailure::invalid_request(
-                request_id,
-                "settings_not_found",
-                "settings record was not found",
-            )
-        })
+    selected_record(store, id).ok_or_else(|| settings_not_found_failure(request_id))
+}
+
+fn selected_record<'a>(store: &'a SettingsStore, id: &str) -> Option<&'a SettingsRecord> {
+    store.records.iter().find(|record| record.id == id)
 }
 
 fn record_index(
@@ -354,17 +459,43 @@ fn record_index(
     id: &str,
     request_id: &str,
 ) -> Result<usize, ProviderFailure> {
-    store
-        .records
-        .iter()
-        .position(|record| record.id == id)
-        .ok_or_else(|| {
-            ProviderFailure::invalid_request(
-                request_id,
-                "settings_not_found",
-                "settings record was not found",
-            )
-        })
+    selected_record_index(store, id).ok_or_else(|| settings_not_found_failure(request_id))
+}
+
+fn selected_record_index(store: &SettingsStore, id: &str) -> Option<usize> {
+    store.records.iter().position(|record| record.id == id)
+}
+
+fn indexed_record(store: &SettingsStore, index: usize) -> &SettingsRecord {
+    &store.records[index]
+}
+
+fn indexed_record_mut(store: &mut SettingsStore, index: usize) -> &mut SettingsRecord {
+    &mut store.records[index]
+}
+
+fn insert_record(store: &mut SettingsStore, record: SettingsRecord) {
+    store.records.push(record);
+}
+
+fn update_record(
+    store: &mut SettingsStore,
+    index: usize,
+    id: &str,
+    values: Value,
+) -> SettingsRecord {
+    let version = version_token(id, &values);
+    replace_record(indexed_record_mut(store, index), version, values);
+    indexed_record(store, index).clone()
+}
+
+fn replace_record(record: &mut SettingsRecord, version: String, values: Value) {
+    record.version = version;
+    record.values = values;
+}
+
+fn remove_record(store: &mut SettingsStore, index: usize) {
+    store.records.remove(index);
 }
 
 fn ensure_version(
@@ -375,35 +506,40 @@ fn ensure_version(
     if record.version == version {
         return Ok(());
     }
-    Err(ProviderFailure {
-        request_id: request_id.to_string(),
-        category: CATEGORY_CONFLICT,
-        code: "stale_settings_version",
-        message: "settings version is stale".to_string(),
-        details: json!({}),
-        retryable: false,
-        exit_code: 4,
-    })
+    Err(stale_settings_version_failure(request_id))
 }
 
 fn new_record(display_name: Option<String>, values: Value) -> SettingsRecord {
     let id = settings_id(&values);
     SettingsRecord {
-        display_name: display_name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| default_display_name(&values)),
+        display_name: record_display_name(display_name, &values),
         version: version_token(&id, &values),
         id,
         values,
     }
 }
 
+fn record_display_name(display_name: Option<String>, values: &Value) -> String {
+    non_empty_display_name(display_name).unwrap_or_else(|| default_display_name(values))
+}
+
+fn non_empty_display_name(display_name: Option<String>) -> Option<String> {
+    display_name.filter(|name| non_empty_text(name))
+}
+
 fn settings_id(values: &Value) -> String {
-    let wrapper = values
+    settings_id_for_base(settings_id_base(values))
+}
+
+fn settings_id_base(values: &Value) -> &str {
+    values
         .get("wrapper")
         .and_then(Value::as_str)
         .or_else(|| values.get("profile").and_then(Value::as_str))
-        .unwrap_or("opencode");
+        .unwrap_or("opencode")
+}
+
+fn settings_id_for_base(wrapper: &str) -> String {
     let digest = sha256_hex(format!("{}:{}", wrapper, now_unix_ms()).as_bytes());
     format!("{wrapper}-{}", &digest[..12])
 }
@@ -458,74 +594,128 @@ fn validate_values(values: &Value) -> Vec<Value> {
 }
 
 fn require_string(values: &Value, key: &str, expected: &str, diagnostics: &mut Vec<Value>) {
-    if values.get(key).and_then(Value::as_str) == Some(expected) {
+    if has_expected_string(values, key, expected) {
         return;
     }
-    diagnostics.push(diagnostic(
+    diagnostics.push(required_string_diagnostic(key, expected));
+}
+
+fn has_expected_string(values: &Value, key: &str, expected: &str) -> bool {
+    values.get(key).and_then(Value::as_str) == Some(expected)
+}
+
+fn required_string_diagnostic(key: &str, expected: &str) -> Value {
+    diagnostic(
         "error",
         format!("values.{key}"),
         format!("{key} must be {expected}"),
         "invalid_settings_value",
-    ));
+    )
 }
 
 fn require_known_wrapper(values: &Value, diagnostics: &mut Vec<Value>) {
-    let wrapper = values
-        .get("wrapper")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if ACCOUNTS
-        .iter()
-        .any(|account| account.opencode_wrapper == wrapper)
-    {
+    if known_wrapper(wrapper_value(values)) {
         return;
     }
-    diagnostics.push(diagnostic(
+    diagnostics.push(invalid_wrapper_diagnostic());
+}
+
+fn wrapper_value(values: &Value) -> &str {
+    values
+        .get("wrapper")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn known_wrapper(wrapper: &str) -> bool {
+    ACCOUNTS
+        .iter()
+        .any(|account| account.opencode_wrapper == wrapper)
+}
+
+fn invalid_wrapper_diagnostic() -> Value {
+    diagnostic(
         "error",
         "values.wrapper",
         "wrapper must be one of opencode1 through opencode5",
         "invalid_wrapper",
-    ));
+    )
 }
 
 fn require_model(values: &Value, diagnostics: &mut Vec<Value>) {
-    let provider_model = values
+    require_provider_model(values, diagnostics);
+    require_model_variant(values, diagnostics);
+}
+
+fn require_provider_model(values: &Value, diagnostics: &mut Vec<Value>) {
+    if provider_model_value(values) == Some(PROVIDER_MODEL) {
+        return;
+    }
+    diagnostics.push(invalid_provider_model_diagnostic());
+}
+
+fn provider_model_value(values: &Value) -> Option<&str> {
+    values
         .pointer("/model/provider_model")
-        .and_then(Value::as_str);
-    if provider_model != Some(PROVIDER_MODEL) {
-        diagnostics.push(diagnostic(
-            "error",
-            "values.model.provider_model",
-            "provider_model must be openai/gpt-5.5",
-            "invalid_provider_model",
-        ));
+        .and_then(Value::as_str)
+}
+
+fn invalid_provider_model_diagnostic() -> Value {
+    diagnostic(
+        "error",
+        "values.model.provider_model",
+        "provider_model must be openai/gpt-5.5",
+        "invalid_provider_model",
+    )
+}
+
+fn require_model_variant(values: &Value, diagnostics: &mut Vec<Value>) {
+    if known_model_variant(model_variant_value(values)) {
+        return;
     }
-    let variant = values.pointer("/model/variant").and_then(Value::as_str);
+    diagnostics.push(invalid_model_variant_diagnostic());
+}
+
+fn model_variant_value(values: &Value) -> Option<&str> {
+    values.pointer("/model/variant").and_then(Value::as_str)
+}
+
+fn known_model_variant(variant: Option<&str>) -> bool {
     let valid_efforts = effort_values();
-    if !variant.is_some_and(|variant| valid_efforts.contains(&variant)) {
-        diagnostics.push(diagnostic(
-            "error",
-            "values.model.variant",
-            "variant must be none, low, medium, high, or xhigh",
-            "invalid_model_variant",
-        ));
-    }
+    variant.is_some_and(|variant| valid_efforts.contains(&variant))
+}
+
+fn invalid_model_variant_diagnostic() -> Value {
+    diagnostic(
+        "error",
+        "values.model.variant",
+        "variant must be none, low, medium, high, or xhigh",
+        "invalid_model_variant",
+    )
 }
 
 fn require_quota(values: &Value, diagnostics: &mut Vec<Value>) {
-    let auth_path = values
-        .pointer("/quota/auth_path")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !auth_path.trim().is_empty() {
+    if has_quota_auth_path(values) {
         return;
     }
-    diagnostics.push(diagnostic(
+    diagnostics.push(invalid_quota_auth_path_diagnostic());
+}
+
+fn has_quota_auth_path(values: &Value) -> bool {
+    quota_auth_path(values).is_some_and(non_empty_text)
+}
+
+fn quota_auth_path(values: &Value) -> Option<&str> {
+    values.pointer("/quota/auth_path").and_then(Value::as_str)
+}
+
+fn invalid_quota_auth_path_diagnostic() -> Value {
+    diagnostic(
         "error",
         "values.quota.auth_path",
         "quota.auth_path must be non-empty",
         "invalid_quota_auth_path",
-    ));
+    )
 }
 
 fn diagnostic(
@@ -551,14 +741,23 @@ fn sanitize_value(value: &Value) -> Value {
 }
 
 fn sanitize_object(object: &Map<String, Value>) -> Value {
+    let entries = non_secret_entries(object);
+    Value::Object(sanitized_entries(entries))
+}
+
+fn non_secret_entries(object: &Map<String, Value>) -> Vec<(&String, &Value)> {
+    object
+        .iter()
+        .filter(|(key, _)| !is_secret_key(key))
+        .collect()
+}
+
+fn sanitized_entries(entries: Vec<(&String, &Value)>) -> Map<String, Value> {
     let mut sanitized = Map::new();
-    for (key, value) in object {
-        if is_secret_key(key) {
-            continue;
-        }
+    for (key, value) in entries {
         sanitized.insert(key.clone(), sanitize_value(value));
     }
-    Value::Object(sanitized)
+    sanitized
 }
 
 fn is_secret_key(key: &str) -> bool {
@@ -570,45 +769,82 @@ fn is_secret_key(key: &str) -> bool {
 }
 
 fn legacy_actions(legacy: &Value) -> Vec<Value> {
-    let mut actions = Vec::new();
     let providers = legacy_provider_names(legacy);
-    for provider in providers {
-        actions.push(json!({
-            "kind": "settings_profile",
-            "provider": provider,
-            "operation": "create_or_update_provider_owned_profile",
-        }));
-    }
-    if actions.is_empty() {
-        actions.push(json!({
-            "kind": "settings_profile",
-            "operation": "inspect_legacy_opencode_tables",
-        }));
+    legacy_actions_for_providers(&providers)
+}
+
+fn legacy_actions_for_providers(providers: &[String]) -> Vec<Value> {
+    let mut actions = legacy_provider_actions(providers);
+    if legacy_providers_empty(providers) {
+        actions.push(legacy_inspect_tables_action());
     }
     actions
 }
 
+fn legacy_provider_actions(providers: &[String]) -> Vec<Value> {
+    providers
+        .iter()
+        .map(|provider| legacy_provider_action(provider))
+        .collect()
+}
+
+fn legacy_provider_action(provider: &str) -> Value {
+    json!({
+        "kind": "settings_profile",
+        "provider": provider,
+        "operation": "create_or_update_provider_owned_profile",
+    })
+}
+
+fn legacy_providers_empty(providers: &[String]) -> bool {
+    providers.is_empty()
+}
+
+fn legacy_inspect_tables_action() -> Value {
+    json!({
+        "kind": "settings_profile",
+        "operation": "inspect_legacy_opencode_tables",
+    })
+}
+
 fn legacy_warnings(legacy: &Value) -> Vec<Value> {
+    let models = legacy_models(legacy);
+    legacy_warnings_for_model_state(legacy_models_empty(&models))
+}
+
+fn legacy_warnings_for_model_state(models_empty: bool) -> Vec<Value> {
     let mut warnings = vec![json!(
         "legacy live provider/model TOML is design input only; no live route cutover is performed"
     )];
-    if legacy_models(legacy).is_empty() {
+    if models_empty {
         warnings.push(json!("legacy input did not include model TOML entries"));
     }
     warnings
 }
 
+fn legacy_models_empty(models: &[String]) -> bool {
+    models.is_empty()
+}
+
 fn legacy_diagnostics(legacy: &Value) -> Vec<Value> {
+    legacy_diagnostics_for_providers(&legacy_provider_names(legacy))
+}
+
+fn legacy_diagnostics_for_providers(providers: &[String]) -> Vec<Value> {
     let mut diagnostics = Vec::new();
-    if legacy_provider_names(legacy).is_empty() {
-        diagnostics.push(diagnostic(
-            "error",
-            "legacy.providers_toml",
-            "no opencode provider tables were found in legacy providers_toml",
-            "legacy_providers_missing",
-        ));
+    if providers.is_empty() {
+        diagnostics.push(legacy_providers_missing_diagnostic());
     }
     diagnostics
+}
+
+fn legacy_providers_missing_diagnostic() -> Value {
+    diagnostic(
+        "error",
+        "legacy.providers_toml",
+        "no opencode provider tables were found in legacy providers_toml",
+        "legacy_providers_missing",
+    )
 }
 
 fn is_error_diagnostic(diagnostic: &Value) -> bool {
@@ -616,20 +852,46 @@ fn is_error_diagnostic(diagnostic: &Value) -> bool {
 }
 
 fn legacy_provider_names(legacy: &Value) -> Vec<String> {
-    let Some(providers_toml) = legacy.get("providers_toml").and_then(Value::as_str) else {
+    let Some(parsed) = legacy_providers_toml(legacy) else {
         return Vec::new();
     };
-    let Ok(parsed) = providers_toml.parse::<toml::Value>() else {
+    legacy_provider_names_from_toml(&parsed)
+}
+
+fn legacy_provider_names_from_toml(parsed: &toml::Value) -> Vec<String> {
+    legacy_provider_names_from_table(legacy_provider_table(parsed))
+}
+
+fn legacy_provider_table(parsed: &toml::Value) -> Option<&toml::Table> {
+    parsed.as_table()
+}
+
+fn legacy_provider_names_from_table(table: Option<&toml::Table>) -> Vec<String> {
+    let Some(table) = table else {
         return Vec::new();
     };
-    let Some(table) = parsed.as_table() else {
-        return Vec::new();
-    };
-    table
-        .iter()
-        .filter(|(name, value)| legacy_opencode_provider(name, value))
-        .map(|(name, _)| name.clone())
+    legacy_opencode_provider_names(table.iter())
+}
+
+fn legacy_opencode_provider_names<'a>(
+    providers: impl Iterator<Item = (&'a String, &'a toml::Value)>,
+) -> Vec<String> {
+    legacy_opencode_provider_name_entries(providers)
+        .into_iter()
+        .map(legacy_provider_name)
         .collect()
+}
+
+fn legacy_opencode_provider_name_entries<'a>(
+    providers: impl Iterator<Item = (&'a String, &'a toml::Value)>,
+) -> Vec<(&'a String, &'a toml::Value)> {
+    providers
+        .filter(|(name, value)| legacy_opencode_provider(name, value))
+        .collect()
+}
+
+fn legacy_provider_name(entry: (&String, &toml::Value)) -> String {
+    entry.0.clone()
 }
 
 fn legacy_opencode_provider(name: &str, value: &toml::Value) -> bool {
@@ -641,11 +903,17 @@ fn legacy_opencode_provider(name: &str, value: &toml::Value) -> bool {
 }
 
 fn legacy_models(legacy: &Value) -> Vec<String> {
-    legacy
-        .get("models")
-        .and_then(Value::as_object)
-        .map(|models| models.keys().cloned().collect())
+    legacy_models_object(legacy)
+        .map(legacy_model_names)
         .unwrap_or_default()
+}
+
+fn legacy_models_object(legacy: &Value) -> Option<&Map<String, Value>> {
+    legacy.get("models").and_then(Value::as_object)
+}
+
+fn legacy_model_names(models: &Map<String, Value>) -> Vec<String> {
+    models.keys().cloned().collect()
 }
 
 fn write_migrated_settings(
@@ -654,18 +922,35 @@ fn write_migrated_settings(
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     let mut store = read_store(host, request_id)?;
-    for provider in legacy_provider_names(legacy) {
-        let values = migrated_values(&provider);
-        store.records.push(new_record(Some(provider), values));
-    }
+    append_records(&mut store, migrated_records(legacy_provider_names(legacy)));
     write_store(host, &store, request_id)
 }
 
+fn migrated_records(providers: Vec<String>) -> Vec<SettingsRecord> {
+    providers.into_iter().map(migrated_record).collect()
+}
+
+fn migrated_record(provider: String) -> SettingsRecord {
+    let values = migrated_values(&provider);
+    new_record(Some(provider), values)
+}
+
+fn append_records(store: &mut SettingsStore, records: Vec<SettingsRecord>) {
+    store.records.extend(records);
+}
+
 fn migrated_values(provider: &str) -> Value {
-    let account = ACCOUNTS
+    migrated_values_for_account(migration_account(provider))
+}
+
+fn migration_account(provider: &str) -> &'static crate::account::AccountProfile {
+    ACCOUNTS
         .iter()
         .find(|account| account.opencode_wrapper == provider)
-        .unwrap_or(&ACCOUNTS[0]);
+        .unwrap_or(&ACCOUNTS[0])
+}
+
+fn migrated_values_for_account(account: &crate::account::AccountProfile) -> Value {
     json!({
         "provider": "opencode",
         "profile": account.opencode_wrapper,
@@ -685,4 +970,113 @@ fn migrated_values(provider: &str) -> Value {
             "dangerously_skip_permissions": true
         }
     })
+}
+
+fn unknown_settings_subcommand_failure(request_id: String, unknown: &str) -> ProviderFailure {
+    ProviderFailure::unsupported(
+        request_id,
+        "unknown_settings_subcommand",
+        format!("unknown settings subcommand: {unknown}"),
+    )
+}
+
+fn invalid_settings_params_failure(
+    request_id: &str,
+    code: &'static str,
+    err: serde_json::Error,
+) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        code,
+        format!("settings params are invalid: {err}"),
+    )
+}
+
+fn settings_store_parse_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "settings_store_parse_failed",
+        format!("provider settings store is invalid JSON: {err}"),
+    )
+}
+
+fn settings_store_serialize_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "settings_store_serialize_failed",
+        format!("failed to serialize provider settings store: {err}"),
+    )
+}
+
+fn store_temp_path(parent: &Path) -> PathBuf {
+    parent.join(format!(".{STORE_FILE}.{}.tmp", std::process::id()))
+}
+
+fn missing_config_root_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "missing_config_root",
+        "settings store requires host.config_root",
+    )
+}
+
+fn settings_store_outside_provider_root_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "settings_store_outside_provider_root",
+        "settings store path must stay under host.config_root",
+    )
+}
+
+fn settings_store_canonicalize_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "settings_store_canonicalize_failed",
+        format!("failed to canonicalize provider settings path: {err}"),
+    )
+}
+
+fn existing_store_ancestor(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|ancestor| ancestor.exists())
+}
+
+fn settings_store_missing_ancestor_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "settings_store_outside_provider_root",
+        "settings store path must have an existing host.config_root ancestor",
+    )
+}
+
+fn settings_not_found_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "settings_not_found",
+        "settings record was not found",
+    )
+}
+
+fn stale_settings_version_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure {
+        request_id: request_id.to_string(),
+        category: CATEGORY_CONFLICT,
+        code: "stale_settings_version",
+        message: "settings version is stale".to_string(),
+        details: json!({}),
+        retryable: false,
+        exit_code: 4,
+    }
+}
+
+fn legacy_providers_toml(legacy: &Value) -> Option<toml::Value> {
+    let providers_toml = legacy_providers_toml_text(legacy)?;
+    parse_legacy_providers_toml(providers_toml)
+}
+
+fn legacy_providers_toml_text(legacy: &Value) -> Option<&str> {
+    legacy.get("providers_toml").and_then(Value::as_str)
+}
+
+fn parse_legacy_providers_toml(providers_toml: &str) -> Option<toml::Value> {
+    providers_toml.parse::<toml::Value>().ok()
 }

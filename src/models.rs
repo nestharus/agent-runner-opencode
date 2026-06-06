@@ -1,4 +1,4 @@
-//! Declared roles: accessor
+//! Declared roles: accessor, mapper
 
 pub const PROVIDER_MODEL: &str = "openai/gpt-5.5";
 pub const DEFAULT_MODEL_ALIAS: &str = "gpt-high";

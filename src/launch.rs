@@ -1,4 +1,4 @@
-//! Declared roles: orchestration, adapter, formatter, parser, mapper
+//! Declared roles: orchestration, formatter, parser, mapper, validator, accessor, filter, predicate
 //! adapter_declarations:
 //!   - component: src/launch.rs
 //!     role: adapter
@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);
+const LAUNCH_ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME"];
 
 #[derive(Deserialize)]
 struct LaunchParams {
@@ -76,13 +77,7 @@ pub fn stream<W: Write>(
 }
 
 fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, ProviderFailure> {
-    serde_json::from_value(params).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "invalid_launch_params",
-            format!("launch params are invalid: {err}"),
-        )
-    })
+    serde_json::from_value(params).map_err(|err| invalid_launch_params_failure(request_id, err))
 }
 
 struct EffectiveLaunch {
@@ -100,7 +95,7 @@ enum PolicyLaunch {
 fn launch_argv(params: &LaunchParams, request_id: &str) -> Result<PolicyLaunch, ProviderFailure> {
     let policy_params = policy_params_for_launch(params, request_id)?;
     let result = policy::evaluate(policy_params, request_id)?;
-    if result.get("accepted").and_then(Value::as_bool) != Some(true) {
+    if !policy_result_accepted(&result) {
         return Ok(PolicyLaunch::Rejected(policy_rejection_reason(&result)));
     }
     Ok(PolicyLaunch::Accepted(effective_launch(
@@ -109,31 +104,26 @@ fn launch_argv(params: &LaunchParams, request_id: &str) -> Result<PolicyLaunch, 
 }
 
 fn effective_launch(result: Value, request_id: &str) -> Result<EffectiveLaunch, ProviderFailure> {
-    let argv = result["argv"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter_map(Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    if argv.is_empty() {
-        return Err(ProviderFailure::invalid_request(
-            request_id,
-            "empty_policy_argv",
-            "policy.evaluate returned no launch argv",
-        ));
-    }
+    let argv = validated_policy_argv(&result, request_id)?;
+    project_effective_launch(&result, argv, request_id)
+}
+
+fn validated_policy_argv(result: &Value, request_id: &str) -> Result<Vec<String>, ProviderFailure> {
+    let argv = policy_argv(result);
+    validate_policy_argv(&argv, request_id)?;
+    Ok(argv)
+}
+
+fn project_effective_launch(
+    result: &Value,
+    argv: Vec<String>,
+    request_id: &str,
+) -> Result<EffectiveLaunch, ProviderFailure> {
     Ok(EffectiveLaunch {
         argv,
-        env: effective_env_from_policy(&result, request_id)?,
-        stdin: result
-            .get("stdin")
-            .and_then(Value::as_str)
-            .map(|stdin| stdin.as_bytes().to_vec()),
-        _prompt: result
-            .get("prompt")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        env: effective_env_from_policy(result, request_id)?,
+        stdin: policy_stdin(result),
+        _prompt: policy_prompt(result),
     })
 }
 
@@ -141,28 +131,27 @@ fn effective_env_from_policy(
     result: &Value,
     request_id: &str,
 ) -> Result<BTreeMap<String, String>, ProviderFailure> {
-    let Some(env) = result.get("env").and_then(Value::as_object) else {
+    let Some(env) = policy_env_object(result) else {
         return Ok(BTreeMap::new());
     };
+    policy_env_entries(env, request_id)
+}
+
+fn policy_env_object(result: &Value) -> Option<&serde_json::Map<String, Value>> {
+    result.get("env").and_then(Value::as_object)
+}
+
+fn policy_env_entries(
+    env: &serde_json::Map<String, Value>,
+    request_id: &str,
+) -> Result<BTreeMap<String, String>, ProviderFailure> {
     env.iter()
-        .map(|(key, value)| {
-            let value = value.as_str().ok_or_else(|| {
-                ProviderFailure::invalid_request(
-                    request_id,
-                    "invalid_policy_env",
-                    "policy.evaluate returned a non-string env value",
-                )
-            })?;
-            Ok((key.clone(), value.to_string()))
-        })
+        .map(|(key, value)| policy_env_entry(key, value, request_id))
         .collect()
 }
 
 fn policy_rejection_reason(result: &Value) -> String {
-    let diagnostics = result
-        .get("diagnostics")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
+    let diagnostics = policy_diagnostics(result);
     format!("policy.evaluate rejected launch params; diagnostics={diagnostics}")
 }
 
@@ -170,40 +159,39 @@ fn policy_params_for_launch(
     params: &LaunchParams,
     request_id: &str,
 ) -> Result<policy::PolicyEvaluateParams, ProviderFailure> {
-    serde_json::from_value(json!({
-        "settings_id": params.settings_id,
-        "mode": params.mode,
-        "model": params.model,
-        "launch": {
-            "argv": params.argv,
-            "env": params.env,
-            "stdin": policy_stdin_for_launch(params.stdin.as_ref(), request_id)?,
-        }
-    }))
-    .map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "invalid_launch_policy_params",
-            format!("launch params could not be evaluated by policy: {err}"),
-        )
-    })
+    let value = launch_policy_value(params, request_id)?;
+    parse_launch_policy_params(value, request_id)
+}
+
+fn parse_launch_policy_params(
+    value: Value,
+    request_id: &str,
+) -> Result<policy::PolicyEvaluateParams, ProviderFailure> {
+    serde_json::from_value(value)
+        .map_err(|err| invalid_launch_policy_params_failure(request_id, err))
 }
 
 fn policy_stdin_for_launch(
     input: Option<&BytePayload>,
     request_id: &str,
 ) -> Result<Option<String>, ProviderFailure> {
-    let Some(input) = input else {
+    let Some(bytes) = optional_stdin_bytes(input, request_id)? else {
         return Ok(None);
     };
-    let bytes = decode_byte_payload(input, request_id)?;
-    String::from_utf8(bytes).map(Some).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "invalid_stdin_utf8",
-            format!("launch stdin must be UTF-8 at the policy boundary: {err}"),
-        )
-    })
+    stdin_utf8_text(bytes, request_id).map(Some)
+}
+
+fn optional_stdin_bytes(
+    input: Option<&BytePayload>,
+    request_id: &str,
+) -> Result<Option<Vec<u8>>, ProviderFailure> {
+    input
+        .map(|input| decode_byte_payload(input, request_id))
+        .transpose()
+}
+
+fn stdin_utf8_text(bytes: Vec<u8>, request_id: &str) -> Result<String, ProviderFailure> {
+    String::from_utf8(bytes).map_err(|err| invalid_stdin_utf8_failure(request_id, err))
 }
 
 fn decode_byte_payload(
@@ -211,20 +199,21 @@ fn decode_byte_payload(
     request_id: &str,
 ) -> Result<Vec<u8>, ProviderFailure> {
     match payload.encoding.as_str() {
-        "base64" => decode_base64(&payload.data).map_err(|err| {
-            ProviderFailure::invalid_request(
-                request_id,
-                "invalid_stdin_base64",
-                format!("launch stdin base64 is invalid: {err}"),
-            )
-        }),
-        "utf8" => Ok(payload.data.as_bytes().to_vec()),
-        other => Err(ProviderFailure::invalid_request(
-            request_id,
-            "invalid_stdin_encoding",
-            format!("unsupported launch stdin encoding: {other}"),
-        )),
+        "base64" => decode_base64_payload(payload, request_id),
+        "utf8" => Ok(utf8_payload_bytes(payload)),
+        other => Err(invalid_stdin_encoding_failure(request_id, other)),
     }
+}
+
+fn decode_base64_payload(
+    payload: &BytePayload,
+    request_id: &str,
+) -> Result<Vec<u8>, ProviderFailure> {
+    decode_base64(&payload.data).map_err(|err| invalid_stdin_base64_failure(request_id, err))
+}
+
+fn utf8_payload_bytes(payload: &BytePayload) -> Vec<u8> {
+    payload.data.as_bytes().to_vec()
 }
 
 fn spawn_child(
@@ -233,28 +222,64 @@ fn spawn_child(
     env: &BTreeMap<String, String>,
     stdin: Option<&Vec<u8>>,
 ) -> std::io::Result<Child> {
+    let mut command = child_command(argv, working_directory, stdin.is_some());
+    command.env_clear();
+    let child_env = child_env(env);
+    command.envs(child_env_pairs(&child_env));
+    configure_process_group(&mut command);
+    let mut child = command.spawn()?;
+    write_child_stdin(&mut child, stdin)?;
+    Ok(child)
+}
+
+fn child_command(argv: &[String], working_directory: &str, stdin_present: bool) -> Command {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
         .current_dir(working_directory)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
-    command.env_clear();
-    command.envs(std::env::vars().filter(|(key, _)| !policy::is_forbidden_env_key(key)));
-    command.envs(
-        env.iter()
-            .filter(|(key, _)| !policy::is_forbidden_env_key(key))
-            .map(|(key, value)| (key.as_str(), value.as_str())),
-    );
-    configure_process_group(&mut command);
-    let mut child = command.spawn()?;
-    write_child_stdin(&mut child, stdin)?;
-    Ok(child)
+        .stdin(child_stdin(stdin_present));
+    command
+}
+
+fn child_stdin(stdin_present: bool) -> Stdio {
+    if stdin_present {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    }
+}
+
+fn child_env_pairs(env: &BTreeMap<String, String>) -> Vec<(&str, &str)> {
+    env.iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
+fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut env = pass_through_env();
+    env.extend(allowed_declared_env(declared));
+    env
+}
+
+fn pass_through_env() -> BTreeMap<String, String> {
+    LAUNCH_ENV_PASSTHROUGH_KEYS
+        .iter()
+        .filter_map(|key| pass_through_env_entry(key))
+        .collect()
+}
+
+fn pass_through_env_entry(key: &str) -> Option<(String, String)> {
+    ambient_env_value(key).map(|value| env_pair(key, value))
+}
+
+fn ambient_env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+fn env_pair(key: &str, value: String) -> (String, String) {
+    (key.to_string(), value)
 }
 
 fn write_child_stdin(child: &mut Child, stdin: Option<&Vec<u8>>) -> std::io::Result<()> {
@@ -288,33 +313,64 @@ fn start_drains(child: &mut Child) -> Receiver<DrainMessage> {
 }
 
 fn spawn_drain<R: Read + Send + 'static>(
-    mut reader: R,
+    reader: R,
     sender: mpsc::Sender<DrainMessage>,
     stdout: bool,
 ) {
-    std::thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
-        while let Ok(count) = reader.read(&mut buffer) {
-            if count == 0 {
-                break;
-            }
-            let bytes = buffer[..count].to_vec();
-            let message = if stdout {
-                DrainMessage::Stdout(bytes)
-            } else {
-                DrainMessage::Stderr(bytes)
-            };
-            if sender.send(message).is_err() {
-                return;
-            }
+    std::thread::spawn(move || drain_reader(reader, sender, stdout));
+}
+
+fn drain_reader<R: Read>(mut reader: R, sender: mpsc::Sender<DrainMessage>, stdout: bool) {
+    let mut buffer = drain_buffer();
+    while let Ok(count) = read_drain_chunk(&mut reader, &mut buffer) {
+        if drain_read_complete(count) {
+            break;
         }
-        let done = if stdout {
-            DrainMessage::StdoutDone
-        } else {
-            DrainMessage::StderrDone
-        };
-        let _ = sender.send(done);
-    });
+        let message = drain_chunk_message(stdout, drain_chunk(&buffer, count));
+        if drain_send_failed(send_drain_message(&sender, message)) {
+            return;
+        }
+    }
+    send_drain_done(&sender, stdout);
+}
+
+fn drain_buffer() -> [u8; 8192] {
+    [0_u8; 8192]
+}
+
+fn read_drain_chunk<R: Read>(reader: &mut R, buffer: &mut [u8]) -> std::io::Result<usize> {
+    reader.read(buffer)
+}
+
+fn drain_read_complete(count: usize) -> bool {
+    count == 0
+}
+
+fn drain_chunk(buffer: &[u8], count: usize) -> &[u8] {
+    &buffer[..count]
+}
+
+fn drain_chunk_message(stdout: bool, chunk: &[u8]) -> DrainMessage {
+    drain_bytes_message(stdout, drain_chunk_bytes(chunk))
+}
+
+fn drain_chunk_bytes(chunk: &[u8]) -> Vec<u8> {
+    chunk.to_vec()
+}
+
+fn send_drain_message(
+    sender: &mpsc::Sender<DrainMessage>,
+    message: DrainMessage,
+) -> Result<(), mpsc::SendError<DrainMessage>> {
+    sender.send(message)
+}
+
+fn drain_send_failed(result: Result<(), mpsc::SendError<DrainMessage>>) -> bool {
+    result.is_err()
+}
+
+fn send_drain_done(sender: &mpsc::Sender<DrainMessage>, stdout: bool) {
+    let _ = send_drain_message(sender, drain_done_message(stdout));
 }
 
 fn run_supervision_loop<W: Write>(
@@ -341,9 +397,7 @@ fn enforce_deadline(child: &mut Child, state: &mut LaunchState) -> Result<(), Pr
     }
     terminate_child(child);
     let _ = child.wait();
-    state.final_status = Some(ProcessStatus::ProlongedSilence {
-        reason: "no output before host deadline".to_string(),
-    });
+    state.final_status = Some(deadline_status());
     Ok(())
 }
 
@@ -366,9 +420,7 @@ fn stream_spawn_error<W: Write>(
     err: std::io::Error,
 ) -> Result<i32, ProviderFailure> {
     let mut state = LaunchState::new(request_id, None);
-    state.final_status = Some(ProcessStatus::SpawnError {
-        reason: err.to_string(),
-    });
+    state.final_status = Some(spawn_error_status(err));
     state.mark_drains_done();
     state.finish(writer)
 }
@@ -379,7 +431,7 @@ fn stream_policy_rejection<W: Write>(
     reason: String,
 ) -> Result<i32, ProviderFailure> {
     let mut state = LaunchState::new(request_id, None);
-    state.final_status = Some(ProcessStatus::SpawnError { reason });
+    state.final_status = Some(policy_rejection_status(reason));
     state.mark_drains_done();
     state.finish(writer)
 }
@@ -484,14 +536,7 @@ impl LaunchState {
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
         self.write_event(
-            json!({
-                "contract": CONTRACT,
-                "request_id": self.request_id,
-                "seq": self.seq,
-                "time_unix_ms": now_unix_ms(),
-                "kind": kind,
-                "data_base64": encode_base64(bytes),
-            }),
+            stream_bytes_event(&self.request_id, self.seq, kind, bytes),
             writer,
         )
     }
@@ -501,14 +546,30 @@ impl LaunchState {
         session: Option<String>,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
-        if self.session_id.is_some() {
+        if self.has_session_marker() {
             return Ok(());
         }
         if let Some(session_id) = session {
-            self.session_id = Some(session_id.clone());
-            self.marker(format!("opencode.sessionID.{session_id}"), writer)?;
+            self.record_session_id(&session_id);
+            self.write_session_marker(&session_id, writer)?;
         }
         Ok(())
+    }
+
+    fn has_session_marker(&self) -> bool {
+        self.session_id.is_some()
+    }
+
+    fn record_session_id(&mut self, session_id: &str) {
+        self.session_id = Some(session_id.to_string());
+    }
+
+    fn write_session_marker<W: Write>(
+        &mut self,
+        session_id: &str,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        self.marker(session_marker_name(session_id), writer)
     }
 
     fn capture_session_from_stdout<W: Write>(
@@ -537,18 +598,7 @@ impl LaunchState {
     }
 
     fn marker<W: Write>(&mut self, name: String, writer: &mut W) -> Result<(), ProviderFailure> {
-        self.write_event(
-            json!({
-                "contract": CONTRACT,
-                "request_id": self.request_id,
-                "seq": self.seq,
-                "time_unix_ms": now_unix_ms(),
-                "kind": "marker",
-                "name": name,
-                "value": true,
-            }),
-            writer,
-        )
+        self.write_event(marker_event(&self.request_id, self.seq, name), writer)
     }
 
     fn heartbeat<W: Write>(&mut self, writer: &mut W) -> Result<(), ProviderFailure> {
@@ -556,17 +606,7 @@ impl LaunchState {
             return Ok(());
         }
         self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-        self.write_event(
-            json!({
-                "contract": CONTRACT,
-                "request_id": self.request_id,
-                "seq": self.seq,
-                "time_unix_ms": now_unix_ms(),
-                "kind": "heartbeat",
-                "detail": "child still running",
-            }),
-            writer,
-        )
+        self.write_event(heartbeat_event(&self.request_id, self.seq), writer)
     }
 
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
@@ -597,12 +637,14 @@ impl LaunchState {
         mut event: Value,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
-        event["seq"] = json!(self.seq);
-        serde_json::to_writer(&mut *writer, &event).map_err(json_write_failure)?;
-        writer.write_all(b"\n").map_err(write_failure)?;
-        writer.flush().map_err(write_failure)?;
-        self.seq += 1;
+        assign_event_seq(&mut event, self.seq);
+        write_ndjson_event(writer, &event)?;
+        self.advance_seq();
         Ok(())
+    }
+
+    fn advance_seq(&mut self) {
+        self.seq += 1;
     }
 
     fn wait_duration(&self) -> Duration {
@@ -635,6 +677,295 @@ impl LaunchState {
         self.stdout_done = true;
         self.stderr_done = true;
     }
+}
+
+fn invalid_launch_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_launch_params",
+        format!("launch params are invalid: {err}"),
+    )
+}
+
+fn policy_result_accepted(result: &Value) -> bool {
+    result.get("accepted").and_then(Value::as_bool) == Some(true)
+}
+
+fn policy_argv(result: &Value) -> Vec<String> {
+    owned_strings(policy_argv_strings(result))
+}
+
+fn policy_argv_strings(result: &Value) -> Vec<&str> {
+    let Some(values) = policy_argv_values(result) else {
+        return Vec::new();
+    };
+    policy_argv_string_refs(policy_argv_string_values(values))
+}
+
+fn policy_argv_values(result: &Value) -> Option<&Vec<Value>> {
+    result.get("argv").and_then(Value::as_array)
+}
+
+fn policy_argv_string_values(values: &[Value]) -> Vec<&Value> {
+    values
+        .iter()
+        .filter(|value| policy_value_is_string(value))
+        .collect()
+}
+
+fn policy_value_is_string(value: &Value) -> bool {
+    value.as_str().is_some()
+}
+
+fn policy_argv_string_refs(values: Vec<&Value>) -> Vec<&str> {
+    values.into_iter().map(policy_string_ref).collect()
+}
+
+fn policy_string_ref(value: &Value) -> &str {
+    value.as_str().expect("filtered policy argv string")
+}
+
+fn owned_strings(values: Vec<&str>) -> Vec<String> {
+    values.into_iter().map(ToOwned::to_owned).collect()
+}
+
+fn validate_policy_argv(argv: &[String], request_id: &str) -> Result<(), ProviderFailure> {
+    if argv.is_empty() {
+        return Err(empty_policy_argv_failure(request_id));
+    }
+    Ok(())
+}
+
+fn empty_policy_argv_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "empty_policy_argv",
+        "policy.evaluate returned no launch argv",
+    )
+}
+
+fn policy_stdin(result: &Value) -> Option<Vec<u8>> {
+    policy_stdin_text(result).map(stdin_text_bytes)
+}
+
+fn policy_stdin_text(result: &Value) -> Option<&str> {
+    result.get("stdin").and_then(Value::as_str)
+}
+
+fn stdin_text_bytes(stdin: &str) -> Vec<u8> {
+    stdin.as_bytes().to_vec()
+}
+
+fn policy_prompt(result: &Value) -> Option<String> {
+    result
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn policy_env_entry(
+    key: &str,
+    value: &Value,
+    request_id: &str,
+) -> Result<(String, String), ProviderFailure> {
+    let value = policy_env_string(value, request_id)?;
+    Ok(policy_env_pair(key, value))
+}
+
+fn policy_env_string<'a>(value: &'a Value, request_id: &str) -> Result<&'a str, ProviderFailure> {
+    value
+        .as_str()
+        .ok_or_else(|| invalid_policy_env_failure(request_id))
+}
+
+fn policy_env_pair(key: &str, value: &str) -> (String, String) {
+    (key.to_string(), value.to_string())
+}
+
+fn invalid_policy_env_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_policy_env",
+        "policy.evaluate returned a non-string env value",
+    )
+}
+
+fn policy_diagnostics(result: &Value) -> Value {
+    result
+        .get("diagnostics")
+        .cloned()
+        .unwrap_or_else(|| json!([]))
+}
+
+fn launch_policy_value(params: &LaunchParams, request_id: &str) -> Result<Value, ProviderFailure> {
+    let stdin = policy_stdin_for_launch(params.stdin.as_ref(), request_id)?;
+    Ok(launch_policy_json(params, stdin))
+}
+
+fn launch_policy_json(params: &LaunchParams, stdin: Option<String>) -> Value {
+    json!({
+        "settings_id": params.settings_id.clone(),
+        "mode": params.mode.clone(),
+        "model": params.model.clone(),
+        "launch": {
+            "argv": params.argv.clone(),
+            "env": params.env.clone(),
+            "stdin": stdin,
+        }
+    })
+}
+
+fn invalid_launch_policy_params_failure(
+    request_id: &str,
+    err: serde_json::Error,
+) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_launch_policy_params",
+        format!("launch params could not be evaluated by policy: {err}"),
+    )
+}
+
+fn invalid_stdin_utf8_failure(
+    request_id: &str,
+    err: std::string::FromUtf8Error,
+) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_stdin_utf8",
+        format!("launch stdin must be UTF-8 at the policy boundary: {err}"),
+    )
+}
+
+fn invalid_stdin_base64_failure(request_id: &str, err: String) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_stdin_base64",
+        format!("launch stdin base64 is invalid: {err}"),
+    )
+}
+
+fn invalid_stdin_encoding_failure(request_id: &str, encoding: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_stdin_encoding",
+        format!("unsupported launch stdin encoding: {encoding}"),
+    )
+}
+
+fn allowed_declared_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    owned_env_pairs(allowed_declared_env_entries(declared))
+}
+
+fn allowed_declared_env_entries(declared: &BTreeMap<String, String>) -> Vec<(&String, &String)> {
+    declared
+        .iter()
+        .filter(|(key, _)| allowed_declared_env_key(key))
+        .collect()
+}
+
+fn allowed_declared_env_key(key: &str) -> bool {
+    !policy::is_forbidden_env_key(key)
+}
+
+fn owned_env_pairs(entries: Vec<(&String, &String)>) -> BTreeMap<String, String> {
+    entries.into_iter().map(owned_env_pair).collect()
+}
+
+fn owned_env_pair(entry: (&String, &String)) -> (String, String) {
+    (entry.0.clone(), entry.1.clone())
+}
+
+fn session_marker_name(session_id: &str) -> String {
+    format!("opencode.sessionID.{session_id}")
+}
+
+fn assign_event_seq(event: &mut Value, seq: u64) {
+    event["seq"] = json!(seq);
+}
+
+fn write_ndjson_event<W: Write>(writer: &mut W, event: &Value) -> Result<(), ProviderFailure> {
+    write_json_event(writer, event)?;
+    write_event_newline(writer)?;
+    flush_event_writer(writer)
+}
+
+fn write_json_event<W: Write>(writer: &mut W, event: &Value) -> Result<(), ProviderFailure> {
+    serde_json::to_writer(writer, event).map_err(json_write_failure)
+}
+
+fn write_event_newline<W: Write>(writer: &mut W) -> Result<(), ProviderFailure> {
+    writer.write_all(b"\n").map_err(write_failure)
+}
+
+fn flush_event_writer<W: Write>(writer: &mut W) -> Result<(), ProviderFailure> {
+    writer.flush().map_err(write_failure)
+}
+
+fn drain_bytes_message(stdout: bool, bytes: Vec<u8>) -> DrainMessage {
+    if stdout {
+        DrainMessage::Stdout(bytes)
+    } else {
+        DrainMessage::Stderr(bytes)
+    }
+}
+
+fn drain_done_message(stdout: bool) -> DrainMessage {
+    if stdout {
+        DrainMessage::StdoutDone
+    } else {
+        DrainMessage::StderrDone
+    }
+}
+
+fn deadline_status() -> ProcessStatus {
+    ProcessStatus::ProlongedSilence {
+        reason: "no output before host deadline".to_string(),
+    }
+}
+
+fn spawn_error_status(err: std::io::Error) -> ProcessStatus {
+    ProcessStatus::SpawnError {
+        reason: err.to_string(),
+    }
+}
+
+fn policy_rejection_status(reason: String) -> ProcessStatus {
+    ProcessStatus::SpawnError { reason }
+}
+
+fn stream_bytes_event(request_id: &str, seq: u64, kind: &str, bytes: &[u8]) -> Value {
+    json!({
+        "contract": CONTRACT,
+        "request_id": request_id,
+        "seq": seq,
+        "time_unix_ms": now_unix_ms(),
+        "kind": kind,
+        "data_base64": encode_base64(bytes),
+    })
+}
+
+fn marker_event(request_id: &str, seq: u64, name: String) -> Value {
+    json!({
+        "contract": CONTRACT,
+        "request_id": request_id,
+        "seq": seq,
+        "time_unix_ms": now_unix_ms(),
+        "kind": "marker",
+        "name": name,
+        "value": true,
+    })
+}
+
+fn heartbeat_event(request_id: &str, seq: u64) -> Value {
+    json!({
+        "contract": CONTRACT,
+        "request_id": request_id,
+        "seq": seq,
+        "time_unix_ms": now_unix_ms(),
+        "kind": "heartbeat",
+        "detail": "child still running",
+    })
 }
 
 fn process_status_from_exit(status: ExitStatus) -> ProcessStatus {
@@ -711,13 +1042,21 @@ fn json_write_failure(err: serde_json::Error) -> ProviderFailure {
 fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     unsafe {
-        command.pre_exec(|| {
-            if setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        command.pre_exec(set_current_process_group);
     }
+}
+
+#[cfg(unix)]
+fn set_current_process_group() -> std::io::Result<()> {
+    if process_group_setup_failed(unsafe { setpgid(0, 0) }) {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_group_setup_failed(result: i32) -> bool {
+    result == -1
 }
 
 #[cfg(not(unix))]
@@ -725,15 +1064,28 @@ fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn terminate_child(child: &mut Child) {
-    let pgid = -(child.id() as i32);
-    unsafe {
-        let _ = kill(pgid, SIGTERM);
-    }
+    let pgid = child_process_group_id(child);
+    send_process_group_signal(pgid, SIGTERM);
     std::thread::sleep(TERMINATION_GRACE);
-    if child.try_wait().ok().flatten().is_none() {
-        unsafe {
-            let _ = kill(pgid, SIGKILL);
-        }
+    if child_still_running(child) {
+        send_process_group_signal(pgid, SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn child_process_group_id(child: &Child) -> i32 {
+    -(child.id() as i32)
+}
+
+#[cfg(unix)]
+fn child_still_running(child: &mut Child) -> bool {
+    child.try_wait().ok().flatten().is_none()
+}
+
+#[cfg(unix)]
+fn send_process_group_signal(pgid: i32, signal: i32) {
+    unsafe {
+        let _ = kill(pgid, signal);
     }
 }
 

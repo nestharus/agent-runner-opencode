@@ -1,4 +1,4 @@
-//! Declared roles: validator, mapper, formatter, parser
+//! Declared roles: validator, mapper, formatter, parser, filter, predicate
 
 use crate::account::profile_for_settings_id;
 use crate::envelope::ProviderFailure;
@@ -41,37 +41,52 @@ pub fn evaluate_params(params: Value, request_id: &str) -> Result<Value, Provide
 }
 
 pub fn evaluate(params: PolicyEvaluateParams, request_id: &str) -> Result<Value, ProviderFailure> {
-    let account = profile_for_settings_id(&params.settings_id).ok_or_else(|| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "unknown_settings_id",
-            format!("unknown opencode settings_id: {}", params.settings_id),
-        )
-    })?;
+    let account = policy_account(&params.settings_id, request_id)?;
     let diagnostics = diagnostics_for_policy(&params);
-    let accepted = !diagnostics.iter().any(is_error_diagnostic);
-    Ok(json!({
-        "accepted": accepted,
-        "argv": effective_argv(account.opencode_wrapper, &params),
+    Ok(policy_result(
+        account.opencode_wrapper,
+        &params,
+        diagnostics,
+    ))
+}
+
+fn policy_result(wrapper: &str, params: &PolicyEvaluateParams, diagnostics: Vec<Value>) -> Value {
+    json!({
+        "accepted": policy_accepted(&diagnostics),
+        "argv": effective_argv(wrapper, params),
         "env": effective_env(params.launch.env.as_ref()),
-        "stdin": params.launch.stdin,
-        "prompt": params.model.inputs.prompt,
+        "stdin": params.launch.stdin.clone(),
+        "prompt": params.model.inputs.prompt.clone(),
         "diagnostics": diagnostics,
-        "markers": policy_markers(account.opencode_wrapper, &params),
-    }))
+        "markers": policy_markers(wrapper, params),
+    })
+}
+
+fn policy_account(
+    settings_id: &str,
+    request_id: &str,
+) -> Result<&'static crate::account::AccountProfile, ProviderFailure> {
+    profile_for_settings_id(settings_id)
+        .ok_or_else(|| unknown_settings_id_failure(request_id, settings_id))
+}
+
+fn unknown_settings_id_failure(request_id: &str, settings_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "unknown_settings_id",
+        format!("unknown opencode settings_id: {settings_id}"),
+    )
+}
+
+fn policy_accepted(diagnostics: &[Value]) -> bool {
+    !diagnostics.iter().any(is_error_diagnostic)
 }
 
 fn parse_policy_params(
     params: Value,
     request_id: &str,
 ) -> Result<PolicyEvaluateParams, ProviderFailure> {
-    serde_json::from_value(params).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "invalid_policy_params",
-            format!("policy.evaluate params are invalid: {err}"),
-        )
-    })
+    serde_json::from_value(params).map_err(|err| invalid_policy_params_failure(request_id, err))
 }
 
 fn effective_argv(wrapper: &str, params: &PolicyEvaluateParams) -> Vec<String> {
@@ -110,11 +125,9 @@ fn effort_from_model_name(name: &str) -> Option<&str> {
 }
 
 fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, String> {
-    input
+    allowed_env_entries(input)
         .into_iter()
-        .flat_map(BTreeMap::iter)
-        .filter(|(key, _)| !is_forbidden_env_key(key))
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .map(env_entry)
         .collect()
 }
 
@@ -125,32 +138,16 @@ fn diagnostics_for_policy(params: &PolicyEvaluateParams) -> Vec<Value> {
 }
 
 fn forbidden_env_diagnostics(input: Option<&BTreeMap<String, String>>) -> Vec<Value> {
-    input
+    forbidden_env_keys(input)
         .into_iter()
-        .flat_map(BTreeMap::keys)
-        .filter(|key| is_forbidden_env_key(key))
-        .map(|key| {
-            diagnostic(
-                "error",
-                "forbidden_env",
-                format!("forbidden env key omitted: {key}"),
-            )
-        })
+        .map(forbidden_env_diagnostic)
         .collect()
 }
 
 fn forbidden_argv_diagnostics(input: Option<&[String]>) -> Vec<Value> {
-    input
+    forbidden_launch_args(input)
         .into_iter()
-        .flatten()
-        .filter(|arg| is_forbidden_launch_arg(arg))
-        .map(|arg| {
-            diagnostic(
-                "error",
-                "forbidden_flag",
-                format!("forbidden launch arg: {arg}"),
-            )
-        })
+        .map(forbidden_arg_diagnostic)
         .collect()
 }
 
@@ -190,4 +187,56 @@ fn policy_markers(wrapper: &str, params: &PolicyEvaluateParams) -> Vec<Value> {
         json!({ "name": "opencode.wrapper", "value": wrapper }),
         json!({ "name": "opencode.mode", "value": params.mode }),
     ]
+}
+
+fn invalid_policy_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_policy_params",
+        format!("policy.evaluate params are invalid: {err}"),
+    )
+}
+
+fn allowed_env_entries(input: Option<&BTreeMap<String, String>>) -> Vec<(&String, &String)> {
+    input
+        .into_iter()
+        .flat_map(BTreeMap::iter)
+        .filter(|(key, _)| !is_forbidden_env_key(key))
+        .collect()
+}
+
+fn env_entry((key, value): (&String, &String)) -> (String, String) {
+    (key.clone(), value.clone())
+}
+
+fn forbidden_env_keys(input: Option<&BTreeMap<String, String>>) -> Vec<&String> {
+    input
+        .into_iter()
+        .flat_map(BTreeMap::keys)
+        .filter(|key| is_forbidden_env_key(key))
+        .collect()
+}
+
+fn forbidden_launch_args(input: Option<&[String]>) -> Vec<&String> {
+    input
+        .into_iter()
+        .flatten()
+        .filter(|arg| is_forbidden_launch_arg(arg))
+        .collect()
+}
+
+fn forbidden_env_diagnostic(key: &String) -> Value {
+    diagnostic(
+        "error",
+        "forbidden_env",
+        format!("forbidden env key omitted: {key}"),
+    )
+}
+
+fn forbidden_arg_diagnostic(arg: &String) -> Value {
+    diagnostic(
+        "error",
+        "forbidden_flag",
+        format!("forbidden launch arg: {arg}"),
+    )
 }

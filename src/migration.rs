@@ -1,4 +1,4 @@
-//! Declared roles: mapper, validator
+//! Declared roles: mapper, validator, orchestration, accessor, formatter, predicate
 
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
@@ -31,35 +31,54 @@ pub fn apply_params(
     ensure_confirmation(&params, request_id)?;
     let config_root = config_root(host, request_id)?;
     let artifact_root = artifact_root(&config_root, &params, request_id)?;
-    fs::create_dir_all(&artifact_root).map_err(|err| {
-        ProviderFailure::internal(
-            request_id,
-            "migration_artifact_dir_failed",
-            format!("failed to create provider-owned artifact directory: {err}"),
-        )
-    })?;
+    fs::create_dir_all(&artifact_root)
+        .map_err(|err| migration_artifact_dir_failure(request_id, err))?;
     let actions = planned_actions(&params);
     let summary = artifact_summary(&params, &actions);
     let path = artifact_root.join("opencode-provider-migration-summary.json");
     ensure_canonical_contained(&path, &config_root, request_id)?;
     write_artifact(&path, &summary, request_id)?;
-    let bytes = fs::read(&path).map_err(|err| {
-        ProviderFailure::internal(
-            request_id,
-            "migration_artifact_read_failed",
-            format!("failed to read provider-owned artifact: {err}"),
-        )
-    })?;
-    Ok(json!({
-        "applied_actions": actions,
-        "artifacts": [{"kind": "file", "path": path.to_string_lossy(), "sha256": sha256_hex(&bytes)}],
-        "warnings": migration_warnings(&params),
-        "outcome": {
-            "status": "provider_artifacts_written",
-            "live_cutover": false,
-            "artifact_root": artifact_root.to_string_lossy()
-        }
-    }))
+    let bytes = read_artifact(&path, request_id)?;
+    Ok(migration_apply_result(
+        actions,
+        migration_apply_artifacts(&path, &bytes),
+        migration_warnings(&params),
+        &artifact_root,
+    ))
+}
+
+fn migration_apply_result(
+    applied_actions: Vec<Value>,
+    artifacts: Vec<Value>,
+    warnings: Vec<Value>,
+    artifact_root: &Path,
+) -> Value {
+    json!({
+        "applied_actions": applied_actions,
+        "artifacts": artifacts,
+        "warnings": warnings,
+        "outcome": migration_apply_outcome(artifact_root)
+    })
+}
+
+fn migration_apply_artifacts(path: &Path, bytes: &[u8]) -> Vec<Value> {
+    vec![migration_apply_artifact(path, bytes)]
+}
+
+fn migration_apply_artifact(path: &Path, bytes: &[u8]) -> Value {
+    json!({"kind": "file", "path": path_string(path), "sha256": sha256_hex(bytes)})
+}
+
+fn migration_apply_outcome(artifact_root: &Path) -> Value {
+    json!({
+        "status": "provider_artifacts_written",
+        "live_cutover": false,
+        "artifact_root": path_string(artifact_root)
+    })
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn planned_actions(params: &Value) -> Vec<Value> {
@@ -96,11 +115,7 @@ fn ensure_confirmation(params: &Value, request_id: &str) -> Result<(), ProviderF
     {
         return Ok(());
     }
-    Err(ProviderFailure::invalid_request(
-        request_id,
-        "migration_confirmation_required",
-        "migration.apply requires confirmation.approved=true",
-    ))
+    Err(migration_confirmation_required_failure(request_id))
 }
 
 fn artifact_root(
@@ -150,16 +165,32 @@ fn requested_artifact_root(
     root: &str,
     request_id: &str,
 ) -> Result<PathBuf, ProviderFailure> {
+    let requested = requested_artifact_root_path(config_root, root);
+    ensure_requested_artifact_root(&requested, request_id)?;
+    Ok(requested)
+}
+
+fn requested_artifact_root_path(config_root: &Path, root: &str) -> PathBuf {
     let path = PathBuf::from(root);
-    let requested = if path.is_absolute() {
+    if path.is_absolute() {
         path
     } else {
         config_root.join(path)
-    };
-    if has_parent_component(&requested) || is_forbidden_live_route_path(&requested) {
+    }
+}
+
+fn ensure_requested_artifact_root(
+    requested: &Path,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if is_invalid_requested_artifact_root(requested) {
         return Err(invalid_artifact_root(request_id));
     }
-    Ok(requested)
+    Ok(())
+}
+
+fn is_invalid_requested_artifact_root(path: &Path) -> bool {
+    has_parent_component(path) || is_forbidden_live_route_path(path)
 }
 
 fn ensure_provider_owned_artifact_root(
@@ -168,9 +199,9 @@ fn ensure_provider_owned_artifact_root(
     config_root: &Path,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let requested = normalized_absolute_path(requested, request_id)?;
+    let requested = validated_normalized_absolute_path(requested, request_id)?;
     for root in allowed_roots {
-        let root = normalized_absolute_path(root, request_id)?;
+        let root = validated_normalized_absolute_path(root, request_id)?;
         if requested.starts_with(&root) {
             ensure_canonical_contained(&requested, config_root, request_id)?;
             return Ok(());
@@ -192,46 +223,91 @@ fn ensure_canonical_contained(
     Err(invalid_artifact_root(request_id))
 }
 
-fn normalized_absolute_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
+fn validated_normalized_absolute_path(
+    path: &Path,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    ensure_no_parent_component(path, request_id)?;
+    Ok(normalized_absolute_path(path))
+}
+
+fn normalized_absolute_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str())
-            }
-            Component::CurDir => {}
-            Component::ParentDir => return Err(invalid_artifact_root(request_id)),
-        }
+        push_normalized_component(&mut normalized, component);
     }
-    Ok(normalized)
+    normalized
+}
+
+fn push_normalized_component(normalized: &mut PathBuf, component: Component<'_>) {
+    match component {
+        Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+            normalized.push(component.as_os_str())
+        }
+        Component::CurDir | Component::ParentDir => {}
+    }
+}
+
+fn ensure_no_parent_component(path: &Path, request_id: &str) -> Result<(), ProviderFailure> {
+    if has_parent_component(path) {
+        return Err(invalid_artifact_root(request_id));
+    }
+    Ok(())
 }
 
 fn canonical_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    fs::canonicalize(path).map_err(|err| {
-        ProviderFailure::internal(
-            request_id,
-            "migration_artifact_root_canonicalize_failed",
-            format!("failed to canonicalize migration artifact root: {err}"),
-        )
-    })
+    fs::canonicalize(path)
+        .map_err(|err| migration_artifact_root_canonicalize_failure(request_id, err))
 }
 
 fn canonical_create_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    let existing = existing_ancestor(path).ok_or_else(|| invalid_artifact_root(request_id))?;
+    let existing = existing_ancestor_path(path, request_id)?;
+    let suffix = create_path_suffix(path, existing, request_id)?;
+    ensure_create_path_suffix(suffix, request_id)?;
     let mut canonical = canonical_path(existing, request_id)?;
-    let suffix = path
-        .strip_prefix(existing)
-        .map_err(|_| invalid_artifact_root(request_id))?;
+    append_create_path_suffix(&mut canonical, suffix);
+    Ok(canonical)
+}
+
+fn existing_ancestor_path<'a>(
+    path: &'a Path,
+    request_id: &str,
+) -> Result<&'a Path, ProviderFailure> {
+    existing_ancestor(path).ok_or_else(|| invalid_artifact_root(request_id))
+}
+
+fn create_path_suffix<'a>(
+    path: &'a Path,
+    existing: &'a Path,
+    request_id: &str,
+) -> Result<&'a Path, ProviderFailure> {
+    path.strip_prefix(existing)
+        .map_err(|_| invalid_artifact_root(request_id))
+}
+
+fn ensure_create_path_suffix(suffix: &Path, request_id: &str) -> Result<(), ProviderFailure> {
     for component in suffix.components() {
-        match component {
-            Component::Normal(part) => canonical.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
-                return Err(invalid_artifact_root(request_id));
-            }
+        if !is_create_path_suffix_component(component) {
+            return Err(invalid_artifact_root(request_id));
         }
     }
-    Ok(canonical)
+    Ok(())
+}
+
+fn is_create_path_suffix_component(component: Component<'_>) -> bool {
+    matches!(component, Component::Normal(_) | Component::CurDir)
+}
+
+fn append_create_path_suffix(canonical: &mut PathBuf, suffix: &Path) {
+    for component in suffix.components() {
+        push_create_path_component(canonical, component);
+    }
+}
+
+fn push_create_path_component(canonical: &mut PathBuf, component: Component<'_>) {
+    if let Component::Normal(part) = component {
+        canonical.push(part);
+    }
 }
 
 fn existing_ancestor(path: &Path) -> Option<&Path> {
@@ -280,28 +356,11 @@ fn legacy_summary(legacy: &Value) -> Value {
     })
 }
 
-fn write_artifact(path: &PathBuf, value: &Value, request_id: &str) -> Result<(), ProviderFailure> {
-    let bytes = serde_json::to_vec(value).map_err(|err| {
-        ProviderFailure::internal(
-            request_id,
-            "migration_artifact_serialize_failed",
-            format!("failed to serialize migration artifact: {err}"),
-        )
-    })?;
-    let mut file = fs::File::create(path).map_err(|err| {
-        ProviderFailure::internal(
-            request_id,
-            "migration_artifact_create_failed",
-            format!("failed to create provider-owned migration artifact: {err}"),
-        )
-    })?;
-    file.write_all(&bytes).map_err(|err| {
-        ProviderFailure::internal(
-            request_id,
-            "migration_artifact_write_failed",
-            format!("failed to write provider-owned migration artifact: {err}"),
-        )
-    })
+fn write_artifact(path: &Path, value: &Value, request_id: &str) -> Result<(), ProviderFailure> {
+    let bytes = artifact_bytes(value, request_id)?;
+    let mut file = create_artifact_file(path, request_id)?;
+    file.write_all(&bytes)
+        .map_err(|err| migration_artifact_write_failure(request_id, err))
 }
 
 fn string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
@@ -309,4 +368,78 @@ fn string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn migration_artifact_dir_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "migration_artifact_dir_failed",
+        format!("failed to create provider-owned artifact directory: {err}"),
+    )
+}
+
+fn read_artifact(path: &Path, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
+    fs::read(path).map_err(|err| migration_artifact_read_failure(request_id, err))
+}
+
+fn migration_artifact_read_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "migration_artifact_read_failed",
+        format!("failed to read provider-owned artifact: {err}"),
+    )
+}
+
+fn migration_confirmation_required_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "migration_confirmation_required",
+        "migration.apply requires confirmation.approved=true",
+    )
+}
+
+fn migration_artifact_root_canonicalize_failure(
+    request_id: &str,
+    err: std::io::Error,
+) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "migration_artifact_root_canonicalize_failed",
+        format!("failed to canonicalize migration artifact root: {err}"),
+    )
+}
+
+fn artifact_bytes(value: &Value, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
+    serde_json::to_vec(value).map_err(|err| migration_artifact_serialize_failure(request_id, err))
+}
+
+fn migration_artifact_serialize_failure(
+    request_id: &str,
+    err: serde_json::Error,
+) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "migration_artifact_serialize_failed",
+        format!("failed to serialize migration artifact: {err}"),
+    )
+}
+
+fn create_artifact_file(path: &Path, request_id: &str) -> Result<fs::File, ProviderFailure> {
+    fs::File::create(path).map_err(|err| migration_artifact_create_failure(request_id, err))
+}
+
+fn migration_artifact_create_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "migration_artifact_create_failed",
+        format!("failed to create provider-owned migration artifact: {err}"),
+    )
+}
+
+fn migration_artifact_write_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "migration_artifact_write_failed",
+        format!("failed to write provider-owned migration artifact: {err}"),
+    )
 }

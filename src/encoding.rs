@@ -1,4 +1,4 @@
-//! Declared roles: formatter, parser, accessor
+//! Declared roles: formatter, parser, accessor, filter, validator
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -81,7 +81,7 @@ fn validate_base64_len(clean: &[u8]) -> Result<(), String> {
     if clean.len().is_multiple_of(4) {
         return Ok(());
     }
-    Err("base64 length must be a multiple of four".to_string())
+    Err(invalid_base64_len_error())
 }
 
 fn decode_base64_chunks(clean: &[u8]) -> Result<Vec<u8>, String> {
@@ -124,6 +124,14 @@ fn base64_value(byte: u8) -> Result<u8, String> {
         b'0'..=b'9' => Ok(byte - b'0' + 52),
         b'+' => Ok(62),
         b'/' => Ok(63),
-        _ => Err(format!("invalid base64 byte 0x{byte:02x}")),
+        _ => Err(invalid_base64_byte_error(byte)),
     }
+}
+
+fn invalid_base64_len_error() -> String {
+    "base64 length must be a multiple of four".to_string()
+}
+
+fn invalid_base64_byte_error(byte: u8) -> String {
+    format!("invalid base64 byte 0x{byte:02x}")
 }

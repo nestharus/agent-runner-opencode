@@ -1,4 +1,4 @@
-//! Declared roles: mapper, parser, formatter, validator
+//! Declared roles: orchestration, mapper, parser, formatter, validator
 
 use crate::encoding::{bounded_text, decode_base64};
 use crate::envelope::ProviderFailure;
@@ -23,7 +23,7 @@ pub fn classify_params(params: Value, request_id: &str) -> Result<Value, Provide
     let stdout = decode_stream(&params.stdout_base64, request_id, "stdout_base64")?;
     let stderr = decode_stream(&params.stderr_base64, request_id, "stderr_base64")?;
     let signal = classify(&stdout, &stderr, &params.status, params.observed_at_unix_ms);
-    Ok(json!({ "terminal_signal": signal }))
+    Ok(classify_result(signal))
 }
 
 pub fn classify(
@@ -78,13 +78,7 @@ fn parse_classify_params(
     params: Value,
     request_id: &str,
 ) -> Result<TerminalClassifyParams, ProviderFailure> {
-    serde_json::from_value(params).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "invalid_terminal_params",
-            format!("terminal.classify params are invalid: {err}"),
-        )
-    })
+    serde_json::from_value(params).map_err(|err| invalid_terminal_params_failure(request_id, err))
 }
 
 fn decode_stream(
@@ -92,13 +86,7 @@ fn decode_stream(
     request_id: &str,
     field: &'static str,
 ) -> Result<Vec<u8>, ProviderFailure> {
-    decode_base64(value).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "invalid_base64",
-            format!("{field} is not valid base64: {err}"),
-        )
-    })
+    decode_base64(value).map_err(|err| invalid_base64_failure(request_id, field, err))
 }
 
 fn signal_kind(status: &ProcessStatus) -> &'static str {
@@ -131,4 +119,24 @@ fn terminal_signal(kind: &str, evidence: String, observed_at_unix_ms: u64) -> Va
         "evidence": evidence,
         "observed_at_unix_ms": observed_at_unix_ms,
     })
+}
+
+fn classify_result(signal: Value) -> Value {
+    json!({ "terminal_signal": signal })
+}
+
+fn invalid_terminal_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_terminal_params",
+        format!("terminal.classify params are invalid: {err}"),
+    )
+}
+
+fn invalid_base64_failure(request_id: &str, field: &'static str, err: String) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_base64",
+        format!("{field} is not valid base64: {err}"),
+    )
 }

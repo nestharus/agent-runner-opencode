@@ -1,4 +1,4 @@
-//! Declared roles: formatter, parser, validator
+//! Declared roles: formatter, parser, validator, accessor, mapper, predicate
 
 use crate::account::{AccountProfile, ACCOUNTS};
 use crate::envelope::{ProviderFailure, CONTRACT};
@@ -22,14 +22,10 @@ pub fn schema_result_params(params: Value, request_id: &str) -> Result<Value, Pr
 }
 
 pub fn validate_schema_id(request_id: &str, schema_id: &str) -> Result<(), ProviderFailure> {
-    if schema_id == SETTINGS_SCHEMA_ID {
+    if is_supported_schema_id(schema_id) {
         return Ok(());
     }
-    Err(ProviderFailure::unsupported(
-        request_id,
-        "unknown_schema",
-        format!("unknown provider schema id: {schema_id}"),
-    ))
+    Err(unknown_schema_failure(request_id, schema_id))
 }
 
 pub fn describe_result() -> Value {
@@ -194,13 +190,7 @@ fn account_index_max() -> u8 {
 }
 
 fn parse_schema_params(params: Value, request_id: &str) -> Result<SchemaParams, ProviderFailure> {
-    serde_json::from_value(params).map_err(|err| {
-        ProviderFailure::invalid_request(
-            request_id,
-            "invalid_schema_params",
-            format!("schema params must contain schema_id only: {err}"),
-        )
-    })
+    serde_json::from_value(params).map_err(|err| invalid_schema_params_failure(request_id, err))
 }
 
 fn schema_result() -> Value {
@@ -226,4 +216,24 @@ fn settings_schema_ui() -> Value {
             }
         ]
     })
+}
+
+fn is_supported_schema_id(schema_id: &str) -> bool {
+    schema_id == SETTINGS_SCHEMA_ID
+}
+
+fn unknown_schema_failure(request_id: &str, schema_id: &str) -> ProviderFailure {
+    ProviderFailure::unsupported(
+        request_id,
+        "unknown_schema",
+        format!("unknown provider schema id: {schema_id}"),
+    )
+}
+
+fn invalid_schema_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_schema_params",
+        format!("schema params must contain schema_id only: {err}"),
+    )
 }
