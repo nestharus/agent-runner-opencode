@@ -211,12 +211,15 @@ fn resume_confirmation(
 }
 
 fn known_provider_session_id(params: &LaunchParams) -> Option<&str> {
+    nonblank_optional_text(raw_known_provider_session_id(params))
+}
+
+fn raw_known_provider_session_id(params: &LaunchParams) -> Option<&str> {
     params
         .session
         .as_ref()
         .and_then(|session| session.get("known_provider_session_id"))
         .and_then(Value::as_str)
-        .filter(|session_id| !session_id.trim().is_empty())
 }
 
 fn require_resume_payload_reaches_child(
@@ -242,15 +245,48 @@ fn submitted_resume_payload(
 }
 
 fn stdin_payload_text(stdin: Option<&[u8]>) -> Option<String> {
-    let bytes = stdin?;
-    if bytes_are_empty_payload(bytes) {
-        return None;
-    }
-    std::str::from_utf8(bytes).ok().map(str::to_string)
+    let bytes = stdin_payload_bytes(stdin)?;
+    payload_string(bytes)
+}
+
+fn stdin_payload_bytes(stdin: Option<&[u8]>) -> Option<&[u8]> {
+    nonempty_payload_bytes(stdin?)
+}
+
+fn nonempty_payload_bytes(bytes: &[u8]) -> Option<&[u8]> {
+    (!bytes_are_empty_payload(bytes)).then_some(bytes)
 }
 
 fn bytes_are_empty_payload(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).map_or(bytes.is_empty(), |text| text.trim().is_empty())
+    payload_text_or_bytes_are_empty(bytes, payload_utf8_text(bytes))
+}
+
+fn payload_text_or_bytes_are_empty(bytes: &[u8], text: Option<&str>) -> bool {
+    text.map_or_else(|| bytes.is_empty(), text_is_blank)
+}
+
+fn payload_string(bytes: &[u8]) -> Option<String> {
+    payload_utf8_text(bytes).map(owned_text)
+}
+
+fn payload_utf8_text(bytes: &[u8]) -> Option<&str> {
+    std::str::from_utf8(bytes).ok()
+}
+
+fn owned_text(text: &str) -> String {
+    text.to_string()
+}
+
+fn nonblank_optional_text(value: Option<&str>) -> Option<&str> {
+    value.filter(|text| is_nonblank_text(text))
+}
+
+fn is_nonblank_text(text: &str) -> bool {
+    !text_is_blank(text)
+}
+
+fn text_is_blank(text: &str) -> bool {
+    text.trim().is_empty()
 }
 
 fn prompt_arg_payload(argv: &[String], prompt: Option<&str>) -> Option<String> {
@@ -261,7 +297,7 @@ fn prompt_arg_payload(argv: &[String], prompt: Option<&str>) -> Option<String> {
 }
 
 fn nonempty_prompt(prompt: Option<&str>) -> Option<&str> {
-    prompt.filter(|prompt| !prompt.trim().is_empty())
+    nonblank_optional_text(prompt)
 }
 
 fn argv_payload_after_resume_session_insert_index(argv: &[String]) -> Option<&str> {
@@ -464,11 +500,29 @@ fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
 }
 
 fn pass_through_env() -> BTreeMap<String, String> {
+    pass_through_env_map(pass_through_env_entries())
+}
+
+fn pass_through_env_entries() -> Vec<(String, String)> {
+    present_pass_through_env_entries(optional_pass_through_env_entries())
+}
+
+fn optional_pass_through_env_entries() -> Vec<Option<(String, String)>> {
     BASE_LAUNCH_ENV_PASSTHROUGH_KEYS
         .iter()
         .chain(HOST_LINKAGE_ENV_KEYS.iter())
-        .filter_map(|key| pass_through_env_entry(key))
+        .map(|key| pass_through_env_entry(key))
         .collect()
+}
+
+fn present_pass_through_env_entries(
+    entries: Vec<Option<(String, String)>>,
+) -> Vec<(String, String)> {
+    entries.into_iter().flatten().collect()
+}
+
+fn pass_through_env_map(entries: Vec<(String, String)>) -> BTreeMap<String, String> {
+    entries.into_iter().collect()
 }
 
 fn pass_through_env_entry(key: &str) -> Option<(String, String)> {
@@ -1041,12 +1095,36 @@ fn message_string_fields(message: &OpencodeMessage) -> Vec<&str> {
 }
 
 fn value_string_fields(value: &Value) -> Vec<&str> {
-    match value {
-        Value::String(text) => vec![text.as_str()],
-        Value::Array(values) => array_string_fields(values),
-        Value::Object(values) => object_string_fields(values),
-        _ => Vec::new(),
+    if let Some(text) = value_text(value) {
+        return single_string_field(text);
     }
+    if let Some(values) = value_array(value) {
+        return array_string_fields(values);
+    }
+    if let Some(values) = value_object(value) {
+        return object_string_fields(values);
+    }
+    empty_string_fields()
+}
+
+fn value_text(value: &Value) -> Option<&str> {
+    value.as_str()
+}
+
+fn value_array(value: &Value) -> Option<&Vec<Value>> {
+    value.as_array()
+}
+
+fn value_object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
+    value.as_object()
+}
+
+fn single_string_field(text: &str) -> Vec<&str> {
+    vec![text]
+}
+
+fn empty_string_fields() -> Vec<&'static str> {
+    Vec::new()
 }
 
 fn array_string_fields(values: &[Value]) -> Vec<&str> {
@@ -1403,25 +1481,27 @@ fn provider_error_signal_evidence(event: &OpencodeEventMetadata) -> String {
 }
 
 fn opencode_error_name(event: &OpencodeEventMetadata) -> &str {
-    event
-        .error
-        .as_ref()
-        .and_then(|error| error.name.as_deref())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("unknown")
+    nonblank_text_or(raw_opencode_error_name(event), "unknown")
+}
+
+fn raw_opencode_error_name(event: &OpencodeEventMetadata) -> Option<&str> {
+    event.error.as_ref().and_then(|error| error.name.as_deref())
 }
 
 fn opencode_error_message(event: &OpencodeEventMetadata) -> &str {
-    event
-        .error
-        .as_ref()
-        .and_then(opencode_error_message_value)
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or("unknown")
+    nonblank_text_or(raw_opencode_error_message(event), "unknown")
+}
+
+fn raw_opencode_error_message(event: &OpencodeEventMetadata) -> Option<&str> {
+    event.error.as_ref().and_then(opencode_error_message_value)
 }
 
 fn opencode_error_message_value(error: &opencode::OpencodeEventError) -> Option<&str> {
     error.data.message.as_deref().or(error.message.as_deref())
+}
+
+fn nonblank_text_or<'a>(value: Option<&'a str>, fallback: &'a str) -> &'a str {
+    nonblank_optional_text(value).unwrap_or(fallback)
 }
 
 fn launch_exit_event(request_id: &str, seq: u64, status: &ProcessStatus, signal: Value) -> Value {
