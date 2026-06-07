@@ -74,31 +74,14 @@ fn existing_path_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
 }
 
 fn env_passthrough_pairs() -> Vec<(&'static str, OsString)> {
-    env_pairs_for_keys(present_env_passthrough_keys())
-}
-
-fn present_env_passthrough_keys() -> Vec<&'static str> {
     ENV_PASSTHROUGH_KEYS
         .iter()
-        .copied()
-        .filter(|key| env_key_is_present(key))
+        .filter_map(|key| optional_env_pair(key))
         .collect()
 }
 
-fn env_key_is_present(key: &str) -> bool {
-    env_value(key).is_some()
-}
-
-fn env_pairs_for_keys(keys: Vec<&'static str>) -> Vec<(&'static str, OsString)> {
-    keys.into_iter().map(required_env_pair).collect()
-}
-
-fn required_env_pair(key: &'static str) -> (&'static str, OsString) {
-    env_pair(key, required_env_value(key))
-}
-
-fn required_env_value(key: &str) -> OsString {
-    env_value(key).expect("present env key should still have value")
+fn optional_env_pair(key: &'static str) -> Option<(&'static str, OsString)> {
+    env_value(key).map(|value| env_pair(key, value))
 }
 
 fn env_value(key: &str) -> Option<OsString> {

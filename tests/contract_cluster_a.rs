@@ -113,33 +113,6 @@ fn contract_launch_resume_emits_submitted_user_turn_marker_after_export_confirms
 }
 
 #[test]
-fn contract_launch_resume_emits_submitted_user_turn_marker_from_sqlite_when_export_json_invalid() {
-    let fake_wrapper =
-        FakeOpencodeWrapper::with_script(fake_wrapper_resume_invalid_export_script().to_string());
-    let xdg_home = fake_wrapper.dir().join("xdg-home");
-    write_opencode_sqlite_resume_confirmation(&xdg_home);
-    let path = prepend_path(fake_wrapper.dir());
-    let log_path = fake_wrapper.log_path_str();
-    let xdg_home = path_string(&xdg_home);
-    let params = resume_launch_params_with_arg_payload_env(path.as_str(), log_path);
-
-    let output = invoke_with_env(
-        "launch",
-        params,
-        &[
-            ("PATH", path.as_str()),
-            ("XDG_DATA_HOME", xdg_home.as_str()),
-        ],
-    );
-
-    assert_output_success(&output, "launch resume sqlite-confirmed payload");
-    let events =
-        launch_events_from_output(&output, "launch resume sqlite-confirmed payload stdout");
-    assert_monotonic_launch_events(&events);
-    assert_submitted_user_turn_marker(&events);
-}
-
-#[test]
 fn contract_launch_resume_does_not_emit_submitted_user_turn_marker_when_export_lacks_payload() {
     let fake_wrapper = FakeOpencodeWrapper::with_script(
         fake_wrapper_resume_unconfirmed_export_script().to_string(),

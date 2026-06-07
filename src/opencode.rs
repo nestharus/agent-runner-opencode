@@ -10,10 +10,8 @@
 
 use crate::account::AccountProfile;
 use crate::shell;
-use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
 
 #[derive(Default)]
 pub struct EventParser {
@@ -105,16 +103,6 @@ pub fn export(
     parse_export_stdout(&output.stdout)
 }
 
-pub fn export_with_sqlite_fallback(
-    session_id: &str,
-    account: &AccountProfile,
-) -> Result<OpencodeExport, OpencodeExportError> {
-    match export(session_id, account) {
-        Ok(native) => Ok(native),
-        Err(err) => export_error_with_sqlite_fallback(session_id, account, err),
-    }
-}
-
 pub fn parse_export_stdout(stdout: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {
     let start = export_json_start(stdout)?;
     parse_export_json(&stdout[start..])
@@ -194,153 +182,6 @@ fn missing_export_json_error() -> OpencodeExportError {
 
 fn invalid_export_json_error(err: serde_json::Error) -> OpencodeExportError {
     OpencodeExportError::InvalidJson(err.to_string())
-}
-
-fn export_error_with_sqlite_fallback(
-    session_id: &str,
-    account: &AccountProfile,
-    err: OpencodeExportError,
-) -> Result<OpencodeExport, OpencodeExportError> {
-    if !matches!(err, OpencodeExportError::InvalidJson(_)) {
-        return Err(err);
-    }
-    sqlite_export(session_id, account).ok_or(err)
-}
-
-fn sqlite_export(session_id: &str, account: &AccountProfile) -> Option<OpencodeExport> {
-    let db_path = sqlite_export_db_path(account)?;
-    let conn = sqlite_export_connection(&db_path)?;
-    let messages = sqlite_export_messages(&conn, session_id)?;
-    if messages.is_empty() {
-        return None;
-    }
-    Some(OpencodeExport {
-        info: OpencodeExportInfo {
-            id: session_id.to_string(),
-            title: None,
-        },
-        messages,
-    })
-}
-
-fn sqlite_export_db_path(account: &AccountProfile) -> Option<PathBuf> {
-    Some(sqlite_export_base_dir(account)?.join("opencode.db"))
-}
-
-fn sqlite_export_base_dir(account: &AccountProfile) -> Option<PathBuf> {
-    if account.opencode_index == 1 {
-        return default_opencode_base_dir();
-    }
-    Some(
-        home_dir()?
-            .join(format!(".opencode{}", account.opencode_index))
-            .join("opencode"),
-    )
-}
-
-fn default_opencode_base_dir() -> Option<PathBuf> {
-    let data_home = xdg_data_home().or_else(default_xdg_data_home)?;
-    Some(data_home.join("opencode"))
-}
-
-fn default_xdg_data_home() -> Option<PathBuf> {
-    Some(home_dir()?.join(".local/share"))
-}
-
-fn xdg_data_home() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME").map(PathBuf::from)
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
-fn sqlite_export_connection(path: &Path) -> Option<Connection> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
-}
-
-fn sqlite_export_messages(conn: &Connection, session_id: &str) -> Option<Vec<OpencodeMessage>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, session_id, time_created, data
-             FROM message
-             WHERE session_id = ?1
-             ORDER BY time_created, id",
-        )
-        .ok()?;
-    let rows = stmt
-        .query_map([session_id], |row| {
-            Ok(SqliteMessageRow {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                time_created: row.get(2)?,
-                data: row.get(3)?,
-            })
-        })
-        .ok()?;
-    let messages = rows
-        .filter_map(Result::ok)
-        .filter_map(|row| sqlite_export_message(conn, row))
-        .collect();
-    Some(messages)
-}
-
-struct SqliteMessageRow {
-    id: String,
-    session_id: String,
-    time_created: i64,
-    data: String,
-}
-
-fn sqlite_export_message(conn: &Connection, row: SqliteMessageRow) -> Option<OpencodeMessage> {
-    let data = sqlite_json(&row.data)?;
-    let role = data.get("role")?.as_str()?.to_string();
-    let parts = sqlite_export_parts(conn, &row.session_id, &row.id)?;
-    Some(OpencodeMessage {
-        info: OpencodeMessageInfo {
-            id: row.id,
-            role,
-            session_id: Some(row.session_id),
-            time: sqlite_message_time(&data, row.time_created),
-        },
-        parts,
-    })
-}
-
-fn sqlite_message_time(data: &Value, time_created: i64) -> Option<OpencodeMessageTime> {
-    let created = data
-        .pointer("/time/created")
-        .and_then(Value::as_u64)
-        .or_else(|| u64::try_from(time_created).ok());
-    let completed = data.pointer("/time/completed").and_then(Value::as_u64);
-    (created.is_some() || completed.is_some()).then_some(OpencodeMessageTime { created, completed })
-}
-
-fn sqlite_export_parts(
-    conn: &Connection,
-    session_id: &str,
-    message_id: &str,
-) -> Option<Vec<Value>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT data
-             FROM part
-             WHERE session_id = ?1 AND message_id = ?2
-             ORDER BY time_created, id",
-        )
-        .ok()?;
-    let rows = stmt
-        .query_map([session_id, message_id], |row| row.get::<_, String>(0))
-        .ok()?;
-    Some(
-        rows.filter_map(Result::ok)
-            .filter_map(|data| sqlite_json(&data))
-            .collect(),
-    )
-}
-
-fn sqlite_json(data: &str) -> Option<Value> {
-    serde_json::from_str(data).ok()
 }
 
 fn non_empty_lines(drained: &[u8]) -> Vec<Vec<u8>> {
