@@ -217,13 +217,29 @@ pub fn wrapper_stdin_log_line(value: &str) -> String {
 }
 
 pub fn wrapper_log_has_selected_wrapper(wrapper_log: &str) -> bool {
-    wrapper_log
-        .lines()
-        .any(|line| line == "argv0=opencode1" || line.ends_with("/opencode1"))
+    wrapper_log_lines_has_selected_wrapper(&wrapper_log_lines(wrapper_log))
 }
 
 pub fn wrapper_log_has_run_arg(wrapper_log: &str) -> bool {
-    wrapper_log.lines().any(|line| line == "arg=run")
+    wrapper_log_lines_has_run_arg(&wrapper_log_lines(wrapper_log))
+}
+
+pub fn wrapper_log_lines_has_selected_wrapper(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .any(|line| wrapper_log_line_is_selected_wrapper(line))
+}
+
+pub fn wrapper_log_line_is_selected_wrapper(line: &str) -> bool {
+    line == "argv0=opencode1" || line.ends_with("/opencode1")
+}
+
+pub fn wrapper_log_lines_has_run_arg(lines: &[&str]) -> bool {
+    lines.iter().any(|line| wrapper_log_line_is_run_arg(line))
+}
+
+pub fn wrapper_log_line_is_run_arg(line: &str) -> bool {
+    line == "arg=run"
 }
 
 pub fn declared_env_log_text(wrapper_log_path: &Path) -> String {
@@ -348,6 +364,10 @@ impl FakeOpencodeWrapper {
         let log_path = fake_wrapper_log_path(&dir);
         write_fake_wrapper(&wrapper_path, script);
         let log_path_string = path_string(&log_path);
+        Self::from_parts(dir, log_path, log_path_string)
+    }
+
+    fn from_parts(dir: PathBuf, log_path: PathBuf, log_path_string: String) -> Self {
         Self {
             dir,
             log_path,

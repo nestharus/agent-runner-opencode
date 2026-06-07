@@ -345,6 +345,13 @@ fn contract_policy_evaluate_rejects_user_injected_managed_flag_after_host_prefix
 }
 
 fn account_host_command_cases() -> Vec<(&'static str, String)> {
+    account_host_settings_ids()
+        .into_iter()
+        .flat_map(account_host_command_cases_for)
+        .collect()
+}
+
+fn account_host_settings_ids() -> [&'static str; 5] {
     [
         "opencode1",
         "opencode2",
@@ -352,20 +359,48 @@ fn account_host_command_cases() -> Vec<(&'static str, String)> {
         "opencode4",
         "opencode5",
     ]
-    .into_iter()
-    .flat_map(|settings_id| {
-        [
-            settings_id.to_string(),
-            format!("/tmp/host-bin/{settings_id}"),
-            "opencode".to_string(),
-            "/tmp/host-bin/opencode".to_string(),
-            "opencode5".to_string(),
-            "/tmp/host-bin/opencode5".to_string(),
-        ]
+}
+
+fn account_host_command_cases_for(settings_id: &'static str) -> Vec<(&'static str, String)> {
+    account_host_commands(settings_id)
         .into_iter()
-        .map(move |command| (settings_id, command))
-    })
-    .collect()
+        .map(move |command| account_host_command_case(settings_id, command))
+        .collect()
+}
+
+fn account_host_commands(settings_id: &str) -> [String; 6] {
+    [
+        settings_id.to_string(),
+        host_bin_command(settings_id),
+        plain_opencode_command(),
+        plain_host_bin_opencode_command(),
+        account_five_command(),
+        account_five_host_bin_command(),
+    ]
+}
+
+fn account_host_command_case(settings_id: &'static str, command: String) -> (&'static str, String) {
+    (settings_id, command)
+}
+
+fn host_bin_command(settings_id: &str) -> String {
+    format!("/tmp/host-bin/{settings_id}")
+}
+
+fn plain_opencode_command() -> String {
+    "opencode".to_string()
+}
+
+fn plain_host_bin_opencode_command() -> String {
+    "/tmp/host-bin/opencode".to_string()
+}
+
+fn account_five_command() -> String {
+    "opencode5".to_string()
+}
+
+fn account_five_host_bin_command() -> String {
+    "/tmp/host-bin/opencode5".to_string()
 }
 
 #[test]

@@ -159,12 +159,18 @@ pub fn assert_launch_events_not_empty(events: &[Value], label: &str) {
 }
 
 pub fn assert_launch_stream_bytes(events: &[Value]) {
-    let stdout_bytes = collect_stream_bytes(events, "stdout");
+    assert_launch_stdout_bytes(&collect_stream_bytes(events, "stdout"));
+    assert_launch_stderr_bytes(&collect_stream_bytes(events, "stderr"));
+}
+
+pub fn assert_launch_stdout_bytes(stdout_bytes: &[u8]) {
     assert_eq!(
         stdout_bytes, FAKE_LAUNCH_STDOUT,
         "stdout events must byte-preserve the selected opencodeN wrapper output"
     );
-    let stderr_bytes = collect_stream_bytes(events, "stderr");
+}
+
+pub fn assert_launch_stderr_bytes(stderr_bytes: &[u8]) {
     assert_eq!(
         stderr_bytes, FAKE_LAUNCH_STDERR,
         "stderr events must byte-preserve the selected opencodeN wrapper output"
@@ -173,6 +179,10 @@ pub fn assert_launch_stream_bytes(events: &[Value]) {
 
 pub fn assert_session_marker(events: &[Value], fixture_session_id: &str) {
     let session_marker = expected_session_marker(events, fixture_session_id);
+    assert_session_marker_truthy(session_marker);
+}
+
+pub fn assert_session_marker_truthy(session_marker: &Value) {
     assert_eq!(
         session_marker["value"], true,
         "session marker should use a truthy marker value"
@@ -180,29 +190,53 @@ pub fn assert_session_marker(events: &[Value], fixture_session_id: &str) {
 }
 
 pub fn assert_exit_event(events: &[Value], expected_status: Value, fixture_session_id: &str) {
-    let final_event = events.last().expect("final event");
+    let final_event = final_launch_event(events);
+    assert_exit_event_kind(final_event);
+    assert_exit_event_status_present(final_event);
+    assert_exit_event_terminal_signal_present(final_event);
+    assert_process_status_kind(&final_event["status"]);
+    assert_exit_event_status(final_event, expected_status);
+    assert_status_derived_terminal_signal(final_event);
+    assert_exit_event_session_present(final_event);
+    assert_exit_event_session_contains(final_event, fixture_session_id);
+}
+
+pub fn assert_exit_event_kind(final_event: &Value) {
     assert_eq!(
         final_event["kind"], "exit",
         "final launch line must be exit"
     );
+}
+
+pub fn assert_exit_event_status_present(final_event: &Value) {
     assert!(
         final_event.get("status").is_some(),
         "exit event must carry status"
     );
+}
+
+pub fn assert_exit_event_terminal_signal_present(final_event: &Value) {
     assert!(
         final_event.get("terminal_signal").is_some(),
         "exit event must carry terminal_signal"
     );
-    assert_process_status_kind(&final_event["status"]);
+}
+
+pub fn assert_exit_event_status(final_event: &Value, expected_status: Value) {
     assert_eq!(
         final_event["status"], expected_status,
         "final status should truthfully report the controlled wrapper exit status"
     );
-    assert_status_derived_terminal_signal(final_event);
+}
+
+pub fn assert_exit_event_session_present(final_event: &Value) {
     assert!(
         final_event.get("session").is_some(),
         "exit event must carry captured session evidence"
     );
+}
+
+pub fn assert_exit_event_session_contains(final_event: &Value, fixture_session_id: &str) {
     assert!(
         json_contains_string(&final_event["session"], fixture_session_id),
         "exit.session must carry the same opencode sessionID evidence as the marker; session={}",
@@ -242,12 +276,16 @@ pub fn assert_declared_env_boundary(output: &std::process::Output, wrapper_log_p
     assert_stderr_diagnostics_only(output);
     let events = parse_launch_events(&output.stdout);
     let final_event = final_launch_event(&events);
+    assert_declared_env_exit_event(final_event);
+    assert_declared_env_log(wrapper_log_path);
+}
+
+pub fn assert_declared_env_exit_event(final_event: &Value) {
     assert_eq!(final_event["kind"], "exit");
     assert_eq!(
         final_event["status"],
         json!({ "kind": "exited", "code": 0 })
     );
-    assert_declared_env_log(wrapper_log_path);
 }
 
 pub fn assert_declared_env_log(wrapper_log_path: &Path) {
@@ -318,17 +356,25 @@ pub fn assert_heartbeat_launch_output(output: &std::process::Output) {
     assert_stderr_diagnostics_only(output);
     let events = launch_events_from_output(output, "launch stdout");
     assert_monotonic_launch_events(&events);
+    assert_heartbeat_event_present(&events);
+    let final_event = final_launch_event(&events);
+    assert_final_launch_exit_kind(final_event);
+    assert_process_status_kind(&final_event["status"]);
+    assert_status_derived_terminal_signal(final_event);
+}
+
+pub fn assert_heartbeat_event_present(events: &[Value]) {
     assert!(
-        has_heartbeat_event(&events),
+        has_heartbeat_event(events),
         "slow launch should deterministically emit at least one heartbeat before exit; events={events:?}"
     );
-    let final_event = final_launch_event(&events);
+}
+
+pub fn assert_final_launch_exit_kind(final_event: &Value) {
     assert_eq!(
         final_event["kind"], "exit",
         "final launch line must be exit"
     );
-    assert_process_status_kind(&final_event["status"]);
-    assert_status_derived_terminal_signal(final_event);
 }
 
 pub fn assert_deadline_launch_output(deadline_output: &std::process::Output) {
@@ -336,6 +382,11 @@ pub fn assert_deadline_launch_output(deadline_output: &std::process::Output) {
     let deadline_events = launch_events_from_output(deadline_output, "deadline launch stdout");
     assert_monotonic_launch_events(&deadline_events);
     let deadline_final_event = final_launch_event(&deadline_events);
+    assert_deadline_final_event(deadline_final_event);
+    assert_deadline_provider_exit_code(deadline_output);
+}
+
+pub fn assert_deadline_final_event(deadline_final_event: &Value) {
     assert_eq!(
         deadline_final_event["kind"], "exit",
         "final deadline launch line must be exit"
@@ -348,6 +399,9 @@ pub fn assert_deadline_launch_output(deadline_output: &std::process::Output) {
         deadline_final_event["terminal_signal"]["kind"], "prolonged_silence",
         "prolonged_silence status should derive a prolonged_silence terminal signal"
     );
+}
+
+pub fn assert_deadline_provider_exit_code(deadline_output: &std::process::Output) {
     assert_eq!(
         deadline_output.status.code(),
         Some(124),
@@ -360,6 +414,10 @@ pub fn assert_final_opencode_error_launch_output(output: &std::process::Output) 
     let events = launch_events_from_output(output, "launch final opencode error stdout");
     assert_monotonic_launch_events(&events);
     let final_event = final_launch_event(&events);
+    assert_final_opencode_error_launch_event(final_event);
+}
+
+pub fn assert_final_opencode_error_launch_event(final_event: &Value) {
     assert_eq!(final_event["kind"], "exit");
     assert_eq!(
         final_event["status"],
@@ -383,6 +441,10 @@ pub fn assert_recovered_opencode_error_launch_output(output: &std::process::Outp
     let events = launch_events_from_output(output, "launch recovered opencode error stdout");
     assert_monotonic_launch_events(&events);
     let final_event = final_launch_event(&events);
+    assert_recovered_opencode_error_launch_event(final_event);
+}
+
+pub fn assert_recovered_opencode_error_launch_event(final_event: &Value) {
     assert_eq!(final_event["kind"], "exit");
     assert_eq!(
         final_event["status"],
@@ -396,28 +458,47 @@ pub fn assert_live_launch_output(output: &std::process::Output) {
     let events = launch_events_from_output(output, "launch stdout");
     assert_monotonic_launch_events(&events);
     let final_event = final_launch_event(&events);
-    assert_eq!(
-        final_event["kind"], "exit",
-        "final launch line must be exit"
-    );
+    assert_final_launch_exit_kind(final_event);
     assert_status_derived_terminal_signal(final_event);
+    let diagnostics = output_stderr_stdout_diagnostics(output);
+    assert_live_provider_exit_code(output, final_event, &diagnostics);
+}
+
+pub fn assert_live_provider_exit_code(
+    output: &std::process::Output,
+    final_event: &Value,
+    diagnostics: &str,
+) {
     assert_eq!(
         output.status.code(),
         expected_provider_exit_code(final_event),
-        "provider process exit should preserve host parity for the final launch status; stderr: {}\nstdout: {}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
+        "provider process exit should preserve host parity for the final launch status; {diagnostics}"
     );
 }
 
 pub fn assert_output_success(output: &std::process::Output, label: &str) {
+    let diagnostics = output_stderr_stdout_diagnostics(output);
+    assert_output_success_with_diagnostics(output, label, &diagnostics);
+}
+
+pub fn assert_output_success_with_diagnostics(
+    output: &std::process::Output,
+    label: &str,
+    diagnostics: &str,
+) {
     assert!(
         output.status.success(),
-        "{label} exited {:?}; stderr: {}\nstdout: {}",
+        "{label} exited {:?}; {diagnostics}",
         output.status.code(),
+    );
+}
+
+pub fn output_stderr_stdout_diagnostics(output: &std::process::Output) -> String {
+    format!(
+        "stderr: {}\nstdout: {}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
-    );
+    )
 }
 
 pub fn assert_resume_arg_payload_wrapper_log(wrapper_log_path: &Path) {
@@ -538,7 +619,7 @@ pub fn assert_policy_accepts(response: &Value) {
     assert_policy_response_shape(response);
     assert_policy_response_secret_absent(response);
     let result = policy_result(response);
-    assert_eq!(result["accepted"], true);
+    assert_policy_accepted(result);
     assert_policy_argv(&policy_result_argv(result));
     assert_policy_env(policy_result_env(result));
 }
@@ -547,9 +628,13 @@ pub fn assert_policy_accepts_for_wrapper(response: &Value, wrapper: &str) {
     assert_policy_response_shape(response);
     assert_policy_response_secret_absent(response);
     let result = policy_result(response);
-    assert_eq!(result["accepted"], true);
+    assert_policy_accepted(result);
     assert_policy_argv_for_wrapper(&policy_result_argv(result), wrapper);
     assert_policy_env(policy_result_env(result));
+}
+
+pub fn assert_policy_accepted(result: &Value) {
+    assert_eq!(result["accepted"], true);
 }
 
 pub fn assert_policy_response_secret_absent(response: &Value) {
@@ -604,11 +689,11 @@ pub fn assert_policy_rejects_forbidden(
 ) {
     assert_policy_response_shape(response);
     let result = policy_result(response);
-    assert_eq!(
-        result["accepted"], false,
-        "forbidden launch inputs must be rejected by policy.evaluate"
+    assert_policy_rejected(
+        result,
+        "forbidden launch inputs must be rejected by policy.evaluate",
     );
-    let diagnostics = result["diagnostics"].as_array().expect("diagnostics array");
+    let diagnostics = policy_diagnostics(result);
     assert_policy_diagnostic(diagnostics, "forbidden_flag", forbidden_flag);
     assert_policy_diagnostic(diagnostics, "forbidden_env", forbidden_env_key);
     assert_forbidden_env_removed(&result["env"], forbidden_env_key);
@@ -617,12 +702,20 @@ pub fn assert_policy_rejects_forbidden(
 pub fn assert_policy_rejects_forbidden_arg(response: &Value, forbidden_flag: &str) {
     assert_policy_response_shape(response);
     let result = policy_result(response);
-    assert_eq!(
-        result["accepted"], false,
-        "forbidden launch flag must be rejected by policy.evaluate"
+    assert_policy_rejected(
+        result,
+        "forbidden launch flag must be rejected by policy.evaluate",
     );
-    let diagnostics = result["diagnostics"].as_array().expect("diagnostics array");
+    let diagnostics = policy_diagnostics(result);
     assert_policy_diagnostic(diagnostics, "forbidden_flag", forbidden_flag);
+}
+
+pub fn assert_policy_rejected(result: &Value, message: &str) {
+    assert_eq!(result["accepted"], false, "{message}");
+}
+
+pub fn policy_diagnostics(result: &Value) -> &[Value] {
+    result["diagnostics"].as_array().expect("diagnostics array")
 }
 
 pub fn assert_policy_diagnostic(diagnostics: &[Value], code: &str, needle: &str) {
@@ -726,22 +819,24 @@ pub fn assert_terminal_classification(
 }
 
 pub fn assert_terminal_classify_output(output: &std::process::Output, expected_kind: &str) {
-    assert!(
-        output.status.success(),
-        "terminal.classify exited {:?}; stderr: {}\nstdout: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    );
+    assert_output_success(output, "terminal.classify");
     let response = json_stdout(output);
+    assert_terminal_classify_response_shape(&response);
+    assert_terminal_classify_kind(&response, expected_kind);
+}
+
+pub fn assert_terminal_classify_response_shape(response: &Value) {
     assert_valid(
-        &response,
+        response,
         "terminal.schema.json#/$defs/TerminalClassifyResponse",
     );
     assert_valid(
         &response["result"],
         "terminal.schema.json#/$defs/TerminalClassifyResult",
     );
+}
+
+pub fn assert_terminal_classify_kind(response: &Value, expected_kind: &str) {
     assert_eq!(response["result"]["terminal_signal"]["kind"], expected_kind);
 }
 
