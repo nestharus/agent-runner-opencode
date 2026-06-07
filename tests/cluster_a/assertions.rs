@@ -507,6 +507,15 @@ pub fn assert_policy_accepts(response: &Value) {
     assert_policy_env(policy_result_env(result));
 }
 
+pub fn assert_policy_accepts_for_wrapper(response: &Value, wrapper: &str) {
+    assert_policy_response_shape(response);
+    assert_policy_response_secret_absent(response);
+    let result = policy_result(response);
+    assert_eq!(result["accepted"], true);
+    assert_policy_argv_for_wrapper(&policy_result_argv(result), wrapper);
+    assert_policy_env(policy_result_env(result));
+}
+
 pub fn assert_policy_response_secret_absent(response: &Value) {
     let response_json = value_json_text(response);
     assert!(
@@ -524,7 +533,11 @@ pub fn assert_policy_response_shape(response: &Value) {
 }
 
 pub fn assert_policy_argv(argv: &[String]) {
-    assert_eq!(argv.first().map(String::as_str), Some("opencode1"));
+    assert_policy_argv_for_wrapper(argv, "opencode1");
+}
+
+pub fn assert_policy_argv_for_wrapper(argv: &[String], wrapper: &str) {
+    assert_eq!(argv.first().map(String::as_str), Some(wrapper));
     assert_contains_subsequence(argv, expected_policy_argv_subsequence());
     assert!(
         !argv_contains_plain_opencode(argv),
@@ -563,6 +576,17 @@ pub fn assert_policy_rejects_forbidden(
     assert_policy_diagnostic(diagnostics, "forbidden_flag", forbidden_flag);
     assert_policy_diagnostic(diagnostics, "forbidden_env", forbidden_env_key);
     assert_forbidden_env_removed(&result["env"], forbidden_env_key);
+}
+
+pub fn assert_policy_rejects_forbidden_arg(response: &Value, forbidden_flag: &str) {
+    assert_policy_response_shape(response);
+    let result = policy_result(response);
+    assert_eq!(
+        result["accepted"], false,
+        "forbidden launch flag must be rejected by policy.evaluate"
+    );
+    let diagnostics = result["diagnostics"].as_array().expect("diagnostics array");
+    assert_policy_diagnostic(diagnostics, "forbidden_flag", forbidden_flag);
 }
 
 pub fn assert_policy_diagnostic(diagnostics: &[Value], code: &str, needle: &str) {

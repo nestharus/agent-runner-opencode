@@ -87,6 +87,24 @@ fn contract_settings_crud() {
 }
 
 #[test]
+fn contract_settings_create_normalizes_all_account_records() {
+    let host = HostRoots::new("agent-runner-opencode-settings-normalize-accounts");
+    for (wrapper, auth_path) in normalized_account_cases() {
+        let create = success_result(
+            invoke_validated_with_host(
+                "settings.create",
+                settings_create_params_for_values(path_wrapped_opencode_settings_values(wrapper)),
+                host.overrides(),
+                "settings.schema.json#/$defs/SettingsCreateRequest",
+            ),
+            "settings.schema.json#/$defs/SettingsCreateResponse",
+            "settings.schema.json#/$defs/SettingsCreateResult",
+        );
+        assert_normalized_account_settings_record(&create["record"], wrapper, auth_path);
+    }
+}
+
+#[test]
 fn contract_settings_validate() {
     let host = HostRoots::new("agent-runner-opencode-settings-validate");
     let valid = success_result(
@@ -112,6 +130,16 @@ fn contract_settings_validate() {
         "settings.schema.json#/$defs/SettingsValidateResult",
     );
     assert_settings_invalid_result(&invalid);
+}
+
+fn normalized_account_cases() -> [(&'static str, &'static str); 5] {
+    [
+        ("opencode1", "~/.codex/auth.json"),
+        ("opencode2", "~/.codex5/auth.json"),
+        ("opencode3", "~/.codex2/auth.json"),
+        ("opencode4", "~/.codex3/auth.json"),
+        ("opencode5", "~/.codex4/auth.json"),
+    ]
 }
 
 #[test]

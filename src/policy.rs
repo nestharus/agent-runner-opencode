@@ -2,9 +2,20 @@
 
 use crate::account::profile_for_settings_id;
 use crate::envelope::ProviderFailure;
+use crate::models::PROVIDER_MODEL;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::path::Path;
+
+const HOST_LAUNCH_COMMAND_BASENAMES: &[&str] = &[
+    "opencode",
+    "opencode1",
+    "opencode2",
+    "opencode3",
+    "opencode4",
+    "opencode5",
+];
 
 #[derive(Deserialize)]
 pub struct PolicyEvaluateParams {
@@ -97,11 +108,11 @@ fn effective_argv(wrapper: &str, params: &PolicyEvaluateParams) -> Vec<String> {
         "json".to_string(),
         "--dangerously-skip-permissions".to_string(),
         "-m".to_string(),
-        "openai/gpt-5.5".to_string(),
+        PROVIDER_MODEL.to_string(),
         "--variant".to_string(),
         model_effort(params).to_string(),
     ];
-    argv.extend(policy_launch_args(wrapper, params));
+    argv.extend(policy_launch_args(params));
     argv
 }
 
@@ -131,17 +142,8 @@ fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, S
 
 fn diagnostics_for_policy(params: &PolicyEvaluateParams) -> Vec<Value> {
     let mut diagnostics = forbidden_env_diagnostics(params.launch.env.as_ref());
-    diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(
-        account_wrapper(params),
-        params,
-    )));
+    diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(params)));
     diagnostics
-}
-
-fn account_wrapper(params: &PolicyEvaluateParams) -> &str {
-    profile_for_settings_id(&params.settings_id)
-        .map(|account| account.opencode_wrapper)
-        .unwrap_or("opencode1")
 }
 
 fn forbidden_env_diagnostics(input: Option<&BTreeMap<String, String>>) -> Vec<Value> {
@@ -158,65 +160,63 @@ fn forbidden_argv_diagnostics(input: &[String]) -> Vec<Value> {
         .collect()
 }
 
-fn policy_launch_args(wrapper: &str, params: &PolicyEvaluateParams) -> Vec<String> {
+fn policy_launch_args(params: &PolicyEvaluateParams) -> Vec<String> {
     let argv = params.launch.argv.as_deref().unwrap_or_default();
-    stripped_policy_launch_args(wrapper, params, argv)
+    stripped_policy_launch_args(params, argv)
         .unwrap_or(argv)
         .to_vec()
 }
 
 fn stripped_policy_launch_args<'a>(
-    wrapper: &str,
     params: &PolicyEvaluateParams,
     argv: &'a [String],
 ) -> Option<&'a [String]> {
-    allowed_launch_prefixes(wrapper, model_effort(params))
-        .into_iter()
-        .find_map(|prefix| strip_launch_prefix(argv, &prefix))
+    let effort = model_effort(params);
+    strip_host_candidate_prefix(argv, effort)
+        .or_else(|| strip_policy_effective_prefix(argv, effort))
 }
 
-fn allowed_launch_prefixes(wrapper: &str, effort: &str) -> Vec<Vec<String>> {
-    let mut prefixes = vec![
-        host_candidate_prefix(wrapper, effort),
-        policy_effective_prefix(wrapper, effort),
-    ];
-    if wrapper == "opencode1" {
-        prefixes.extend([
-            host_candidate_prefix("opencode", effort),
-            policy_effective_prefix("opencode", effort),
-        ]);
+fn strip_host_candidate_prefix<'a>(argv: &'a [String], effort: &str) -> Option<&'a [String]> {
+    strip_intrinsic_launch_prefix(argv, &host_candidate_args(effort))
+}
+
+fn strip_policy_effective_prefix<'a>(argv: &'a [String], effort: &str) -> Option<&'a [String]> {
+    strip_intrinsic_launch_prefix(argv, &policy_effective_args(effort))
+}
+
+fn strip_intrinsic_launch_prefix<'a>(
+    argv: &'a [String],
+    args_after_command: &[String],
+) -> Option<&'a [String]> {
+    let (command, args) = argv.split_first()?;
+    if !intrinsic_host_launch_command(command) || !args.starts_with(args_after_command) {
+        return None;
     }
-    prefixes
+    Some(&args[args_after_command.len()..])
 }
 
-fn host_candidate_prefix(wrapper: &str, effort: &str) -> Vec<String> {
+fn host_candidate_args(effort: &str) -> Vec<String> {
     vec![
-        wrapper.to_string(),
         "run".to_string(),
         "--dangerously-skip-permissions".to_string(),
         "-m".to_string(),
-        "openai/gpt-5.5".to_string(),
+        PROVIDER_MODEL.to_string(),
         "--variant".to_string(),
         effort.to_string(),
     ]
 }
 
-fn policy_effective_prefix(wrapper: &str, effort: &str) -> Vec<String> {
+fn policy_effective_args(effort: &str) -> Vec<String> {
     vec![
-        wrapper.to_string(),
         "run".to_string(),
         "--format".to_string(),
         "json".to_string(),
         "--dangerously-skip-permissions".to_string(),
         "-m".to_string(),
-        "openai/gpt-5.5".to_string(),
+        PROVIDER_MODEL.to_string(),
         "--variant".to_string(),
         effort.to_string(),
     ]
-}
-
-fn strip_launch_prefix<'a>(argv: &'a [String], prefix: &[String]) -> Option<&'a [String]> {
-    argv.starts_with(prefix).then(|| &argv[prefix.len()..])
 }
 
 pub(crate) fn is_forbidden_env_key(key: &str) -> bool {
@@ -224,18 +224,18 @@ pub(crate) fn is_forbidden_env_key(key: &str) -> bool {
 }
 
 fn is_forbidden_launch_arg(arg: &str) -> bool {
-    matches!(
-        arg,
-        "opencode"
-            | "opencode1"
-            | "opencode2"
-            | "opencode3"
-            | "opencode4"
-            | "opencode5"
-            | "--format"
-            | "--variant"
-            | "-m"
-    )
+    intrinsic_host_launch_command(arg) || matches!(arg, "--format" | "--variant" | "-m")
+}
+
+fn intrinsic_host_launch_command(command: &str) -> bool {
+    HOST_LAUNCH_COMMAND_BASENAMES.contains(&command_basename(command))
+}
+
+fn command_basename(command: &str) -> &str {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
 }
 
 fn diagnostic(severity: &str, code: &str, message: String) -> Value {

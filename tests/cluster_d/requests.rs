@@ -35,6 +35,13 @@ pub fn settings_create_params(secret: Option<&str>) -> Value {
     })
 }
 
+pub fn settings_create_params_for_values(values: Value) -> Value {
+    json!({
+        "display_name": "Contract normalized opencode profile",
+        "values": values
+    })
+}
+
 pub fn settings_get_params(id: &str) -> Value {
     json!({ "id": id })
 }
@@ -137,6 +144,14 @@ pub fn opencode_settings_values(secret: Option<&str>) -> Value {
     if let Some(secret) = secret {
         values["auth_token"] = json!(secret);
     }
+    values
+}
+
+pub fn path_wrapped_opencode_settings_values(wrapper: &str) -> Value {
+    let mut values = opencode_settings_values(None);
+    values["profile"] = json!(format!("/tmp/host-bin/{wrapper}"));
+    values["wrapper"] = json!(format!("/tmp/host-bin/{wrapper}"));
+    values["quota"]["auth_path"] = json!("~/.codex/wrong-auth.json");
     values
 }
 

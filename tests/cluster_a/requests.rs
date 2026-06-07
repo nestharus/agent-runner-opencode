@@ -107,6 +107,29 @@ pub fn policy_evaluate_params_with_host_candidate_command(command: &str) -> Valu
     params
 }
 
+pub fn policy_evaluate_params_for_account_host_candidate(settings_id: &str) -> Value {
+    policy_evaluate_params_for_alias_host_candidate(settings_id, settings_id)
+}
+
+pub fn policy_evaluate_params_for_alias_host_candidate(settings_id: &str, command: &str) -> Value {
+    let mut params = policy_evaluate_params();
+    params["settings_id"] = json!(settings_id);
+    params["launch"]["argv"] = json!(host_candidate_argv_for_command(command, "low"));
+    params
+}
+
+pub fn forbidden_policy_evaluate_params_for_account_host_candidate(
+    settings_id: &str,
+    forbidden_flag: &str,
+) -> Value {
+    let mut params = policy_evaluate_params_for_account_host_candidate(settings_id);
+    params["launch"]["argv"]
+        .as_array_mut()
+        .expect("host candidate argv")
+        .extend([json!(forbidden_flag), json!("high")]);
+    params
+}
+
 pub fn policy_evaluate_account_one_provider_name_settings_id_params() -> Value {
     policy_evaluate_params_with_settings_id(policy_evaluate_params_with_host_candidate_argv())
 }

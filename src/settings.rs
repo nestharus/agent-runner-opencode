@@ -112,7 +112,7 @@ pub fn create_params(
 ) -> Result<Value, ProviderFailure> {
     let params: SettingsCreateParams =
         parse_params(params, request_id, "invalid_settings_create_params")?;
-    let values = sanitize_value(&params.values);
+    let values = normalize_settings_value(sanitize_value(&params.values));
     let diagnostics = validate_values(&values);
     let mut store = read_store(host, request_id)?;
     let record = new_record(params.display_name, values);
@@ -131,7 +131,7 @@ pub fn update_params(
     let mut store = read_store(host, request_id)?;
     let index = record_index(&store, &params.id, request_id)?;
     ensure_version(indexed_record(&store, index), &params.version, request_id)?;
-    let values = sanitize_value(&params.values);
+    let values = normalize_settings_value(sanitize_value(&params.values));
     let diagnostics = validate_values(&values);
     let record = update_record(&mut store, index, &params.id, values);
     write_store(host, &store, request_id)?;
@@ -156,7 +156,7 @@ pub fn delete_params(
 pub fn validate_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
     let params: SettingsValidateParams =
         parse_params(params, request_id, "invalid_settings_validate_params")?;
-    let values = sanitize_value(&params.values);
+    let values = normalize_settings_value(sanitize_value(&params.values));
     let diagnostics = validate_values(&values);
     let valid = settings_valid(&diagnostics);
     Ok(settings_validate_result(valid, diagnostics))
@@ -766,6 +766,87 @@ fn is_secret_key(key: &str) -> bool {
         || key.contains("secret")
         || key.contains("password")
         || key.contains("api_key")
+}
+
+fn normalize_settings_value(value: Value) -> Value {
+    let Some(account) = settings_value_account(&value) else {
+        return value;
+    };
+    normalize_account_settings_value(value, account)
+}
+
+fn settings_value_account(value: &Value) -> Option<&'static crate::account::AccountProfile> {
+    settings_account_reference(value).and_then(account_for_settings_reference)
+}
+
+fn settings_account_reference(value: &Value) -> Option<&str> {
+    value
+        .get("wrapper")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("profile").and_then(Value::as_str))
+}
+
+fn account_for_settings_reference(
+    reference: &str,
+) -> Option<&'static crate::account::AccountProfile> {
+    let basename = settings_reference_basename(reference);
+    ACCOUNTS
+        .iter()
+        .find(|account| account.opencode_wrapper == basename)
+        .or_else(|| account_one_for_plain_opencode(basename))
+}
+
+fn account_one_for_plain_opencode(
+    basename: &str,
+) -> Option<&'static crate::account::AccountProfile> {
+    (basename == "opencode").then_some(&ACCOUNTS[0])
+}
+
+fn settings_reference_basename(reference: &str) -> &str {
+    Path::new(reference)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(reference)
+}
+
+fn normalize_account_settings_value(
+    mut value: Value,
+    account: &crate::account::AccountProfile,
+) -> Value {
+    if let Value::Object(object) = &mut value {
+        object.insert("provider".to_string(), json!("opencode"));
+        object.insert("profile".to_string(), json!(account.opencode_wrapper));
+        object.insert("wrapper".to_string(), json!(account.opencode_wrapper));
+        normalize_quota_value(object, account);
+        normalize_launch_value(object);
+    }
+    value
+}
+
+fn normalize_quota_value(
+    object: &mut Map<String, Value>,
+    account: &crate::account::AccountProfile,
+) {
+    let quota = child_object(object, "quota");
+    quota.insert("source".to_string(), json!("codex"));
+    quota.insert("auth_path".to_string(), json!(account.codex_auth_path));
+    quota.insert("usage_command".to_string(), json!("chatgpt-usage"));
+}
+
+fn normalize_launch_value(object: &mut Map<String, Value>) {
+    let launch = child_object(object, "launch");
+    launch.insert("format".to_string(), json!("json"));
+    launch.insert("dangerously_skip_permissions".to_string(), json!(true));
+}
+
+fn child_object<'a>(object: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
+    let value = object.entry(key.to_string()).or_insert_with(|| json!({}));
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value
+        .as_object_mut()
+        .expect("child value normalized to object")
 }
 
 fn legacy_actions(legacy: &Value) -> Vec<Value> {

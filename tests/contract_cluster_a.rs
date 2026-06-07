@@ -244,6 +244,79 @@ fn contract_policy_evaluate_accepts_host_candidate_argv() {
 }
 
 #[test]
+fn contract_policy_evaluate_accepts_host_candidate_argv_for_every_account_id() {
+    for (settings_id, command) in account_host_command_cases() {
+        let output = invoke_with_env(
+            "policy.evaluate",
+            policy_evaluate_params_for_alias_host_candidate(settings_id, command.as_str()),
+            &[],
+        );
+
+        assert_output_success(
+            &output,
+            &format!("policy.evaluate host candidate argv for {settings_id}"),
+        );
+        let response = json_stdout(&output);
+        assert_policy_accepts_for_wrapper(&response, settings_id);
+    }
+}
+
+#[test]
+fn contract_policy_evaluate_accepts_host_candidate_argv_for_account_aliases() {
+    for (settings_id, command, expected_wrapper) in [
+        ("opencode", "opencode", "opencode1"),
+        ("opencode", "/tmp/host-bin/opencode", "opencode1"),
+    ] {
+        let output = invoke_with_env(
+            "policy.evaluate",
+            policy_evaluate_params_for_alias_host_candidate(settings_id, command),
+            &[],
+        );
+
+        assert_output_success(
+            &output,
+            &format!("policy.evaluate host candidate argv for alias {settings_id}"),
+        );
+        let response = json_stdout(&output);
+        assert_policy_accepts_for_wrapper(&response, expected_wrapper);
+    }
+}
+
+#[test]
+fn contract_policy_evaluate_rejects_user_injected_managed_flag_after_host_prefix() {
+    let forbidden_flag = "--variant";
+    let output = invoke_with_env(
+        "policy.evaluate",
+        forbidden_policy_evaluate_params_for_account_host_candidate("opencode2", forbidden_flag),
+        &[],
+    );
+
+    assert_output_success(&output, "policy.evaluate injected host suffix rejection");
+    let response = json_stdout(&output);
+    assert_policy_rejects_forbidden_arg(&response, forbidden_flag);
+}
+
+fn account_host_command_cases() -> Vec<(&'static str, String)> {
+    [
+        "opencode1",
+        "opencode2",
+        "opencode3",
+        "opencode4",
+        "opencode5",
+    ]
+    .into_iter()
+    .flat_map(|settings_id| {
+        [
+            settings_id.to_string(),
+            format!("/tmp/host-bin/{settings_id}"),
+        ]
+        .into_iter()
+        .map(move |command| (settings_id, command))
+    })
+    .collect()
+}
+
+#[test]
 fn contract_policy_evaluate_accepts_account_one_provider_name_settings_id() {
     let output = invoke_with_env(
         "policy.evaluate",

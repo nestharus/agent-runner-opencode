@@ -17,6 +17,21 @@ pub fn assert_settings_create_result(create: &Value) {
     assert_eq!(create["record"]["values"]["wrapper"], "opencode1");
 }
 
+pub fn assert_normalized_account_settings_record(record: &Value, wrapper: &str, auth_path: &str) {
+    assert_secret_absent(record);
+    assert_eq!(record["values"]["provider"], "opencode");
+    assert_eq!(record["values"]["profile"], wrapper);
+    assert_eq!(record["values"]["wrapper"], wrapper);
+    assert_eq!(record["values"]["quota"]["source"], "codex");
+    assert_eq!(record["values"]["quota"]["auth_path"], auth_path);
+    assert_eq!(record["values"]["quota"]["usage_command"], "chatgpt-usage");
+    assert_eq!(record["values"]["launch"]["format"], "json");
+    assert_eq!(
+        record["values"]["launch"]["dangerously_skip_permissions"],
+        true
+    );
+}
+
 pub fn assert_settings_list_result(list: &Value, id: &str, created_version: &str) {
     assert_secret_absent(list);
     let list_record = find_record(list["records"].as_array().expect("settings records"), id);
