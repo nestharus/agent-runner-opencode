@@ -60,12 +60,12 @@ pub fn assert_present_source_result(result: &Value) {
         .as_str()
         .expect("quota.source should identify the resolved auth source when present");
     assert!(
-        source_id.contains(PAIRED_CODEX_AUTH_RELATIVE),
-        "opencode3 quota source must resolve paired codex auth path; source_id={source_id}"
+        source_id.contains(PAIRED_OPENCODE_AUTH_RELATIVE),
+        "opencode3 quota source must resolve native opencode auth path; source_id={source_id}"
     );
     assert!(
-        !source_id.contains(WRONG_WRAPPER_NUMBER_AUTH_RELATIVE),
-        "opencode3 quota source must not use wrapper-number auth path; source_id={source_id}"
+        !source_id.contains(WRONG_CODEX_AUTH_RELATIVE),
+        "opencode3 quota source must not use stale codex auth path; source_id={source_id}"
     );
 }
 
@@ -86,7 +86,7 @@ pub fn assert_freshness_present(result: &Value, message: &str) {
 pub fn assert_f6_source_mapping(result: &Value, mapping: &F6AccountMapping) {
     assert_eq!(
         result["has_source"], true,
-        "{} should find its paired codex auth source",
+        "{} should find its native opencode auth source",
         mapping.settings_id
     );
     let source_id = result["source_id"].as_str().unwrap_or_else(|| {
@@ -96,19 +96,17 @@ pub fn assert_f6_source_mapping(result: &Value, mapping: &F6AccountMapping) {
         )
     });
     assert!(
-        source_id.contains(mapping.codex_auth_relative),
-        "{} quota.source must resolve paired codex auth path {}; source_id={source_id}",
+        source_id.contains(mapping.opencode_auth_relative),
+        "{} quota.source must resolve native opencode auth path {}; source_id={source_id}",
         mapping.settings_id,
-        mapping.codex_auth_relative
+        mapping.opencode_auth_relative
     );
-    if let Some(wrapper_derived_relative) = mapping.wrapper_derived_relative {
-        assert!(
-            !source_id.contains(wrapper_derived_relative),
-            "{} quota.source must not derive auth from wrapper number {}; source_id={source_id}",
-            mapping.settings_id,
-            wrapper_derived_relative
-        );
-    }
+    assert!(
+        !source_id.contains(WRONG_CODEX_AUTH_RELATIVE),
+        "{} quota.source must not use stale codex auth path {}; source_id={source_id}",
+        mapping.settings_id,
+        WRONG_CODEX_AUTH_RELATIVE
+    );
 }
 
 pub fn assert_available_probe_result(result: &Value, raw_windows: &[RawUsageWindow]) {
@@ -161,11 +159,11 @@ pub fn assert_probe_invocation(log_path: &Path, auth_path: &Path) {
     let invocation = probe_invocation_log(log_path);
     assert!(
         probe_invocation_contains_auth_path(&invocation, auth_path),
-        "quota.probe must invoke chatgpt-usage with paired opencode3 auth path; log={invocation:?}"
+        "quota.probe must invoke chatgpt-usage with native opencode3 auth path; log={invocation:?}"
     );
     assert!(
-        !probe_invocation_contains_wrong_wrapper_auth(&invocation),
-        "quota.probe must not invoke wrapper-number auth path; log={invocation:?}"
+        !probe_invocation_contains_stale_codex_auth(&invocation),
+        "quota.probe must not invoke stale codex auth path; log={invocation:?}"
     );
 }
 
@@ -177,8 +175,8 @@ pub fn probe_invocation_contains_auth_path(invocation: &str, auth_path: &Path) -
     invocation.contains(auth_path.to_string_lossy().as_ref())
 }
 
-pub fn probe_invocation_contains_wrong_wrapper_auth(invocation: &str) -> bool {
-    invocation.contains(WRONG_WRAPPER_NUMBER_AUTH_RELATIVE)
+pub fn probe_invocation_contains_stale_codex_auth(invocation: &str) -> bool {
+    invocation.contains(WRONG_CODEX_AUTH_RELATIVE)
 }
 
 pub fn assert_unavailable_probe_result(unavailable: &Value) {
@@ -200,14 +198,14 @@ pub fn assert_unavailable_probe_result(unavailable: &Value) {
 }
 
 pub fn assert_refresh_auth_result(result: &Value) {
-    assert_eq!(result["refreshed"], false);
+    assert_eq!(result["refreshed"], true);
     assert_eq!(result["available"], false);
     assert!(
         result["checked_at_unix_ms"].as_u64().is_some(),
         "refresh_auth must include checked_at_unix_ms"
     );
     let detail = normalized_refresh_detail(refresh_detail(result));
-    assert_refresh_detail_explains_noop(&detail);
+    assert_refresh_detail_explains_native_refresh(&detail);
 }
 
 pub fn refresh_detail(result: &Value) -> &str {
@@ -218,11 +216,10 @@ pub fn normalized_refresh_detail(detail: &str) -> String {
     detail.to_ascii_lowercase()
 }
 
-pub fn assert_refresh_detail_explains_noop(detail: &str) {
+pub fn assert_refresh_detail_explains_native_refresh(detail: &str) {
     assert!(
-        (detail.contains("cli") || detail.contains("codex"))
-            && (detail.contains("owned") || detail.contains("unavailable")),
-        "refresh_auth detail should explain that auth is CLI-owned/unavailable; detail={detail:?}"
+        detail.contains("opencode") && detail.contains("auth"),
+        "refresh_auth detail should explain native opencode auth refresh; detail={detail:?}"
     );
 }
 
@@ -382,35 +379,29 @@ pub fn assert_probe_detail_present(response: &Value, case_name: &str) {
 
 pub struct F6AccountMapping {
     pub settings_id: &'static str,
-    pub codex_auth_relative: &'static str,
-    pub wrapper_derived_relative: Option<&'static str>,
+    pub opencode_auth_relative: &'static str,
 }
 
 pub const F6_ACCOUNT_MAPPINGS: &[F6AccountMapping] = &[
     F6AccountMapping {
         settings_id: "opencode1",
-        codex_auth_relative: ".codex/auth.json",
-        wrapper_derived_relative: None,
+        opencode_auth_relative: ".local/share/opencode/auth.json",
     },
     F6AccountMapping {
         settings_id: "opencode2",
-        codex_auth_relative: ".codex5/auth.json",
-        wrapper_derived_relative: Some(".codex2/auth.json"),
+        opencode_auth_relative: ".opencode2/opencode/auth.json",
     },
     F6AccountMapping {
         settings_id: "opencode3",
-        codex_auth_relative: ".codex2/auth.json",
-        wrapper_derived_relative: Some(".codex3/auth.json"),
+        opencode_auth_relative: ".opencode3/opencode/auth.json",
     },
     F6AccountMapping {
         settings_id: "opencode4",
-        codex_auth_relative: ".codex3/auth.json",
-        wrapper_derived_relative: Some(".codex4/auth.json"),
+        opencode_auth_relative: ".opencode4/opencode/auth.json",
     },
     F6AccountMapping {
         settings_id: "opencode5",
-        codex_auth_relative: ".codex4/auth.json",
-        wrapper_derived_relative: Some(".codex5/auth.json"),
+        opencode_auth_relative: ".opencode5/opencode/auth.json",
     },
 ];
 
@@ -516,7 +507,7 @@ impl HomeFixture {
     }
 
     pub fn write_paired_auth(&self, bytes: &[u8]) -> PathBuf {
-        self.write_auth_at(PAIRED_CODEX_AUTH_RELATIVE, bytes)
+        self.write_auth_at(PAIRED_OPENCODE_AUTH_RELATIVE, bytes)
     }
 
     pub fn write_auth_at(&self, relative_path: &str, bytes: &[u8]) -> PathBuf {
@@ -576,6 +567,33 @@ pub struct FakeChatgptUsage {
     pub dir: PathBuf,
     pub log_path: PathBuf,
     pub log_path_string: String,
+}
+
+pub struct FakeOpencodeAuth {
+    pub dir: PathBuf,
+}
+
+impl FakeOpencodeAuth {
+    pub fn success(wrapper: &str) -> Self {
+        Self::with_script(wrapper, fake_opencode_auth_success_script())
+    }
+
+    pub fn touches_marker(wrapper: &str, marker: &Path) -> Self {
+        Self::with_script(wrapper, fake_opencode_auth_touch_script(marker))
+    }
+
+    pub fn with_script(wrapper: &str, script: String) -> Self {
+        let dir = unique_temp_dir("agent-runner-opencode-fake-auth");
+        fs::create_dir_all(&dir).expect("create fake opencode auth dir");
+        let script_path = dir.join(wrapper);
+        fs::write(&script_path, script).expect("write fake opencode auth");
+        make_path_executable(&script_path);
+        Self { dir }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
 }
 
 impl FakeChatgptUsage {
@@ -652,31 +670,34 @@ pub struct RefreshAuthFixture {
     pub auth_path: PathBuf,
     pub before: String,
     pub fake_usage: FakeChatgptUsage,
+    pub _fake_auth: FakeOpencodeAuth,
     pub path: String,
 }
 
 impl RefreshAuthFixture {
     pub fn new() -> Self {
         let home = HomeFixture::new("agent-runner-opencode-quota-refresh-home");
-        let auth_path = home.write_paired_auth(
-            b"{\"tokens\":{\"access_token\":\"refresh-sentinel\",\"account_id\":\"acct\"}}\n",
-        );
+        let auth_path =
+            home.write_paired_auth(opencode_auth_json("refresh-sentinel", "acct").as_bytes());
         let before = file_sha256(&auth_path);
         let fake_usage = FakeChatgptUsage::failure(17, "probe unavailable during refresh");
-        let path = prepend_path(fake_usage.dir());
+        let fake_auth = FakeOpencodeAuth::success("opencode3");
+        let path = prepend_paths(&[fake_auth.dir(), fake_usage.dir()]);
         Self {
             home,
             auth_path,
             before,
             fake_usage,
+            _fake_auth: fake_auth,
             path,
         }
     }
 
-    pub fn env(&self) -> [(&str, &str); 3] {
+    pub fn env(&self) -> [(&str, &str); 4] {
         [
             ("HOME", self.home.path_str()),
             ("PATH", self.path.as_str()),
+            ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
             (
                 "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
                 self.fake_usage.log_path_str(),
@@ -688,7 +709,15 @@ impl RefreshAuthFixture {
         assert_eq!(
             file_sha256(&self.auth_path),
             self.before,
-            "quota.refresh_auth must never mutate codex auth tokens"
+            "test fake auth command must not mutate auth tokens directly"
+        );
+    }
+
+    pub fn assert_auth_command_invoked(&self) {
+        let log = optional_usage_log(self.fake_usage.log_path());
+        assert!(
+            log.contains("auth list"),
+            "quota.refresh_auth must invoke opencode auth list; log={log:?}"
         );
     }
 }
@@ -697,6 +726,18 @@ impl Drop for FakeChatgptUsage {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+impl Drop for FakeOpencodeAuth {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+pub fn opencode_auth_json(access: &str, account_id: &str) -> String {
+    format!(
+        r#"{{"openai":{{"access":"{access}","accountId":"{account_id}","refresh":"refresh-sentinel","expires":4102444800,"type":"oauth"}}}}"#
+    )
 }
 
 pub fn fake_chatgpt_usage_success_script(stdout: &str) -> String {
@@ -720,6 +761,44 @@ fi\n\
 printf '%s\\n' {} >&2\n\
 exit {exit_code}\n",
         shell_single_quote(stderr)
+    )
+}
+
+pub fn fake_chatgpt_usage_401_then_success_script(marker: &Path, stdout: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
+  printf 'argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
+fi\n\
+if [ -e {marker} ]; then\n\
+  printf '%s' {stdout}\n\
+  exit 0\n\
+fi\n\
+printf '%s\\n' 'ChatGPT API returned HTTP 401: Provided authentication token is expired. Please try signing in again.' >&2\n\
+exit 4\n",
+        marker = shell_single_quote(&marker.to_string_lossy()),
+        stdout = shell_single_quote(stdout)
+    )
+}
+
+pub fn fake_opencode_auth_success_script() -> String {
+    "#!/bin/sh\n\
+if [ -n \"${AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}\" ]; then\n\
+  printf 'auth argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
+fi\n\
+exit 0\n"
+        .to_string()
+}
+
+pub fn fake_opencode_auth_touch_script(marker: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
+  printf 'auth argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
+fi\n\
+: > {marker}\n\
+exit 0\n",
+        marker = shell_single_quote(&marker.to_string_lossy())
     )
 }
 
@@ -759,11 +838,11 @@ pub fn formatted_temp_dir_name(prefix: &str, nanos: u128, process_id: u32) -> St
 }
 
 pub fn prepend_path(dir: &Path) -> String {
-    joined_path_string(prepended_path_entries(dir))
+    prepend_paths(&[dir])
 }
 
-pub fn prepended_path_entries(dir: &Path) -> Vec<PathBuf> {
-    vec![dir.to_path_buf()]
+pub fn prepend_paths(dirs: &[&Path]) -> String {
+    joined_path_string(dirs.iter().map(|dir| (*dir).to_path_buf()).collect())
 }
 
 pub fn joined_path_string(paths: Vec<PathBuf>) -> String {

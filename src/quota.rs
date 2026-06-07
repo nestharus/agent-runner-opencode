@@ -3,9 +3,9 @@
 //!   - component: src/quota.rs
 //!     role: adapter
 //!     Translates:
-//!       - codex auth source profile to QuotaSourceResult
+//!       - opencode auth source profile to QuotaSourceResult
 //!       - chatgpt-usage rolling windows to QuotaProbeWindow
-//!       - codex CLI-owned auth refresh boundary to QuotaRefreshAuthResult
+//!       - opencode CLI-owned auth refresh boundary to QuotaRefreshAuthResult
 
 use crate::account::{profile_for_settings_id, AccountProfile};
 use crate::codex::{self, ChatgptUsageWindow};
@@ -17,7 +17,8 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const REFRESH_DETAIL: &str = "codex-cli-owned refresh; agent-runner never mutates tokens";
+const REFRESH_DETAIL: &str =
+    "opencode auth list completed; agent-runner never mutates tokens directly";
 
 #[derive(Deserialize)]
 struct QuotaBaseParams {
@@ -58,8 +59,15 @@ pub fn refresh_auth_params(params: Value, request_id: &str) -> Result<Value, Pro
     let params = parse_refresh_params(params, request_id)?;
     let account = account_for_settings_id(&params.settings_id, request_id)?;
     let checked_at_unix_ms = now_unix_ms();
-    let available = refresh_available(account, request_id);
-    Ok(refresh_auth_result(available, checked_at_unix_ms))
+    let refresh = run_account_auth_refresh(account);
+    let refreshed = refresh_succeeded(&refresh);
+    let available = refreshed && refresh_available(account, request_id);
+    Ok(refresh_auth_result(
+        refreshed,
+        available,
+        checked_at_unix_ms,
+        refresh_detail(refresh.as_ref()),
+    ))
 }
 
 fn source_result(account: &AccountProfile, auth_path: &Path) -> Value {
@@ -92,11 +100,60 @@ fn probe_account(account: &AccountProfile, request_id: &str) -> Result<Value, Pr
         return Ok(unreadable_auth_probe_result());
     }
     let output = run_probe_command(&auth_path, request_id)?;
+    if probe_output_needs_auth_refresh(&output) {
+        return probe_after_auth_refresh(account, &auth_path, &output, request_id);
+    }
     Ok(probe_output_result(&output))
 }
 
+fn probe_account_without_refresh(
+    account: &AccountProfile,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
+    let auth_path = resolved_auth_path(account);
+    if !auth_has_source(&auth_path) {
+        return Ok(unreadable_auth_probe_result());
+    }
+    let output = run_probe_command(&auth_path, request_id)?;
+    Ok(probe_output_result(&output))
+}
+
+fn probe_after_auth_refresh(
+    account: &AccountProfile,
+    auth_path: &Path,
+    first: &crate::shell::ShellOutput,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
+    match run_account_auth_refresh(account) {
+        Ok(refresh) if refresh.status == 0 => {
+            let retry = run_probe_command(auth_path, request_id)?;
+            Ok(probe_output_result(&retry))
+        }
+        Ok(refresh) => Ok(unavailable_result(format!(
+            "{} (opencode auth refresh failed: {})",
+            command_failure_detail(first),
+            command_failure_detail(&refresh)
+        ))),
+        Err(err) => Ok(unavailable_result(format!(
+            "{} (failed to run opencode auth refresh: {err})",
+            command_failure_detail(first)
+        ))),
+    }
+}
+
+fn probe_output_needs_auth_refresh(output: &crate::shell::ShellOutput) -> bool {
+    probe_command_failed(output) && output_detail_mentions_expired_auth(output)
+}
+
+fn output_detail_mentions_expired_auth(output: &crate::shell::ShellOutput) -> bool {
+    let detail = command_failure_detail(output).to_ascii_lowercase();
+    detail.contains("http 401")
+        || detail.contains("token is expired")
+        || detail.contains("authentication token is expired")
+}
+
 fn unreadable_auth_probe_result() -> Value {
-    unavailable_result("paired codex auth source is missing or unreadable".to_string())
+    unavailable_result("native opencode auth source is missing or unreadable".to_string())
 }
 
 fn run_probe_command(
@@ -174,7 +231,7 @@ fn account_for_settings_id(
 }
 
 fn resolved_auth_path(account: &AccountProfile) -> PathBuf {
-    expand_tilde(account.codex_auth_path)
+    expand_tilde(account.opencode_auth_path)
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -214,9 +271,9 @@ fn has_read_permission(_metadata: &fs::Metadata) -> bool {
 
 fn source_id(account: &AccountProfile, auth_path: &Path) -> String {
     format!(
-        "codex-auth:{}:{}:{}",
-        account.codex_account_tag,
-        account.codex_account_hash,
+        "opencode-auth:{}:{}:{}",
+        account.opencode_wrapper,
+        account.opencode_index,
         auth_path.to_string_lossy()
     )
 }
@@ -234,18 +291,44 @@ fn command_failure_detail(output: &crate::shell::ShellOutput) -> String {
 }
 
 fn refresh_available(account: &AccountProfile, request_id: &str) -> bool {
-    probe_account(account, request_id)
+    probe_account_without_refresh(account, request_id)
         .ok()
         .and_then(|result| result.get("available").and_then(Value::as_bool))
         .unwrap_or(false)
 }
 
-fn refresh_auth_result(available: bool, checked_at_unix_ms: u64) -> Value {
+fn run_account_auth_refresh(
+    account: &AccountProfile,
+) -> std::io::Result<crate::shell::ShellOutput> {
+    crate::opencode::refresh_auth(account)
+}
+
+fn refresh_succeeded(refresh: &std::io::Result<crate::shell::ShellOutput>) -> bool {
+    refresh.as_ref().is_ok_and(|output| output.status == 0)
+}
+
+fn refresh_detail(refresh: Result<&crate::shell::ShellOutput, &std::io::Error>) -> String {
+    match refresh {
+        Ok(output) if output.status == 0 => REFRESH_DETAIL.to_string(),
+        Ok(output) => format!(
+            "opencode auth list failed: {}",
+            command_failure_detail(output)
+        ),
+        Err(err) => format!("failed to run opencode auth list: {err}"),
+    }
+}
+
+fn refresh_auth_result(
+    refreshed: bool,
+    available: bool,
+    checked_at_unix_ms: u64,
+    detail: String,
+) -> Value {
     json!({
-        "refreshed": false,
+        "refreshed": refreshed,
         "available": available,
         "checked_at_unix_ms": checked_at_unix_ms,
-        "detail": REFRESH_DETAIL,
+        "detail": detail,
     })
 }
 

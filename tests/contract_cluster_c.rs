@@ -19,9 +19,7 @@ fn characterization_codex_chatgpt_usage_windows() {
 #[test]
 fn contract_quota_source() {
     let home = HomeFixture::new("agent-runner-opencode-quota-source-home");
-    home.write_paired_auth(
-        b"{\"tokens\":{\"access_token\":\"sentinel\",\"account_id\":\"acct\"}}\n",
-    );
+    home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
     let fake_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
     let path = prepend_path(fake_usage.dir());
 
@@ -32,6 +30,7 @@ fn contract_quota_source() {
             &[
                 ("HOME", home.path_str()),
                 ("PATH", path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
                 (
                     "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
                     fake_usage.log_path_str(),
@@ -71,9 +70,7 @@ fn contract_quota_source() {
     assert_no_chatgpt_usage_invocation(missing_usage.log_path());
 
     let unreadable_home = HomeFixture::new("agent-runner-opencode-quota-source-unreadable-home");
-    unreadable_home.write_unreadable_paired_auth(
-        b"{\"tokens\":{\"access_token\":\"sentinel\",\"account_id\":\"acct\"}}\n",
-    );
+    unreadable_home.write_unreadable_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
     let unreadable_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
     let unreadable_path = prepend_path(unreadable_usage.dir());
     let unreadable = success_result(
@@ -107,8 +104,8 @@ fn contract_quota_source_uses_all_f6_account_mappings() {
             mapping.settings_id
         ));
         home.write_auth_at(
-            mapping.codex_auth_relative,
-            b"{\"tokens\":{\"access_token\":\"sentinel\",\"account_id\":\"acct\"}}\n",
+            mapping.opencode_auth_relative,
+            opencode_auth_json("sentinel", "acct").as_bytes(),
         );
         let fake_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
         let path = prepend_path(fake_usage.dir());
@@ -140,9 +137,7 @@ fn contract_quota_probe() {
     let raw_windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
         .expect("captured chatgpt-usage fixture should parse");
     let home = HomeFixture::new("agent-runner-opencode-quota-probe-home");
-    let auth_path = home.write_paired_auth(
-        b"{\"tokens\":{\"access_token\":\"sentinel\",\"account_id\":\"acct\"}}\n",
-    );
+    let auth_path = home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
     let fake_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
     let path = prepend_path(fake_usage.dir());
 
@@ -153,6 +148,7 @@ fn contract_quota_probe() {
             &[
                 ("HOME", home.path_str()),
                 ("PATH", path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
                 (
                     "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
                     fake_usage.log_path_str(),
@@ -174,6 +170,7 @@ fn contract_quota_probe() {
             &[
                 ("HOME", home.path_str()),
                 ("PATH", failing_path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
                 (
                     "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
                     failing_usage.log_path_str(),
@@ -205,6 +202,7 @@ fn contract_quota_probe() {
                 &[
                     ("HOME", home.path_str()),
                     ("PATH", malformed_path.as_str()),
+                    ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
                     (
                         "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
                         malformed_usage.log_path_str(),
@@ -214,6 +212,47 @@ fn contract_quota_probe() {
             case_name,
         );
     }
+}
+
+#[test]
+fn contract_quota_probe_refreshes_native_auth_on_401_then_retries() {
+    let raw_windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
+        .expect("captured chatgpt-usage fixture should parse");
+    let home = HomeFixture::new("agent-runner-opencode-quota-probe-refresh-home");
+    let auth_path = home.write_paired_auth(opencode_auth_json("expired", "acct").as_bytes());
+    let marker = home.path.join("refresh-ran");
+    let fake_usage = FakeChatgptUsage::with_script(fake_chatgpt_usage_401_then_success_script(
+        &marker,
+        CHATGPT_USAGE_WINDOWS_RAW,
+    ));
+    let fake_auth = FakeOpencodeAuth::touches_marker("opencode3", &marker);
+    let path = prepend_paths(&[fake_auth.dir(), fake_usage.dir()]);
+
+    let result = success_result(
+        invoke_with_env(
+            "quota.probe",
+            quota_base_params(),
+            &[
+                ("HOME", home.path_str()),
+                ("PATH", path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
+                (
+                    "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
+                    fake_usage.log_path_str(),
+                ),
+            ],
+        ),
+        "quota.schema.json#/$defs/QuotaProbeResponse",
+        "quota.schema.json#/$defs/QuotaProbeResult",
+    );
+
+    assert_available_probe_result(&result, &raw_windows);
+    assert_probe_invocation(fake_usage.log_path(), &auth_path);
+    let log = optional_usage_log(fake_usage.log_path());
+    assert!(
+        log.contains("auth argv=auth list"),
+        "quota.probe must invoke opencode auth list before retry; log={log:?}"
+    );
 }
 
 #[test]
@@ -231,6 +270,7 @@ fn contract_quota_refresh_auth() {
     );
     assert_refresh_auth_result(&result);
     fixture.assert_auth_unchanged();
+    fixture.assert_auth_command_invoked();
 }
 
 #[test]

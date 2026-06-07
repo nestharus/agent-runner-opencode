@@ -10,6 +10,7 @@
 
 use crate::account::AccountProfile;
 use crate::shell;
+use crate::shell::ShellOutput;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -101,6 +102,18 @@ pub fn export(
         .map_err(export_spawn_error)?;
     validate_export_status(&output)?;
     parse_export_stdout(&output.stdout)
+}
+
+pub fn refresh_auth(account: &AccountProfile) -> std::io::Result<ShellOutput> {
+    crate::shell::run(&refresh_auth_argv(account))
+}
+
+fn refresh_auth_argv(account: &AccountProfile) -> Vec<String> {
+    vec![
+        account.opencode_wrapper.to_string(),
+        "auth".to_string(),
+        "list".to_string(),
+    ]
 }
 
 pub fn parse_export_stdout(stdout: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {

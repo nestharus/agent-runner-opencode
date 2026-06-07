@@ -11,6 +11,7 @@
 pub struct AccountProfile {
     pub opencode_wrapper: &'static str,
     pub opencode_index: u8,
+    pub opencode_auth_path: &'static str,
     pub codex_auth_path: &'static str,
     pub codex_account_tag: &'static str,
     pub codex_account_hash: &'static str,
@@ -20,6 +21,7 @@ pub const ACCOUNTS: [AccountProfile; 5] = [
     AccountProfile {
         opencode_wrapper: "opencode1",
         opencode_index: 1,
+        opencode_auth_path: "~/.local/share/opencode/auth.json",
         codex_auth_path: "~/.codex/auth.json",
         codex_account_tag: "codex1",
         codex_account_hash: "781db66f",
@@ -27,6 +29,7 @@ pub const ACCOUNTS: [AccountProfile; 5] = [
     AccountProfile {
         opencode_wrapper: "opencode2",
         opencode_index: 2,
+        opencode_auth_path: "~/.opencode2/opencode/auth.json",
         codex_auth_path: "~/.codex5/auth.json",
         codex_account_tag: "codex5",
         codex_account_hash: "27f8ea6e",
@@ -34,6 +37,7 @@ pub const ACCOUNTS: [AccountProfile; 5] = [
     AccountProfile {
         opencode_wrapper: "opencode3",
         opencode_index: 3,
+        opencode_auth_path: "~/.opencode3/opencode/auth.json",
         codex_auth_path: "~/.codex2/auth.json",
         codex_account_tag: "codex2",
         codex_account_hash: "60238f0b",
@@ -41,6 +45,7 @@ pub const ACCOUNTS: [AccountProfile; 5] = [
     AccountProfile {
         opencode_wrapper: "opencode4",
         opencode_index: 4,
+        opencode_auth_path: "~/.opencode4/opencode/auth.json",
         codex_auth_path: "~/.codex3/auth.json",
         codex_account_tag: "codex3",
         codex_account_hash: "9d764739",
@@ -48,6 +53,7 @@ pub const ACCOUNTS: [AccountProfile; 5] = [
     AccountProfile {
         opencode_wrapper: "opencode5",
         opencode_index: 5,
+        opencode_auth_path: "~/.opencode5/opencode/auth.json",
         codex_auth_path: "~/.codex4/auth.json",
         codex_account_tag: "codex4",
         codex_account_hash: "835bbc4d",
