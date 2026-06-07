@@ -69,12 +69,37 @@ struct AuthTokens {
 }
 
 fn read_auth_tokens(path: &Path) -> Result<AuthTokens, String> {
-    let raw = fs::read(path).map_err(|err| format!("failed to read auth file: {err}"))?;
-    let parsed: Value =
-        serde_json::from_slice(&raw).map_err(|err| format!("auth file must be JSON: {err}"))?;
-    codex_auth_tokens(&parsed)
-        .or_else(|| opencode_auth_tokens(&parsed))
-        .ok_or_else(|| "missing ChatGPT access token or account id in auth file".to_string())
+    let raw = read_auth_file(path).map_err(auth_file_read_error)?;
+    let parsed = parse_auth_json(&raw).map_err(auth_file_json_error)?;
+    required_auth_tokens(auth_tokens_from_json(&parsed))
+}
+
+fn read_auth_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    fs::read(path)
+}
+
+fn parse_auth_json(raw: &[u8]) -> Result<Value, serde_json::Error> {
+    serde_json::from_slice(raw)
+}
+
+fn auth_tokens_from_json(parsed: &Value) -> Option<AuthTokens> {
+    codex_auth_tokens(parsed).or_else(|| opencode_auth_tokens(parsed))
+}
+
+fn required_auth_tokens(tokens: Option<AuthTokens>) -> Result<AuthTokens, String> {
+    tokens.ok_or_else(missing_auth_tokens_error)
+}
+
+fn auth_file_read_error(err: std::io::Error) -> String {
+    format!("failed to read auth file: {err}")
+}
+
+fn auth_file_json_error(err: serde_json::Error) -> String {
+    format!("auth file must be JSON: {err}")
+}
+
+fn missing_auth_tokens_error() -> String {
+    "missing ChatGPT access token or account id in auth file".to_string()
 }
 
 fn codex_auth_tokens(parsed: &Value) -> Option<AuthTokens> {
@@ -136,11 +161,15 @@ fn run_curl_usage(tokens: &AuthTokens) -> std::io::Result<ShellOutput> {
         .expect("curl stdin is piped")
         .write_all(curl_usage_config(tokens).as_bytes())?;
     let output = child.wait_with_output()?;
-    Ok(ShellOutput {
+    Ok(shell_output_from_process(output))
+}
+
+fn shell_output_from_process(output: std::process::Output) -> ShellOutput {
+    ShellOutput {
         stdout: output.stdout,
         stderr: output.stderr,
         status: output.status.code().unwrap_or(1),
-    })
+    }
 }
 
 fn curl_usage_config(tokens: &AuthTokens) -> String {
@@ -171,12 +200,11 @@ fn project_curl_usage_output(output: ShellOutput) -> ShellOutput {
 
 fn wham_usage_windows_stdout(raw: &[u8]) -> Result<Vec<u8>, String> {
     let (body, status) = split_http_body_and_status(raw)?;
-    if !status.starts_with('2') {
-        return Err(format_http_error(status, body));
+    if validate_success_http_status(status).is_err() {
+        return Err(http_status_failure(status, body));
     }
-    let parsed: Value = serde_json::from_str(body)
-        .map_err(|err| format!("ChatGPT usage response must be JSON: {err}"))?;
-    serde_json::to_vec(&usage_windows_result(&parsed)).map_err(|err| err.to_string())
+    let parsed = parse_wham_usage_json(body).map_err(wham_usage_json_error)?;
+    wham_usage_windows_bytes(&parsed).map_err(json_bytes_error)
 }
 
 fn split_http_body_and_status(raw: &[u8]) -> Result<(&str, &str), String> {
@@ -196,17 +224,63 @@ fn format_http_error(status: &str, body: &str) -> String {
 }
 
 fn http_error_detail(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|parsed| {
-            parsed
-                .pointer("/detail")
-                .or_else(|| parsed.pointer("/error/message"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .filter(|detail| !detail.trim().is_empty())
-        .unwrap_or_else(|| body.trim().to_string())
+    let parsed = parse_http_error_body(body);
+    let detail = parsed.as_ref().and_then(http_error_detail_value);
+    if let Some(detail) = nonempty_http_error_detail(detail) {
+        return owned_http_error_detail(detail);
+    }
+    trimmed_http_error_body(body)
+}
+
+fn validate_success_http_status(status: &str) -> Result<(), ()> {
+    successful_http_status(status).then_some(()).ok_or(())
+}
+
+fn successful_http_status(status: &str) -> bool {
+    status.starts_with('2')
+}
+
+fn http_status_failure(status: &str, body: &str) -> String {
+    format_http_error(status, body)
+}
+
+fn parse_wham_usage_json(body: &str) -> Result<Value, serde_json::Error> {
+    serde_json::from_str(body)
+}
+
+fn wham_usage_json_error(err: serde_json::Error) -> String {
+    format!("ChatGPT usage response must be JSON: {err}")
+}
+
+fn wham_usage_windows_bytes(parsed: &Value) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&usage_windows_result(parsed))
+}
+
+fn json_bytes_error(err: serde_json::Error) -> String {
+    err.to_string()
+}
+
+fn parse_http_error_body(body: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(body).ok()
+}
+
+fn http_error_detail_value(parsed: &Value) -> Option<&str> {
+    parsed
+        .pointer("/detail")
+        .or_else(|| parsed.pointer("/error/message"))
+        .and_then(Value::as_str)
+}
+
+fn nonempty_http_error_detail(detail: Option<&str>) -> Option<&str> {
+    detail.filter(|detail| !detail.trim().is_empty())
+}
+
+fn owned_http_error_detail(detail: &str) -> String {
+    detail.to_string()
+}
+
+fn trimmed_http_error_body(body: &str) -> String {
+    body.trim().to_string()
 }
 
 fn usage_windows_result(parsed: &Value) -> Value {

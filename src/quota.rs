@@ -129,16 +129,34 @@ fn probe_after_auth_refresh(
             let retry = run_probe_command(auth_path, request_id)?;
             Ok(probe_output_result(&retry))
         }
-        Ok(refresh) => Ok(unavailable_result(format!(
-            "{} (opencode auth refresh failed: {})",
-            command_failure_detail(first),
-            command_failure_detail(&refresh)
+        Ok(refresh) => Ok(unavailable_result(auth_refresh_failed_detail(
+            first, &refresh,
         ))),
-        Err(err) => Ok(unavailable_result(format!(
-            "{} (failed to run opencode auth refresh: {err})",
-            command_failure_detail(first)
+        Err(err) => Ok(unavailable_result(auth_refresh_spawn_failed_detail(
+            first, err,
         ))),
     }
+}
+
+fn auth_refresh_failed_detail(
+    first: &crate::shell::ShellOutput,
+    refresh: &crate::shell::ShellOutput,
+) -> String {
+    format!(
+        "{} (opencode auth refresh failed: {})",
+        command_failure_detail(first),
+        command_failure_detail(refresh)
+    )
+}
+
+fn auth_refresh_spawn_failed_detail(
+    first: &crate::shell::ShellOutput,
+    err: std::io::Error,
+) -> String {
+    format!(
+        "{} (failed to run opencode auth refresh: {err})",
+        command_failure_detail(first)
+    )
 }
 
 fn probe_output_needs_auth_refresh(output: &crate::shell::ShellOutput) -> bool {
