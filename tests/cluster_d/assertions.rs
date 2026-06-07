@@ -27,8 +27,8 @@ pub fn assert_normalized_account_settings_record(record: &Value, wrapper: &str, 
     assert_eq!(record["values"]["quota"]["usage_command"], "chatgpt-usage");
     assert_eq!(record["values"]["launch"]["format"], "json");
     assert_eq!(
-        record["values"]["launch"]["dangerously_skip_permissions"],
-        true
+        record["values"]["launch"]["dangerously_skip_permissions"].as_bool(),
+        Some(true)
     );
 }
 
