@@ -309,6 +309,10 @@ fn account_host_command_cases() -> Vec<(&'static str, String)> {
         [
             settings_id.to_string(),
             format!("/tmp/host-bin/{settings_id}"),
+            "opencode".to_string(),
+            "/tmp/host-bin/opencode".to_string(),
+            "opencode5".to_string(),
+            "/tmp/host-bin/opencode5".to_string(),
         ]
         .into_iter()
         .map(move |command| (settings_id, command))
