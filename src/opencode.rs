@@ -26,7 +26,26 @@ pub struct OpencodeEventMetadata {
     #[serde(rename = "sessionID")]
     pub session_id: Option<String>,
     pub timestamp: u64,
+    #[serde(default)]
     pub part: Value,
+    #[serde(default)]
+    pub error: Option<OpencodeEventError>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OpencodeEventError {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub data: OpencodeEventErrorData,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct OpencodeEventErrorData {
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -91,6 +110,10 @@ pub fn first_session_id(events: &[OpencodeEventMetadata]) -> Option<String> {
     events.iter().find_map(|event| event.session_id.clone())
 }
 
+pub fn is_structured_error_event(event: &OpencodeEventMetadata) -> bool {
+    event.event_type.as_str() == "error" && event.error.is_some()
+}
+
 pub fn export(
     session_id: &str,
     account: &AccountProfile,
@@ -136,6 +159,10 @@ fn parse_event_line(line: &[u8]) -> Option<OpencodeEventMetadata> {
 }
 
 fn is_pinned_native_event(event: &OpencodeEventMetadata) -> bool {
+    is_pinned_part_event(event) || is_structured_error_event(event)
+}
+
+fn is_pinned_part_event(event: &OpencodeEventMetadata) -> bool {
     matches!(
         event.event_type.as_str(),
         "step_start" | "text" | "step_finish"

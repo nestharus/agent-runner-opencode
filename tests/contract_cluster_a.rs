@@ -47,6 +47,54 @@ fn contract_launch_stream_accepts_policy_effective_argv() {
 }
 
 #[test]
+fn contract_launch_final_opencode_error_event_exit_zero_reports_unknown_signal() {
+    let stdout = incident_error_event_stdout();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(
+        fake_opencode_script_with_output_and_status(&stdout, "", 0),
+    );
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+
+    let output = invoke_with_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_WRAPPER_LOG", log_path),
+            ],
+        ),
+        &[("PATH", path.as_str())],
+    );
+
+    assert_final_opencode_error_launch_output(&output);
+}
+
+#[test]
+fn contract_launch_error_event_followed_by_later_opencode_event_exit_zero_stays_clean() {
+    let stdout = recovered_after_incident_error_event_stdout();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(
+        fake_opencode_script_with_output_and_status(&stdout, "", 0),
+    );
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+
+    let output = invoke_with_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_WRAPPER_LOG", log_path),
+            ],
+        ),
+        &[("PATH", path.as_str())],
+    );
+
+    assert_recovered_opencode_error_launch_output(&output);
+}
+
+#[test]
 fn contract_launch_resume_forwards_session_and_arg_payload() {
     let fake_wrapper =
         FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());

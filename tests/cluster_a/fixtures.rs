@@ -9,6 +9,14 @@ pub const FAKE_LAUNCH_STDOUT: &[u8] = include_bytes!("../fixtures/opencode_launc
 
 pub const FAKE_LAUNCH_STDERR: &[u8] = b"fake wrapper stderr bytes\n";
 
+pub const INCIDENT_ERROR_EVENT_TIMESTAMP: u64 = 1_780_808_654_364;
+
+pub const INCIDENT_ERROR_EVENT_MESSAGE: &str = "Failed to execute statement";
+
+pub const INCIDENT_ERROR_EVENT_SESSION_ID: &str = "ses_15f9407ccffelCcB6CyXvpzdXK";
+
+pub const INCIDENT_ERROR_EVENT_LINE: &str = "{\"type\":\"error\",\"timestamp\":1780808654364,\"sessionID\":\"ses_15f9407ccffelCcB6CyXvpzdXK\",\"error\":{\"name\":\"UnknownError\",\"data\":{\"message\":\"Failed to execute statement\"}}}";
+
 pub const SLOW_WRAPPER_SLEEP_SECONDS: u64 = 2;
 
 pub const SUBMITTED_USER_TURN_MARKER_FOR_TEST: &str = "oulipoly.submitted_user_turn";
@@ -422,11 +430,41 @@ pub fn fake_launch_stderr_text() -> &'static str {
 }
 
 pub fn fake_opencode_script_with_output(stdout: &str, stderr: &str) -> String {
+    fake_opencode_script_with_output_and_status(stdout, stderr, 7)
+}
+
+pub fn fake_opencode_script_with_output_and_status(
+    stdout: &str,
+    stderr: &str,
+    exit_code: i32,
+) -> String {
     format!(
-        "{}\nprintf '%s' {}\nprintf '%s' {} >&2\nexit 7\n",
+        "{}\nprintf '%s' {}\nprintf '%s' {} >&2\nexit {}\n",
         fake_wrapper_log_script(),
         shell_single_quote(stdout),
-        shell_single_quote(stderr)
+        shell_single_quote(stderr),
+        exit_code
+    )
+}
+
+pub fn incident_error_event_stdout() -> String {
+    format!("{INCIDENT_ERROR_EVENT_LINE}\n")
+}
+
+pub fn recovered_after_incident_error_event_stdout() -> String {
+    format!(
+        "{}{}\n",
+        incident_error_event_stdout(),
+        recovered_after_incident_error_event_line()
+    )
+}
+
+pub fn recovered_after_incident_error_event_line() -> String {
+    format!(
+        "{{\"type\":\"step_start\",\"timestamp\":{},\"sessionID\":\"{}\",\"part\":{{\"type\":\"step-start\",\"sessionID\":\"{}\"}}}}",
+        INCIDENT_ERROR_EVENT_TIMESTAMP + 1,
+        INCIDENT_ERROR_EVENT_SESSION_ID,
+        INCIDENT_ERROR_EVENT_SESSION_ID
     )
 }
 

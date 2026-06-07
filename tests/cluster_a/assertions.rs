@@ -355,6 +355,42 @@ pub fn assert_deadline_launch_output(deadline_output: &std::process::Output) {
     );
 }
 
+pub fn assert_final_opencode_error_launch_output(output: &std::process::Output) {
+    assert_output_success(output, "launch final opencode error event");
+    let events = launch_events_from_output(output, "launch final opencode error stdout");
+    assert_monotonic_launch_events(&events);
+    let final_event = final_launch_event(&events);
+    assert_eq!(final_event["kind"], "exit");
+    assert_eq!(
+        final_event["status"],
+        json!({ "kind": "exited", "code": 0 })
+    );
+    assert_eq!(final_event["terminal_signal"]["kind"], "unknown");
+    assert!(
+        final_event["terminal_signal"]["evidence"]
+            .as_str()
+            .is_some_and(|evidence| evidence.contains(INCIDENT_ERROR_EVENT_MESSAGE)),
+        "terminal_signal.evidence should include structured opencode error message; event={final_event}"
+    );
+    assert_eq!(
+        final_event["terminal_signal"]["observed_at_unix_ms"].as_u64(),
+        Some(INCIDENT_ERROR_EVENT_TIMESTAMP)
+    );
+}
+
+pub fn assert_recovered_opencode_error_launch_output(output: &std::process::Output) {
+    assert_output_success(output, "launch recovered opencode error event");
+    let events = launch_events_from_output(output, "launch recovered opencode error stdout");
+    assert_monotonic_launch_events(&events);
+    let final_event = final_launch_event(&events);
+    assert_eq!(final_event["kind"], "exit");
+    assert_eq!(
+        final_event["status"],
+        json!({ "kind": "exited", "code": 0 })
+    );
+    assert_eq!(final_event["terminal_signal"]["kind"], "clean_exit");
+}
+
 pub fn assert_live_launch_output(output: &std::process::Output) {
     assert_stderr_diagnostics_only(output);
     let events = launch_events_from_output(output, "launch stdout");

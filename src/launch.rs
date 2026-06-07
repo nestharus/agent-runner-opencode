@@ -10,9 +10,11 @@
 //!       - process terminal status to LaunchExitEvent
 
 use crate::account::profile_for_settings_id;
-use crate::encoding::{decode_base64, encode_base64, now_unix_ms, sha256_hex};
+use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
-use crate::opencode::{self, first_session_id, EventParser, OpencodeExport, OpencodeMessage};
+use crate::opencode::{
+    self, first_session_id, EventParser, OpencodeEventMetadata, OpencodeExport, OpencodeMessage,
+};
 use crate::policy;
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use serde::Deserialize;
@@ -40,6 +42,7 @@ const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
 const SUBMITTED_USER_TURN_SOURCE: &str = "opencode.export";
 const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_NONCE_SUFFIX: char = ']';
+const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 
 #[derive(Deserialize)]
 struct LaunchParams {
@@ -644,6 +647,7 @@ struct LaunchState {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     parser: EventParser,
+    last_opencode_event: Option<OpencodeEventMetadata>,
     session_id: Option<String>,
     resume_confirmation: Option<ResumeConfirmation>,
     deadline_unix_ms: Option<u64>,
@@ -665,6 +669,7 @@ impl LaunchState {
             stdout: Vec::new(),
             stderr: Vec::new(),
             parser: EventParser::default(),
+            last_opencode_event: None,
             session_id: None,
             resume_confirmation,
             deadline_unix_ms,
@@ -787,7 +792,9 @@ impl LaunchState {
     }
 
     fn session_from_stdout(&mut self, bytes: &[u8]) -> Option<String> {
-        first_session_id(&self.parser.ingest(bytes))
+        let events = self.parser.ingest(bytes);
+        self.record_opencode_events(&events);
+        first_session_id(&events)
     }
 
     fn capture_session_from_parser_tail<W: Write>(
@@ -799,7 +806,15 @@ impl LaunchState {
     }
 
     fn session_from_parser_tail(&mut self) -> Option<String> {
-        first_session_id(&self.parser.finish())
+        let events = self.parser.finish();
+        self.record_opencode_events(&events);
+        first_session_id(&events)
+    }
+
+    fn record_opencode_events(&mut self, events: &[OpencodeEventMetadata]) {
+        if let Some(event) = events.last() {
+            self.last_opencode_event = Some(event.clone());
+        }
     }
 
     fn marker<W: Write>(&mut self, name: String, writer: &mut W) -> Result<(), ProviderFailure> {
@@ -856,7 +871,21 @@ impl LaunchState {
     }
 
     fn terminal_signal_for(&self, status: &ProcessStatus) -> Value {
+        if let Some(signal) = self.final_opencode_error_signal(status) {
+            return signal;
+        }
         classify(&self.stdout, &self.stderr, status, now_unix_ms())
+    }
+
+    fn final_opencode_error_signal(&self, status: &ProcessStatus) -> Option<Value> {
+        if !is_clean_exit_status(status) {
+            return None;
+        }
+        let event = self.last_opencode_event.as_ref()?;
+        if !opencode::is_structured_error_event(event) {
+            return None;
+        }
+        Some(provider_error_terminal_signal(event))
     }
 
     fn exit_event(&self, status: &ProcessStatus, signal: Value) -> Value {
@@ -1348,6 +1377,51 @@ fn process_status_from_exit(status: ExitStatus) -> ProcessStatus {
         return ProcessStatus::Exited { code };
     }
     signal_status(status)
+}
+
+fn is_clean_exit_status(status: &ProcessStatus) -> bool {
+    matches!(status, ProcessStatus::Exited { code: 0 })
+}
+
+fn provider_error_terminal_signal(event: &OpencodeEventMetadata) -> Value {
+    json!({
+        "kind": "unknown",
+        "evidence": provider_error_signal_evidence(event),
+        "observed_at_unix_ms": event.timestamp,
+    })
+}
+
+fn provider_error_signal_evidence(event: &OpencodeEventMetadata) -> String {
+    bounded_text(
+        &format!(
+            "provider error: opencode {}: {}",
+            opencode_error_name(event),
+            opencode_error_message(event)
+        ),
+        TERMINAL_SIGNAL_EVIDENCE_MAX_LEN,
+    )
+}
+
+fn opencode_error_name(event: &OpencodeEventMetadata) -> &str {
+    event
+        .error
+        .as_ref()
+        .and_then(|error| error.name.as_deref())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("unknown")
+}
+
+fn opencode_error_message(event: &OpencodeEventMetadata) -> &str {
+    event
+        .error
+        .as_ref()
+        .and_then(opencode_error_message_value)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("unknown")
+}
+
+fn opencode_error_message_value(error: &opencode::OpencodeEventError) -> Option<&str> {
+    error.data.message.as_deref().or(error.message.as_deref())
 }
 
 fn launch_exit_event(request_id: &str, seq: u64, status: &ProcessStatus, signal: Value) -> Value {
