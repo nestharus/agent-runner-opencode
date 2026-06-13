@@ -545,6 +545,15 @@ pub fn assert_submitted_user_turn_marker(events: &[Value]) {
     assert_submitted_user_turn_marker_value(marker);
 }
 
+pub fn assert_submitted_user_turn_marker_without_message_id(events: &[Value]) {
+    let marker = expected_submitted_user_turn_marker(events);
+    assert_submitted_user_turn_provider_session(marker);
+    assert_submitted_user_turn_prompt_hash(marker);
+    assert_submitted_user_turn_source(marker);
+    assert_submitted_user_turn_no_message_id(marker);
+    assert_submitted_user_turn_delivery_nonce(marker);
+}
+
 pub fn assert_submitted_user_turn_marker_value(marker: &Value) {
     assert_submitted_user_turn_provider_session(marker);
     assert_submitted_user_turn_prompt_hash(marker);
@@ -576,17 +585,17 @@ pub fn assert_submitted_user_turn_message_id(marker: &Value) {
     assert_eq!(marker["value"]["message_id"].as_str(), Some("msg-user"));
 }
 
+pub fn assert_submitted_user_turn_no_message_id(marker: &Value) {
+    assert!(
+        marker["value"].get("message_id").is_none(),
+        "submitted user turn marker must omit message_id when export lacks payload; marker={marker:?}"
+    );
+}
+
 pub fn assert_submitted_user_turn_delivery_nonce(marker: &Value) {
     assert_eq!(
         marker["value"]["delivery_nonce"].as_str(),
         Some("5169694d-de0f-40d1-890c-6e28e55bab27")
-    );
-}
-
-pub fn assert_no_submitted_user_turn_marker(events: &[Value]) {
-    assert!(
-        !has_submitted_user_turn_marker(events),
-        "unconfirmed export must not emit submitted user turn marker; events={events:?}"
     );
 }
 

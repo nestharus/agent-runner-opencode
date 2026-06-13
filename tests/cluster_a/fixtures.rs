@@ -262,10 +262,6 @@ pub fn submitted_user_turn_marker(events: &[Value]) -> Option<&Value> {
         .find(|event| is_submitted_user_turn_marker(event))
 }
 
-pub fn has_submitted_user_turn_marker(events: &[Value]) -> bool {
-    submitted_user_turn_marker(events).is_some()
-}
-
 pub fn is_submitted_user_turn_marker(event: &Value) -> bool {
     event["kind"] == "marker" && event["name"] == SUBMITTED_USER_TURN_MARKER_FOR_TEST
 }

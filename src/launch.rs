@@ -996,12 +996,20 @@ impl LaunchState {
 }
 
 fn submitted_user_turn_marker_value(confirmation: &ResumeConfirmation) -> Option<Value> {
+    let message_id = exported_submitted_message_id(confirmation);
+    Some(submitted_user_turn_marker(
+        confirmation,
+        message_id.as_deref(),
+    ))
+}
+
+fn exported_submitted_message_id(confirmation: &ResumeConfirmation) -> Option<String> {
     let native = export_for_resume_confirmation(confirmation)?;
     if !export_session_matches_confirmation(&native, confirmation) {
         return None;
     }
-    let message = submitted_user_turn_message(&native.messages, confirmation)?;
-    Some(submitted_user_turn_marker(confirmation, message))
+    submitted_user_turn_message(&native.messages, confirmation)
+        .map(|message| message.info.id.as_str().to_string())
 }
 
 fn export_for_resume_confirmation(confirmation: &ResumeConfirmation) -> Option<OpencodeExport> {
@@ -1027,22 +1035,25 @@ fn submitted_user_turn_message<'a>(
 
 fn submitted_user_turn_marker(
     confirmation: &ResumeConfirmation,
-    message: &OpencodeMessage,
+    message_id: Option<&str>,
 ) -> Value {
-    let marker = submitted_user_turn_marker_base(confirmation, message);
+    let marker = submitted_user_turn_marker_base(confirmation, message_id);
     marker_with_delivery_nonce(marker, confirmation.delivery_nonce.as_deref())
 }
 
 fn submitted_user_turn_marker_base(
     confirmation: &ResumeConfirmation,
-    message: &OpencodeMessage,
+    message_id: Option<&str>,
 ) -> Value {
-    json!({
+    let mut marker = json!({
         "provider_session_id": confirmation.session_id.as_str(),
         "prompt_sha256": sha256_hex(confirmation.prompt.as_bytes()),
         "source": SUBMITTED_USER_TURN_SOURCE,
-        "message_id": message.info.id.as_str(),
-    })
+    });
+    if let Some(message_id) = message_id {
+        marker["message_id"] = json!(message_id);
+    }
+    marker
 }
 
 fn marker_with_delivery_nonce(mut marker: Value, delivery_nonce: Option<&str>) -> Value {

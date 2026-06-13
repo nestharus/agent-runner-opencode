@@ -161,7 +161,7 @@ fn contract_launch_resume_emits_submitted_user_turn_marker_after_export_confirms
 }
 
 #[test]
-fn contract_launch_resume_does_not_emit_submitted_user_turn_marker_when_export_lacks_payload() {
+fn contract_launch_resume_emits_submitted_user_turn_marker_even_when_export_lacks_payload() {
     let fake_wrapper = FakeOpencodeWrapper::with_script(
         fake_wrapper_resume_unconfirmed_export_script().to_string(),
     );
@@ -173,7 +173,7 @@ fn contract_launch_resume_does_not_emit_submitted_user_turn_marker_when_export_l
 
     assert_output_success(&output, "launch resume unconfirmed payload");
     let events = launch_events_from_output(&output, "launch resume unconfirmed payload stdout");
-    assert_no_submitted_user_turn_marker(&events);
+    assert_submitted_user_turn_marker_without_message_id(&events);
 }
 
 #[test]
