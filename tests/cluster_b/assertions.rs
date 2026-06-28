@@ -267,6 +267,153 @@ pub fn assert_deterministic_export(first: &Value, second: &Value) {
     );
 }
 
+pub fn assert_empty_enumerate_result(result: &Value) {
+    assert_eq!(enumerate_sessions(result).len(), 0);
+    assert_eq!(result["complete"], true);
+    assert!(result["next_cursor"].is_null());
+    assert_eq!(enumerate_warnings(result).len(), 0);
+}
+
+pub fn assert_multiple_enumerate_result(result: &Value) {
+    let sessions = enumerate_sessions(result);
+    assert_eq!(sessions.len(), 2);
+    assert_enumerate_entry(
+        &sessions[0],
+        "ses_list_one",
+        Some("First session"),
+        Some("/tmp/project-one"),
+        Some(111),
+        Some(222),
+        Some(3),
+    );
+    assert_enumerate_entry(
+        &sessions[1],
+        "ses_list_two",
+        None,
+        Some("/var/tmp/project-two"),
+        Some(333),
+        Some(444),
+        Some(0),
+    );
+    assert_eq!(enumerate_warnings(result).len(), 0);
+}
+
+pub fn assert_bad_cwd_enumerate_result(result: &Value) {
+    let sessions = enumerate_sessions(result);
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0]["provider_session_id"], "ses_relative_cwd");
+    assert!(sessions[0]["cwd"].is_null());
+    assert_eq!(sessions[1]["provider_session_id"], "ses_missing_cwd");
+    assert!(sessions[1]["cwd"].is_null());
+    let warnings = enumerate_warning_text(result);
+    assert!(
+        warnings.contains("non-absolute"),
+        "relative cwd warning missing: {warnings}"
+    );
+    assert!(
+        warnings.contains("no directory/cwd"),
+        "missing cwd warning missing: {warnings}"
+    );
+}
+
+pub fn assert_limited_enumerate_result(result: &Value, limit: usize) {
+    let sessions = enumerate_sessions(result);
+    assert_eq!(sessions.len(), limit);
+    assert_eq!(sessions[0]["provider_session_id"], "ses_limit_one");
+    assert_eq!(sessions[1]["provider_session_id"], "ses_limit_two");
+}
+
+pub fn assert_session_list_limit_forwarded(log_path: &Path, limit: u64) {
+    let log = fs::read_to_string(log_path).expect("read fake session list wrapper log");
+    assert!(
+        log.contains("arg=session"),
+        "session list wrapper should receive session subcommand: {log}"
+    );
+    assert!(
+        log.contains("arg=list"),
+        "session list wrapper should receive list subcommand: {log}"
+    );
+    assert!(
+        log.contains("arg=--format") && log.contains("arg=json"),
+        "session list wrapper should receive JSON format args: {log}"
+    );
+    assert!(
+        log.contains("arg=--max-count") && log.contains(&format!("arg={limit}")),
+        "session list wrapper should receive max-count limit {limit}: {log}"
+    );
+}
+
+pub fn assert_enumerate_error_code(response: &Value, code: &str) {
+    assert_eq!(response["error"]["code"], code);
+}
+
+pub fn assert_error_message_contains(response: &Value, needle: &str) {
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("error message string");
+    assert!(
+        message.contains(needle),
+        "error message should contain {needle:?}: {message}"
+    );
+}
+
+pub fn enumerate_sessions(result: &Value) -> &[Value] {
+    result["sessions"].as_array().expect("sessions array")
+}
+
+pub fn enumerate_warnings(result: &Value) -> &[Value] {
+    result["warnings"].as_array().expect("warnings array")
+}
+
+pub fn enumerate_warning_text(result: &Value) -> String {
+    enumerate_warnings(result)
+        .iter()
+        .map(|warning| warning.as_str().expect("warning string"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn assert_enumerate_entry(
+    entry: &Value,
+    provider_session_id: &str,
+    title: Option<&str>,
+    cwd: Option<&str>,
+    created_unix_ms: Option<u64>,
+    updated_unix_ms: Option<u64>,
+    turn_count: Option<u64>,
+) {
+    assert_eq!(entry["provider_session_id"], provider_session_id);
+    assert_optional_string(&entry["title"], title, "title");
+    assert_optional_string(&entry["cwd"], cwd, "cwd");
+    assert_optional_u64(
+        &entry["created_unix_ms"],
+        created_unix_ms,
+        "created_unix_ms",
+    );
+    assert_optional_u64(
+        &entry["updated_unix_ms"],
+        updated_unix_ms,
+        "updated_unix_ms",
+    );
+    assert_optional_u64(&entry["turn_count"], turn_count, "turn_count");
+    assert_eq!(entry["source"]["kind"], "opencode.session_list");
+    assert!(entry["source"]["detail"].as_str().is_some());
+}
+
+pub fn assert_optional_string(value: &Value, expected: Option<&str>, label: &str) {
+    match expected {
+        Some(expected) => assert_eq!(value.as_str(), Some(expected), "{label}"),
+        None => assert!(value.is_null(), "{label} should be null: {value}"),
+    }
+}
+
+pub fn assert_optional_u64(value: &Value, expected: Option<u64>, label: &str) {
+    match expected {
+        Some(expected) => assert_eq!(value.as_u64(), Some(expected), "{label}"),
+        None => assert!(value.is_null(), "{label} should be null: {value}"),
+    }
+}
+
 pub fn assert_launch_capture_result(result: &Value, session_id: &str) {
     assert_launch_capture_state(result, session_id);
     assert_capture_artifacts(&result["artifacts"]);

@@ -502,6 +502,145 @@ impl Drop for FakeOpencodeExport {
     }
 }
 
+pub struct FakeOpencodeSessionList {
+    pub dir: PathBuf,
+    pub log_path: PathBuf,
+}
+
+impl FakeOpencodeSessionList {
+    pub fn with_output(stdout: &str, stderr: &str, exit_code: i32) -> Self {
+        let paths = fake_opencode_session_list_paths();
+        write_fake_opencode_session_list(&paths, stdout, stderr, exit_code);
+        FakeOpencodeSessionList {
+            dir: paths.dir,
+            log_path: paths.log_path,
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+}
+
+impl Drop for FakeOpencodeSessionList {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+pub struct FakeOpencodeSessionListPaths {
+    pub dir: PathBuf,
+    pub wrapper_path: PathBuf,
+    pub log_path: PathBuf,
+}
+
+pub fn fake_opencode_session_list_paths() -> FakeOpencodeSessionListPaths {
+    fake_opencode_session_list_paths_for_dir(unique_temp_dir(
+        "agent-runner-opencode-contract-session-list",
+    ))
+}
+
+pub fn fake_opencode_session_list_paths_for_dir(dir: PathBuf) -> FakeOpencodeSessionListPaths {
+    let wrapper_path = dir.join("opencode1");
+    let log_path = dir.join("wrapper.log");
+    FakeOpencodeSessionListPaths {
+        dir,
+        wrapper_path,
+        log_path,
+    }
+}
+
+pub fn write_fake_opencode_session_list(
+    paths: &FakeOpencodeSessionListPaths,
+    stdout: &str,
+    stderr: &str,
+    exit_code: i32,
+) {
+    fs::create_dir_all(&paths.dir).expect("create fake opencode session list dir");
+    fs::write(
+        &paths.wrapper_path,
+        fake_opencode_session_list_script(stdout, stderr, exit_code, &paths.log_path),
+    )
+    .expect("write fake opencode1 session list wrapper");
+    make_fake_opencode_export_executable(&paths.wrapper_path);
+}
+
+pub fn fake_opencode_session_list_script(
+    stdout: &str,
+    stderr: &str,
+    exit_code: i32,
+    log_path: &Path,
+) -> String {
+    format!(
+        "#!/bin/sh\n\
+{{\n\
+  printf 'argv0=%s\\n' \"$0\"\n\
+  for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
+}} > {}\n\
+if [ \"$1\" = \"session\" ] && [ \"${{2:-}}\" = \"list\" ]; then\n\
+  printf '%s' {}\n\
+  printf '%s' {} >&2\n\
+  exit {}\n\
+fi\n\
+printf 'unsupported fake opencode invocation\\n' >&2\n\
+exit 64\n",
+        shell_single_quote(&path_string(log_path)),
+        shell_single_quote(stdout),
+        shell_single_quote(stderr),
+        exit_code
+    )
+}
+
+pub fn session_list_multiple_json() -> &'static str {
+    r#"[
+  {
+    "id": "ses_list_one",
+    "title": "First session",
+    "directory": "/tmp/project-one",
+    "created": 111,
+    "updated": 222,
+    "messageCount": 3
+  },
+  {
+    "id": "ses_list_two",
+    "title": null,
+    "directory": "/var/tmp/project-two",
+    "time": { "created": 333, "updated": 444 },
+    "turn_count": 0
+  }
+]"#
+}
+
+pub fn session_list_bad_cwd_json() -> &'static str {
+    r#"[
+  {
+    "id": "ses_relative_cwd",
+    "title": "Relative cwd",
+    "directory": "relative/path",
+    "created": 111,
+    "updated": 222
+  },
+  {
+    "id": "ses_missing_cwd",
+    "title": "Missing cwd",
+    "created": 333,
+    "updated": 444
+  }
+]"#
+}
+
+pub fn session_list_limit_json() -> &'static str {
+    r#"[
+  { "id": "ses_limit_one", "title": "One", "directory": "/tmp/one" },
+  { "id": "ses_limit_two", "title": "Two", "directory": "/tmp/two" },
+  { "id": "ses_limit_three", "title": "Three", "directory": "/tmp/three" }
+]"#
+}
+
 pub fn fake_opencode_export_script(session_id: &str) -> String {
     format!(
         "#!/bin/sh\n\
@@ -556,6 +695,10 @@ pub fn joined_path_string(paths: Vec<PathBuf>) -> String {
         .expect("join PATH entries")
         .to_string_lossy()
         .into_owned()
+}
+
+pub fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 pub fn shell_single_quote(value: &str) -> String {

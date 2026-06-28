@@ -10,6 +10,23 @@ pub fn session_params(session_id: &str) -> Value {
     })
 }
 
+pub fn session_enumerate_params() -> Value {
+    json!({
+        "settings_id": "opencode1"
+    })
+}
+
+pub fn session_enumerate_limit_params(limit: u64) -> Value {
+    json!({
+        "settings_id": "opencode1",
+        "limit": limit,
+        "cursor": null,
+        "include_cwd": true,
+        "include_turn_count": true,
+        "since_unix_ms": null
+    })
+}
+
 pub fn launch_capture_params(session_id: &str) -> Value {
     json!({
         "settings_id": "opencode1",

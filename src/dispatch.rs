@@ -81,6 +81,7 @@ pub fn handle_decoded_invocation(
         "session.locate_transcript"
         | "session.read_turns"
         | "session.capture"
+        | "session.enumerate"
         | "session.export"
         | "session.replace" => handle_capability(subcommand, request, session::handle),
         "quota.source" | "quota.probe" | "quota.refresh_auth" => {

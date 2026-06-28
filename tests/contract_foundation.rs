@@ -173,12 +173,13 @@ fn assert_describe_identity(result: &Value) {
     }
 }
 
-fn described_true_capabilities() -> [&'static str; 10] {
+fn described_true_capabilities() -> [&'static str; 11] {
     [
         "launch",
         "policy",
         "quota",
         "session",
+        "session_enumerate",
         "terminal",
         "rotation",
         "discovery",

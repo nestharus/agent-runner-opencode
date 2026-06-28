@@ -39,6 +39,7 @@ pub fn describe_result() -> Value {
             "policy": true,
             "quota": true,
             "session": true,
+            "session_enumerate": true,
             "terminal": true,
             "rotation": true,
             "discovery": true,

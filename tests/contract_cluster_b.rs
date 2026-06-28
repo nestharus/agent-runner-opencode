@@ -55,6 +55,76 @@ fn contract_session_export_canonical() {
 }
 
 #[test]
+fn contract_session_enumerate_empty_list() {
+    let fake_opencode = FakeOpencodeSessionList::with_output("[]", "", 0);
+    let path = prepend_path(fake_opencode.dir());
+
+    let result = enumerate_result(session_enumerate_params(), &path);
+
+    assert_empty_enumerate_result(&result);
+}
+
+#[test]
+fn contract_session_enumerate_maps_multiple_sessions() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_multiple_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+
+    let result = enumerate_result(session_enumerate_params(), &path);
+
+    assert_multiple_enumerate_result(&result);
+}
+
+#[test]
+fn contract_session_enumerate_returns_warning_for_bad_cwd_rows() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_bad_cwd_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+
+    let result = enumerate_result(session_enumerate_params(), &path);
+
+    assert_bad_cwd_enumerate_result(&result);
+}
+
+#[test]
+fn contract_session_enumerate_honors_limit() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+
+    let result = enumerate_result(session_enumerate_limit_params(2), &path);
+
+    assert_limited_enumerate_result(&result, 2);
+    assert_session_list_limit_forwarded(fake_opencode.log_path(), 2);
+}
+
+#[test]
+fn contract_session_enumerate_invalid_json_is_provider_error() {
+    let fake_opencode = FakeOpencodeSessionList::with_output("not json", "", 0);
+    let path = prepend_path(fake_opencode.dir());
+
+    let response = assert_error_envelope(invoke_with_env(
+        "session.enumerate",
+        session_enumerate_params(),
+        &[("PATH", path.as_str())],
+    ));
+
+    assert_enumerate_error_code(&response, "invalid_opencode_session_list");
+}
+
+#[test]
+fn contract_session_enumerate_nonzero_wrapper_exit_is_provider_error() {
+    let fake_opencode = FakeOpencodeSessionList::with_output("[]", "list failed", 9);
+    let path = prepend_path(fake_opencode.dir());
+
+    let response = assert_error_envelope(invoke_with_env(
+        "session.enumerate",
+        session_enumerate_params(),
+        &[("PATH", path.as_str())],
+    ));
+
+    assert_enumerate_error_code(&response, "session_list_failed");
+    assert_error_message_contains(&response, "list failed");
+}
+
+#[test]
 #[ignore = "live opencode auth/network session export proof; run explicitly when external dependencies are available"]
 fn integration_session_export_live() {
     let session_id = live_opencode_session_id();

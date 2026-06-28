@@ -13,6 +13,14 @@ pub fn read_turns_result(params: Value, path: &str) -> Value {
     )
 }
 
+pub fn enumerate_result(params: Value, path: &str) -> Value {
+    success_result(
+        invoke_with_env("session.enumerate", params, &[("PATH", path)]),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    )
+}
+
 pub fn missing_read_turns_output(path: &str) -> std::process::Output {
     invoke_with_env(
         "session.read_turns",

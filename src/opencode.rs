@@ -90,6 +90,13 @@ pub enum OpencodeExportError {
     InvalidJson(String),
 }
 
+#[derive(Debug)]
+pub enum OpencodeSessionListError {
+    Spawn(String),
+    Failed { status: Option<i32>, stderr: String },
+    InvalidJson(String),
+}
+
 impl EventParser {
     pub fn ingest(&mut self, bytes: &[u8]) -> Vec<OpencodeEventMetadata> {
         self.pending.extend_from_slice(bytes);
@@ -127,6 +134,24 @@ pub fn export(
     parse_export_stdout(&output.stdout)
 }
 
+pub fn session_list(
+    limit: Option<usize>,
+    account: &AccountProfile,
+) -> Result<Vec<Value>, OpencodeSessionListError> {
+    let mut command = shell::command(account.opencode_wrapper);
+    command
+        .arg("session")
+        .arg("list")
+        .arg("--format")
+        .arg("json");
+    if let Some(limit) = limit {
+        command.arg("--max-count").arg(limit.to_string());
+    }
+    let output = command.output().map_err(session_list_spawn_error)?;
+    validate_session_list_status(&output)?;
+    parse_session_list_stdout(&output.stdout)
+}
+
 pub fn refresh_auth(account: &AccountProfile) -> std::io::Result<ShellOutput> {
     crate::shell::run(&refresh_auth_argv(account))
 }
@@ -142,6 +167,11 @@ fn refresh_auth_argv(account: &AccountProfile) -> Vec<String> {
 pub fn parse_export_stdout(stdout: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {
     let start = export_json_start(stdout)?;
     parse_export_json(&stdout[start..])
+}
+
+pub fn parse_session_list_stdout(stdout: &[u8]) -> Result<Vec<Value>, OpencodeSessionListError> {
+    let start = session_list_json_start(stdout)?;
+    parse_session_list_json(&stdout[start..])
 }
 
 fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
@@ -191,6 +221,10 @@ fn export_spawn_error(err: std::io::Error) -> OpencodeExportError {
     OpencodeExportError::Spawn(err.to_string())
 }
 
+fn session_list_spawn_error(err: std::io::Error) -> OpencodeSessionListError {
+    OpencodeSessionListError::Spawn(err.to_string())
+}
+
 fn validate_export_status(output: &std::process::Output) -> Result<(), OpencodeExportError> {
     if output.status.success() {
         return Ok(());
@@ -198,8 +232,24 @@ fn validate_export_status(output: &std::process::Output) -> Result<(), OpencodeE
     Err(export_failed_error(output))
 }
 
+fn validate_session_list_status(
+    output: &std::process::Output,
+) -> Result<(), OpencodeSessionListError> {
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(session_list_failed_error(output))
+}
+
 fn export_failed_error(output: &std::process::Output) -> OpencodeExportError {
     OpencodeExportError::Failed {
+        status: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    }
+}
+
+fn session_list_failed_error(output: &std::process::Output) -> OpencodeSessionListError {
+    OpencodeSessionListError::Failed {
         status: output.status.code(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     }
@@ -212,16 +262,35 @@ fn export_json_start(stdout: &[u8]) -> Result<usize, OpencodeExportError> {
         .ok_or_else(missing_export_json_error)
 }
 
+fn session_list_json_start(stdout: &[u8]) -> Result<usize, OpencodeSessionListError> {
+    stdout
+        .iter()
+        .position(|byte| *byte == b'[')
+        .ok_or_else(missing_session_list_json_error)
+}
+
 fn parse_export_json(bytes: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {
     serde_json::from_slice(bytes).map_err(invalid_export_json_error)
+}
+
+fn parse_session_list_json(bytes: &[u8]) -> Result<Vec<Value>, OpencodeSessionListError> {
+    serde_json::from_slice(bytes).map_err(invalid_session_list_json_error)
 }
 
 fn missing_export_json_error() -> OpencodeExportError {
     OpencodeExportError::InvalidJson("missing JSON object".to_string())
 }
 
+fn missing_session_list_json_error() -> OpencodeSessionListError {
+    OpencodeSessionListError::InvalidJson("missing JSON array".to_string())
+}
+
 fn invalid_export_json_error(err: serde_json::Error) -> OpencodeExportError {
     OpencodeExportError::InvalidJson(err.to_string())
+}
+
+fn invalid_session_list_json_error(err: serde_json::Error) -> OpencodeSessionListError {
+    OpencodeSessionListError::InvalidJson(err.to_string())
 }
 
 fn non_empty_lines(drained: &[u8]) -> Vec<Vec<u8>> {
