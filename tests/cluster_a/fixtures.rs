@@ -306,12 +306,21 @@ pub fn pure_semantics_preserved(argv: &[String]) -> bool {
 }
 
 pub fn policy_diagnostic_matches(diagnostic: &Value, code: &str, needle: &str) -> bool {
-    policy_diagnostic_has_error_code(diagnostic, code)
+    policy_diagnostic_has_severity_and_code(diagnostic, "error", code)
         && diagnostic_text_contains(diagnostic, needle)
 }
 
-pub fn policy_diagnostic_has_error_code(diagnostic: &Value, code: &str) -> bool {
-    diagnostic["severity"] == "error" && diagnostic["code"] == code
+pub fn policy_warning_matches(diagnostic: &Value, code: &str, needle: &str) -> bool {
+    policy_diagnostic_has_severity_and_code(diagnostic, "warning", code)
+        && diagnostic_text_contains(diagnostic, needle)
+}
+
+pub fn policy_diagnostic_has_severity_and_code(
+    diagnostic: &Value,
+    severity: &str,
+    code: &str,
+) -> bool {
+    diagnostic["severity"] == severity && diagnostic["code"] == code
 }
 
 pub fn diagnostic_text_contains(diagnostic: &Value, needle: &str) -> bool {

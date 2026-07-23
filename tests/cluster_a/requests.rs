@@ -164,6 +164,17 @@ pub fn forbidden_policy_evaluate_params(forbidden_flag: &str, forbidden_env_key:
     })
 }
 
+pub fn policy_evaluate_params_with_env(settings_id: &str, env: &[(&str, &str)]) -> Value {
+    let mut params = policy_evaluate_params();
+    params["settings_id"] = json!(settings_id);
+    params["launch"]["env"] = env
+        .iter()
+        .map(|(key, value)| (key.to_string(), json!(value)))
+        .collect::<serde_json::Map<String, Value>>()
+        .into();
+    params
+}
+
 pub fn terminal_status_cases() -> Vec<(Value, &'static str)> {
     vec![
         (json!({ "kind": "exited", "code": 0 }), "clean_exit"),
