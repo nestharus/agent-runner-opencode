@@ -10,7 +10,7 @@ pub fn launch_params(effort: &str) -> Value {
         "settings_id": "opencode1",
         "mode": "agent",
         "model": model_request(effort),
-        "argv": ["reply with the single word: ok"],
+        "argv": host_candidate_argv(effort),
         "working_directory": env!("CARGO_MANIFEST_DIR")
     })
 }
@@ -18,7 +18,11 @@ pub fn launch_params(effort: &str) -> Value {
 pub fn resume_launch_params_with_arg_payload() -> Value {
     let mut params = launch_params("low");
     params["session"] = json!({ "known_provider_session_id": resume_session_id() });
-    params["argv"] = json!([resume_payload()]);
+    *params["argv"]
+        .as_array_mut()
+        .expect("launch argv")
+        .last_mut()
+        .expect("prompt arg") = json!(resume_payload());
     params["model"]["inputs"]["prompt"] = json!(resume_payload());
     params
 }
@@ -40,7 +44,7 @@ pub fn resume_launch_params_with_arg_payload_prompt_env(
 pub fn resume_launch_params_with_stdin_payload() -> Value {
     let mut params = launch_params("low");
     params["session"] = json!({ "known_provider_session_id": resume_session_id() });
-    params["argv"] = json!([]);
+    params["argv"].as_array_mut().expect("launch argv").pop();
     params["stdin"] = json!({
         "encoding": "utf8",
         "data": resume_payload(),
@@ -56,7 +60,7 @@ pub fn resume_launch_params_with_stdin_payload_env(path: &str, log_path: &str) -
 pub fn resume_launch_params_without_payload() -> Value {
     let mut params = launch_params("low");
     params["session"] = json!({ "known_provider_session_id": resume_session_id() });
-    params["argv"] = json!([]);
+    params["argv"].as_array_mut().expect("launch argv").pop();
     params["model"]["inputs"]["prompt"] = json!("");
     params
 }
@@ -89,7 +93,7 @@ pub fn policy_evaluate_params() -> Value {
         "mode": "agent",
         "model": model_request("low"),
         "launch": {
-            "argv": ["reply with the single word: ok"],
+            "argv": host_candidate_argv("low"),
             "working_directory": env!("CARGO_MANIFEST_DIR")
         }
     })
@@ -146,22 +150,24 @@ pub fn policy_evaluate_params_with_settings_id(mut params: Value) -> Value {
 }
 
 pub fn forbidden_policy_evaluate_params(forbidden_flag: &str, forbidden_env_key: &str) -> Value {
-    let mut env = serde_json::Map::new();
-    env.insert(
-        forbidden_env_key.to_string(),
-        json!("SENTINEL_POLICY_FORBIDDEN_ENV_DO_NOT_LEAK"),
+    let mut params = policy_evaluate_params();
+    let argv = params["launch"]["argv"]
+        .as_array_mut()
+        .expect("host candidate argv");
+    let prompt = argv.pop().expect("prompt arg");
+    argv.extend([json!(forbidden_flag), json!("high"), prompt]);
+    params["launch"]["env"] = Value::Object(
+        [
+            (
+                forbidden_env_key.to_string(),
+                json!("SENTINEL_POLICY_CONFIGURED_ENV"),
+            ),
+            ("CONTRACT_ALLOWED_ENV".to_string(), json!("allowed")),
+        ]
+        .into_iter()
+        .collect(),
     );
-    env.insert("CONTRACT_ALLOWED_ENV".to_string(), json!("allowed"));
-    json!({
-        "settings_id": "opencode1",
-        "mode": "agent",
-        "model": model_request("low"),
-        "launch": {
-            "argv": [forbidden_flag, "high", "reply with the single word: ok"],
-            "env": env,
-            "working_directory": env!("CARGO_MANIFEST_DIR")
-        }
-    })
+    params
 }
 
 pub fn policy_evaluate_params_with_env(settings_id: &str, env: &[(&str, &str)]) -> Value {
@@ -246,8 +252,11 @@ pub fn host_candidate_argv(effort: &str) -> Vec<&str> {
 }
 
 pub fn host_candidate_argv_for_command<'a>(command: &'a str, effort: &'a str) -> Vec<&'a str> {
-    vec![
-        command,
+    let mut argv = vec![command];
+    if command.rsplit('/').next() == Some("opencode") {
+        argv.push("--pure");
+    }
+    argv.extend([
         "run",
         "--dangerously-skip-permissions",
         "-m",
@@ -255,7 +264,8 @@ pub fn host_candidate_argv_for_command<'a>(command: &'a str, effort: &'a str) ->
         "--variant",
         effort,
         "reply with the single word: ok",
-    ]
+    ]);
+    argv
 }
 
 pub fn policy_effective_argv(effort: &str) -> Vec<&str> {

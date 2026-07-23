@@ -278,10 +278,6 @@ pub fn policy_result_env(result: &Value) -> &Value {
     &result["env"]
 }
 
-pub fn argv_contains_plain_opencode(argv: &[String]) -> bool {
-    argv.iter().any(|arg| arg == "opencode")
-}
-
 pub fn expected_policy_argv_subsequence() -> &'static [&'static str] {
     &[
         "run",
@@ -299,7 +295,7 @@ pub fn pure_semantics_preserved(argv: &[String]) -> bool {
     argv.iter().any(|arg| arg == "--pure")
         || argv.first().is_some_and(|arg| {
             matches!(
-                arg.as_str(),
+                arg.rsplit('/').next().unwrap_or(arg),
                 "opencode1" | "opencode2" | "opencode3" | "opencode4" | "opencode5"
             )
         })
@@ -307,11 +303,6 @@ pub fn pure_semantics_preserved(argv: &[String]) -> bool {
 
 pub fn policy_diagnostic_matches(diagnostic: &Value, code: &str, needle: &str) -> bool {
     policy_diagnostic_has_severity_and_code(diagnostic, "error", code)
-        && diagnostic_text_contains(diagnostic, needle)
-}
-
-pub fn policy_warning_matches(diagnostic: &Value, code: &str, needle: &str) -> bool {
-    policy_diagnostic_has_severity_and_code(diagnostic, "warning", code)
         && diagnostic_text_contains(diagnostic, needle)
 }
 

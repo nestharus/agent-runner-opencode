@@ -670,12 +670,8 @@ pub fn assert_policy_argv_for_wrapper(argv: &[String], wrapper: &str) {
     assert_eq!(argv.first().map(String::as_str), Some(wrapper));
     assert_contains_subsequence(argv, expected_policy_argv_subsequence());
     assert!(
-        !argv_contains_plain_opencode(argv),
-        "policy should preserve wrapper semantics instead of bypassing opencodeN"
-    );
-    assert!(
         pure_semantics_preserved(argv),
-        "policy must preserve --pure semantics either by retaining --pure or by invoking an opencodeN wrapper; argv={argv:?}"
+        "policy must preserve --pure semantics from the configured command; argv={argv:?}"
     );
 }
 
@@ -694,7 +690,7 @@ pub fn assert_policy_env(env: &Value) {
 pub fn assert_policy_rejects_forbidden(
     response: &Value,
     forbidden_flag: &str,
-    forbidden_env_key: &str,
+    configured_env_key: &str,
 ) {
     assert_policy_response_shape(response);
     let result = policy_result(response);
@@ -704,8 +700,11 @@ pub fn assert_policy_rejects_forbidden(
     );
     let diagnostics = policy_diagnostics(result);
     assert_policy_diagnostic(diagnostics, "forbidden_flag", forbidden_flag);
-    assert_policy_warning(diagnostics, "forbidden_env", forbidden_env_key);
-    assert_forbidden_env_removed(&result["env"], forbidden_env_key);
+    assert_eq!(
+        result["env"][configured_env_key], "SENTINEL_POLICY_CONFIGURED_ENV",
+        "provider policy must not rewrite host-configured environment values"
+    );
+    assert_eq!(result["env"]["CONTRACT_ALLOWED_ENV"], "allowed");
 }
 
 pub fn assert_policy_rejects_forbidden_arg(response: &Value, forbidden_flag: &str) {
@@ -736,46 +735,24 @@ pub fn assert_policy_diagnostic(diagnostics: &[Value], code: &str, needle: &str)
     );
 }
 
-pub fn assert_policy_warning(diagnostics: &[Value], code: &str, needle: &str) {
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| policy_warning_matches(diagnostic, code, needle)),
-        "policy warnings must name {needle} for {code}; diagnostics={diagnostics:?}"
-    );
-}
-
-pub fn assert_forbidden_env_removed(env: &Value, forbidden_env_key: &str) {
-    let env = env.as_object().expect("result.env object");
-    assert!(
-        !env.contains_key(forbidden_env_key),
-        "forbidden env key must be omitted from the effective env"
-    );
-    assert_eq!(
-        env.get("CONTRACT_ALLOWED_ENV").and_then(Value::as_str),
-        Some("allowed"),
-        "allowed env keys should remain visible in the effective env"
-    );
-}
-
-pub fn assert_account_env_transform(response: &Value, forbidden_env_key: &str) {
+pub fn assert_policy_preserves_configured_env(response: &Value, configured_env_key: &str) {
     assert_policy_response_shape(response);
     let result = policy_result(response);
     assert_policy_accepted(result);
-    let diagnostics = policy_diagnostics(result);
-    assert_policy_warning(diagnostics, "forbidden_env", forbidden_env_key);
+    assert!(policy_diagnostics(result).is_empty());
     let env = result["env"].as_object().expect("result.env object");
     assert_eq!(
         env.get("XDG_DATA_HOME").and_then(Value::as_str),
-        Some("/tmp/provider-home/.opencode2")
+        Some("/tmp/configured-opencode-data-home")
     );
     assert_eq!(
         env.get("CONTRACT_ALLOWED_ENV").and_then(Value::as_str),
         Some("allowed")
     );
-    assert!(
-        !env.contains_key(forbidden_env_key),
-        "forbidden inherited credentials must be omitted"
+    assert_eq!(
+        env.get(configured_env_key).and_then(Value::as_str),
+        Some("configured-provider-value"),
+        "provider policy must preserve host-configured values without key-specific logic"
     );
 }
 

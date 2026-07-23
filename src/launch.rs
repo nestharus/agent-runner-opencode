@@ -1347,26 +1347,7 @@ fn invalid_stdin_encoding_failure(request_id: &str, encoding: &str) -> ProviderF
 }
 
 fn allowed_declared_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    owned_env_pairs(allowed_declared_env_entries(declared))
-}
-
-fn allowed_declared_env_entries(declared: &BTreeMap<String, String>) -> Vec<(&String, &String)> {
-    declared
-        .iter()
-        .filter(|(key, _)| allowed_declared_env_key(key))
-        .collect()
-}
-
-fn allowed_declared_env_key(key: &str) -> bool {
-    !policy::is_forbidden_env_key(key)
-}
-
-fn owned_env_pairs(entries: Vec<(&String, &String)>) -> BTreeMap<String, String> {
-    entries.into_iter().map(owned_env_pair).collect()
-}
-
-fn owned_env_pair(entry: (&String, &String)) -> (String, String) {
-    (entry.0.clone(), entry.1.clone())
+    declared.clone()
 }
 
 fn session_marker_name(session_id: &str) -> String {

@@ -1,6 +1,6 @@
 //! Declared roles: validator, mapper, formatter, parser, filter, predicate
 
-use crate::account::{profile_for_settings_id, AccountProfile};
+use crate::account::profile_for_settings_id;
 use crate::envelope::ProviderFailure;
 use crate::models::PROVIDER_MODEL;
 use serde::Deserialize;
@@ -16,9 +16,6 @@ const HOST_LAUNCH_COMMAND_BASENAMES: &[&str] = &[
     "opencode4",
     "opencode5",
 ];
-const HOME_ENV: &str = "HOME";
-const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
-
 #[derive(Deserialize)]
 pub struct PolicyEvaluateParams {
     settings_id: String,
@@ -54,25 +51,21 @@ pub fn evaluate_params(params: Value, request_id: &str) -> Result<Value, Provide
 }
 
 pub fn evaluate(params: PolicyEvaluateParams, request_id: &str) -> Result<Value, ProviderFailure> {
-    let account = policy_account(&params.settings_id, request_id)?;
+    policy_account(&params.settings_id, request_id)?;
     let diagnostics = diagnostics_for_policy(&params);
-    Ok(policy_result(account, &params, diagnostics))
+    Ok(policy_result(&params, diagnostics))
 }
 
-fn policy_result(
-    account: &AccountProfile,
-    params: &PolicyEvaluateParams,
-    diagnostics: Vec<Value>,
-) -> Value {
-    let wrapper = account.opencode_wrapper;
+fn policy_result(params: &PolicyEvaluateParams, diagnostics: Vec<Value>) -> Value {
+    let argv = effective_argv(params);
     json!({
         "accepted": policy_accepted(&diagnostics),
-        "argv": effective_argv(wrapper, params),
-        "env": effective_env(account, params.launch.env.as_ref()),
+        "argv": argv,
+        "env": effective_env(params.launch.env.as_ref()),
         "stdin": params.launch.stdin.clone(),
         "prompt": params.model.inputs.prompt.clone(),
         "diagnostics": diagnostics,
-        "markers": policy_markers(wrapper, params),
+        "markers": policy_markers(configured_launch_command(params), params),
     })
 }
 
@@ -103,9 +96,12 @@ fn parse_policy_params(
     serde_json::from_value(params).map_err(|err| invalid_policy_params_failure(request_id, err))
 }
 
-fn effective_argv(wrapper: &str, params: &PolicyEvaluateParams) -> Vec<String> {
-    let mut argv = vec![
-        wrapper.to_string(),
+fn effective_argv(params: &PolicyEvaluateParams) -> Vec<String> {
+    let Some(prefix) = configured_launch_prefix(params) else {
+        return params.launch.argv.clone().unwrap_or_default();
+    };
+    let mut argv = prefix.to_vec();
+    argv.extend([
         "run".to_string(),
         "--format".to_string(),
         "json".to_string(),
@@ -114,9 +110,29 @@ fn effective_argv(wrapper: &str, params: &PolicyEvaluateParams) -> Vec<String> {
         PROVIDER_MODEL.to_string(),
         "--variant".to_string(),
         model_effort(params).to_string(),
-    ];
+    ]);
     argv.extend(policy_launch_args(params));
     argv
+}
+
+fn configured_launch_command(params: &PolicyEvaluateParams) -> Option<&str> {
+    configured_launch_prefix(params)
+        .and_then(|prefix| prefix.first())
+        .map(String::as_str)
+}
+
+fn configured_launch_prefix(params: &PolicyEvaluateParams) -> Option<&[String]> {
+    let argv = params.launch.argv.as_deref()?;
+    let run_index = argv.iter().position(|arg| arg == "run")?;
+    let prefix = &argv[..run_index];
+    valid_launch_command_prefix(prefix).then_some(prefix)
+}
+
+fn valid_launch_command_prefix(prefix: &[String]) -> bool {
+    let Some((command, options)) = prefix.split_first() else {
+        return false;
+    };
+    intrinsic_host_launch_command(command) && options.iter().all(|arg| arg == "--pure")
 }
 
 fn model_effort(params: &PolicyEvaluateParams) -> &str {
@@ -136,43 +152,26 @@ fn effort_from_model_name(name: &str) -> Option<&str> {
         .filter(|effort| !effort.is_empty())
 }
 
-fn effective_env(
-    account: &AccountProfile,
-    input: Option<&BTreeMap<String, String>>,
-) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = allowed_env_entries(input)
-        .into_iter()
-        .map(env_entry)
-        .collect();
-    apply_account_data_home(&mut env, account);
-    env
-}
-
-fn apply_account_data_home(env: &mut BTreeMap<String, String>, account: &AccountProfile) {
-    if account.opencode_index == 1 {
-        return;
-    }
-    let Some(home) = env.get(HOME_ENV) else {
-        return;
-    };
-    let data_home = Path::new(home)
-        .join(format!(".opencode{}", account.opencode_index))
-        .display()
-        .to_string();
-    env.insert(XDG_DATA_HOME_ENV.to_string(), data_home);
+fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, String> {
+    input.cloned().unwrap_or_default()
 }
 
 fn diagnostics_for_policy(params: &PolicyEvaluateParams) -> Vec<Value> {
-    let mut diagnostics = forbidden_env_diagnostics(params.launch.env.as_ref());
+    let mut diagnostics = launch_command_diagnostics(params);
     diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(params)));
     diagnostics
 }
 
-fn forbidden_env_diagnostics(input: Option<&BTreeMap<String, String>>) -> Vec<Value> {
-    forbidden_env_keys(input)
-        .into_iter()
-        .map(forbidden_env_diagnostic)
-        .collect()
+fn launch_command_diagnostics(params: &PolicyEvaluateParams) -> Vec<Value> {
+    if configured_launch_command(params).is_some() {
+        Vec::new()
+    } else {
+        vec![diagnostic(
+            "error",
+            "invalid_command",
+            "launch argv must begin with a configured OpenCode command".to_string(),
+        )]
+    }
 }
 
 fn forbidden_argv_diagnostics(input: &[String]) -> Vec<Value> {
@@ -210,11 +209,13 @@ fn strip_intrinsic_launch_prefix<'a>(
     argv: &'a [String],
     args_after_command: &[String],
 ) -> Option<&'a [String]> {
-    let (command, args) = argv.split_first()?;
-    if !intrinsic_host_launch_command(command) || !args.starts_with(args_after_command) {
+    let run_index = argv.iter().position(|arg| arg == "run")?;
+    if !valid_launch_command_prefix(&argv[..run_index])
+        || !argv[run_index..].starts_with(args_after_command)
+    {
         return None;
     }
-    Some(&args[args_after_command.len()..])
+    Some(&argv[run_index + args_after_command.len()..])
 }
 
 fn host_candidate_args(effort: &str) -> Vec<String> {
@@ -239,10 +240,6 @@ fn policy_effective_args(effort: &str) -> Vec<String> {
         "--variant".to_string(),
         effort.to_string(),
     ]
-}
-
-pub(crate) fn is_forbidden_env_key(key: &str) -> bool {
-    key.starts_with("OPENAI_API_KEY") || key.starts_with("OPENAI_BASE_URL")
 }
 
 fn is_forbidden_launch_arg(arg: &str) -> bool {
@@ -272,9 +269,9 @@ fn is_error_diagnostic(diagnostic: &Value) -> bool {
     diagnostic.get("severity").and_then(Value::as_str) == Some("error")
 }
 
-fn policy_markers(wrapper: &str, params: &PolicyEvaluateParams) -> Vec<Value> {
+fn policy_markers(command: Option<&str>, params: &PolicyEvaluateParams) -> Vec<Value> {
     vec![
-        json!({ "name": "opencode.wrapper", "value": wrapper }),
+        json!({ "name": "opencode.command", "value": command.unwrap_or("") }),
         json!({ "name": "opencode.mode", "value": params.mode }),
     ]
 }
@@ -287,39 +284,11 @@ fn invalid_policy_params_failure(request_id: &str, err: serde_json::Error) -> Pr
     )
 }
 
-fn allowed_env_entries(input: Option<&BTreeMap<String, String>>) -> Vec<(&String, &String)> {
-    input
-        .into_iter()
-        .flat_map(BTreeMap::iter)
-        .filter(|(key, _)| !is_forbidden_env_key(key))
-        .collect()
-}
-
-fn env_entry((key, value): (&String, &String)) -> (String, String) {
-    (key.clone(), value.clone())
-}
-
-fn forbidden_env_keys(input: Option<&BTreeMap<String, String>>) -> Vec<&String> {
-    input
-        .into_iter()
-        .flat_map(BTreeMap::keys)
-        .filter(|key| is_forbidden_env_key(key))
-        .collect()
-}
-
 fn forbidden_launch_args(input: &[String]) -> Vec<&String> {
     input
         .iter()
         .filter(|arg| is_forbidden_launch_arg(arg))
         .collect()
-}
-
-fn forbidden_env_diagnostic(key: &String) -> Value {
-    diagnostic(
-        "warning",
-        "forbidden_env",
-        format!("forbidden env key omitted: {key}"),
-    )
 }
 
 fn forbidden_arg_diagnostic(arg: &String) -> Value {
