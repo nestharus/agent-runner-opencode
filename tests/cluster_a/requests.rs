@@ -221,7 +221,7 @@ pub fn wrapper_env(path: &str, log_path: &str) -> Value {
 pub fn model_request(effort: &str) -> Value {
     json!({
         "name": format!("gpt-{effort}"),
-        "provider_args": ["-m", "openai/gpt-5.5", "--variant", effort],
+        "provider_args": ["-m", "openai/gpt-5.6-sol", "--variant", effort],
         "inputs": {
             "prompt": "reply with the single word: ok",
             "named": {}
@@ -251,7 +251,7 @@ pub fn host_candidate_argv_for_command<'a>(command: &'a str, effort: &'a str) ->
         "run",
         "--dangerously-skip-permissions",
         "-m",
-        "openai/gpt-5.5",
+        "openai/gpt-5.6-sol",
         "--variant",
         effort,
         "reply with the single word: ok",
@@ -266,7 +266,7 @@ pub fn policy_effective_argv(effort: &str) -> Vec<&str> {
         "json",
         "--dangerously-skip-permissions",
         "-m",
-        "openai/gpt-5.5",
+        "openai/gpt-5.6-sol",
         "--variant",
         effort,
         "reply with the single word: ok",
