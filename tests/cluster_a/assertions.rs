@@ -704,7 +704,7 @@ pub fn assert_policy_rejects_forbidden(
     );
     let diagnostics = policy_diagnostics(result);
     assert_policy_diagnostic(diagnostics, "forbidden_flag", forbidden_flag);
-    assert_policy_diagnostic(diagnostics, "forbidden_env", forbidden_env_key);
+    assert_policy_warning(diagnostics, "forbidden_env", forbidden_env_key);
     assert_forbidden_env_removed(&result["env"], forbidden_env_key);
 }
 
@@ -736,6 +736,15 @@ pub fn assert_policy_diagnostic(diagnostics: &[Value], code: &str, needle: &str)
     );
 }
 
+pub fn assert_policy_warning(diagnostics: &[Value], code: &str, needle: &str) {
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| policy_warning_matches(diagnostic, code, needle)),
+        "policy warnings must name {needle} for {code}; diagnostics={diagnostics:?}"
+    );
+}
+
 pub fn assert_forbidden_env_removed(env: &Value, forbidden_env_key: &str) {
     let env = env.as_object().expect("result.env object");
     assert!(
@@ -746,6 +755,27 @@ pub fn assert_forbidden_env_removed(env: &Value, forbidden_env_key: &str) {
         env.get("CONTRACT_ALLOWED_ENV").and_then(Value::as_str),
         Some("allowed"),
         "allowed env keys should remain visible in the effective env"
+    );
+}
+
+pub fn assert_account_env_transform(response: &Value, forbidden_env_key: &str) {
+    assert_policy_response_shape(response);
+    let result = policy_result(response);
+    assert_policy_accepted(result);
+    let diagnostics = policy_diagnostics(result);
+    assert_policy_warning(diagnostics, "forbidden_env", forbidden_env_key);
+    let env = result["env"].as_object().expect("result.env object");
+    assert_eq!(
+        env.get("XDG_DATA_HOME").and_then(Value::as_str),
+        Some("/tmp/provider-home/.opencode2")
+    );
+    assert_eq!(
+        env.get("CONTRACT_ALLOWED_ENV").and_then(Value::as_str),
+        Some("allowed")
+    );
+    assert!(
+        !env.contains_key(forbidden_env_key),
+        "forbidden inherited credentials must be omitted"
     );
 }
 

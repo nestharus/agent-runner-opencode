@@ -445,6 +445,27 @@ fn contract_policy_evaluate_rejects_forbidden() {
 }
 
 #[test]
+fn contract_policy_evaluate_scopes_account_env_and_filters_openai_credentials() {
+    let forbidden_env_key = "OPENAI_API_KEY_CONTRACT_FORBIDDEN";
+    let output = invoke_with_env(
+        "policy.evaluate",
+        policy_evaluate_params_with_env(
+            "opencode2",
+            &[
+                ("HOME", "/tmp/provider-home"),
+                ("XDG_DATA_HOME", "/tmp/inherited-wrong-account"),
+                (forbidden_env_key, "SENTINEL_DO_NOT_LEAK"),
+                ("CONTRACT_ALLOWED_ENV", "allowed"),
+            ],
+        ),
+        &[],
+    );
+
+    assert_output_success(&output, "policy.evaluate account env transform");
+    assert_account_env_transform(&json_stdout(&output), forbidden_env_key);
+}
+
+#[test]
 fn contract_terminal_classify_status_only() {
     for (status, expected) in terminal_status_cases() {
         assert_terminal_classification(status, "", "", expected);

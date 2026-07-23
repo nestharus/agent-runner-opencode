@@ -1,6 +1,6 @@
 //! Declared roles: validator, mapper, formatter, parser, filter, predicate
 
-use crate::account::profile_for_settings_id;
+use crate::account::{profile_for_settings_id, AccountProfile};
 use crate::envelope::ProviderFailure;
 use crate::models::PROVIDER_MODEL;
 use serde::Deserialize;
@@ -16,6 +16,8 @@ const HOST_LAUNCH_COMMAND_BASENAMES: &[&str] = &[
     "opencode4",
     "opencode5",
 ];
+const HOME_ENV: &str = "HOME";
+const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
 
 #[derive(Deserialize)]
 pub struct PolicyEvaluateParams {
@@ -54,18 +56,19 @@ pub fn evaluate_params(params: Value, request_id: &str) -> Result<Value, Provide
 pub fn evaluate(params: PolicyEvaluateParams, request_id: &str) -> Result<Value, ProviderFailure> {
     let account = policy_account(&params.settings_id, request_id)?;
     let diagnostics = diagnostics_for_policy(&params);
-    Ok(policy_result(
-        account.opencode_wrapper,
-        &params,
-        diagnostics,
-    ))
+    Ok(policy_result(account, &params, diagnostics))
 }
 
-fn policy_result(wrapper: &str, params: &PolicyEvaluateParams, diagnostics: Vec<Value>) -> Value {
+fn policy_result(
+    account: &AccountProfile,
+    params: &PolicyEvaluateParams,
+    diagnostics: Vec<Value>,
+) -> Value {
+    let wrapper = account.opencode_wrapper;
     json!({
         "accepted": policy_accepted(&diagnostics),
         "argv": effective_argv(wrapper, params),
-        "env": effective_env(params.launch.env.as_ref()),
+        "env": effective_env(account, params.launch.env.as_ref()),
         "stdin": params.launch.stdin.clone(),
         "prompt": params.model.inputs.prompt.clone(),
         "diagnostics": diagnostics,
@@ -133,11 +136,30 @@ fn effort_from_model_name(name: &str) -> Option<&str> {
         .filter(|effort| !effort.is_empty())
 }
 
-fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, String> {
-    allowed_env_entries(input)
+fn effective_env(
+    account: &AccountProfile,
+    input: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = allowed_env_entries(input)
         .into_iter()
         .map(env_entry)
-        .collect()
+        .collect();
+    apply_account_data_home(&mut env, account);
+    env
+}
+
+fn apply_account_data_home(env: &mut BTreeMap<String, String>, account: &AccountProfile) {
+    if account.opencode_index == 1 {
+        return;
+    }
+    let Some(home) = env.get(HOME_ENV) else {
+        return;
+    };
+    let data_home = Path::new(home)
+        .join(format!(".opencode{}", account.opencode_index))
+        .display()
+        .to_string();
+    env.insert(XDG_DATA_HOME_ENV.to_string(), data_home);
 }
 
 fn diagnostics_for_policy(params: &PolicyEvaluateParams) -> Vec<Value> {
@@ -294,7 +316,7 @@ fn forbidden_launch_args(input: &[String]) -> Vec<&String> {
 
 fn forbidden_env_diagnostic(key: &String) -> Value {
     diagnostic(
-        "error",
+        "warning",
         "forbidden_env",
         format!("forbidden env key omitted: {key}"),
     )
