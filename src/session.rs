@@ -24,6 +24,7 @@ use crate::envelope::{ProviderFailure, RequestEnvelope};
 use crate::opencode::{
     self, OpencodeExport, OpencodeExportError, OpencodeMessage, OpencodeSessionListError,
 };
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -454,8 +455,10 @@ fn native_turns(native: &OpencodeExport, session_id: &str) -> Result<Vec<Value>,
 
 fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, ProviderFailure> {
     Ok(json!({
-        "id": stable_turn_id(message, session_id),
+        "session_id": session_id,
+        "turn_id": stable_turn_id(message, session_id),
         "role": message.info.role,
+        "timestamp": provider_turn_timestamp(message),
         "body": text_parts(message),
         "native": {
             "message_id": message.info.id,
@@ -465,6 +468,18 @@ fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, Pro
             "parts": message.parts,
         },
     }))
+}
+
+fn provider_turn_timestamp(message: &OpencodeMessage) -> String {
+    message
+        .info
+        .time
+        .as_ref()
+        .and_then(|time| time.created.or(time.completed))
+        .and_then(|milliseconds| i64::try_from(milliseconds).ok())
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn canonical_records(
