@@ -305,15 +305,15 @@ fn contract_policy_evaluate_accepts_host_candidate_argv_for_every_account_id() {
             &format!("policy.evaluate host candidate argv for {settings_id}"),
         );
         let response = json_stdout(&output);
-        assert_policy_accepts_for_wrapper(&response, settings_id);
+        assert_policy_accepts_for_wrapper(&response, command.as_str());
     }
 }
 
 #[test]
 fn contract_policy_evaluate_accepts_host_candidate_argv_for_account_aliases() {
-    for (settings_id, command, expected_wrapper) in [
-        ("opencode", "opencode", "opencode1"),
-        ("opencode", "/tmp/host-bin/opencode", "opencode1"),
+    for (settings_id, command) in [
+        ("opencode", "opencode"),
+        ("opencode", "/tmp/host-bin/opencode"),
     ] {
         let output = invoke_with_env(
             "policy.evaluate",
@@ -326,7 +326,7 @@ fn contract_policy_evaluate_accepts_host_candidate_argv_for_account_aliases() {
             &format!("policy.evaluate host candidate argv for alias {settings_id}"),
         );
         let response = json_stdout(&output);
-        assert_policy_accepts_for_wrapper(&response, expected_wrapper);
+        assert_policy_accepts_for_wrapper(&response, command);
     }
 }
 
@@ -426,35 +426,34 @@ fn contract_policy_evaluate_accepts_account_one_plain_host_command() {
 
     assert_output_success(&output, "policy.evaluate account-one plain host command");
     let response = json_stdout(&output);
-    assert_policy_accepts(&response);
+    assert_policy_accepts_for_wrapper(&response, "opencode");
 }
 
 #[test]
-fn contract_policy_evaluate_rejects_forbidden() {
-    let forbidden_env_key = "OPENAI_API_KEY_CONTRACT_FORBIDDEN";
+fn contract_policy_evaluate_rejects_forbidden_arg_without_rewriting_env() {
+    let configured_env_key = "OPENAI_API_KEY_CONFIGURED";
     let forbidden_flag = "--variant";
 
     let output = invoke_with_env(
         "policy.evaluate",
-        forbidden_policy_evaluate_params(forbidden_flag, forbidden_env_key),
+        forbidden_policy_evaluate_params(forbidden_flag, configured_env_key),
         &[],
     );
     assert_output_success(&output, "policy.evaluate rejection");
     let response = json_stdout(&output);
-    assert_policy_rejects_forbidden(&response, forbidden_flag, forbidden_env_key);
+    assert_policy_rejects_forbidden(&response, forbidden_flag, configured_env_key);
 }
 
 #[test]
-fn contract_policy_evaluate_scopes_account_env_and_filters_openai_credentials() {
-    let forbidden_env_key = "OPENAI_API_KEY_CONTRACT_FORBIDDEN";
+fn contract_policy_evaluate_preserves_host_configured_environment() {
+    let configured_env_key = "OPENAI_API_KEY_CONFIGURED";
     let output = invoke_with_env(
         "policy.evaluate",
         policy_evaluate_params_with_env(
             "opencode2",
             &[
-                ("HOME", "/tmp/provider-home"),
-                ("XDG_DATA_HOME", "/tmp/inherited-wrong-account"),
-                (forbidden_env_key, "SENTINEL_DO_NOT_LEAK"),
+                ("XDG_DATA_HOME", "/tmp/configured-opencode-data-home"),
+                (configured_env_key, "configured-provider-value"),
                 ("CONTRACT_ALLOWED_ENV", "allowed"),
             ],
         ),
@@ -462,7 +461,7 @@ fn contract_policy_evaluate_scopes_account_env_and_filters_openai_credentials() 
     );
 
     assert_output_success(&output, "policy.evaluate account env transform");
-    assert_account_env_transform(&json_stdout(&output), forbidden_env_key);
+    assert_policy_preserves_configured_env(&json_stdout(&output), configured_env_key);
 }
 
 #[test]
