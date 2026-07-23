@@ -496,6 +496,24 @@ pub fn assert_bare_capture_result(result: &Value, session_id: &str) {
     );
 }
 
+pub fn assert_lifecycle_capture_result(result: &Value, session_id: &str) {
+    assert_eq!(
+        result["provider_session_id"].as_str(),
+        Some(session_id),
+        "capture should preserve the lifecycle-bound provider session"
+    );
+    assert_eq!(
+        result["state"]["source"].as_str(),
+        Some("start_bound_provider_session_id"),
+        "capture should identify lifecycle-bound session evidence"
+    );
+}
+
+pub fn assert_pinned_capture_result(result: &Value, session_id: &str) {
+    assert_eq!(result["provider_session_id"].as_str(), Some(session_id));
+    assert_eq!(result["state"]["source"].as_str(), Some("pinned_target"));
+}
+
 pub fn assert_removed_evidence_capture_error(response: &Value) {
     assert_eq!(
         removed_evidence_error_code(response),

@@ -40,12 +40,15 @@ struct SessionParams {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SessionCaptureParams {
     #[serde(rename = "settings_id")]
     _settings_id: String,
     session_id: Option<String>,
     launch: Option<SessionCaptureLaunch>,
+    pinned_target: Option<String>,
+    start_bound_provider_session_id: Option<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -143,8 +146,15 @@ fn parse_capture_params(
     params: Value,
     request_id: &str,
 ) -> Result<SessionCaptureParams, ProviderFailure> {
-    serde_json::from_value(params)
-        .map_err(|err| invalid_session_capture_params_failure(request_id, err))
+    let params: SessionCaptureParams = serde_json::from_value(params)
+        .map_err(|err| invalid_session_capture_params_failure(request_id, err))?;
+    if params.extra.contains_key("evidence") {
+        return Err(invalid_session_capture_params_failure(
+            request_id,
+            "the removed evidence field is unsupported",
+        ));
+    }
+    Ok(params)
 }
 
 fn parse_enumerate_params(
@@ -590,6 +600,18 @@ fn captured_session_id(params: &SessionCaptureParams) -> CapturedSession {
             source: "session_id",
         };
     }
+    if let Some(provider_session_id) = pinned_target(params) {
+        return CapturedSession {
+            provider_session_id: Some(provider_session_id),
+            source: "pinned_target",
+        };
+    }
+    if let Some(provider_session_id) = start_bound_provider_session_id(params) {
+        return CapturedSession {
+            provider_session_id: Some(provider_session_id),
+            source: "start_bound_provider_session_id",
+        };
+    }
     CapturedSession {
         provider_session_id: None,
         source: "none",
@@ -690,7 +712,7 @@ fn invalid_session_params_failure(request_id: &str, err: serde_json::Error) -> P
 
 fn invalid_session_capture_params_failure(
     request_id: &str,
-    err: serde_json::Error,
+    err: impl std::fmt::Display,
 ) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
@@ -867,4 +889,12 @@ fn launch_provider_session_id(params: &SessionCaptureParams) -> Option<String> {
 
 fn bare_provider_session_id(params: &SessionCaptureParams) -> Option<String> {
     non_empty_string(params.session_id.as_deref())
+}
+
+fn pinned_target(params: &SessionCaptureParams) -> Option<String> {
+    non_empty_string(params.pinned_target.as_deref())
+}
+
+fn start_bound_provider_session_id(params: &SessionCaptureParams) -> Option<String> {
+    non_empty_string(params.start_bound_provider_session_id.as_deref())
 }

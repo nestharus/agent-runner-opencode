@@ -164,6 +164,29 @@ fn contract_session_capture() {
         "session.schema.json#/$defs/SessionCaptureResult",
     );
     assert_bare_capture_result(&bare_session_result, session_id);
+
+    let lifecycle_result = success_result(
+        invoke_validated(
+            "session.capture",
+            lifecycle_capture_params(session_id),
+            "session.schema.json#/$defs/SessionCaptureRequest",
+        ),
+        "session.schema.json#/$defs/SessionCaptureResponse",
+        "session.schema.json#/$defs/SessionCaptureResult",
+    );
+    assert_lifecycle_capture_result(&lifecycle_result, session_id);
+
+    let pinned_session_id = "ses_pinned_lifecycle";
+    let pinned_result = success_result(
+        invoke_validated(
+            "session.capture",
+            pinned_lifecycle_capture_params(pinned_session_id, session_id),
+            "session.schema.json#/$defs/SessionCaptureRequest",
+        ),
+        "session.schema.json#/$defs/SessionCaptureResponse",
+        "session.schema.json#/$defs/SessionCaptureResult",
+    );
+    assert_pinned_capture_result(&pinned_result, pinned_session_id);
 }
 
 #[test]
