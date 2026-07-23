@@ -155,6 +155,17 @@ pub fn assert_read_turns_result(result: &Value) {
         fixture_message_count(),
         "turns length should match turn_count and native message count"
     );
+    for turn in turns(result) {
+        assert_eq!(turn["session_id"].as_str(), Some(fixture_session_id()));
+        assert!(turn["turn_id"].as_str().is_some_and(non_empty_string));
+        assert!(turn["role"].as_str().is_some_and(non_empty_string));
+        let timestamp = turn["timestamp"]
+            .as_str()
+            .expect("turn timestamp should be a string");
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .unwrap_or_else(|err| panic!("turn timestamp must be RFC3339: {err}"));
+        assert!(turn["body"].is_array(), "turn body should be an array");
+    }
 }
 
 pub fn assert_first_read_turns_result(result: &Value) -> Vec<String> {
