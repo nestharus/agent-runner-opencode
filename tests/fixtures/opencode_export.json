@@ -1,0 +1,162 @@
+Exporting session: ses_16ddfad2affeVMaL23dRZBOEQ7
+{
+  "info": {
+    "id": "ses_16ddfad2affeVMaL23dRZBOEQ7",
+    "slug": "calm-falcon",
+    "projectID": "f0920c5e786c15a258b8b9a095cda382b6f899c3",
+    "directory": "/home/nes/projects/agent-runner-opencode/trunk",
+    "path": "",
+    "title": "Single-word ok response",
+    "agent": "build",
+    "model": {
+      "id": "gpt-5.5",
+      "providerID": "openai",
+      "variant": "low"
+    },
+    "version": "1.15.13",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 119,
+      "output": 5,
+      "reasoning": 0,
+      "cache": {
+        "read": 17408,
+        "write": 0
+      }
+    },
+    "permission": [
+      {
+        "permission": "question",
+        "pattern": "*",
+        "action": "deny"
+      },
+      {
+        "permission": "plan_enter",
+        "pattern": "*",
+        "action": "deny"
+      },
+      {
+        "permission": "plan_exit",
+        "pattern": "*",
+        "action": "deny"
+      }
+    ],
+    "time": {
+      "created": 1780568052438,
+      "updated": 1780568056647
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1780568052506
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "openai",
+          "modelID": "gpt-5.5",
+          "variant": "low"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_e9220531a001yNa6rtD009uuO5",
+        "sessionID": "ses_16ddfad2affeVMaL23dRZBOEQ7"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "\"reply with the single word: ok\"",
+          "id": "prt_e92205323001lGZEFfGMENApe3",
+          "sessionID": "ses_16ddfad2affeVMaL23dRZBOEQ7",
+          "messageID": "msg_e9220531a001yNa6rtD009uuO5"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_e9220531a001yNa6rtD009uuO5",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "variant": "low",
+        "path": {
+          "cwd": "/home/nes/projects/agent-runner-opencode/trunk",
+          "root": "/home/nes/projects/agent-runner-opencode/trunk"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 17532,
+          "input": 119,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 17408
+          }
+        },
+        "modelID": "gpt-5.5",
+        "providerID": "openai",
+        "time": {
+          "created": 1780568052688,
+          "completed": 1780568056601
+        },
+        "finish": "stop",
+        "id": "msg_e922053d0001iGjKmqNKCw699x",
+        "sessionID": "ses_16ddfad2affeVMaL23dRZBOEQ7"
+      },
+      "parts": [
+        {
+          "snapshot": "7483e9d153ff1c32c12e23a4cc4a3aeea56e414f",
+          "type": "step-start",
+          "id": "prt_e92205ebb001UfhYal2hZIs6VU",
+          "sessionID": "ses_16ddfad2affeVMaL23dRZBOEQ7",
+          "messageID": "msg_e922053d0001iGjKmqNKCw699x"
+        },
+        {
+          "type": "text",
+          "text": "ok",
+          "time": {
+            "start": 1780568056403,
+            "end": 1780568056505
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "msg_03cff842e68c95aa016a214ff8618c81999689ba5888e92dd7",
+              "phase": "final_answer"
+            }
+          },
+          "id": "prt_e92206253001nSDWBUV7WYOwqJ",
+          "sessionID": "ses_16ddfad2affeVMaL23dRZBOEQ7",
+          "messageID": "msg_e922053d0001iGjKmqNKCw699x"
+        },
+        {
+          "reason": "stop",
+          "snapshot": "7483e9d153ff1c32c12e23a4cc4a3aeea56e414f",
+          "type": "step-finish",
+          "tokens": {
+            "total": 17532,
+            "input": 119,
+            "output": 5,
+            "reasoning": 0,
+            "cache": {
+              "write": 0,
+              "read": 17408
+            }
+          },
+          "cost": 0,
+          "id": "prt_e922062f8001GwWz8UEdHeSu4A",
+          "sessionID": "ses_16ddfad2affeVMaL23dRZBOEQ7",
+          "messageID": "msg_e922053d0001iGjKmqNKCw699x"
+        }
+      ]
+    }
+  ]
+}

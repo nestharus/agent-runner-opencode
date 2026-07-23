@@ -9,6 +9,10 @@ publish = false
 name = "agent-runner-opencode"
 path = "src/main.rs"
 
+[lib]
+name = "agent_runner_opencode"
+path = "src/lib.rs"
+
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 serde = { version = "1", features = ["derive"] }
