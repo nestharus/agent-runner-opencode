@@ -1,6 +1,6 @@
 //! Declared roles: accessor, mapper
 
-pub const PROVIDER_MODEL: &str = "openai/gpt-5.5";
+pub const PROVIDER_MODEL: &str = "openai/gpt-5.6-sol";
 pub const DEFAULT_MODEL_ALIAS: &str = "gpt-high";
 
 pub struct ModelAlias {
@@ -9,10 +9,6 @@ pub struct ModelAlias {
 }
 
 pub const MODEL_ALIASES: &[ModelAlias] = &[
-    ModelAlias {
-        name: "gpt-none",
-        effort: "none",
-    },
     ModelAlias {
         name: "gpt-low",
         effort: "low",
@@ -28,6 +24,10 @@ pub const MODEL_ALIASES: &[ModelAlias] = &[
     ModelAlias {
         name: "gpt-xhigh",
         effort: "xhigh",
+    },
+    ModelAlias {
+        name: "gpt-max",
+        effort: "max",
     },
 ];
 

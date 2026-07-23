@@ -112,7 +112,7 @@ pub fn opencode_settings_schema() -> Value {
                 "type": "string",
                 "enum": alias_names(),
                 "default": DEFAULT_MODEL_ALIAS,
-                "description": "Provider model alias mapped to openai/gpt-5.5 with the matching effort variant."
+                "description": "Provider model alias mapped to openai/gpt-5.6-sol with the matching effort variant."
             },
             "working_directory": {
                 "type": "string",

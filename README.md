@@ -5,7 +5,7 @@ provider contract.
 
 One CLI, two underlying tools:
 
-- **opencode** owns the model lifecycle — `launch` (`opencode run --pure -m openai/gpt-5.5
+- **opencode** owns the model lifecycle — `launch` (`opencode run --pure -m openai/gpt-5.6-sol
   --variant <effort>`), `session` (read_turns/capture/export/replace/locate), `terminal`
   classification, and `policy` application.
 - **codex** owns **only** `quota` — ChatGPT plan-window usage via `chatgpt-usage

@@ -664,7 +664,7 @@ fn invalid_provider_model_diagnostic() -> Value {
     diagnostic(
         "error",
         "values.model.provider_model",
-        "provider_model must be openai/gpt-5.5",
+        "provider_model must be openai/gpt-5.6-sol",
         "invalid_provider_model",
     )
 }
@@ -689,7 +689,7 @@ fn invalid_model_variant_diagnostic() -> Value {
     diagnostic(
         "error",
         "values.model.variant",
-        "variant must be none, low, medium, high, or xhigh",
+        "variant must be low, medium, high, xhigh, or max",
         "invalid_model_variant",
     )
 }

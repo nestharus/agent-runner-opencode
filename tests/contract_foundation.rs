@@ -237,20 +237,20 @@ fn assert_discovery_models_response(response: &Value) {
 
 fn expected_model_variants() -> [(&'static str, &'static str); 5] {
     [
-        ("gpt-none", "none"),
         ("gpt-low", "low"),
         ("gpt-medium", "medium"),
         ("gpt-high", "high"),
         ("gpt-xhigh", "xhigh"),
+        ("gpt-max", "max"),
     ]
 }
 
 fn assert_model_variant(models: &[Value], alias: &str, effort: &str) {
     let model = find_by_field(models, "name", alias);
-    assert_eq!(model["provider_model"], "openai/gpt-5.5", "{alias}");
+    assert_eq!(model["provider_model"], "openai/gpt-5.6-sol", "{alias}");
     assert_eq!(
         model["provider_args"],
-        json!(["-m", "openai/gpt-5.5", "--variant", effort]),
+        json!(["-m", "openai/gpt-5.6-sol", "--variant", effort]),
         "{alias} provider args"
     );
 }
