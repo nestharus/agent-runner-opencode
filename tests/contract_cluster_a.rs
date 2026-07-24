@@ -202,6 +202,30 @@ fn contract_launch_completed_resume_does_not_wait_for_lingering_native_process()
 }
 
 #[test]
+fn contract_launch_completed_export_does_not_wait_for_buffered_native_events() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_completed_export_then_hang_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let params = resume_launch_params_with_arg_payload_env(path.as_str(), log_path);
+    let started = Instant::now();
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch completed buffered resume");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "provider should stop a completed exported resume before the fake five-second hang"
+    );
+    let events = launch_events_from_output(&output, "completed buffered resume stdout");
+    let final_event = final_launch_event(&events);
+    assert_eq!(
+        final_event["status"],
+        serde_json::json!({"kind": "exited", "code": 0})
+    );
+}
+
+#[test]
 fn contract_launch_resume_rejects_empty_payload_without_spawning_child() {
     let fake_wrapper =
         FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());

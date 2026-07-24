@@ -28,6 +28,9 @@ use std::time::{Duration, Instant};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);
 const COMPLETED_RESUME_GRACE: Duration = Duration::from_millis(500);
+const RESUME_COMPLETION_PROBE_DELAY: Duration = Duration::from_secs(1);
+const RESUME_COMPLETION_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+const RESUME_MESSAGE_CLOCK_TOLERANCE_MS: u64 = 5_000;
 const BASE_LAUNCH_ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME"];
 // Step-6a host-linkage contract: these runner bindings must survive env_clear.
 const HOST_LINKAGE_ENV_KEYS: &[&str] = &[
@@ -119,6 +122,7 @@ struct ResumeConfirmation {
     session_id: String,
     prompt: String,
     delivery_nonce: Option<String>,
+    started_at_unix_ms: u64,
 }
 
 enum PolicyLaunch {
@@ -208,6 +212,7 @@ fn resume_confirmation(
         session_id: session_id.to_string(),
         prompt,
         delivery_nonce,
+        started_at_unix_ms: now_unix_ms(),
     })
 }
 
@@ -639,6 +644,7 @@ fn run_supervision_loop<W: Write>(
     while !state.is_complete() {
         capture_child_exit(child, state)?;
         enforce_deadline(child, state)?;
+        state.probe_completed_resume();
         complete_terminal_resume(child, state);
         match receiver.recv_timeout(state.wait_duration()) {
             Ok(message) => state.handle_drain_message(message, writer)?,
@@ -714,6 +720,7 @@ struct LaunchState {
     parser: EventParser,
     last_opencode_event: Option<OpencodeEventMetadata>,
     completed_resume_at: Option<Instant>,
+    next_resume_completion_probe: Option<Instant>,
     session_id: Option<String>,
     resume_confirmation: Option<ResumeConfirmation>,
     deadline_unix_ms: Option<u64>,
@@ -726,6 +733,9 @@ impl LaunchState {
         deadline_unix_ms: Option<u64>,
         resume_confirmation: Option<ResumeConfirmation>,
     ) -> Self {
+        let next_resume_completion_probe = resume_confirmation
+            .as_ref()
+            .map(|_| Instant::now() + RESUME_COMPLETION_PROBE_DELAY);
         Self {
             request_id: request_id.to_string(),
             seq: 1,
@@ -737,6 +747,7 @@ impl LaunchState {
             parser: EventParser::default(),
             last_opencode_event: None,
             completed_resume_at: None,
+            next_resume_completion_probe,
             session_id: None,
             resume_confirmation,
             deadline_unix_ms,
@@ -880,8 +891,9 @@ impl LaunchState {
 
     fn record_opencode_events(&mut self, events: &[OpencodeEventMetadata]) {
         if let Some(event) = events.last() {
-            if self.resume_confirmation.is_some() && opencode::is_successful_terminal_event(event) {
-                self.completed_resume_at = Some(Instant::now());
+            if self.resume_confirmation.is_some() {
+                self.completed_resume_at =
+                    opencode::is_successful_terminal_event(event).then(Instant::now);
             }
             self.last_opencode_event = Some(event.clone());
         }
@@ -890,10 +902,22 @@ impl LaunchState {
     fn completed_resume_grace_elapsed(&self) -> bool {
         self.completed_resume_at
             .is_some_and(|completed_at| completed_at.elapsed() >= COMPLETED_RESUME_GRACE)
-            && self
-                .last_opencode_event
-                .as_ref()
-                .is_some_and(opencode::is_successful_terminal_event)
+    }
+
+    fn probe_completed_resume(&mut self) {
+        let Some(next_probe) = self.next_resume_completion_probe else {
+            return;
+        };
+        if self.completed_resume_at.is_some() || Instant::now() < next_probe {
+            return;
+        }
+        self.next_resume_completion_probe = Some(Instant::now() + RESUME_COMPLETION_PROBE_INTERVAL);
+        let Some(confirmation) = self.resume_confirmation.as_ref() else {
+            return;
+        };
+        if exported_resume_is_complete(confirmation) {
+            self.completed_resume_at = Some(Instant::now());
+        }
     }
 
     fn marker<W: Write>(&mut self, name: String, writer: &mut W) -> Result<(), ProviderFailure> {
@@ -1037,6 +1061,56 @@ fn exported_submitted_message_id(confirmation: &ResumeConfirmation) -> Option<St
         .map(|message| message.info.id.as_str().to_string())
 }
 
+fn exported_resume_is_complete(confirmation: &ResumeConfirmation) -> bool {
+    let Some(native) = export_for_resume_confirmation(confirmation) else {
+        return false;
+    };
+    if !export_session_matches_confirmation(&native, confirmation) {
+        return false;
+    }
+    let Some(submitted_index) = native
+        .messages
+        .iter()
+        .rposition(|message| current_launch_user_message(message, confirmation))
+    else {
+        return false;
+    };
+    native.messages[submitted_index + 1..]
+        .iter()
+        .any(|message| completed_assistant_message(message, confirmation))
+}
+
+fn current_launch_user_message(
+    message: &OpencodeMessage,
+    confirmation: &ResumeConfirmation,
+) -> bool {
+    submitted_user_message_matches(message, confirmation)
+        && message
+            .info
+            .time
+            .as_ref()
+            .and_then(|time| time.created)
+            .is_some_and(|created| {
+                created
+                    >= confirmation
+                        .started_at_unix_ms
+                        .saturating_sub(RESUME_MESSAGE_CLOCK_TOLERANCE_MS)
+            })
+}
+
+fn completed_assistant_message(
+    message: &OpencodeMessage,
+    confirmation: &ResumeConfirmation,
+) -> bool {
+    message.info.role == "assistant"
+        && message.info.session_id.as_deref() == Some(confirmation.session_id.as_str())
+        && message
+            .info
+            .time
+            .as_ref()
+            .is_some_and(|time| time.completed.is_some())
+}
+
 fn export_for_resume_confirmation(confirmation: &ResumeConfirmation) -> Option<OpencodeExport> {
     let account = profile_for_settings_id(&confirmation.settings_id)?;
     opencode::export(&confirmation.session_id, account).ok()
@@ -1111,8 +1185,13 @@ fn message_has_exact_text_part(message: &OpencodeMessage, prompt: &str) -> bool 
     message.parts.iter().any(|part| {
         part.get("text")
             .and_then(Value::as_str)
-            .is_some_and(|text| text == prompt)
+            .is_some_and(|text| text_matches_prompt(text, prompt))
     })
+}
+
+fn text_matches_prompt(text: &str, prompt: &str) -> bool {
+    text == prompt
+        || serde_json::from_str::<String>(text).is_ok_and(|decoded| decoded.as_str() == prompt)
 }
 
 fn message_contains_delivery_nonce(message: &OpencodeMessage, delivery_nonce: &str) -> bool {

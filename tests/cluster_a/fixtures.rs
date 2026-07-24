@@ -578,6 +578,17 @@ exit 9\n"
         .to_string()
 }
 
+pub fn fake_wrapper_completed_export_then_hang_script() -> String {
+    "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]},{\"info\":{\"id\":\"msg-assistant\",\"role\":\"assistant\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":4102444800001,\"completed\":4102444800002}},\"parts\":[{\"type\":\"text\",\"text\":\"done\"}]}]}'\n\
+  exit 0\n\
+fi\n\
+/bin/sleep 5\n\
+exit 9\n"
+        .to_string()
+}
+
 pub fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
