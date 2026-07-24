@@ -1191,6 +1191,10 @@ fn message_has_exact_text_part(message: &OpencodeMessage, prompt: &str) -> bool 
 
 fn text_matches_prompt(text: &str, prompt: &str) -> bool {
     text == prompt
+        || text
+            .strip_prefix('"')
+            .and_then(|quoted| quoted.strip_suffix('"'))
+            .is_some_and(|unquoted| unquoted == prompt)
         || serde_json::from_str::<String>(text).is_ok_and(|decoded| decoded.as_str() == prompt)
 }
 
@@ -1729,4 +1733,17 @@ const SIGKILL: i32 = 9;
 extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_matches_prompt;
+
+    #[test]
+    fn quoted_native_text_matches_prompt_with_literal_newline() {
+        let prompt = "Print exactly LIVE_ROTATION_OK and nothing else.\n";
+        let native = format!("\"{prompt}\"");
+
+        assert!(text_matches_prompt(&native, prompt));
+    }
 }
