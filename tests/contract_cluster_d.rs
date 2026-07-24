@@ -320,6 +320,7 @@ fn contract_setup_brain_unsupported() {
 #[test]
 fn contract_rotation_assess_materialize() {
     let host = HostRoots::new("agent-runner-opencode-rotation");
+    let opencode = RotationOpencodeFixture::new();
     let allowed = success_result(
         invoke_validated_with_host(
             "rotation.assess",
@@ -346,17 +347,42 @@ fn contract_rotation_assess_materialize() {
 
     let host_owned = RotationHostSentinels::new(host.data_root());
 
+    let path = opencode.path_env();
     let materialized = success_result(
-        invoke_validated_with_host(
+        invoke_validated_with_host_and_env(
             "rotation.materialize",
             rotation_materialize_params(),
             host.overrides(),
             "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            &[("PATH", path.as_str())],
         ),
         "rotation.schema.json#/$defs/RotationMaterializeResponse",
         "rotation.schema.json#/$defs/RotationMaterializeResult",
     );
     assert_rotation_materialized(&materialized);
+    let retried = success_result(
+        invoke_validated_with_host_and_env(
+            "rotation.materialize",
+            rotation_materialize_params(),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            &[("PATH", path.as_str())],
+        ),
+        "rotation.schema.json#/$defs/RotationMaterializeResponse",
+        "rotation.schema.json#/$defs/RotationMaterializeResult",
+    );
+    assert_eq!(retried, materialized, "materialization must be retry-safe");
+    let imported = opencode.imported_session();
+    assert_eq!(opencode.imported_cwd(), host.working_directory());
+    assert_eq!(opencode.import_count(), 2);
+    assert_eq!(imported["info"]["id"], ROTATION_SOURCE_SESSION);
+    assert_eq!(imported["info"]["projectID"], "project_rotation_native");
+    assert_eq!(
+        imported["messages"][0]["info"]["parentID"],
+        "msg_rotation_parent"
+    );
+    assert_eq!(imported["messages"][0]["mode"], "build");
+    assert_eq!(imported["nativeRoot"]["preserved"], true);
     host_owned.assert_unchanged();
 }
 

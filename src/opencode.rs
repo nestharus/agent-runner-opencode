@@ -13,6 +13,7 @@ use crate::shell;
 use crate::shell::ShellOutput;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Default)]
 pub struct EventParser {
@@ -48,11 +49,18 @@ pub struct OpencodeEventErrorData {
     pub message: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct OpencodeExport {
     pub info: OpencodeExportInfo,
-    #[serde(default)]
     pub messages: Vec<OpencodeMessage>,
+    native_json: Value,
+}
+
+#[derive(Deserialize)]
+struct ParsedOpencodeExport {
+    info: OpencodeExportInfo,
+    #[serde(default)]
+    messages: Vec<OpencodeMessage>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -83,6 +91,12 @@ pub struct OpencodeMessageTime {
     pub completed: Option<u64>,
 }
 
+impl OpencodeExport {
+    pub fn native_json(&self) -> &Value {
+        &self.native_json
+    }
+}
+
 #[derive(Debug)]
 pub enum OpencodeExportError {
     Spawn(String),
@@ -95,6 +109,13 @@ pub enum OpencodeSessionListError {
     Spawn(String),
     Failed { status: Option<i32>, stderr: String },
     InvalidJson(String),
+}
+
+#[derive(Debug)]
+pub enum OpencodeImportError {
+    Spawn(String),
+    Failed { status: Option<i32>, stderr: String },
+    MissingSessionId(String),
 }
 
 impl EventParser {
@@ -152,6 +173,21 @@ pub fn session_list(
     parse_session_list_stdout(&output.stdout)
 }
 
+pub fn import_session(
+    path: &Path,
+    account: &AccountProfile,
+    working_directory: &Path,
+) -> Result<String, OpencodeImportError> {
+    let output = shell::command(account.opencode_wrapper)
+        .current_dir(working_directory)
+        .arg("import")
+        .arg(path)
+        .output()
+        .map_err(import_spawn_error)?;
+    validate_import_status(&output)?;
+    parse_import_stdout(&output.stdout)
+}
+
 pub fn refresh_auth(account: &AccountProfile) -> std::io::Result<ShellOutput> {
     crate::shell::run(&refresh_auth_argv(account))
 }
@@ -172,6 +208,16 @@ pub fn parse_export_stdout(stdout: &[u8]) -> Result<OpencodeExport, OpencodeExpo
 pub fn parse_session_list_stdout(stdout: &[u8]) -> Result<Vec<Value>, OpencodeSessionListError> {
     let start = session_list_json_start(stdout)?;
     parse_session_list_json(&stdout[start..])
+}
+
+pub fn parse_import_stdout(stdout: &[u8]) -> Result<String, OpencodeImportError> {
+    let text = String::from_utf8_lossy(stdout);
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("Imported session: "))
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| OpencodeImportError::MissingSessionId(text.into_owned()))
 }
 
 fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
@@ -221,6 +267,10 @@ fn export_spawn_error(err: std::io::Error) -> OpencodeExportError {
     OpencodeExportError::Spawn(err.to_string())
 }
 
+fn import_spawn_error(err: std::io::Error) -> OpencodeImportError {
+    OpencodeImportError::Spawn(err.to_string())
+}
+
 fn session_list_spawn_error(err: std::io::Error) -> OpencodeSessionListError {
     OpencodeSessionListError::Spawn(err.to_string())
 }
@@ -239,6 +289,16 @@ fn validate_session_list_status(
         return Ok(());
     }
     Err(session_list_failed_error(output))
+}
+
+fn validate_import_status(output: &std::process::Output) -> Result<(), OpencodeImportError> {
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(OpencodeImportError::Failed {
+        status: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
 }
 
 fn export_failed_error(output: &std::process::Output) -> OpencodeExportError {
@@ -270,7 +330,14 @@ fn session_list_json_start(stdout: &[u8]) -> Result<usize, OpencodeSessionListEr
 }
 
 fn parse_export_json(bytes: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {
-    serde_json::from_slice(bytes).map_err(invalid_export_json_error)
+    let native_json: Value = serde_json::from_slice(bytes).map_err(invalid_export_json_error)?;
+    let parsed: ParsedOpencodeExport =
+        serde_json::from_value(native_json.clone()).map_err(invalid_export_json_error)?;
+    Ok(OpencodeExport {
+        info: parsed.info,
+        messages: parsed.messages,
+        native_json,
+    })
 }
 
 fn parse_session_list_json(bytes: &[u8]) -> Result<Vec<Value>, OpencodeSessionListError> {

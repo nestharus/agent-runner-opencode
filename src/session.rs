@@ -481,15 +481,30 @@ fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, Pro
 }
 
 fn provider_turn_timestamp(message: &OpencodeMessage) -> String {
+    message_time_millis(message)
+        .and_then(|milliseconds| i64::try_from(milliseconds).ok())
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+pub(crate) fn rotation_boundary_timestamp(native: &OpencodeExport) -> Option<String> {
+    native
+        .messages
+        .iter()
+        .map(|message| message_time_millis(message).unwrap_or_default())
+        .max()
+        .and_then(|milliseconds| i64::try_from(milliseconds).ok())
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
+fn message_time_millis(message: &OpencodeMessage) -> Option<u64> {
     message
         .info
         .time
         .as_ref()
         .and_then(|time| time.created.or(time.completed))
-        .and_then(|milliseconds| i64::try_from(milliseconds).ok())
-        .and_then(DateTime::<Utc>::from_timestamp_millis)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-        .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn canonical_records(

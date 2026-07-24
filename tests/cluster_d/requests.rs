@@ -185,8 +185,7 @@ pub fn rotation_materialize_params() -> Value {
         "chain_id": "chain-contract-d",
         "source_provider": "opencode1",
         "target_provider": "opencode2",
-        "source_session_id": "ses_source_contract_d",
-        "target_session_id": "ses_target_contract_d",
+        "source_session_id": ROTATION_SOURCE_SESSION,
         "transition_reason": "quota_threshold",
         "requirements": rotation_requirements(true),
         "session_export": {
