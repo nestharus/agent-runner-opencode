@@ -4,6 +4,7 @@ mod cluster_a;
 mod support;
 
 use cluster_a::*;
+use std::time::{Duration, Instant};
 use support::{invoke, invoke_with_env, invoke_with_host_and_env, json_stdout};
 
 #[test]
@@ -174,6 +175,30 @@ fn contract_launch_resume_emits_submitted_user_turn_marker_even_when_export_lack
     assert_output_success(&output, "launch resume unconfirmed payload");
     let events = launch_events_from_output(&output, "launch resume unconfirmed payload stdout");
     assert_submitted_user_turn_marker_without_message_id(&events);
+}
+
+#[test]
+fn contract_launch_completed_resume_does_not_wait_for_lingering_native_process() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_completed_resume_then_hang_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let params = resume_launch_params_with_arg_payload_env(path.as_str(), log_path);
+    let started = Instant::now();
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch completed lingering resume");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "provider should stop a completed resume before the fake five-second hang"
+    );
+    let events = launch_events_from_output(&output, "completed lingering resume stdout");
+    let final_event = final_launch_event(&events);
+    assert_eq!(
+        final_event["status"],
+        serde_json::json!({"kind": "exited", "code": 0})
+    );
 }
 
 #[test]

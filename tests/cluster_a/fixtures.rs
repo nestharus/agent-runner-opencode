@@ -564,6 +564,20 @@ printf '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timesta
 exit 0\n"
 }
 
+pub fn fake_wrapper_completed_resume_then_hang_script() -> String {
+    "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]}]}'\n\
+  exit 0\n\
+fi\n\
+printf '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000001,\"part\":{\"type\":\"step-start\",\"sessionID\":\"ses_resume_contract\"}}\\n'\n\
+printf '{\"type\":\"text\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000002,\"part\":{\"type\":\"text\",\"sessionID\":\"ses_resume_contract\",\"text\":\"done\"}}\\n'\n\
+printf '{\"type\":\"step_finish\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000003,\"part\":{\"type\":\"step-finish\",\"sessionID\":\"ses_resume_contract\",\"reason\":\"stop\"}}\\n'\n\
+/bin/sleep 5\n\
+exit 9\n"
+        .to_string()
+}
+
 pub fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
