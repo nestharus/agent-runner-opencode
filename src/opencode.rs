@@ -142,6 +142,11 @@ pub fn is_structured_error_event(event: &OpencodeEventMetadata) -> bool {
     event.event_type.as_str() == "error" && event.error.is_some()
 }
 
+pub fn is_successful_terminal_event(event: &OpencodeEventMetadata) -> bool {
+    event.event_type == "step_finish"
+        && event.part.get("reason").and_then(Value::as_str) == Some("stop")
+}
+
 pub fn export(
     session_id: &str,
     account: &AccountProfile,

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);
+const COMPLETED_RESUME_GRACE: Duration = Duration::from_millis(500);
 const BASE_LAUNCH_ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME"];
 // Step-6a host-linkage contract: these runner bindings must survive env_clear.
 const HOST_LINKAGE_ENV_KEYS: &[&str] = &[
@@ -638,6 +639,7 @@ fn run_supervision_loop<W: Write>(
     while !state.is_complete() {
         capture_child_exit(child, state)?;
         enforce_deadline(child, state)?;
+        complete_terminal_resume(child, state);
         match receiver.recv_timeout(state.wait_duration()) {
             Ok(message) => state.handle_drain_message(message, writer)?,
             Err(mpsc::RecvTimeoutError::Timeout) => state.heartbeat(writer)?,
@@ -645,6 +647,15 @@ fn run_supervision_loop<W: Write>(
         }
     }
     Ok(())
+}
+
+fn complete_terminal_resume(child: &mut Child, state: &mut LaunchState) {
+    if state.final_status.is_some() || !state.completed_resume_grace_elapsed() {
+        return;
+    }
+    terminate_child(child);
+    let _ = child.wait();
+    state.final_status = Some(ProcessStatus::Exited { code: 0 });
 }
 
 fn enforce_deadline(child: &mut Child, state: &mut LaunchState) -> Result<(), ProviderFailure> {
@@ -702,6 +713,7 @@ struct LaunchState {
     stderr: Vec<u8>,
     parser: EventParser,
     last_opencode_event: Option<OpencodeEventMetadata>,
+    completed_resume_at: Option<Instant>,
     session_id: Option<String>,
     resume_confirmation: Option<ResumeConfirmation>,
     deadline_unix_ms: Option<u64>,
@@ -724,6 +736,7 @@ impl LaunchState {
             stderr: Vec::new(),
             parser: EventParser::default(),
             last_opencode_event: None,
+            completed_resume_at: None,
             session_id: None,
             resume_confirmation,
             deadline_unix_ms,
@@ -867,8 +880,20 @@ impl LaunchState {
 
     fn record_opencode_events(&mut self, events: &[OpencodeEventMetadata]) {
         if let Some(event) = events.last() {
+            if self.resume_confirmation.is_some() && opencode::is_successful_terminal_event(event) {
+                self.completed_resume_at = Some(Instant::now());
+            }
             self.last_opencode_event = Some(event.clone());
         }
+    }
+
+    fn completed_resume_grace_elapsed(&self) -> bool {
+        self.completed_resume_at
+            .is_some_and(|completed_at| completed_at.elapsed() >= COMPLETED_RESUME_GRACE)
+            && self
+                .last_opencode_event
+                .as_ref()
+                .is_some_and(opencode::is_successful_terminal_event)
     }
 
     fn marker<W: Write>(&mut self, name: String, writer: &mut W) -> Result<(), ProviderFailure> {
