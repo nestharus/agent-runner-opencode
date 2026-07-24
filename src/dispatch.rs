@@ -100,7 +100,7 @@ pub fn handle_decoded_invocation(
         )),
         "rotation.materialize" => Ok(success_response(
             &request.request_id,
-            rotation::materialize_params(request.params, &request.request_id)?,
+            rotation::materialize_params(&request.host, request.params, &request.request_id)?,
         )),
         "migration.plan" => Ok(success_response(
             &request.request_id,

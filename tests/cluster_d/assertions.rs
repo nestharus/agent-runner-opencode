@@ -313,8 +313,27 @@ pub fn assert_rotation_requirements(result: &Value) {
 }
 
 pub fn assert_rotation_materialized(materialized: &Value) {
-    assert!(materialized["changed"].as_bool().is_some());
-    assert!(materialized["artifacts"].as_array().is_some());
+    assert_eq!(materialized["changed"], true);
+    assert_eq!(
+        materialized["target_provider_session_id"],
+        ROTATION_SOURCE_SESSION
+    );
+    let artifacts = materialized["artifacts"].as_array().expect("artifacts");
+    assert_eq!(artifacts.len(), 1);
+    let artifact_path = Path::new(artifacts[0]["path"].as_str().expect("artifact path"));
+    let artifact_bytes = fs::read(artifact_path).expect("materialized native export artifact");
+    let artifact_digest = sha256_hex(&artifact_bytes);
+    assert_eq!(
+        artifact_path.file_stem().and_then(|stem| stem.to_str()),
+        Some(artifact_digest.as_str()),
+        "rotation artifacts should be content-addressed"
+    );
+    assert_private_rotation_artifact(artifact_path);
+    assert_eq!(
+        artifacts[0]["sha256"],
+        sha256_hex(&artifact_bytes),
+        "artifact digest should cover the imported native export"
+    );
     assert_valid(
         &materialized["host_state_plan"],
         "rotation.schema.json#/$defs/RotationHostStatePlan",
@@ -327,7 +346,38 @@ pub fn assert_rotation_materialized(materialized: &Value) {
         materialized["host_state_plan"]["chain_id"],
         "chain-contract-d"
     );
+    let segments = materialized["host_state_plan"]["segments"]
+        .as_array()
+        .expect("rotation segments");
+    assert_eq!(segments[0]["ended_at"], "2026-07-01T00:00:00.000Z");
+    assert_eq!(segments[1]["started_at"], segments[0]["ended_at"]);
 }
+
+#[cfg(unix)]
+fn assert_private_rotation_artifact(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(path)
+            .expect("artifact metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "native transcript artifacts must be owner-readable only"
+    );
+    assert_eq!(
+        fs::metadata(path.parent().expect("artifact parent"))
+            .expect("artifact parent metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "native transcript artifact directories must be owner-accessible only"
+    );
+}
+
+#[cfg(not(unix))]
+fn assert_private_rotation_artifact(_path: &Path) {}
 
 pub fn assert_migration_plan_result(plan: &Value) {
     assert!(

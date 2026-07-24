@@ -13,6 +13,8 @@ pub const OPENCODE_VERSION_SENTINEL: &str = "opencode 0.0.0-contract";
 
 pub const CHATGPT_USAGE_READY_SENTINEL: &str = "contract_chatgpt_usage_ready";
 
+pub const ROTATION_SOURCE_SESSION: &str = "ses_source_contract_d";
+
 pub const PROVIDERS_TOML: &str = r#"
 [opencode]
 command = "opencode1"
@@ -122,10 +124,133 @@ pub fn write_live_route(path: &Path, contents: &str) {
     fs::write(path, contents).expect("write live route sentinel");
 }
 
+pub struct RotationOpencodeFixture {
+    root: PathBuf,
+    import_record: PathBuf,
+    import_cwd_record: PathBuf,
+    import_count_record: PathBuf,
+}
+
+impl RotationOpencodeFixture {
+    pub fn new() -> Self {
+        let root = unique_temp_dir("agent-runner-opencode-rotation-native");
+        fs::create_dir_all(&root).expect("create rotation native fixture");
+        let import_record = root.join("imported-session.json");
+        let import_cwd_record = root.join("imported-session.cwd");
+        let import_count_record = root.join("imported-session.count");
+        write_executable(&root.join("opencode1"), &rotation_source_script());
+        write_executable(
+            &root.join("opencode2"),
+            &rotation_target_script(&import_record, &import_cwd_record, &import_count_record),
+        );
+        Self {
+            root,
+            import_record,
+            import_cwd_record,
+            import_count_record,
+        }
+    }
+
+    pub fn path_env(&self) -> String {
+        prepend_path(&self.root)
+    }
+
+    pub fn imported_session(&self) -> Value {
+        serde_json::from_slice(
+            &fs::read(&self.import_record).expect("target wrapper should record imported session"),
+        )
+        .expect("recorded imported session JSON")
+    }
+
+    pub fn imported_cwd(&self) -> PathBuf {
+        PathBuf::from(
+            fs::read_to_string(&self.import_cwd_record)
+                .expect("target wrapper should record its working directory"),
+        )
+    }
+
+    pub fn import_count(&self) -> u64 {
+        fs::read_to_string(&self.import_count_record)
+            .expect("target wrapper should record import count")
+            .parse()
+            .expect("recorded import count")
+    }
+}
+
+impl Drop for RotationOpencodeFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn rotation_source_script() -> String {
+    r#"#!/usr/bin/python3
+import json
+import sys
+
+if len(sys.argv) != 3 or sys.argv[1] != "export":
+    raise SystemExit(64)
+session_id = sys.argv[2]
+native = {
+    "info": {
+        "id": session_id,
+        "title": "Rotation source",
+        "projectID": "project_rotation_native",
+        "directory": "/workspace/rotation-native"
+    },
+    "messages": [{
+        "info": {
+            "id": "msg_rotation_source",
+            "role": "user",
+            "sessionID": session_id,
+            "parentID": "msg_rotation_parent",
+            "time": {"created": 1782864000000, "updated": 1782864005000}
+        },
+        "parts": [{"type": "text", "text": "rotation source turn", "synthetic": False}],
+        "mode": "build"
+    }],
+    "nativeRoot": {"preserved": True}
+}
+print("Exporting session: " + session_id)
+print(json.dumps(native))
+"#
+    .to_string()
+}
+
+fn rotation_target_script(
+    import_record: &Path,
+    import_cwd_record: &Path,
+    import_count_record: &Path,
+) -> String {
+    format!(
+        r#"#!/usr/bin/python3
+import json
+import pathlib
+import sys
+
+if len(sys.argv) != 3 or sys.argv[1] != "import":
+    raise SystemExit(64)
+native = json.loads(pathlib.Path(sys.argv[2]).read_text())
+pathlib.Path({record}).write_text(json.dumps(native, separators=(",", ":")))
+pathlib.Path({cwd_record}).write_text(str(pathlib.Path.cwd()))
+count_path = pathlib.Path({count_record})
+count = int(count_path.read_text()) if count_path.exists() else 0
+count_path.write_text(str(count + 1))
+print("Imported session: " + native["info"]["id"])
+"#,
+        record = serde_json::to_string(&path_string(import_record)).expect("record path JSON"),
+        cwd_record =
+            serde_json::to_string(&path_string(import_cwd_record)).expect("cwd record path JSON"),
+        count_record = serde_json::to_string(&path_string(import_count_record))
+            .expect("count record path JSON")
+    )
+}
+
 pub struct HostRoots {
     pub root: PathBuf,
     pub config_root: PathBuf,
     pub data_root: PathBuf,
+    pub working_directory: PathBuf,
 }
 
 impl HostRoots {
@@ -138,7 +263,8 @@ impl HostRoots {
     pub fn overrides(&self) -> Value {
         json!({
             "config_root": self.config_root.to_string_lossy(),
-            "data_root": self.data_root.to_string_lossy()
+            "data_root": self.data_root.to_string_lossy(),
+            "working_directory": self.working_directory.to_string_lossy()
         })
     }
 
@@ -149,22 +275,29 @@ impl HostRoots {
     pub fn data_root(&self) -> &Path {
         &self.data_root
     }
+
+    pub fn working_directory(&self) -> &Path {
+        &self.working_directory
+    }
 }
 
 fn host_roots(prefix: &str) -> HostRoots {
     let root = unique_temp_dir(prefix);
     let config_root = root.join("config");
     let data_root = root.join("data");
+    let working_directory = root.join("workspace");
     HostRoots {
         root,
         config_root,
         data_root,
+        working_directory,
     }
 }
 
 fn create_host_root_dirs(roots: &HostRoots) {
     create_host_config_root(roots.config_root());
     create_host_data_root(roots.data_root());
+    fs::create_dir_all(roots.working_directory()).expect("create temp working_directory");
 }
 
 fn create_host_config_root(config_root: &Path) {
