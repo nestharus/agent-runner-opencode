@@ -13,7 +13,9 @@ use crate::shell;
 use crate::shell::ShellOutput;
 use serde::Deserialize;
 use serde_json::Value;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::process::Stdio;
 
 #[derive(Default)]
 pub struct EventParser {
@@ -151,13 +153,23 @@ pub fn export(
     session_id: &str,
     account: &AccountProfile,
 ) -> Result<OpencodeExport, OpencodeExportError> {
+    let mut stdout = tempfile::tempfile().map_err(export_capture_error)?;
+    let stdout_writer = stdout.try_clone().map_err(export_capture_error)?;
     let output = shell::command(account.opencode_wrapper)
         .arg("export")
         .arg(session_id)
+        .stdout(Stdio::from(stdout_writer))
         .output()
         .map_err(export_spawn_error)?;
     validate_export_status(&output)?;
-    parse_export_stdout(&output.stdout)
+    stdout
+        .seek(SeekFrom::Start(0))
+        .map_err(export_capture_error)?;
+    let mut bytes = Vec::new();
+    stdout
+        .read_to_end(&mut bytes)
+        .map_err(export_capture_error)?;
+    parse_export_stdout(&bytes)
 }
 
 pub fn session_list(
@@ -270,6 +282,10 @@ fn pinned_native_events(events: Vec<OpencodeEventMetadata>) -> Vec<OpencodeEvent
 
 fn export_spawn_error(err: std::io::Error) -> OpencodeExportError {
     OpencodeExportError::Spawn(err.to_string())
+}
+
+fn export_capture_error(err: std::io::Error) -> OpencodeExportError {
+    OpencodeExportError::Spawn(format!("failed to capture opencode export: {err}"))
 }
 
 fn import_spawn_error(err: std::io::Error) -> OpencodeImportError {

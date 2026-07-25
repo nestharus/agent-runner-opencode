@@ -5,6 +5,7 @@ mod cluster_b;
 mod support;
 
 use cluster_b::*;
+use serde_json::json;
 use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env};
 
 #[test]
@@ -27,6 +28,44 @@ fn contract_session_read_turns() {
     assert_stable_turn_ids(&second, &first_ids);
 
     assert_missing_read_turns_error(&path);
+}
+
+#[test]
+fn contract_session_read_turns_uses_regular_file_for_export_stdout() {
+    let session_id = fixture_session_id();
+    let fake_opencode = FakeOpencodeExport::pipe_truncating(session_id);
+    let path = prepend_path(fake_opencode.dir());
+
+    let result = read_turns_result(session_params(session_id), &path);
+
+    assert_first_read_turns_result(&result);
+}
+
+#[test]
+fn contract_session_read_turns_projects_bounded_user_observation() {
+    let session_id = fixture_session_id();
+    let fake_opencode = FakeOpencodeExport::new(session_id);
+    let path = prepend_path(fake_opencode.dir());
+    let result = read_turns_result(
+        json!({
+            "settings_id": "opencode",
+            "session_id": session_id,
+            "turn_projection": "user_observation",
+            "body_tail_limit": 4
+        }),
+        &path,
+    );
+
+    assert_eq!(result["turn_count"], 1);
+    let turns = result["turns"].as_array().expect("projected turns array");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["role"], "user");
+    assert_eq!(turns[0]["session_id"], session_id);
+    assert!(turns[0].get("native").is_none());
+    assert_eq!(
+        turns[0]["body"][0]["text"],
+        "\"reply with the single word: ok\""
+    );
 }
 
 #[test]

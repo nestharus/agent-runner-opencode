@@ -32,11 +32,15 @@ use std::path::Path;
 const CANONICAL_FORMAT: &str = "oulipoly.canonical_transcript/v1";
 const NATIVE_FORMAT_ID: &str = "opencode.export/native-json";
 const SOURCE_KIND: &str = "opencode.export";
+const USER_OBSERVATION_PROJECTION: &str = "user_observation";
+const MAX_OBSERVATION_BODY_TAIL: usize = 16;
 
 #[derive(Deserialize)]
 struct SessionParams {
     settings_id: String,
     session_id: Option<String>,
+    turn_projection: Option<String>,
+    body_tail_limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -103,9 +107,15 @@ pub fn locate_transcript_params(params: Value, request_id: &str) -> Result<Value
 
 pub fn read_turns_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
     let params = parse_session_params(params, request_id)?;
+    validate_turn_projection(&params, request_id)?;
     let session_id = required_session_id(&params, request_id)?;
     let native = export_native(&params.settings_id, &session_id, request_id)?;
-    let turns = native_turns(&native, &session_id)?;
+    let turns = match params.turn_projection.as_deref() {
+        Some(USER_OBSERVATION_PROJECTION) => {
+            user_observation_turns(&native, &session_id, params.body_tail_limit.unwrap_or(4))?
+        }
+        _ => native_turns(&native, &session_id)?,
+    };
     Ok(read_turns_result(turns))
 }
 
@@ -185,6 +195,31 @@ fn required_session_id(
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .ok_or_else(|| missing_session_id_failure(request_id))
+}
+
+fn validate_turn_projection(
+    params: &SessionParams,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    match params.turn_projection.as_deref() {
+        None => Ok(()),
+        Some(USER_OBSERVATION_PROJECTION)
+            if matches!(
+                params.body_tail_limit,
+                None | Some(1..=MAX_OBSERVATION_BODY_TAIL)
+            ) =>
+        {
+            Ok(())
+        }
+        Some(USER_OBSERVATION_PROJECTION) => Err(invalid_session_params_message_failure(
+            request_id,
+            format!("body_tail_limit must be between 1 and {MAX_OBSERVATION_BODY_TAIL}"),
+        )),
+        Some(projection) => Err(invalid_session_params_message_failure(
+            request_id,
+            format!("unsupported turn_projection: {projection}"),
+        )),
+    }
 }
 
 fn export_native(
@@ -463,6 +498,38 @@ fn native_turns(native: &OpencodeExport, session_id: &str) -> Result<Vec<Value>,
         .collect()
 }
 
+fn user_observation_turns(
+    native: &OpencodeExport,
+    session_id: &str,
+    body_tail_limit: usize,
+) -> Result<Vec<Value>, ProviderFailure> {
+    let messages = native
+        .messages
+        .iter()
+        .filter(|message| message.info.role == "user")
+        .collect::<Vec<_>>();
+    let body_start = messages.len().saturating_sub(body_tail_limit);
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| user_observation_turn(message, session_id, index >= body_start))
+        .collect()
+}
+
+fn user_observation_turn(
+    message: &OpencodeMessage,
+    session_id: &str,
+    include_body: bool,
+) -> Result<Value, ProviderFailure> {
+    Ok(json!({
+        "session_id": session_id,
+        "turn_id": stable_turn_id(message, session_id),
+        "role": message.info.role,
+        "timestamp": provider_turn_timestamp(message),
+        "body": include_body.then(|| text_parts(message)),
+    }))
+}
+
 fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, ProviderFailure> {
     Ok(json!({
         "session_id": session_id,
@@ -718,6 +785,13 @@ fn session_replace_unsupported_failure(request_id: &str) -> ProviderFailure {
 }
 
 fn invalid_session_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
+    invalid_session_params_message_failure(request_id, err)
+}
+
+fn invalid_session_params_message_failure(
+    request_id: &str,
+    err: impl std::fmt::Display,
+) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
         "invalid_session_params",
