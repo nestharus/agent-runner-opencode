@@ -521,13 +521,16 @@ fn user_observation_turn(
     session_id: &str,
     include_body: bool,
 ) -> Result<Value, ProviderFailure> {
-    Ok(json!({
+    let mut turn = json!({
         "session_id": session_id,
         "turn_id": stable_turn_id(message, session_id),
         "role": message.info.role,
         "timestamp": provider_turn_timestamp(message),
-        "body": include_body.then(|| text_parts(message)),
-    }))
+    });
+    if include_body {
+        turn["body"] = Value::Array(text_parts(message));
+    }
+    Ok(turn)
 }
 
 fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, ProviderFailure> {
@@ -986,4 +989,34 @@ fn pinned_target(params: &SessionCaptureParams) -> Option<String> {
 
 fn start_bound_provider_session_id(params: &SessionCaptureParams) -> Option<String> {
     non_empty_string(params.start_bound_provider_session_id.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_observation_turn_omits_unselected_body() {
+        let message: OpencodeMessage = serde_json::from_value(json!({
+            "info": {
+                "id": "message-1",
+                "role": "user",
+                "sessionID": "session-1",
+                "time": { "created": 1 }
+            },
+            "parts": [{ "type": "text", "text": "body" }]
+        }))
+        .expect("user message");
+
+        let without_body =
+            user_observation_turn(&message, "session-1", false).expect("observation without body");
+        let with_body =
+            user_observation_turn(&message, "session-1", true).expect("observation with body");
+
+        assert!(!without_body
+            .as_object()
+            .expect("observation object")
+            .contains_key("body"));
+        assert_eq!(with_body["body"][0]["text"], "body");
+    }
 }
