@@ -445,6 +445,12 @@ impl FakeOpencodeExport {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+
+    pub fn pipe_truncating(session_id: &str) -> Self {
+        let paths = fake_opencode_export_paths();
+        write_pipe_truncating_opencode_export(&paths, session_id);
+        fake_opencode_export_fixture(paths)
+    }
 }
 
 pub struct FakeOpencodeExportPaths {
@@ -467,6 +473,16 @@ pub fn write_fake_opencode_export(paths: &FakeOpencodeExportPaths, session_id: &
     fs::create_dir_all(&paths.dir).expect("create fake opencode dir");
     fs::write(&paths.wrapper_path, fake_opencode_export_script(session_id))
         .expect("write fake opencode1 export wrapper");
+    make_fake_opencode_export_executable(&paths.wrapper_path);
+}
+
+pub fn write_pipe_truncating_opencode_export(paths: &FakeOpencodeExportPaths, session_id: &str) {
+    fs::create_dir_all(&paths.dir).expect("create pipe-sensitive fake opencode dir");
+    fs::write(
+        &paths.wrapper_path,
+        pipe_truncating_opencode_export_script(session_id),
+    )
+    .expect("write pipe-sensitive fake opencode1 export wrapper");
     make_fake_opencode_export_executable(&paths.wrapper_path);
 }
 
@@ -653,6 +669,24 @@ if [ \"$1\" = \"export\" ]; then\n\
   exit 2\n\
 fi\n\
 printf 'unsupported fake opencode invocation\\n' >&2\n\
+exit 64\n",
+        shell_single_quote(session_id),
+        shell_single_quote(OPENCODE_EXPORT_RAW)
+    )
+}
+
+pub fn pipe_truncating_opencode_export_script(session_id: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ] && [ \"${{2:-}}\" = {} ]; then\n\
+  if [ -p /dev/stdout ]; then\n\
+    printf '%s' '{{\"info\":{{\"id\":\"truncated\"}}'\n\
+    exit 0\n\
+  fi\n\
+  printf '%s' {}\n\
+  exit 0\n\
+fi\n\
+printf 'unsupported fake opencode invocation\n' >&2\n\
 exit 64\n",
         shell_single_quote(session_id),
         shell_single_quote(OPENCODE_EXPORT_RAW)
