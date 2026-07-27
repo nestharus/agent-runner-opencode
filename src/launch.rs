@@ -44,6 +44,7 @@ const POLICY_MANAGED_FLAGS_WITH_VALUE: &[&str] = &["--format", "-m", "--variant"
 const POLICY_MANAGED_FLAGS_WITHOUT_VALUE: &[&str] = &["--dangerously-skip-permissions"];
 const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
 const SUBMITTED_USER_TURN_SOURCE: &str = "opencode.export";
+const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_NONCE_SUFFIX: char = ']';
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
@@ -857,7 +858,15 @@ impl LaunchState {
         session_id: &str,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
-        self.marker(session_marker_name(session_id), writer)
+        self.marker(session_marker_name(session_id), writer)?;
+        self.marker_with_value(
+            PROVIDER_SESSION_MARKER.to_string(),
+            json!({
+                "provider_session_id": session_id,
+                "source": "opencode.run.format_json",
+            }),
+            writer,
+        )
     }
 
     fn capture_session_from_stdout<W: Write>(
@@ -1045,10 +1054,10 @@ impl LaunchState {
 }
 
 fn submitted_user_turn_marker_value(confirmation: &ResumeConfirmation) -> Option<Value> {
-    let message_id = exported_submitted_message_id(confirmation);
+    let message_id = exported_submitted_message_id(confirmation)?;
     Some(submitted_user_turn_marker(
         confirmation,
-        message_id.as_deref(),
+        Some(message_id.as_str()),
     ))
 }
 

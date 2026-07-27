@@ -139,6 +139,7 @@ pub fn assert_contract_launch_events(events: &[Value], fixture_session_id: &str)
     assert_monotonic_launch_events(events);
     assert_launch_stream_bytes(events);
     assert_session_marker(events, fixture_session_id);
+    assert_provider_session_marker(events, fixture_session_id);
     assert_exit_event(
         events,
         json!({ "kind": "exited", "code": 7 }),
@@ -186,6 +187,17 @@ pub fn assert_session_marker_truthy(session_marker: &Value) {
     assert_eq!(
         session_marker["value"], true,
         "session marker should use a truthy marker value"
+    );
+}
+
+pub fn assert_provider_session_marker(events: &[Value], fixture_session_id: &str) {
+    let marker = events
+        .iter()
+        .find(|event| event["kind"] == "marker" && event["name"] == "oulipoly.provider_session")
+        .unwrap_or_else(|| panic!("missing fixed provider session marker; events={events:?}"));
+    assert_eq!(
+        marker["value"]["provider_session_id"].as_str(),
+        Some(fixture_session_id)
     );
 }
 
@@ -545,13 +557,11 @@ pub fn assert_submitted_user_turn_marker(events: &[Value]) {
     assert_submitted_user_turn_marker_value(marker);
 }
 
-pub fn assert_submitted_user_turn_marker_without_message_id(events: &[Value]) {
-    let marker = expected_submitted_user_turn_marker(events);
-    assert_submitted_user_turn_provider_session(marker);
-    assert_submitted_user_turn_prompt_hash(marker);
-    assert_submitted_user_turn_source(marker);
-    assert_submitted_user_turn_no_message_id(marker);
-    assert_submitted_user_turn_delivery_nonce(marker);
+pub fn assert_no_submitted_user_turn_marker(events: &[Value]) {
+    assert!(
+        submitted_user_turn_marker(events).is_none(),
+        "unconfirmed resume must not emit a submitted user turn marker; events={events:?}"
+    );
 }
 
 pub fn assert_submitted_user_turn_marker_value(marker: &Value) {
@@ -583,13 +593,6 @@ pub fn assert_submitted_user_turn_source(marker: &Value) {
 
 pub fn assert_submitted_user_turn_message_id(marker: &Value) {
     assert_eq!(marker["value"]["message_id"].as_str(), Some("msg-user"));
-}
-
-pub fn assert_submitted_user_turn_no_message_id(marker: &Value) {
-    assert!(
-        marker["value"].get("message_id").is_none(),
-        "submitted user turn marker must omit message_id when export lacks payload; marker={marker:?}"
-    );
 }
 
 pub fn assert_submitted_user_turn_delivery_nonce(marker: &Value) {
