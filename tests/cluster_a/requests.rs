@@ -15,6 +15,43 @@ pub fn launch_params(effort: &str) -> Value {
     })
 }
 
+pub fn launch_params_with_prompt(prompt: &str) -> Value {
+    let mut params = launch_params("low");
+    *params["argv"]
+        .as_array_mut()
+        .expect("launch argv")
+        .last_mut()
+        .expect("prompt arg") = json!(prompt);
+    params["model"]["inputs"]["prompt"] = json!(prompt);
+    params
+}
+
+pub fn launch_params_with_prompt_env(prompt: &str, path: &str, log_path: &str) -> Value {
+    launch_params_with_wrapper_env(launch_params_with_prompt(prompt), path, log_path)
+}
+
+pub fn launch_params_with_argv_and_prompt_env(
+    argv: Vec<String>,
+    prompt: Option<&str>,
+    path: &str,
+    log_path: &str,
+) -> Value {
+    let mut params = launch_params("low");
+    let launch_argv = params["argv"].as_array_mut().expect("launch argv");
+    launch_argv.pop();
+    launch_argv.extend(argv.into_iter().map(Value::String));
+    match prompt {
+        Some(prompt) => params["model"]["inputs"]["prompt"] = json!(prompt),
+        None => {
+            params["model"]["inputs"]
+                .as_object_mut()
+                .expect("model inputs")
+                .remove("prompt");
+        }
+    }
+    launch_params_with_wrapper_env(params, path, log_path)
+}
+
 pub fn resume_launch_params_with_arg_payload() -> Value {
     let mut params = launch_params("low");
     params["session"] = json!({ "known_provider_session_id": resume_session_id() });
@@ -29,6 +66,12 @@ pub fn resume_launch_params_with_arg_payload() -> Value {
 
 pub fn resume_launch_params_with_arg_payload_env(path: &str, log_path: &str) -> Value {
     launch_params_with_wrapper_env(resume_launch_params_with_arg_payload(), path, log_path)
+}
+
+pub fn resume_launch_params_with_prompt_env(prompt: &str, path: &str, log_path: &str) -> Value {
+    let mut params = launch_params_with_prompt(prompt);
+    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    launch_params_with_wrapper_env(params, path, log_path)
 }
 
 pub fn resume_launch_params_with_arg_payload_prompt_env(
@@ -245,6 +288,17 @@ pub fn resume_payload() -> &'static str {
 
 pub fn resume_payload_sha256() -> String {
     sha256_hex(resume_payload().as_bytes())
+}
+
+pub fn oversized_prompt() -> String {
+    format!(
+        "  {}\n\"quoted\"  --share --attach --session -m trailing  ",
+        vec!["prompt\u{1f642}chunk"; 12_000].join(" ")
+    )
+}
+
+pub fn oversized_unbroken_prompt() -> String {
+    "x".repeat(64 * 1024)
 }
 
 pub fn host_candidate_argv(effort: &str) -> Vec<&str> {

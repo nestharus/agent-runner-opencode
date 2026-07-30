@@ -145,6 +145,17 @@ pub fn wrapper_log_text(wrapper_log_path: &Path) -> String {
         .expect("selected opencodeN wrapper should record its invocation")
 }
 
+pub fn wrapper_nul_log_args(wrapper_log_path: &Path) -> Vec<String> {
+    let bytes = fs::read(wrapper_log_path)
+        .expect("selected opencodeN wrapper should record its invocation");
+    let args = bytes
+        .strip_suffix(&[0])
+        .expect("NUL argv log should end with a terminator");
+    args.split(|byte| *byte == 0)
+        .map(|arg| String::from_utf8(arg.to_vec()).expect("wrapper argv should be UTF-8"))
+        .collect()
+}
+
 pub fn wrapper_log_args(wrapper_log: &str) -> Vec<&str> {
     wrapper_log_arg_values(wrapper_log_arg_lines(wrapper_log))
 }
@@ -534,6 +545,40 @@ pub fn fake_wrapper_log_stdin_script() -> &'static str {
   printf '\\n'\n\
 } > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
 exit 0\n"
+}
+
+pub fn fake_wrapper_log_only_script() -> String {
+    "#!/bin/sh\n\
+for arg in \"$@\"; do printf '%s\\0' \"$arg\"; done > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
+exit 0\n"
+        .to_string()
+}
+
+pub fn fake_wrapper_nul_log_resume_confirming_export_script(prompt: &str) -> String {
+    let export = json!({
+        "info": {"id": resume_session_id(), "title": "resume contract"},
+        "messages": [{
+            "info": {
+                "id": "msg-user",
+                "role": "user",
+                "sessionID": resume_session_id(),
+                "time": {"created": 4_102_444_800_000_u64}
+            },
+            "parts": [{"type": "text", "text": prompt}]
+        }]
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '%s\\n' {}\n\
+  exit 0\n\
+fi\n\
+for arg in \"$@\"; do printf '%s\\0' \"$arg\"; done > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
+printf '%s\\n' '{{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000001,\"part\":{{\"type\":\"step-start\",\"sessionID\":\"ses_resume_contract\"}}}}'\n\
+exit 0\n",
+        shell_single_quote(&export)
+    )
 }
 
 pub fn fake_wrapper_resume_confirming_export_script() -> &'static str {

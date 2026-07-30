@@ -48,6 +48,7 @@ const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_NONCE_SUFFIX: char = ']';
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
+pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 struct LaunchParams {
@@ -174,6 +175,7 @@ fn project_effective_launch(
     )?;
     let resume_confirmation =
         resume_confirmation(params, stdin.as_deref(), prompt.as_deref(), &argv);
+    let argv = split_oversized_prompt_argv(argv, request_id)?;
     Ok(EffectiveLaunch {
         argv,
         env: effective_env_from_policy(result, request_id)?,
@@ -181,6 +183,51 @@ fn project_effective_launch(
         _prompt: prompt,
         resume_confirmation,
     })
+}
+
+fn split_oversized_prompt_argv(
+    mut argv: Vec<String>,
+    request_id: &str,
+) -> Result<Vec<String>, ProviderFailure> {
+    let Some((message_start, has_boundary)) = opencode_message_region(&argv) else {
+        return Ok(argv);
+    };
+    if !argv[message_start..]
+        .iter()
+        .any(|arg| arg.len() >= OPENCODE_PROMPT_ARG_BYTE_CEILING)
+    {
+        return Ok(argv);
+    }
+    let tokens = argv[message_start..]
+        .iter()
+        .flat_map(|arg| arg.split(' '))
+        .map(|token| validate_prompt_token(token, request_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    argv.truncate(message_start);
+    if !has_boundary {
+        argv.push("--".to_string());
+    }
+    argv.extend(tokens);
+    Ok(argv)
+}
+
+fn validate_prompt_token(token: &str, request_id: &str) -> Result<String, ProviderFailure> {
+    if token.len() >= OPENCODE_PROMPT_ARG_BYTE_CEILING {
+        return Err(oversized_prompt_token_failure(request_id));
+    }
+    Ok(token.to_string())
+}
+
+fn oversized_prompt_token_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "oversized_prompt_token",
+        format!(
+            "opencode positional message contains a token of at least {} UTF-8 bytes without an ASCII space; cannot keep each positional message argument below the {}-byte ceiling",
+            OPENCODE_PROMPT_ARG_BYTE_CEILING,
+            OPENCODE_PROMPT_ARG_BYTE_CEILING,
+        ),
+    )
 }
 
 fn resume_argv(
@@ -320,6 +367,17 @@ fn argv_payload_after_resume_session_insert_index(argv: &[String]) -> Option<&st
         index += 1;
     }
     None
+}
+
+fn opencode_message_region(argv: &[String]) -> Option<(usize, bool)> {
+    let mut index = policy_managed_opencode_prefix_end(argv)?;
+    if let Some(boundary) = argv[index..].iter().position(|arg| arg == "--") {
+        return Some((index + boundary + 1, true));
+    }
+    if argv.get(index).map(String::as_str) == Some(OPENCODE_SESSION_FLAG) {
+        index = index.saturating_add(2).min(argv.len());
+    }
+    Some((index, false))
 }
 
 fn resume_session_insert_index(argv: &[String]) -> usize {
