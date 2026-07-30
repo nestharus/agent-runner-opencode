@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 
 use super::*;
+use agent_runner_opencode::{encoding::sha256_hex, launch::OPENCODE_PROMPT_ARG_BYTE_CEILING};
 
 pub fn assert_opencode_launch_fixture(fixture: &str) {
     let events = parse_opencode_fixture_events(fixture);
@@ -535,6 +536,102 @@ pub fn assert_wrapper_log_arg_value(wrapper_log: &str, value: &str) {
 pub fn assert_wrapper_log_stdin_value(wrapper_log: &str, value: &str) {
     let expected = wrapper_stdin_log_line(value);
     assert!(wrapper_log.contains(&expected), "{wrapper_log}");
+}
+
+pub fn assert_oversized_prompt_segments(wrapper_log_path: &Path, prompt: &str) {
+    assert!(
+        prompt.len() > 128 * 1024,
+        "fixture must exceed Linux's per-string argv cap"
+    );
+    let argv = wrapper_nul_log_args(wrapper_log_path);
+    assert!(
+        argv.iter()
+            .all(|arg| arg.len() < OPENCODE_PROMPT_ARG_BYTE_CEILING),
+        "every final child argv element must remain below the ceiling"
+    );
+    let boundary = argv_arg_index_owned(&argv, "--");
+    let segments = &argv[boundary + 1..];
+    assert!(segments.len() > 1, "oversized prompt must be tokenized");
+    assert!(
+        segments.iter().all(|segment| !segment.contains(' ')),
+        "generated message tokens must not contain ASCII spaces"
+    );
+    for option_text in ["--share", "--attach", "--session", "-m"] {
+        assert!(
+            segments.iter().any(|segment| segment == option_text),
+            "{option_text} must remain positional message text"
+        );
+    }
+    assert_eq!(opencode_1_18_9_message(segments), prompt);
+}
+
+pub fn assert_short_prompt_argv_unchanged(wrapper_log_path: &Path) {
+    let argv = wrapper_nul_log_args(wrapper_log_path);
+    let expected = policy_effective_argv("low")[1..]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(argv, expected);
+}
+
+pub fn assert_oversized_resume_prompt(
+    output: &std::process::Output,
+    wrapper_log_path: &Path,
+    prompt: &str,
+) {
+    assert_output_success(output, "launch oversized resume prompt");
+    let argv = wrapper_nul_log_args(wrapper_log_path);
+    let session = argv_arg_index_owned(&argv, OPENCODE_SESSION_FLAG_FOR_TEST);
+    let boundary = argv_arg_index_owned(&argv, "--");
+    assert_eq!(
+        argv.get(session + 1).map(String::as_str),
+        Some(resume_session_id())
+    );
+    assert!(
+        session < boundary,
+        "--session <id> must precede --: {argv:?}"
+    );
+    assert_oversized_prompt_segments(wrapper_log_path, prompt);
+    let events = launch_events_from_output(output, "launch oversized resume prompt stdout");
+    let marker = expected_submitted_user_turn_marker(&events);
+    assert_eq!(
+        marker["value"]["prompt_sha256"],
+        sha256_hex(prompt.as_bytes())
+    );
+    assert_eq!(marker["value"]["message_id"], "msg-user");
+}
+
+pub fn assert_oversized_prompt_rejected(output: &std::process::Output, wrapper_log_path: &Path) {
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !wrapper_log_path.exists(),
+        "oversized unbroken prompt must fail before spawning opencode"
+    );
+    let response = json_stdout(output);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "oversized_prompt_token");
+    assert!(response["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("ASCII space")));
+}
+
+pub fn opencode_1_18_9_message(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg.contains(' ') {
+                format!("\"{}\"", arg.replace('"', "\\\""))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn argv_arg_index_owned(argv: &[String], needle: &str) -> usize {
+    argv.iter()
+        .position(|arg| arg == needle)
+        .unwrap_or_else(|| panic!("argv missing {needle:?}: {argv:?}"))
 }
 
 pub fn assert_session_before_notification_payload(wrapper_log_path: &Path) {

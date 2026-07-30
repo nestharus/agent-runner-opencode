@@ -48,6 +48,114 @@ fn contract_launch_stream_accepts_policy_effective_argv() {
 }
 
 #[test]
+fn contract_launch_splits_oversized_prompt_at_ascii_spaces() {
+    let prompt = oversized_prompt();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_prompt_env(&prompt, path.as_str(), fake_wrapper.log_path_str());
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch oversized prompt");
+    assert_oversized_prompt_segments(fake_wrapper.log_path(), &prompt);
+}
+
+#[test]
+fn contract_launch_transports_oversized_argv_without_prompt_metadata() {
+    let prompt = oversized_prompt();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_argv_and_prompt_env(
+        vec![prompt.clone()],
+        None,
+        path.as_str(),
+        fake_wrapper.log_path_str(),
+    );
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch oversized argv without prompt metadata");
+    assert_oversized_prompt_segments(fake_wrapper.log_path(), &prompt);
+}
+
+#[test]
+fn contract_launch_transports_oversized_argv_with_mismatched_prompt_metadata() {
+    let prompt = oversized_prompt();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_argv_and_prompt_env(
+        vec!["--share".to_string(), "--".to_string(), prompt.clone()],
+        Some("short metadata that differs from the positional payload"),
+        path.as_str(),
+        fake_wrapper.log_path_str(),
+    );
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch oversized argv with mismatched metadata");
+    assert_oversized_prompt_segments(fake_wrapper.log_path(), &prompt);
+    let argv = wrapper_nul_log_args(fake_wrapper.log_path());
+    let share = argv_arg_index_owned(&argv, "--share");
+    let boundary = argv_arg_index_owned(&argv, "--");
+    assert!(
+        share < boundary,
+        "existing options must remain before --: {argv:?}"
+    );
+    assert_eq!(
+        argv.iter().filter(|arg| arg.as_str() == "--").count(),
+        1,
+        "an existing message boundary must be reused"
+    );
+}
+
+#[test]
+fn contract_launch_transforms_duplicate_oversized_positional_values() {
+    let prompt = oversized_prompt();
+    let expected_message = format!("{prompt} {prompt}");
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_argv_and_prompt_env(
+        vec![prompt.clone(), prompt],
+        Some("different metadata"),
+        path.as_str(),
+        fake_wrapper.log_path_str(),
+    );
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch duplicate oversized positional values");
+    assert_oversized_prompt_segments(fake_wrapper.log_path(), &expected_message);
+}
+
+#[test]
+fn contract_launch_preserves_short_prompt_argv() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_prompt_env(
+        "reply with the single word: ok",
+        path.as_str(),
+        fake_wrapper.log_path_str(),
+    );
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch short prompt");
+    assert_short_prompt_argv_unchanged(fake_wrapper.log_path());
+}
+
+#[test]
+fn contract_launch_rejects_oversized_unbroken_prompt_before_spawn() {
+    let prompt = oversized_unbroken_prompt();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_prompt_env(&prompt, path.as_str(), fake_wrapper.log_path_str());
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_oversized_prompt_rejected(&output, fake_wrapper.log_path());
+}
+
+#[test]
 fn contract_launch_final_opencode_error_event_exit_zero_reports_unknown_signal() {
     let stdout = incident_error_event_stdout();
     let fake_wrapper = FakeOpencodeWrapper::with_script(
@@ -107,6 +215,21 @@ fn contract_launch_resume_forwards_session_and_arg_payload() {
 
     assert_output_success(&output, "launch resume arg payload");
     assert_resume_arg_payload_wrapper_log(fake_wrapper.log_path());
+}
+
+#[test]
+fn contract_launch_resume_splits_prompt_and_preserves_confirmation() {
+    let prompt = oversized_prompt();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(
+        fake_wrapper_nul_log_resume_confirming_export_script(&prompt),
+    );
+    let path = prepend_path(fake_wrapper.dir());
+    let params =
+        resume_launch_params_with_prompt_env(&prompt, path.as_str(), fake_wrapper.log_path_str());
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_oversized_resume_prompt(&output, fake_wrapper.log_path(), &prompt);
 }
 
 #[test]
