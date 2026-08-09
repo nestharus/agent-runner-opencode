@@ -69,6 +69,7 @@ struct ParsedOpencodeExport {
 pub struct OpencodeExportInfo {
     pub id: String,
     pub title: Option<String>,
+    pub directory: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

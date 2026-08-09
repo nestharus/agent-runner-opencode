@@ -45,14 +45,21 @@ struct SessionParams {
 
 #[derive(Deserialize)]
 struct SessionCaptureParams {
-    #[serde(rename = "settings_id")]
-    _settings_id: String,
+    settings_id: String,
     session_id: Option<String>,
     launch: Option<SessionCaptureLaunch>,
+    live_report: Option<SessionCaptureLiveReport>,
     pinned_target: Option<String>,
     start_bound_provider_session_id: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionCaptureLiveReport {
+    provider_session_id: String,
+    invocation_uuid: String,
 }
 
 #[derive(Deserialize)]
@@ -87,12 +94,15 @@ struct CapturedSession {
 
 pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
     let RequestEnvelope {
-        params, request_id, ..
+        host,
+        params,
+        request_id,
+        ..
     } = request;
     match subcommand {
         "session.locate_transcript" => locate_transcript_params(params, &request_id),
         "session.read_turns" => read_turns_params(params, &request_id),
-        "session.capture" => capture_params(params, &request_id),
+        "session.capture" => capture_params(params, host.working_directory.as_deref(), &request_id),
         "session.enumerate" => enumerate_params(params, &request_id),
         "session.export" => export_params(params, &request_id),
         "session.replace" => replace_params(params, &request_id),
@@ -119,12 +129,95 @@ pub fn read_turns_params(params: Value, request_id: &str) -> Result<Value, Provi
     Ok(read_turns_result(turns))
 }
 
-pub fn capture_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn capture_params(
+    params: Value,
+    working_directory: Option<&str>,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let params = parse_capture_params(params, request_id)?;
+    if let Some(captured) = capture_live_report(&params, working_directory, request_id)? {
+        return Ok(capture_result(
+            Some(captured),
+            "live_report.provider_session_id",
+        ));
+    }
     let captured = captured_session_id(&params);
     let provider_session_id = captured.provider_session_id;
     let source = captured.source;
     Ok(capture_result(provider_session_id, source))
+}
+
+fn capture_live_report(
+    params: &SessionCaptureParams,
+    working_directory: Option<&str>,
+    request_id: &str,
+) -> Result<Option<String>, ProviderFailure> {
+    let Some(report) = params.live_report.as_ref() else {
+        return Ok(None);
+    };
+    let provider_session_id =
+        non_empty_string(Some(&report.provider_session_id)).ok_or_else(|| {
+            invalid_session_capture_params_failure(
+                request_id,
+                "live_report.provider_session_id must be non-empty",
+            )
+        })?;
+    let invocation_uuid = non_empty_string(Some(&report.invocation_uuid)).ok_or_else(|| {
+        invalid_session_capture_params_failure(
+            request_id,
+            "live_report.invocation_uuid must be non-empty",
+        )
+    })?;
+    let envelope_invocation_uuid = params
+        .extra
+        .get("invocation_uuid")
+        .and_then(Value::as_str)
+        .and_then(|value| non_empty_string(Some(value)));
+    if envelope_invocation_uuid.as_deref() != Some(invocation_uuid.as_str()) {
+        return Err(invalid_session_capture_params_failure(
+            request_id,
+            "live_report.invocation_uuid must match invocation_uuid",
+        ));
+    }
+    if let Some(other) = captured_session_id(params).provider_session_id {
+        if other != provider_session_id {
+            return Err(invalid_session_capture_params_failure(
+                request_id,
+                "live report conflicts with other session evidence",
+            ));
+        }
+    }
+    let native = export_native(&params.settings_id, &provider_session_id, request_id)?;
+    validate_live_report_working_directory(&native, working_directory, request_id)?;
+    Ok(Some(native.info.id))
+}
+
+fn validate_live_report_working_directory(
+    native: &OpencodeExport,
+    working_directory: Option<&str>,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let expected = non_empty_string(working_directory).ok_or_else(|| {
+        invalid_session_capture_params_failure(
+            request_id,
+            "live reports require host.working_directory",
+        )
+    })?;
+    let actual = non_empty_string(native.info.directory.as_deref()).ok_or_else(|| {
+        invalid_session_capture_params_failure(
+            request_id,
+            "opencode export is missing info.directory for the live report",
+        )
+    })?;
+    if Path::new(&actual) != Path::new(&expected) {
+        return Err(invalid_session_capture_params_failure(
+            request_id,
+            format!(
+                "live report workspace mismatch: opencode exported {actual}, runner requested {expected}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub fn enumerate_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {

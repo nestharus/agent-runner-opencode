@@ -355,6 +355,10 @@ pub fn assert_session_list_limit_forwarded(log_path: &Path, limit: u64) {
 }
 
 pub fn assert_enumerate_error_code(response: &Value, code: &str) {
+    assert_error_code(response, code);
+}
+
+pub fn assert_error_code(response: &Value, code: &str) {
     assert_eq!(response["error"]["code"], code);
 }
 
@@ -449,6 +453,15 @@ pub fn assert_launch_capture_state_source(result: &Value) {
         Some("launch.session.provider_session_id"),
         "launch.session.provider_session_id should be the canonical launch evidence key"
     );
+}
+
+pub fn assert_live_capture_result(result: &Value, session_id: &str) {
+    assert_eq!(result["provider_session_id"].as_str(), Some(session_id));
+    assert_eq!(
+        result["state"]["source"].as_str(),
+        Some("live_report.provider_session_id")
+    );
+    assert_capture_artifacts(&result["artifacts"]);
 }
 
 pub fn assert_capture_artifacts(artifacts: &Value) {

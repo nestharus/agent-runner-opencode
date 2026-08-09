@@ -59,6 +59,19 @@ pub fn lifecycle_capture_params(session_id: &str) -> Value {
     })
 }
 
+pub fn live_capture_params(session_id: &str, invocation_uuid: &str) -> Value {
+    json!({
+        "settings_id": "opencode1",
+        "model_name": "gpt-high",
+        "provider_name": "opencode1",
+        "invocation_uuid": invocation_uuid,
+        "live_report": {
+            "provider_session_id": session_id,
+            "invocation_uuid": invocation_uuid,
+        }
+    })
+}
+
 pub fn pinned_lifecycle_capture_params(pinned_session_id: &str, start_bound_id: &str) -> Value {
     let mut params = lifecycle_capture_params(start_bound_id);
     params["pinned_target"] = Value::String(pinned_session_id.to_string());
