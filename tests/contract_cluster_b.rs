@@ -5,7 +5,7 @@ mod cluster_b;
 mod support;
 
 use cluster_b::*;
-use serde_json::json;
+use serde_json::{json, Value};
 use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env};
 
 #[test]
@@ -226,6 +226,66 @@ fn contract_session_capture() {
         "session.schema.json#/$defs/SessionCaptureResult",
     );
     assert_pinned_capture_result(&pinned_result, pinned_session_id);
+}
+
+#[test]
+fn contract_session_capture_validates_exact_live_report() {
+    let session_id = fixture_session_id();
+    let invocation_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let fake_opencode = FakeOpencodeExport::new(session_id);
+    let path = prepend_path(fake_opencode.dir());
+    let working_directory = native_export_fixture()["info"]["directory"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = success_result(
+        invoke_with_host_and_env(
+            "session.capture",
+            live_capture_params(session_id, invocation_uuid),
+            json!({"working_directory": working_directory}),
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionCaptureResponse",
+        "session.schema.json#/$defs/SessionCaptureResult",
+    );
+
+    assert_live_capture_result(&result, session_id);
+}
+
+#[test]
+fn contract_session_capture_rejects_live_report_workspace_mismatch() {
+    let session_id = fixture_session_id();
+    let invocation_uuid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    let fake_opencode = FakeOpencodeExport::new(session_id);
+    let path = prepend_path(fake_opencode.dir());
+
+    let response = assert_error_envelope(invoke_with_host_and_env(
+        "session.capture",
+        live_capture_params(session_id, invocation_uuid),
+        json!({"working_directory": "/tmp/not-the-exported-workspace"}),
+        &[("PATH", path.as_str())],
+    ));
+
+    assert_error_code(&response, "invalid_session_capture_params");
+}
+
+#[test]
+fn contract_session_capture_rejects_live_report_invocation_mismatch() {
+    let session_id = fixture_session_id();
+    let fake_opencode = FakeOpencodeExport::new(session_id);
+    let path = prepend_path(fake_opencode.dir());
+    let mut params = live_capture_params(session_id, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+    params["live_report"]["invocation_uuid"] =
+        Value::String("dddddddd-dddd-4ddd-8ddd-dddddddddddd".to_string());
+
+    let response = assert_error_envelope(invoke_with_env(
+        "session.capture",
+        params,
+        &[("PATH", path.as_str())],
+    ));
+
+    assert_error_code(&response, "invalid_session_capture_params");
 }
 
 #[test]
