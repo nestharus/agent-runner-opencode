@@ -959,9 +959,11 @@ impl LaunchState {
 
     fn record_opencode_events(&mut self, events: &[OpencodeEventMetadata]) {
         if let Some(event) = events.last() {
-            if self.resume_confirmation.is_some() {
-                self.completed_resume_at =
-                    opencode::is_successful_terminal_event(event).then(Instant::now);
+            if self.resume_confirmation.is_some()
+                && self.completed_resume_at.is_none()
+                && opencode::is_successful_terminal_event(event)
+            {
+                self.completed_resume_at = Some(Instant::now());
             }
             self.last_opencode_event = Some(event.clone());
         }

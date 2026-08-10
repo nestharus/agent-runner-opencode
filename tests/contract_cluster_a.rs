@@ -327,6 +327,22 @@ fn contract_launch_completed_resume_does_not_wait_for_lingering_native_process()
 }
 
 #[test]
+fn contract_launch_completed_resume_preserves_completion_across_non_terminal_parser_tail() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(
+        fake_wrapper_completed_resume_with_non_terminal_tail_script().to_string(),
+    );
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let params = resume_launch_params_with_arg_payload_env(path.as_str(), log_path);
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch completed resume with parser tail");
+    let events = launch_events_from_output(&output, "completed resume parser tail stdout");
+    assert_produced_assistant_response_marker(&events);
+}
+
+#[test]
 fn contract_launch_completed_export_does_not_wait_for_buffered_native_events() {
     let fake_wrapper =
         FakeOpencodeWrapper::with_script(fake_wrapper_completed_export_then_hang_script());
