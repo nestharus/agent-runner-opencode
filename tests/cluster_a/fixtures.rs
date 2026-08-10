@@ -21,6 +21,9 @@ pub const SLOW_WRAPPER_SLEEP_SECONDS: u64 = 2;
 
 pub const SUBMITTED_USER_TURN_MARKER_FOR_TEST: &str = "oulipoly.submitted_user_turn";
 
+pub const PRODUCED_ASSISTANT_RESPONSE_MARKER_FOR_TEST: &str =
+    "oulipoly.produced_assistant_response";
+
 pub const OPENCODE_SESSION_FLAG_FOR_TEST: &str = "--session";
 
 pub const NOTIFICATION_PAYLOAD_NEEDLE_FOR_TEST: &str = "[OULIPOLY NOTIFICATIONS]";
@@ -621,6 +624,17 @@ printf '{\"type\":\"step_finish\",\"sessionID\":\"ses_resume_contract\",\"timest
 /bin/sleep 5\n\
 exit 9\n"
         .to_string()
+}
+
+pub fn fake_wrapper_completed_resume_with_non_terminal_tail_script() -> &'static str {
+    "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]}]}'\n\
+  exit 0\n\
+fi\n\
+printf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000003,\"part\":{\"type\":\"step-finish\",\"sessionID\":\"ses_resume_contract\",\"reason\":\"stop\"}}'\n\
+printf '%s' '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000004,\"part\":{\"type\":\"step-start\",\"sessionID\":\"ses_resume_contract\"}}'\n\
+exit 0\n"
 }
 
 pub fn fake_wrapper_completed_export_then_hang_script() -> String {

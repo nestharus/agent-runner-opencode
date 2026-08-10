@@ -282,6 +282,7 @@ fn contract_launch_resume_emits_submitted_user_turn_marker_after_export_confirms
     let events = launch_events_from_output(&output, "launch resume confirmed payload stdout");
     assert_monotonic_launch_events(&events);
     assert_submitted_user_turn_marker(&events);
+    assert_no_produced_assistant_response_marker(&events);
 }
 
 #[test]
@@ -317,11 +318,28 @@ fn contract_launch_completed_resume_does_not_wait_for_lingering_native_process()
         "provider should stop a completed resume before the fake five-second hang"
     );
     let events = launch_events_from_output(&output, "completed lingering resume stdout");
+    assert_produced_assistant_response_marker(&events);
     let final_event = final_launch_event(&events);
     assert_eq!(
         final_event["status"],
         serde_json::json!({"kind": "exited", "code": 0})
     );
+}
+
+#[test]
+fn contract_launch_completed_resume_preserves_completion_across_non_terminal_parser_tail() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(
+        fake_wrapper_completed_resume_with_non_terminal_tail_script().to_string(),
+    );
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let params = resume_launch_params_with_arg_payload_env(path.as_str(), log_path);
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch completed resume with parser tail");
+    let events = launch_events_from_output(&output, "completed resume parser tail stdout");
+    assert_produced_assistant_response_marker(&events);
 }
 
 #[test]
@@ -341,6 +359,7 @@ fn contract_launch_completed_export_does_not_wait_for_buffered_native_events() {
         "provider should stop a completed exported resume before the fake five-second hang"
     );
     let events = launch_events_from_output(&output, "completed buffered resume stdout");
+    assert_produced_assistant_response_marker(&events);
     let final_event = final_launch_event(&events);
     assert_eq!(
         final_event["status"],

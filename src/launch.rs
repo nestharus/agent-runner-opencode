@@ -42,6 +42,7 @@ const OPENCODE_SESSION_FLAG: &str = "--session";
 const OPENCODE_RUN_ARG: &str = "run";
 const POLICY_MANAGED_FLAGS_WITH_VALUE: &[&str] = &["--format", "-m", "--variant"];
 const POLICY_MANAGED_FLAGS_WITHOUT_VALUE: &[&str] = &["--dangerously-skip-permissions"];
+const PRODUCED_ASSISTANT_RESPONSE_MARKER: &str = "oulipoly.produced_assistant_response";
 const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
 const SUBMITTED_USER_TURN_SOURCE: &str = "opencode.export";
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
@@ -958,9 +959,11 @@ impl LaunchState {
 
     fn record_opencode_events(&mut self, events: &[OpencodeEventMetadata]) {
         if let Some(event) = events.last() {
-            if self.resume_confirmation.is_some() {
-                self.completed_resume_at =
-                    opencode::is_successful_terminal_event(event).then(Instant::now);
+            if self.resume_confirmation.is_some()
+                && self.completed_resume_at.is_none()
+                && opencode::is_successful_terminal_event(event)
+            {
+                self.completed_resume_at = Some(Instant::now());
             }
             self.last_opencode_event = Some(event.clone());
         }
@@ -1014,6 +1017,7 @@ impl LaunchState {
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
         self.capture_session_from_parser_tail(writer)?;
         self.confirm_submitted_user_turn(writer)?;
+        self.confirm_produced_assistant_response(writer)?;
         let status = self.finished_status();
         let signal = self.terminal_signal_for(&status);
         let event = self.exit_event(&status, signal);
@@ -1029,6 +1033,16 @@ impl LaunchState {
             return Ok(());
         };
         self.marker_with_value(SUBMITTED_USER_TURN_MARKER.to_string(), marker_value, writer)
+    }
+
+    fn confirm_produced_assistant_response<W: Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        if self.completed_resume_at.is_none() {
+            return Ok(());
+        }
+        self.marker(PRODUCED_ASSISTANT_RESPONSE_MARKER.to_string(), writer)
     }
 
     fn submitted_user_turn_marker_value(&self) -> Option<Value> {
