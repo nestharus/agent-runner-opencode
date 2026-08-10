@@ -282,6 +282,7 @@ fn contract_launch_resume_emits_submitted_user_turn_marker_after_export_confirms
     let events = launch_events_from_output(&output, "launch resume confirmed payload stdout");
     assert_monotonic_launch_events(&events);
     assert_submitted_user_turn_marker(&events);
+    assert_no_produced_assistant_response_marker(&events);
 }
 
 #[test]
@@ -317,6 +318,7 @@ fn contract_launch_completed_resume_does_not_wait_for_lingering_native_process()
         "provider should stop a completed resume before the fake five-second hang"
     );
     let events = launch_events_from_output(&output, "completed lingering resume stdout");
+    assert_produced_assistant_response_marker(&events);
     let final_event = final_launch_event(&events);
     assert_eq!(
         final_event["status"],
@@ -341,6 +343,7 @@ fn contract_launch_completed_export_does_not_wait_for_buffered_native_events() {
         "provider should stop a completed exported resume before the fake five-second hang"
     );
     let events = launch_events_from_output(&output, "completed buffered resume stdout");
+    assert_produced_assistant_response_marker(&events);
     let final_event = final_launch_event(&events);
     assert_eq!(
         final_event["status"],

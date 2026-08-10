@@ -661,6 +661,32 @@ pub fn assert_no_submitted_user_turn_marker(events: &[Value]) {
     );
 }
 
+pub fn assert_produced_assistant_response_marker(events: &[Value]) {
+    let markers = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "marker"
+                && event["name"] == PRODUCED_ASSISTANT_RESPONSE_MARKER_FOR_TEST
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        markers.len(),
+        1,
+        "completed resume must emit exactly one assistant response marker; events={events:?}"
+    );
+    assert_eq!(markers[0]["value"], true);
+}
+
+pub fn assert_no_produced_assistant_response_marker(events: &[Value]) {
+    assert!(
+        events.iter().all(|event| {
+            event["kind"] != "marker"
+                || event["name"] != PRODUCED_ASSISTANT_RESPONSE_MARKER_FOR_TEST
+        }),
+        "resume without completed assistant response must not emit a productivity marker; events={events:?}"
+    );
+}
+
 pub fn assert_submitted_user_turn_marker_value(marker: &Value) {
     assert_submitted_user_turn_provider_session(marker);
     assert_submitted_user_turn_prompt_hash(marker);

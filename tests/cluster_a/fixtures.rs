@@ -21,6 +21,9 @@ pub const SLOW_WRAPPER_SLEEP_SECONDS: u64 = 2;
 
 pub const SUBMITTED_USER_TURN_MARKER_FOR_TEST: &str = "oulipoly.submitted_user_turn";
 
+pub const PRODUCED_ASSISTANT_RESPONSE_MARKER_FOR_TEST: &str =
+    "oulipoly.produced_assistant_response";
+
 pub const OPENCODE_SESSION_FLAG_FOR_TEST: &str = "--session";
 
 pub const NOTIFICATION_PAYLOAD_NEEDLE_FOR_TEST: &str = "[OULIPOLY NOTIFICATIONS]";
