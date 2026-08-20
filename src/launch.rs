@@ -3456,6 +3456,44 @@ mod custody_tests {
     }
 
     #[test]
+    fn steady_state_admission_classifies_one_active_payload() {
+        let directory = tempfile::tempdir().expect("launch custody directory");
+        let active_records = MAX_ACTIVE_LAUNCH_REQUEST_RECORDS;
+        for index in 0..active_records {
+            let stem = format!("{index:064x}");
+            fs::write(directory.path().join(format!("{stem}.lock")), b"")
+                .expect("launch request lock");
+            fs::write(
+                directory.path().join(format!("{stem}.json")),
+                br#"{"phase":"prepared"}"#,
+            )
+            .expect("active launch record");
+        }
+
+        let custody = launch_request_custody(directory.path());
+        maintain_launch_request_capacity(
+            &custody,
+            &directory.path().join("new.lock"),
+            "request-test",
+        )
+        .expect("migrate bounded launch custody");
+
+        let active_parses = AtomicUsize::new(0);
+        let active = custody
+            .maintain(&directory.path().join("new.lock"), |bytes| {
+                active_parses.fetch_add(1, Ordering::Relaxed);
+                launch_request_bytes_are_replay(bytes)
+            })
+            .expect("maintain compact active custody");
+        assert_eq!(active, active_records);
+        assert_eq!(
+            active_parses.load(Ordering::Relaxed),
+            1,
+            "steady-state admission must classify at most one active payload"
+        );
+    }
+
+    #[test]
     fn exact_replay_pin_prevents_handoff_eviction() {
         let directory = tempfile::tempdir().expect("launch custody directory");
         let first = format!("{:064x}", 1);

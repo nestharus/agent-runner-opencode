@@ -1,15 +1,128 @@
 //! Declared roles: orchestration, validator, accessor
 
 use crate::durable_fs;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const INDEX_SCHEMA_VERSION: u64 = 1;
+const INDEX_SCHEMA_VERSION: u64 = 2;
 const MAX_INDEX_RECORD_BYTES: usize = 1024;
+const MAX_ACTIVE_INDEX_BYTES: usize = 16 * 1024;
 const MAX_REPLAY_EVICTION_PROBES: usize = 64;
+const EMPTY_ACTIVE_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ActiveSlot {
+    occupied: u8,
+    request_sha256: String,
+}
+
+impl ActiveSlot {
+    fn empty() -> Self {
+        Self {
+            occupied: 0,
+            request_sha256: EMPTY_ACTIVE_DIGEST.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ActiveIndex {
+    next_probe: usize,
+    slots: Vec<ActiveSlot>,
+}
+
+impl ActiveIndex {
+    fn empty(active_limit: usize) -> Self {
+        Self {
+            next_probe: 0,
+            slots: (0..active_limit).map(|_| ActiveSlot::empty()).collect(),
+        }
+    }
+
+    fn validate(&self, active_limit: usize) -> Result<(), CustodyError> {
+        if self.slots.len() != active_limit
+            || (active_limit != 0 && self.next_probe >= active_limit)
+            || self.slots.iter().any(|slot| {
+                !matches!(slot.occupied, 0 | 1)
+                    || !valid_digest(&slot.request_sha256)
+                    || (slot.occupied == 0 && slot.request_sha256 != EMPTY_ACTIVE_DIGEST)
+            })
+        {
+            return Err(CustodyError::Invalid(
+                "request custody active index is inconsistent".to_string(),
+            ));
+        }
+        let mut occupied = HashSet::with_capacity(active_limit);
+        if self
+            .slots
+            .iter()
+            .filter(|slot| slot.occupied == 1)
+            .any(|slot| !occupied.insert(slot.request_sha256.as_str()))
+        {
+            return Err(CustodyError::Invalid(
+                "request custody active index contains duplicate requests".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn active(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.occupied == 1).count()
+    }
+
+    fn reserve(&mut self, stem: String) -> Result<(), CustodyError> {
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
+        {
+            return Ok(());
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.occupied == 0)
+            .ok_or(CustodyError::Capacity)?;
+        slot.occupied = 1;
+        slot.request_sha256 = stem;
+        Ok(())
+    }
+
+    fn remove(&mut self, stem: &str) -> bool {
+        let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
+        else {
+            return false;
+        };
+        *slot = ActiveSlot::empty();
+        true
+    }
+
+    fn next_occupied(&mut self) -> Option<String> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut selected = None;
+        for offset in 0..self.slots.len() {
+            let index = (self.next_probe + offset) % self.slots.len();
+            if selected.is_none() && self.slots[index].occupied == 1 {
+                selected = Some((index, self.slots[index].request_sha256.clone()));
+            }
+        }
+        if let Some((index, _)) = selected.as_ref() {
+            self.next_probe = (*index + 1) % self.slots.len();
+        }
+        selected.map(|(_, stem)| stem)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum CustodyError {
@@ -71,30 +184,8 @@ impl RequestCustody {
         classify_replay: impl Fn(&[u8]) -> Result<bool, String>,
     ) -> Result<usize, CustodyError> {
         self.initialize(&classify_replay)?;
-        let active_root = self.active_root();
-        let mut active = 0_usize;
-        let mut visited = 0_usize;
-        let mut replay_candidates = Vec::new();
-        for entry in fs::read_dir(&active_root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("marker") {
-                return Err(CustodyError::Invalid(format!(
-                    "active custody entry has an unsupported shape: {}",
-                    path.display()
-                )));
-            }
-            if !entry.file_type()?.is_file() {
-                return Err(CustodyError::Invalid(format!(
-                    "active custody entry is not a file: {}",
-                    path.display()
-                )));
-            }
-            visited += 1;
-            if visited > self.active_limit.saturating_add(1) {
-                return Err(CustodyError::Capacity);
-            }
-            let stem = required_digest_stem(&path)?;
+        let mut index = self.read_active_index()?;
+        if let Some(stem) = index.next_occupied() {
             let state_path = self.state_path(&stem);
             let lock_path = self.lock_path(&stem);
             let state = match durable_fs::read_file_bounded(&state_path, self.state_byte_limit) {
@@ -103,33 +194,26 @@ impl RequestCustody {
                 Err(error) => return Err(CustodyError::Io(error)),
             };
             if let Some(bytes) = state {
-                if classify_replay(&bytes).map_err(CustodyError::Invalid)? {
-                    replay_candidates.push((record_modified(&state_path, &path), stem, path));
-                    continue;
+                if classify_replay(&bytes).map_err(CustodyError::Invalid)?
+                    && self.place_replay(&stem, current_lock_path)?
+                {
+                    index.remove(&stem);
                 }
-            } else if record_expired(&path, self.orphan_retention)
-                && self.remove_abandoned_active(&stem, &path, &lock_path, current_lock_path)?
+            } else if record_expired(&lock_path, self.orphan_retention)
+                && self.remove_abandoned_active(&stem, &lock_path, current_lock_path)?
             {
-                continue;
+                index.remove(&stem);
             }
-            active += 1;
+            self.write_active_index(&index)?;
         }
-        replay_candidates.sort_by_key(|candidate| candidate.0);
-        for (_, stem, marker_path) in replay_candidates {
-            if self.place_replay(&stem, current_lock_path)? {
-                remove_file_synced(&marker_path)?;
-            } else {
-                active += 1;
-            }
-        }
-        if active > self.active_limit {
-            return Err(CustodyError::Capacity);
-        }
-        Ok(active)
+        Ok(index.active())
     }
 
     pub(crate) fn reserve_active(&self, state_path: &Path) -> Result<(), CustodyError> {
-        write_empty_marker(&self.active_marker_path(state_path)?)
+        let stem = required_digest_stem(state_path)?;
+        let mut index = self.read_active_index()?;
+        index.reserve(stem)?;
+        self.write_active_index(&index)
     }
 
     pub(crate) fn pin_existing(&self, state_path: &Path) -> Result<fs::File, CustodyError> {
@@ -151,15 +235,10 @@ impl RequestCustody {
     }
 
     pub(crate) fn remove_active_marker(&self, state_path: &Path) -> Result<(), CustodyError> {
-        let active = self.active_marker_path(state_path)?;
-        match fs::remove_file(&active) {
-            Ok(()) => durable_fs::sync_directory(
-                active
-                    .parent()
-                    .expect("active marker always has a parent directory"),
-            )?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(CustodyError::Io(error)),
+        let stem = required_digest_stem(state_path)?;
+        let mut index = self.read_active_index()?;
+        if index.remove(&stem) {
+            self.write_active_index(&index)?;
         }
         Ok(())
     }
@@ -206,14 +285,10 @@ impl RequestCustody {
         }
         create_private_index_subtree(
             &self.index_root,
-            &[
-                self.active_root(),
-                self.replay_root(),
-                self.pin_root(),
-                self.temporary_root(),
-            ],
+            &[self.replay_root(), self.pin_root(), self.temporary_root()],
         )?;
         let mut migrated = 0_usize;
+        let mut active_index = ActiveIndex::empty(self.active_limit);
         let mut replay_candidates = Vec::new();
         let migration_limit = self.active_limit.saturating_add(self.replay_slots);
         for entry in fs::read_dir(&self.lock_root)? {
@@ -241,7 +316,7 @@ impl RequestCustody {
             if replay {
                 replay_candidates.push((record_modified(&state_path, &lock_path), stem));
             } else {
-                write_empty_marker(&self.active_root().join(format!("{stem}.marker")))?;
+                active_index.reserve(stem)?;
             }
         }
         replay_candidates.sort_by_key(|candidate| candidate.0);
@@ -250,6 +325,7 @@ impl RequestCustody {
                 return Err(CustodyError::Capacity);
             }
         }
+        self.write_active_index(&active_index)?;
         self.write_json_atomic(
             &schema_path,
             &json!({
@@ -340,7 +416,6 @@ impl RequestCustody {
     fn remove_abandoned_active(
         &self,
         stem: &str,
-        marker_path: &Path,
         lock_path: &Path,
         current_lock_path: &Path,
     ) -> Result<bool, CustodyError> {
@@ -360,7 +435,6 @@ impl RequestCustody {
             Err(error) => return Err(CustodyError::Io(error)),
         }
         remove_file_if_present(lock_path)?;
-        remove_file_synced(marker_path)?;
         if let Some((pin, pin_path)) = pin {
             remove_file_if_present(&pin_path)?;
             drop(pin);
@@ -385,11 +459,6 @@ impl RequestCustody {
         }
     }
 
-    fn active_marker_path(&self, state_path: &Path) -> Result<PathBuf, CustodyError> {
-        let stem = required_digest_stem(state_path)?;
-        Ok(self.active_root().join(format!("{stem}.marker")))
-    }
-
     fn state_path(&self, stem: &str) -> PathBuf {
         self.state_root.join(format!("{stem}.json"))
     }
@@ -398,8 +467,8 @@ impl RequestCustody {
         self.lock_root.join(format!("{stem}.lock"))
     }
 
-    fn active_root(&self) -> PathBuf {
-        self.index_root.join("active")
+    fn active_index_path(&self) -> PathBuf {
+        self.index_root.join("active.json")
     }
 
     fn replay_root(&self) -> PathBuf {
@@ -449,10 +518,35 @@ impl RequestCustody {
         self.write_json_atomic(path, &json!({"next_slot": next_slot}))
     }
 
+    fn read_active_index(&self) -> Result<ActiveIndex, CustodyError> {
+        let bytes =
+            durable_fs::read_file_bounded(&self.active_index_path(), MAX_ACTIVE_INDEX_BYTES)?;
+        let index: ActiveIndex = serde_json::from_slice(&bytes)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        index.validate(self.active_limit)?;
+        Ok(index)
+    }
+
+    fn write_active_index(&self, index: &ActiveIndex) -> Result<(), CustodyError> {
+        index.validate(self.active_limit)?;
+        let value = serde_json::to_value(index)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        self.write_json_atomic_bounded(&self.active_index_path(), &value, MAX_ACTIVE_INDEX_BYTES)
+    }
+
     fn write_json_atomic(&self, path: &Path, value: &Value) -> Result<(), CustodyError> {
+        self.write_json_atomic_bounded(path, value, MAX_INDEX_RECORD_BYTES)
+    }
+
+    fn write_json_atomic_bounded(
+        &self,
+        path: &Path,
+        value: &Value,
+        byte_limit: usize,
+    ) -> Result<(), CustodyError> {
         let bytes =
             serde_json::to_vec(value).map_err(|error| CustodyError::Invalid(error.to_string()))?;
-        if bytes.len() > MAX_INDEX_RECORD_BYTES {
+        if bytes.len() > byte_limit {
             return Err(CustodyError::Capacity);
         }
         let parent = path.parent().ok_or_else(|| {
@@ -542,6 +636,10 @@ fn required_digest_stem(path: &Path) -> Result<String, CustodyError> {
     Ok(stem.to_string())
 }
 
+fn valid_digest(stem: &str) -> bool {
+    stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn open_lock(path: &Path) -> Result<fs::File, CustodyError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -551,22 +649,6 @@ fn open_lock(path: &Path) -> Result<fs::File, CustodyError> {
         options.mode(0o600);
     }
     options.open(path).map_err(CustodyError::Io)
-}
-
-fn write_empty_marker(path: &Path) -> Result<(), CustodyError> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)?;
-    durable_fs::sync_directory(
-        path.parent()
-            .ok_or_else(|| CustodyError::Invalid("custody marker has no parent".to_string()))?,
-    )?;
-    Ok(())
 }
 
 fn open_existing_lock(path: &Path) -> std::io::Result<Option<fs::File>> {
@@ -585,15 +667,6 @@ fn remove_file_if_present(path: &Path) -> Result<(), CustodyError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(CustodyError::Io(error)),
     }
-}
-
-fn remove_file_synced(path: &Path) -> Result<(), CustodyError> {
-    remove_file_if_present(path)?;
-    durable_fs::sync_directory(
-        path.parent()
-            .expect("request custody file always has a parent"),
-    )?;
-    Ok(())
 }
 
 fn record_expired(path: &Path, retention: Duration) -> bool {

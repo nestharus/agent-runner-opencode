@@ -209,13 +209,15 @@ native effect.
 Launch custody reserves 64 records for active obligations independently of a
 fixed 4,096-slot recent-replay ring; every record is no larger than 256 KiB.
 Cyclic slot replacement retires the oldest available completion without parsing
-replay payloads. Admission reads at most the 64 active records, and completion
-probes at most 64 compact ring slots. Prepared, submission-observed, and
-unresolved records never age out because they may still own an effect. New work
-fails at the active cap until those live obligations are reconciled, but routine
+replay payloads. Steady-state admission reads one fixed-shape compact active
+index and classifies at most one active payload per request; completion probes at
+most 64 compact ring slots. Prepared, submission-observed, and unresolved
+records never age out because they may still own an effect. New work fails at
+the active cap until those live obligations are reconciled, but routine
 completed history cannot consume its admission reserve or make admission work
-proportional to replay history. Shared replay pins prevent cyclic eviction while
-an exact caller crosses from capacity admission to its request lock.
+proportional to active payload volume or replay history. Shared replay pins
+prevent cyclic eviction while an exact caller crosses from capacity admission
+to its request lock.
 
 For resumed sessions, model switching is allowed per turn. During the normal
 launch, matching bounded `opencode run --format json` `step_start` and successful
