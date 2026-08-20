@@ -326,6 +326,69 @@ fn contract_launch_resume_replay_does_not_resubmit_after_output_loss() {
 }
 
 #[test]
+fn contract_launch_resume_replay_preserves_multi_part_positional_identity() {
+    let runtime = IsolatedLaunchSettings::new();
+    let submitted_message = "hello world";
+    let fake_wrapper = FakeOpencodeWrapper::with_counted_resume_payload(submitted_message);
+    let path = prepend_path(fake_wrapper.dir());
+    let mut params = launch_params_with_argv_and_prompt_env(
+        vec!["--".to_string(), "hello".to_string(), "world".to_string()],
+        None,
+        path.as_str(),
+        fake_wrapper.log_path_str(),
+    );
+    params["session"] = serde_json::json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
+    let mut request = support::validated_request_envelope(
+        "launch",
+        params,
+        runtime.host_overrides(),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    request["request_id"] =
+        serde_json::json!("req-launch-resume-multi-part-submission-response-loss");
+    support::assert_valid_request_envelope(&request, "launch.schema.json#/$defs/LaunchRequest");
+    support::ensure_default_runtime_settings(&request);
+
+    let args = vec!["agent-runner-opencode".to_string(), "launch".to_string()];
+    let mut writer = FailAfterFirstLaunchEvent {
+        completed_events: 0,
+    };
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&request).expect("serialize resumed launch request"),
+            &mut writer,
+        ),
+        1,
+        "losing a deferred post-spawn event should fail the first invocation"
+    );
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read resumed launch count"),
+        "1\n",
+        "the first invocation should submit the multi-part resumed turn exactly once"
+    );
+    runtime.delete_settings_record();
+
+    let replay = json_stdout(&support::invoke_with_request("launch", request));
+    assert_eq!(
+        replay["error"]["code"],
+        "launch_resume_reconciliation_required"
+    );
+    assert_eq!(
+        replay["error"]["details"]["provider_session_id"],
+        resume_session_id()
+    );
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read replay resume count"),
+        "1\n",
+        "an exact replay must not duplicate the reconstructed multi-part turn"
+    );
+}
+
+#[test]
 fn contract_launch_route_handoff_failure_releases_request_before_spawn() {
     let provider_session_id = "ses_route_handoff_retry";
     let fake_wrapper = FakeOpencodeWrapper::with_counted_new_session(provider_session_id);
@@ -791,6 +854,39 @@ fn contract_launch_resume_forwards_session_and_arg_payload() {
 }
 
 #[test]
+fn contract_launch_resume_preserves_session_shaped_positional_message() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());
+    let path = prepend_path(fake_wrapper.dir());
+    let mut params = launch_params_with_argv_and_prompt_env(
+        vec![
+            "--".to_string(),
+            "--session".to_string(),
+            "literal-session-text".to_string(),
+        ],
+        None,
+        path.as_str(),
+        fake_wrapper.log_path_str(),
+    );
+    params["session"] = serde_json::json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "launch resume session-shaped positional message");
+    let wrapper_log = wrapper_log_text(fake_wrapper.log_path());
+    let argv = wrapper_log_args(&wrapper_log);
+    let boundary = argv_arg_index(&argv, "--");
+    assert_eq!(
+        &argv[boundary + 1..],
+        &["--session", "literal-session-text"],
+        "the managed session option must not rewrite positional message text"
+    );
+}
+
+#[test]
 fn contract_launch_resume_splits_prompt_and_preserves_confirmation() {
     let prompt = oversized_prompt();
     let fake_wrapper = FakeOpencodeWrapper::with_script(
@@ -931,6 +1027,34 @@ fn contract_launch_resume_rejects_empty_payload_without_spawning_child() {
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
     assert_empty_resume_payload_rejected(&output, fake_wrapper.log_path());
+}
+
+#[test]
+fn contract_launch_resume_rejects_unbounded_option_shaped_payload_before_spawn() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());
+    let path = prepend_path(fake_wrapper.dir());
+    let mut params = launch_params_with_argv_and_prompt_env(
+        vec!["--share".to_string(), "hello".to_string()],
+        None,
+        path.as_str(),
+        fake_wrapper.log_path_str(),
+    );
+    params["session"] = serde_json::json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "ambiguous resume payload must fail before spawning opencode"
+    );
+    let response = json_stdout(&output);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "ambiguous_resume_payload");
 }
 
 #[test]

@@ -462,21 +462,9 @@ fn effective_launch(
     } = plan;
     validate_policy_argv(&argv, request_id)?;
     let stdin = stdin.map(String::into_bytes);
-    let argv = resume_argv(
-        params,
-        argv,
-        stdin.as_deref(),
-        prompt.as_deref(),
-        request_id,
-    )?;
-    let resume_observation_request = resume_observation_request(
-        params,
-        stdin.as_deref(),
-        prompt.as_deref(),
-        &argv,
-        deadline_unix_ms,
-        &route,
-    );
+    let argv = resume_argv(params, argv, stdin.as_deref(), request_id)?;
+    let resume_observation_request =
+        resume_observation_request(params, stdin.as_deref(), &argv, deadline_unix_ms, &route);
     let mut activity_targets = ActivityTargets::default();
     policy::append_route_activity_targets(&mut activity_targets, &route);
     let argv = split_oversized_prompt_argv(argv, request_id)?;
@@ -541,13 +529,12 @@ fn resume_argv(
     params: &LaunchParams,
     mut argv: Vec<String>,
     stdin: Option<&[u8]>,
-    prompt: Option<&str>,
     request_id: &str,
 ) -> Result<Vec<String>, ProviderFailure> {
     let Some(session_id) = known_provider_session_id(params) else {
         return Ok(argv);
     };
-    require_resume_payload_reaches_child(&argv, stdin, prompt, request_id)?;
+    require_resume_payload_reaches_child(&argv, stdin, request_id)?;
     let insert_at = resume_session_insert_index(&argv);
     upsert_session_arg(&mut argv, session_id, insert_at);
     Ok(argv)
@@ -556,13 +543,12 @@ fn resume_argv(
 fn resume_observation_request(
     params: &LaunchParams,
     stdin: Option<&[u8]>,
-    prompt: Option<&str>,
     argv: &[String],
     deadline_unix_ms: Option<u64>,
     route: &policy::PolicyRouteIdentity,
 ) -> Option<ResumeObservationRequest> {
     let session_id = known_provider_session_id(params)?;
-    let prompt = submitted_resume_payload(argv, stdin, prompt)?;
+    let prompt = submitted_resume_payload(argv, stdin)?;
     Some(ResumeObservationRequest::new(
         route.account_wrapper.clone(),
         session_id.to_string(),
@@ -612,48 +598,56 @@ fn validate_launch_session(params: &LaunchParams, request_id: &str) -> Result<()
 fn require_resume_payload_reaches_child(
     argv: &[String],
     stdin: Option<&[u8]>,
-    prompt: Option<&str>,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    if submitted_resume_payload(argv, stdin, prompt).is_some() {
+    if has_unbounded_option_shaped_message_arg(argv) {
+        return Err(ProviderFailure::invalid_request(
+            request_id,
+            "ambiguous_resume_payload",
+            "resume launch with option-shaped positional values must place -- before the message so its exact native identity can be retained",
+        ));
+    }
+    if submitted_resume_payload(argv, stdin).is_some() {
         return Ok(());
     }
     Err(empty_resume_payload_failure(request_id))
 }
 
-fn submitted_resume_payload(
-    argv: &[String],
-    stdin: Option<&[u8]>,
-    prompt: Option<&str>,
-) -> Option<String> {
+fn submitted_resume_payload(argv: &[String], stdin: Option<&[u8]>) -> Option<String> {
     stdin
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .filter(|text| !text.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| prompt_arg_payload(argv, prompt))
-        .or_else(|| argv_payload_after_resume_session_insert_index(argv).map(str::to_string))
+        .or_else(|| opencode_argv_payload(argv))
 }
 
-fn prompt_arg_payload(argv: &[String], prompt: Option<&str>) -> Option<String> {
-    let prompt = prompt.filter(|text| !text.trim().is_empty())?;
-    argv.iter()
-        .any(|arg| arg == prompt)
-        .then(|| prompt.to_string())
-}
-
-fn argv_payload_after_resume_session_insert_index(argv: &[String]) -> Option<&str> {
-    let mut index = resume_session_insert_index(argv);
-    while index < argv.len() {
-        if argv[index] == OPENCODE_SESSION_FLAG {
-            index = index.saturating_add(2);
-            continue;
-        }
-        if !argv[index].trim().is_empty() {
-            return Some(&argv[index]);
-        }
-        index += 1;
+fn opencode_argv_payload(argv: &[String]) -> Option<String> {
+    let (message_start, _) = opencode_message_region(argv)?;
+    let message_args = &argv[message_start..];
+    if has_unbounded_option_shaped_message_arg(argv) {
+        return None;
     }
-    None
+    let payload = match message_args {
+        [single] => single.clone(),
+        multiple => multiple
+            .iter()
+            .map(|arg| {
+                if arg.contains(' ') {
+                    format!("\"{}\"", arg.replace('"', "\\\""))
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    (!payload.trim().is_empty()).then_some(payload)
+}
+
+fn has_unbounded_option_shaped_message_arg(argv: &[String]) -> bool {
+    opencode_message_region(argv).is_some_and(|(message_start, has_boundary)| {
+        !has_boundary && argv[message_start..].iter().any(|arg| arg.starts_with('-'))
+    })
 }
 
 fn opencode_message_region(argv: &[String]) -> Option<(usize, bool)> {
@@ -687,7 +681,14 @@ fn policy_managed_opencode_prefix_end(argv: &[String]) -> Option<usize> {
 }
 
 fn upsert_session_arg(argv: &mut Vec<String>, session_id: &str, insert_at: usize) {
-    if let Some(index) = argv.iter().position(|arg| arg == OPENCODE_SESSION_FLAG) {
+    let option_end = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(argv.len());
+    if let Some(index) = argv[..option_end]
+        .iter()
+        .position(|arg| arg == OPENCODE_SESSION_FLAG)
+    {
         set_existing_session_arg(argv, index, session_id);
     } else {
         insert_session_arg(argv, insert_at, session_id);

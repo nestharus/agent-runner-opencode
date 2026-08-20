@@ -279,11 +279,18 @@ impl FakeOpencodeWrapper {
     }
 
     pub fn with_counted_resume() -> Self {
+        Self::with_counted_resume_payload(resume_payload())
+    }
+
+    pub fn with_counted_resume_payload(payload: &str) -> Self {
         let dir = unique_temp_dir("agent-runner-opencode-counted-resume");
         create_fake_wrapper_dir(&dir);
         let wrapper_path = fake_wrapper_path(&dir);
         let log_path = fake_wrapper_log_path(&dir);
-        write_fake_wrapper(&wrapper_path, fake_counted_resume_script(&log_path));
+        write_fake_wrapper(
+            &wrapper_path,
+            fake_counted_resume_script(&log_path, payload),
+        );
         let log_path_string = path_string(&log_path);
         Self::from_parts(dir, log_path, log_path_string)
     }
@@ -504,7 +511,7 @@ exit 0\n",
     )
 }
 
-pub fn fake_counted_resume_script(count_path: &Path) -> String {
+pub fn fake_counted_resume_script(count_path: &Path, payload: &str) -> String {
     let export = json!({
         "info": {"id": resume_session_id(), "title": "durable resume contract"},
         "messages": [{
@@ -519,7 +526,7 @@ pub fn fake_counted_resume_script(count_path: &Path) -> String {
                 },
                 "time": {"created": 4_102_444_800_000_u64}
             },
-            "parts": [{"type": "text", "text": resume_payload()}]
+            "parts": [{"type": "text", "text": payload}]
         }]
     })
     .to_string();
