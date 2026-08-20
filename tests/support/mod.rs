@@ -6,9 +6,12 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
 
 pub const CONTRACT: &str = "oulipoly.provider/v1";
+
+static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub fn invoke(subcommand: &str, params: Value) -> Output {
     invoke_with_host(subcommand, params, json!({}))
@@ -98,7 +101,10 @@ pub fn invoke_raw_stdin_with_env(
 pub fn request_envelope(subcommand: &str, params: Value, host_overrides: Value) -> Value {
     json!({
         "contract": CONTRACT,
-        "request_id": format!("req-{subcommand}"),
+        "request_id": format!(
+            "req-{subcommand}-{}",
+            REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ),
         "provider_instance_id": "opencode-primary",
         "host": host_context(host_overrides),
         "params": params
@@ -147,7 +153,7 @@ fn default_test_root() -> PathBuf {
     ))
 }
 
-fn ensure_default_runtime_settings(request: &Value) {
+pub fn ensure_default_runtime_settings(request: &Value) {
     static INITIALIZE: Once = Once::new();
     let default_config_root = default_test_root().join("config");
     if request.pointer("/host/config_root").and_then(Value::as_str) != default_config_root.to_str()

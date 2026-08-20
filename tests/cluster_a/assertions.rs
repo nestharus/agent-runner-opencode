@@ -933,9 +933,17 @@ pub fn assert_valid_launch_event(line_number: usize, event: &Value) {
 }
 
 pub fn assert_monotonic_launch_events(events: &[Value]) {
+    let request_id = events
+        .first()
+        .and_then(|event| event["request_id"].as_str())
+        .expect("launch stream must contain a request_id");
+    assert!(
+        request_id.starts_with("req-launch-"),
+        "launch request_id should use the test sequence: {request_id}"
+    );
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event["contract"], CONTRACT);
-        assert_eq!(event["request_id"], "req-launch");
+        assert_eq!(event["request_id"], request_id);
         assert!(
             event["time_unix_ms"].as_u64().is_some(),
             "launch event line {} must carry time_unix_ms",

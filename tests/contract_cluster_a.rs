@@ -4,7 +4,29 @@ mod cluster_a;
 mod support;
 
 use cluster_a::*;
+use std::fs;
 use support::{invoke_validated, invoke_with_env, invoke_with_host_and_env, json_stdout};
+
+struct FailAfterFirstLaunchEvent {
+    completed_events: usize,
+}
+
+impl std::io::Write for FailAfterFirstLaunchEvent {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.completed_events >= 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "simulated launch event handoff failure",
+            ));
+        }
+        self.completed_events += buffer.iter().filter(|byte| **byte == b'\n').count();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 #[test]
 fn characterization_opencode_launch_json_events() {
@@ -31,6 +53,66 @@ fn contract_launch_stream() {
         &[("PATH", path.as_str())],
     );
     assert_contract_launch_stream_output(&output, fake_wrapper.log_path(), fixture_session_id);
+}
+
+#[test]
+fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss() {
+    let provider_session_id = "ses_durable_launch_response_loss";
+    let fake_wrapper = FakeOpencodeWrapper::with_counted_new_session(provider_session_id);
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_env(
+        "low",
+        &[
+            ("PATH", path.as_str()),
+            (
+                "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                fake_wrapper.log_path_str(),
+            ),
+        ],
+    );
+    let mut request = support::validated_request_envelope(
+        "launch",
+        params,
+        serde_json::json!({}),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    request["request_id"] = serde_json::json!("req-launch-generated-session-response-loss");
+    support::assert_valid_request_envelope(&request, "launch.schema.json#/$defs/LaunchRequest");
+    support::ensure_default_runtime_settings(&request);
+
+    let args = vec!["agent-runner-opencode".to_string(), "launch".to_string()];
+    let mut writer = FailAfterFirstLaunchEvent {
+        completed_events: 0,
+    };
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&request).expect("serialize launch request"),
+            &mut writer,
+        ),
+        1,
+        "losing the stdout event should fail the first invocation"
+    );
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read launch count"),
+        "1\n",
+        "the first invocation should create exactly one provider session"
+    );
+
+    let replay = json_stdout(&support::invoke_with_request("launch", request));
+    assert_eq!(
+        replay["error"]["code"],
+        "launch_session_reconciliation_required"
+    );
+    assert_eq!(
+        replay["error"]["details"]["provider_session_id"],
+        provider_session_id
+    );
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read replay launch count"),
+        "1\n",
+        "an exact replay must not create a second provider session"
+    );
 }
 
 #[test]

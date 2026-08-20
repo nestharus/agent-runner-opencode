@@ -109,6 +109,14 @@ truncation are emitted as explicit evidence markers. Independent stdout and
 stderr pipes are sequenced in provider receipt order; the provider makes no
 claim about an unknowable pre-receipt cross-pipe emission order.
 
+Before a new-session child is spawned, launch durably binds the request ID to
+the accepted route and prompt digest. The first generated provider session ID
+is added to that binding before its native stdout bytes are handed off. An
+exact retry therefore never spawns independent work: it returns the durable
+session identity, when observed, and requires the caller to reconcile that
+session. Reusing the request ID with different launch inputs is rejected as a
+conflict.
+
 For resumed sessions, model switching is allowed per turn. Delivery and
 completion are credited only when bounded native export observes the submitted
 payload and a completed assistant message for the requested session, provider

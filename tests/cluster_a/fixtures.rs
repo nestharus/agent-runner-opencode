@@ -265,6 +265,19 @@ impl FakeOpencodeWrapper {
         Self::from_parts(dir, log_path, log_path_string)
     }
 
+    pub fn with_counted_new_session(session_id: &str) -> Self {
+        let dir = unique_temp_dir("agent-runner-opencode-counted-new-session");
+        create_fake_wrapper_dir(&dir);
+        let wrapper_path = fake_wrapper_path(&dir);
+        let log_path = fake_wrapper_log_path(&dir);
+        write_fake_wrapper(
+            &wrapper_path,
+            fake_counted_new_session_script(&log_path, session_id),
+        );
+        let log_path_string = path_string(&log_path);
+        Self::from_parts(dir, log_path, log_path_string)
+    }
+
     fn from_parts(dir: PathBuf, log_path: PathBuf, log_path_string: String) -> Self {
         Self {
             dir,
@@ -443,6 +456,30 @@ pub fn fake_wrapper_log_only_script() -> String {
 for arg in \"$@\"; do printf '%s\\0' \"$arg\"; done > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
 exit 0\n"
         .to_string()
+}
+
+pub fn fake_counted_new_session_script(count_path: &Path, session_id: &str) -> String {
+    let event = json!({
+        "type": "step_start",
+        "timestamp": OBSERVED_AT_UNIX_MS,
+        "sessionID": session_id,
+        "part": {
+            "type": "step-start",
+            "sessionID": session_id
+        }
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+count=0\n\
+if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
+count=$((count + 1))\n\
+printf '%s\\n' \"$count\" > {count_path}\n\
+printf '%s\\n' {event}\n\
+exit 0\n",
+        count_path = shell_single_quote(&path_string(count_path)),
+        event = shell_single_quote(&event),
+    )
 }
 
 pub fn fake_wrapper_nul_log_resume_confirming_export_script(prompt: &str) -> String {

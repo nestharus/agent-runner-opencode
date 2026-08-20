@@ -11,16 +11,21 @@
 
 use crate::activity::ActivityTargets;
 use crate::child_custody::ChildCustody;
-use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms};
+use crate::durable_fs;
+use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
+use crate::path_guard;
 use crate::policy;
 use crate::resume_observation::{self, ResumeObservationRequest};
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
-use serde::Deserialize;
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
@@ -50,6 +55,7 @@ const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
 const RESUME_COMPLETION_UNRESOLVED_MARKER: &str = "oulipoly.resume_completion_unresolved";
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
+const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
 pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -86,6 +92,31 @@ enum DrainMessage {
     ReadError { stdout: bool, message: String },
 }
 
+#[derive(Serialize, Deserialize)]
+struct LaunchRequestState {
+    schema_version: u32,
+    request_id: String,
+    binding_sha256: String,
+    prompt_sha256: Option<String>,
+    phase: LaunchRequestPhase,
+    provider_session_id: Option<String>,
+    prepared_at_unix_ms: u64,
+    observed_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LaunchRequestPhase {
+    Prepared,
+    SessionObserved,
+}
+
+struct LaunchRequestGuard {
+    state_path: PathBuf,
+    state: LaunchRequestState,
+    _lock: fs::File,
+}
+
 pub(crate) struct LaunchOutcome {
     pub exit_code: i32,
     pub activity_targets: ActivityTargets,
@@ -97,6 +128,7 @@ pub(crate) fn stream<W: Write>(
     params: Value,
     writer: &mut W,
 ) -> Result<LaunchOutcome, ProviderFailure> {
+    let raw_params = params.clone();
     let params = parse_launch_params(params, request_id)?;
     let effective = match launch_argv(&params, host, request_id)? {
         PolicyLaunch::Accepted(effective) => *effective,
@@ -109,6 +141,19 @@ pub(crate) fn stream<W: Write>(
             })
         }
     };
+    let mut launch_request = if known_provider_session_id(&params).is_none() {
+        Some(LaunchRequestGuard::prepare(
+            host,
+            request_id,
+            launch_request_binding_sha256(host, &raw_params, &effective.route_evidence),
+            effective
+                .prompt
+                .as_deref()
+                .map(|prompt| sha256_hex(prompt.as_bytes())),
+        )?)
+    } else {
+        None
+    };
     let child = match spawn_child(
         &effective.argv,
         &params.working_directory,
@@ -117,10 +162,13 @@ pub(crate) fn stream<W: Write>(
     ) {
         Ok(child) => child,
         Err(err) => {
+            if let Some(launch_request) = launch_request.take() {
+                launch_request.abandon_before_spawn()?;
+            }
             return stream_spawn_error(request_id, writer, err).map(|exit_code| LaunchOutcome {
                 exit_code,
                 activity_targets: effective.activity_targets,
-            })
+            });
         }
     };
     let mut custody = ChildCustody::with_cleanup(child, |child| {
@@ -138,6 +186,7 @@ pub(crate) fn stream<W: Write>(
         custody.child_mut(),
         effective.resume_observation_request,
         effective.route_evidence,
+        launch_request,
         writer,
     )
     .map(|exit_code| LaunchOutcome {
@@ -187,7 +236,7 @@ struct EffectiveLaunch {
     argv: Vec<String>,
     env: BTreeMap<String, String>,
     stdin: Option<Vec<u8>>,
-    _prompt: Option<String>,
+    prompt: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
     route_evidence: Value,
     activity_targets: ActivityTargets,
@@ -266,7 +315,7 @@ fn effective_launch(
         argv,
         env,
         stdin,
-        _prompt: prompt,
+        prompt,
         resume_observation_request,
         route_evidence: json!(markers),
         activity_targets,
@@ -607,6 +656,7 @@ fn stream_child<W: Write>(
     child: &mut Child,
     resume_observation_request: Option<ResumeObservationRequest>,
     route_evidence: Value,
+    launch_request: Option<LaunchRequestGuard>,
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
     let mut state = LaunchState::new(
@@ -614,6 +664,7 @@ fn stream_child<W: Write>(
         host.deadline_unix_ms,
         resume_observation_request,
         route_evidence,
+        launch_request,
     );
     let receiver = start_drains(child);
     state.emit_route_evidence(writer)?;
@@ -755,7 +806,7 @@ fn stream_spawn_error<W: Write>(
     writer: &mut W,
     err: std::io::Error,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, None, None, json!([]));
+    let mut state = LaunchState::new(request_id, None, None, json!([]), None);
     state.final_status = Some(spawn_error_status(err));
     state.mark_drains_done();
     state.finish(writer)
@@ -766,10 +817,264 @@ fn stream_policy_rejection<W: Write>(
     writer: &mut W,
     reason: String,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, None, None, json!([]));
+    let mut state = LaunchState::new(request_id, None, None, json!([]), None);
     state.final_status = Some(policy_rejection_status(reason));
     state.mark_drains_done();
     state.finish(writer)
+}
+
+impl LaunchRequestGuard {
+    fn prepare(
+        host: &HostContext,
+        request_id: &str,
+        binding_sha256: String,
+        prompt_sha256: Option<String>,
+    ) -> Result<Self, ProviderFailure> {
+        let root = launch_state_root(host, request_id)?;
+        durable_fs::create_private_directories(&root)
+            .map_err(|error| launch_state_failure(request_id, error))?;
+        let key = sha256_hex(request_id.as_bytes());
+        let state_path =
+            confined_launch_state_target(host, &root.join(format!("{key}.json")), request_id)?;
+        let lock_path =
+            confined_launch_state_target(host, &root.join(format!("{key}.lock")), request_id)?;
+        let lock = open_launch_state_lock(&lock_path)
+            .map_err(|error| launch_state_failure(request_id, error))?;
+        lock.lock_exclusive()
+            .map_err(|error| launch_state_failure(request_id, error))?;
+        match durable_fs::read_file(&state_path) {
+            Ok(bytes) => {
+                let state: LaunchRequestState = serde_json::from_slice(&bytes)
+                    .map_err(|error| launch_state_invalid(request_id, error))?;
+                validate_launch_request_state(&state, request_id)?;
+                if state.binding_sha256 != binding_sha256 {
+                    return Err(launch_request_reuse_conflict(
+                        request_id,
+                        &binding_sha256,
+                        &state,
+                    ));
+                }
+                return Err(launch_session_reconciliation_required(request_id, &state));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(launch_state_failure(request_id, error)),
+        }
+        let state = LaunchRequestState {
+            schema_version: 1,
+            request_id: request_id.to_string(),
+            binding_sha256,
+            prompt_sha256,
+            phase: LaunchRequestPhase::Prepared,
+            provider_session_id: None,
+            prepared_at_unix_ms: now_unix_ms(),
+            observed_at_unix_ms: None,
+        };
+        write_launch_request_state(&state_path, &state, request_id)?;
+        Ok(Self {
+            state_path,
+            state,
+            _lock: lock,
+        })
+    }
+
+    fn observe_session(&mut self, provider_session_id: &str) -> Result<(), ProviderFailure> {
+        if self.state.phase == LaunchRequestPhase::SessionObserved {
+            if self.state.provider_session_id.as_deref() == Some(provider_session_id) {
+                return Ok(());
+            }
+            return Err(ProviderFailure::conflict(
+                &self.state.request_id,
+                "launch_generated_session_conflict",
+                "one launch request produced conflicting provider session identities",
+                json!({
+                    "committed_provider_session_id": self.state.provider_session_id,
+                    "observed_provider_session_id": provider_session_id,
+                }),
+            ));
+        }
+        self.state.phase = LaunchRequestPhase::SessionObserved;
+        self.state.provider_session_id = Some(provider_session_id.to_string());
+        self.state.observed_at_unix_ms = Some(now_unix_ms());
+        write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
+    }
+
+    fn abandon_before_spawn(self) -> Result<(), ProviderFailure> {
+        match fs::remove_file(&self.state_path) {
+            Ok(()) => durable_fs::sync_directory(
+                self.state_path
+                    .parent()
+                    .expect("launch state path always has a parent"),
+            )
+            .map_err(|error| launch_state_failure(&self.state.request_id, error)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(launch_state_failure(&self.state.request_id, error)),
+        }
+    }
+}
+
+fn launch_request_binding_sha256(
+    host: &HostContext,
+    params: &Value,
+    route_evidence: &Value,
+) -> String {
+    sha256_hex(
+        json!({
+            "host_app": host.app,
+            "params": params,
+            "route": route_evidence,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+fn launch_state_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
+    let data_root = launch_data_root(host, request_id)?;
+    confined_launch_state_target(host, &data_root.join(LAUNCH_STATE_DIR), request_id)
+}
+
+fn launch_data_root<'a>(
+    host: &'a HostContext,
+    request_id: &str,
+) -> Result<&'a Path, ProviderFailure> {
+    host.data_root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+        .map(Path::new)
+        .ok_or_else(|| {
+            ProviderFailure::invalid_request(
+                request_id,
+                "launch_data_root_missing",
+                "new-session launch requires host.data_root for durable request-to-session binding",
+            )
+        })
+}
+
+fn confined_launch_state_target(
+    host: &HostContext,
+    target: &Path,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    path_guard::confined_target(launch_data_root(host, request_id)?, target)
+        .map_err(|error| launch_state_failure(request_id, error))
+}
+
+fn open_launch_state_lock(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn write_launch_request_state(
+    path: &Path,
+    state: &LaunchRequestState,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let parent = path
+        .parent()
+        .expect("launch request state path always has a parent");
+    durable_fs::create_private_directories(parent)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    let bytes =
+        serde_json::to_vec(state).map_err(|error| launch_state_invalid(request_id, error))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    temporary
+        .persist(path)
+        .map_err(|error| launch_state_failure(request_id, error.error))?;
+    durable_fs::sync_directory(parent).map_err(|error| launch_state_failure(request_id, error))
+}
+
+fn validate_launch_request_state(
+    state: &LaunchRequestState,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let phase_valid = match state.phase {
+        LaunchRequestPhase::Prepared => {
+            state.provider_session_id.is_none() && state.observed_at_unix_ms.is_none()
+        }
+        LaunchRequestPhase::SessionObserved => {
+            state
+                .provider_session_id
+                .as_deref()
+                .is_some_and(|session_id| !session_id.trim().is_empty())
+                && state.observed_at_unix_ms.is_some()
+        }
+    };
+    if state.schema_version == 1
+        && state.request_id == request_id
+        && !state.binding_sha256.trim().is_empty()
+        && phase_valid
+    {
+        return Ok(());
+    }
+    Err(launch_state_invalid(
+        request_id,
+        "launch request state identity or phase is inconsistent",
+    ))
+}
+
+fn launch_state_failure(request_id: &str, error: impl std::fmt::Display) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "launch_state_failed",
+        format!("durable launch request state failed: {error}"),
+    )
+}
+
+fn launch_state_invalid(request_id: &str, error: impl std::fmt::Display) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "launch_state_invalid",
+        format!("durable launch request state is invalid: {error}"),
+    )
+}
+
+fn launch_request_reuse_conflict(
+    request_id: &str,
+    attempted_binding_sha256: &str,
+    state: &LaunchRequestState,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "launch_request_conflict",
+        "launch request_id already names a different durable new-session operation",
+        json!({
+            "attempted_binding_sha256": attempted_binding_sha256,
+            "committed_binding_sha256": state.binding_sha256,
+            "provider_session_id": state.provider_session_id,
+        }),
+    )
+}
+
+fn launch_session_reconciliation_required(
+    request_id: &str,
+    state: &LaunchRequestState,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "launch_session_reconciliation_required",
+        "new-session launch request already has durable state and will not spawn independent work",
+        json!({
+            "phase": state.phase,
+            "binding_sha256": state.binding_sha256,
+            "prompt_sha256": state.prompt_sha256,
+            "provider_session_id": state.provider_session_id,
+            "required_action": "reconcile the bound provider session before deciding whether to resume",
+        }),
+    )
 }
 
 struct LaunchState {
@@ -796,6 +1101,7 @@ struct LaunchState {
     deadline_unix_ms: Option<u64>,
     next_heartbeat: Instant,
     route_evidence: Value,
+    launch_request: Option<LaunchRequestGuard>,
 }
 
 impl LaunchState {
@@ -804,6 +1110,7 @@ impl LaunchState {
         deadline_unix_ms: Option<u64>,
         resume_observation_request: Option<ResumeObservationRequest>,
         route_evidence: Value,
+        launch_request: Option<LaunchRequestGuard>,
     ) -> Self {
         let next_resume_completion_probe = resume_observation_request
             .as_ref()
@@ -832,6 +1139,7 @@ impl LaunchState {
             deadline_unix_ms,
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
             route_evidence,
+            launch_request,
         }
     }
 
@@ -872,8 +1180,10 @@ impl LaunchState {
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
         self.record_stdout(bytes);
+        let session = self.session_from_stdout(bytes);
+        self.persist_generated_session(session.as_deref())?;
         self.project_stdout_bytes(bytes, writer)?;
-        self.capture_session_from_stdout(bytes, writer)
+        self.capture_session(session, writer)
     }
 
     fn stderr_bytes<W: Write>(
@@ -926,6 +1236,7 @@ impl LaunchState {
         session: Option<String>,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
+        self.persist_generated_session(session.as_deref())?;
         if self.has_session_marker() {
             return Ok(());
         }
@@ -934,6 +1245,18 @@ impl LaunchState {
             self.write_session_marker(&session_id, writer)?;
         }
         Ok(())
+    }
+
+    fn persist_generated_session(
+        &mut self,
+        provider_session_id: Option<&str>,
+    ) -> Result<(), ProviderFailure> {
+        let (Some(launch_request), Some(provider_session_id)) =
+            (self.launch_request.as_mut(), provider_session_id)
+        else {
+            return Ok(());
+        };
+        launch_request.observe_session(provider_session_id)
     }
 
     fn has_session_marker(&self) -> bool {
@@ -958,15 +1281,6 @@ impl LaunchState {
             }),
             writer,
         )
-    }
-
-    fn capture_session_from_stdout<W: Write>(
-        &mut self,
-        bytes: &[u8],
-        writer: &mut W,
-    ) -> Result<(), ProviderFailure> {
-        let session = self.session_from_stdout(bytes);
-        self.capture_session(session, writer)
     }
 
     fn session_from_stdout(&mut self, bytes: &[u8]) -> Option<String> {
