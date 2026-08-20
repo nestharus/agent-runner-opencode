@@ -1363,7 +1363,14 @@ fn legacy_models_empty(models: &[String]) -> bool {
 }
 
 fn legacy_diagnostics(legacy: &Value) -> Vec<Value> {
-    legacy_diagnostics_for_providers(&legacy_provider_names(legacy))
+    let providers = legacy_provider_names(legacy);
+    let mut diagnostics = legacy_diagnostics_for_providers(&providers);
+    diagnostics.extend(
+        legacy_unrecognized_provider_names(legacy)
+            .into_iter()
+            .map(legacy_unrecognized_provider_diagnostic),
+    );
+    diagnostics
 }
 
 fn legacy_diagnostics_for_providers(providers: &[String]) -> Vec<Value> {
@@ -1412,30 +1419,53 @@ fn legacy_provider_names_from_table(table: Option<&toml::Table>) -> Vec<String> 
 fn legacy_opencode_provider_names<'a>(
     providers: impl Iterator<Item = (&'a String, &'a toml::Value)>,
 ) -> Vec<String> {
-    legacy_opencode_provider_name_entries(providers)
-        .into_iter()
-        .map(legacy_provider_name)
-        .collect()
-}
-
-fn legacy_opencode_provider_name_entries<'a>(
-    providers: impl Iterator<Item = (&'a String, &'a toml::Value)>,
-) -> Vec<(&'a String, &'a toml::Value)> {
     providers
-        .filter(|(name, value)| legacy_opencode_provider(name, value))
+        .filter_map(|(_, value)| legacy_provider_account(value))
+        .map(|account| account.opencode_wrapper.to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
-fn legacy_provider_name(entry: (&String, &toml::Value)) -> String {
-    entry.0.clone()
+fn legacy_provider_account(value: &toml::Value) -> Option<&'static AccountProfile> {
+    value
+        .get("command")
+        .and_then(toml::Value::as_str)
+        .and_then(profile_for_wrapper_reference)
 }
 
-fn legacy_opencode_provider(name: &str, value: &toml::Value) -> bool {
-    name.starts_with("opencode")
-        && value
-            .get("command")
-            .and_then(toml::Value::as_str)
-            .is_some_and(|command| command.starts_with("opencode"))
+fn legacy_unrecognized_provider_names(legacy: &Value) -> Vec<String> {
+    let Some(parsed) = legacy_providers_toml(legacy) else {
+        return Vec::new();
+    };
+    let Some(table) = legacy_provider_table(&parsed) else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .filter(|(_, value)| {
+            legacy_opencode_shaped_command(value) && legacy_provider_account(value).is_none()
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+fn legacy_opencode_shaped_command(value: &toml::Value) -> bool {
+    value
+        .get("command")
+        .and_then(toml::Value::as_str)
+        .and_then(|command| Path::new(command).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("opencode"))
+}
+
+fn legacy_unrecognized_provider_diagnostic(provider: String) -> Value {
+    diagnostic(
+        "error",
+        format!("legacy.providers_toml.{provider}"),
+        "legacy OpenCode command does not resolve to a declared account wrapper",
+        "legacy_provider_unknown",
+    )
 }
 
 fn legacy_models(legacy: &Value) -> Vec<String> {
@@ -1466,37 +1496,44 @@ fn write_migrated_settings(
         "settings.migrate",
         |store| {
             for provider in providers {
-                upsert_migrated_record(store, &provider, request_id);
+                upsert_migrated_record(store, &provider, request_id)?;
             }
             Ok(())
         },
     )
 }
 
-fn upsert_migrated_record(store: &mut SettingsStore, provider: &str, request_id: &str) {
-    let values = migrated_values(provider);
-    if let Some(index) = store
-        .records
-        .iter()
-        .position(|record| record.values.get("profile").and_then(Value::as_str) == Some(provider))
-    {
+fn upsert_migrated_record(
+    store: &mut SettingsStore,
+    provider: &str,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let account = profile_for_wrapper_reference(provider)
+        .ok_or_else(|| legacy_account_resolution_failure(request_id, provider))?;
+    let values = migrated_values_for_account(account);
+    if let Some(index) = store.records.iter().position(|record| {
+        record.values.get("profile").and_then(Value::as_str) == Some(account.opencode_wrapper)
+    }) {
         let id = store.records[index].id.clone();
         update_record(store, index, &id, values, request_id);
-        return;
+        return Ok(());
     }
-    let record = new_record(store, Some(provider.to_string()), values, request_id);
+    let record = new_record(
+        store,
+        Some(account.opencode_wrapper.to_string()),
+        values,
+        request_id,
+    );
     insert_record(store, record);
+    Ok(())
 }
 
-fn migrated_values(provider: &str) -> Value {
-    migrated_values_for_account(migration_account(provider))
-}
-
-fn migration_account(provider: &str) -> &'static crate::account::AccountProfile {
-    ACCOUNTS
-        .iter()
-        .find(|account| account.opencode_wrapper == provider)
-        .unwrap_or(&ACCOUNTS[0])
+fn legacy_account_resolution_failure(request_id: &str, provider: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "legacy_provider_unknown",
+        format!("legacy provider {provider} does not resolve to a declared OpenCode account"),
+    )
 }
 
 fn migrated_values_for_account(account: &crate::account::AccountProfile) -> Value {

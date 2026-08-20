@@ -1,10 +1,11 @@
 //! Declared roles: accessor, mapper, orchestration, validator, predicate, filter, formatter, parser
 
-use crate::account::ACCOUNTS;
+use crate::account::{profile_for_wrapper_reference, ACCOUNTS};
 use crate::encoding::bounded_text;
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::shell;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
@@ -233,10 +234,25 @@ fn setup_warnings(installed: bool) -> Vec<Value> {
 }
 
 fn sync_diagnostics(params: &Value) -> Vec<Value> {
-    if params.get("settings_schema_id").and_then(Value::as_str) == Some("opencode.settings/v1") {
-        return Vec::new();
+    let mut diagnostics = desired_profile_diagnostics(params);
+    if params.get("settings_schema_id").and_then(Value::as_str) != Some("opencode.settings/v1") {
+        diagnostics.push(settings_schema_mismatch_diagnostic());
     }
-    vec![settings_schema_mismatch_diagnostic()]
+    diagnostics
+}
+
+fn desired_profile_diagnostics(params: &Value) -> Vec<Value> {
+    desired_profile_values(params)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| match value.as_str() {
+            Some(reference) if profile_for_wrapper_reference(reference).is_none() => {
+                Some(unknown_profile_diagnostic(reference))
+            }
+            None => Some(invalid_profile_type_diagnostic()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn wrapper_names() -> Vec<&'static str> {
@@ -389,7 +405,13 @@ fn desired_profile_values(params: &Value) -> Option<&[Value]> {
 }
 
 fn desired_profile_strings(values: &[Value]) -> Vec<String> {
-    owned_profile_strings(desired_profile_string_entries(values))
+    desired_profile_string_entries(values)
+        .into_iter()
+        .filter_map(profile_for_wrapper_reference)
+        .map(|account| account.opencode_wrapper.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn desired_profile_string_entries(values: &[Value]) -> Vec<&str> {
@@ -401,10 +423,6 @@ fn desired_profile_string_entries(values: &[Value]) -> Vec<&str> {
 
 fn desired_profile_string_entry(value: &Value) -> Option<&str> {
     value.as_str()
-}
-
-fn owned_profile_strings(entries: Vec<&str>) -> Vec<String> {
-    entries.into_iter().map(str::to_string).collect()
 }
 
 fn default_profiles() -> Vec<String> {
@@ -564,5 +582,23 @@ fn settings_schema_mismatch_diagnostic() -> Value {
         "path": "settings_schema_id",
         "message": "sync plan expects opencode.settings/v1 settings",
         "code": "settings_schema_mismatch",
+    })
+}
+
+fn unknown_profile_diagnostic(reference: &str) -> Value {
+    json!({
+        "severity": "error",
+        "path": "desired_profiles",
+        "message": format!("unknown OpenCode account wrapper reference: {reference}"),
+        "code": "unknown_opencode_profile",
+    })
+}
+
+fn invalid_profile_type_diagnostic() -> Value {
+    json!({
+        "severity": "error",
+        "path": "desired_profiles",
+        "message": "OpenCode account wrapper references must be strings",
+        "code": "invalid_opencode_profile",
     })
 }

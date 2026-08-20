@@ -538,6 +538,64 @@ fn contract_settings_migrate() {
 }
 
 #[test]
+fn contract_settings_migrate_canonicalizes_and_rejects_unknown_legacy_accounts() {
+    let host = HostRoots::new("agent-runner-opencode-settings-migrate-account-admission");
+    let providers_toml = r#"
+[legacy_alias]
+command = "/tmp/bin/opencode"
+
+[legacy_two]
+command = "/tmp/bin/opencode2"
+
+[legacy_unknown]
+command = "/tmp/bin/opencode9"
+"#;
+    let legacy = json!({
+        "providers_toml": providers_toml,
+        "models": { "gpt-high.toml": MODEL_TOML }
+    });
+    let dry_run = success_result(
+        invoke_validated_with_host(
+            "settings.migrate",
+            json!({ "dry_run": true, "legacy": legacy.clone() }),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsMigrateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsMigrateResponse",
+        "settings.schema.json#/$defs/SettingsMigrateResult",
+    );
+    let action_providers = dry_run["actions"]
+        .as_array()
+        .expect("migration actions")
+        .iter()
+        .filter_map(|action| action["provider"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(action_providers, vec!["opencode1", "opencode2"]);
+    assert_eq!(dry_run["requires_user_input"], true);
+    assert!(dry_run["diagnostics"]
+        .as_array()
+        .expect("migration diagnostics")
+        .iter()
+        .any(|diagnostic| diagnostic["code"] == "legacy_provider_unknown"));
+
+    let apply = invoke_validated_with_host(
+        "settings.migrate",
+        json!({ "dry_run": false, "legacy": legacy }),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsMigrateRequest",
+    );
+    let error = error_response(apply);
+    assert_eq!(error["error"]["code"], "settings_validation_failed");
+    assert!(
+        !host
+            .config_root()
+            .join("agent-runner-opencode/settings-store.json")
+            .exists(),
+        "invalid legacy account must not be mapped or persisted"
+    );
+}
+
+#[test]
 fn contract_setup_detect_install_sync() {
     let host = HostRoots::new("agent-runner-opencode-setup");
     let toolchain = FakeToolchain::new();
@@ -597,6 +655,36 @@ fn contract_setup_detect_install_sync() {
         "setup.schema.json#/$defs/SetupSyncPlanResult",
     );
     assert_setup_sync_result(&sync);
+}
+
+#[test]
+fn contract_setup_sync_canonicalizes_and_rejects_unknown_account_references() {
+    let host = HostRoots::new("agent-runner-opencode-setup-account-admission");
+    let result = success_result(
+        invoke_validated_with_host(
+            "setup.sync_plan",
+            json!({
+                "desired_profiles": ["/tmp/bin/opencode2", "opencode", "opencode9"],
+                "settings_schema_id": "opencode.settings/v1"
+            }),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    let profiles = result["operations"]
+        .as_array()
+        .expect("setup operations")
+        .iter()
+        .map(|operation| operation["profile"].as_str().expect("canonical profile"))
+        .collect::<Vec<_>>();
+    assert_eq!(profiles, vec!["opencode1", "opencode2"]);
+    assert!(result["diagnostics"]
+        .as_array()
+        .expect("setup diagnostics")
+        .iter()
+        .any(|diagnostic| diagnostic["code"] == "unknown_opencode_profile"));
 }
 
 #[test]

@@ -16,7 +16,10 @@ auth path, quota probe, refresh command, and rotation target must resolve to
 the same profile. One account-catalog resolver owns wrapper-shaped references
 from command paths, settings values, and native routing. The bare `opencode`
 name is a compatibility alias for account one; numbered wrappers are canonical
-persisted identities. Persisted opaque settings IDs are operational IDs and can be
+persisted identities. Setup plans and legacy-provider migration both resolve
+their inputs through this same catalog and emit canonical numbered identities;
+unknown OpenCode-shaped references are diagnostic errors and are never mapped
+to account one. Persisted opaque settings IDs are operational IDs and can be
 used anywhere a `settings_id` is accepted. Stores written by the prior schema
 are compatibility-projected to the current OpenCode-owned account, quota, and
 model shape while preserving record IDs and versions; the next mutation writes
