@@ -86,6 +86,29 @@ pub fn invoke_with_request_and_env(
     invoke_raw_stdin_with_env(subcommand, &stdin, env)
 }
 
+#[allow(dead_code)]
+pub fn invoke_with_request_and_env_fresh_deadline(
+    subcommand: &str,
+    mut request_json: Value,
+    env: &[(&str, &str)],
+    deadline_after: std::time::Duration,
+) -> (Output, std::time::Duration) {
+    scope_default_host_to_native_env(&mut request_json, env);
+    ensure_default_runtime_settings(&request_json);
+    let mut child = spawn_provider(subcommand, env);
+    let deadline_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after the epoch")
+        .as_millis() as u64
+        + deadline_after.as_millis() as u64;
+    request_json["host"]["deadline_unix_ms"] = json!(deadline_unix_ms);
+    let stdin = request_stdin_bytes(&request_json);
+    let started = std::time::Instant::now();
+    write_provider_stdin(&mut child, &stdin);
+    let output = wait_provider(child);
+    (output, started.elapsed())
+}
+
 pub fn invoke_raw_stdin(subcommand: &str, stdin_bytes: &[u8]) -> Output {
     invoke_raw_stdin_with_env(subcommand, stdin_bytes, &[])
 }

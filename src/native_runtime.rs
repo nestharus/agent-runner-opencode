@@ -111,7 +111,9 @@ pub fn resolve_for_launch(
     }
     let candidate =
         candidate_context(account, stable_launch_environment(declared_env), request_id)?;
-    let timeout = runtime_lock_timeout(host, request_id)?;
+    let timeout =
+        operation_bounds::remaining_timeout(host.deadline_unix_ms, NATIVE_RUNTIME_LOCK_TIMEOUT)
+            .unwrap_or(Duration::ZERO);
     let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
     if let Some(context) = read_runtime_context(host, account, request_id)? {
         validate_runtime_context(&context, account, request_id)?;

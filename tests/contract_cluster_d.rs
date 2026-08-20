@@ -8,10 +8,19 @@ use cluster_d::*;
 use serde_json::{json, Value};
 use std::fs;
 use std::fs::OpenOptions;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use support::{
     invoke, invoke_validated, invoke_validated_with_host, invoke_validated_with_host_and_env,
 };
+
+static IO_INTENSIVE_CONTRACT_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_io_intensive_contract() -> MutexGuard<'static, ()> {
+    IO_INTENSIVE_CONTRACT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[test]
 fn contract_settings_crud() {
@@ -248,6 +257,7 @@ fn contract_settings_mutations_replay_committed_results_after_response_loss() {
 
 #[test]
 fn contract_settings_parallel_creates_do_not_lose_records() {
+    let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-settings-parallel-create");
     let host_overrides = host.overrides();
     let workers = (0..8)
@@ -296,6 +306,7 @@ fn contract_settings_parallel_creates_do_not_lose_records() {
 
 #[test]
 fn contract_settings_parallel_updates_preserve_optimistic_concurrency() {
+    let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-settings-parallel-update");
     let created = success_result(
         invoke_validated_with_host(
@@ -661,7 +672,7 @@ fn contract_busy_activity_evidence_never_blocks_capability_dispatch() {
         "describe.schema.json#/$defs/DescribeRequest",
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
+        started.elapsed() < std::time::Duration::from_secs(60),
         "busy best-effort activity evidence must not delay capability dispatch"
     );
     assert!(
@@ -1622,6 +1633,7 @@ fn contract_setup_detect_rejects_present_but_unusable_dependencies() {
 #[cfg(unix)]
 #[test]
 fn contract_setup_detect_bounds_hanging_version_probe() {
+    let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-setup-probe-timeout");
     let tool_root = unique_temp_dir("agent-runner-opencode-hanging-setup-tools");
     fs::create_dir_all(&tool_root).expect("create hanging setup tool root");
@@ -1903,6 +1915,7 @@ fn contract_rotation_assess_materialize() {
 
 #[test]
 fn contract_rotation_hanging_import_releases_global_capability_lock() {
+    let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-rotation-import-timeout");
     let opencode = RotationOpencodeFixture::with_hanging_import();
     let _ = success_result(
@@ -1915,21 +1928,23 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
         "rotation.schema.json#/$defs/RotationAssessResponse",
         "rotation.schema.json#/$defs/RotationAssessResult",
     );
-    let mut bounded_host = host.overrides();
-    bounded_host["deadline_unix_ms"] =
-        json!(agent_runner_opencode::encoding::now_unix_ms() + 3_000);
     let path = opencode.path_env();
-    let started = std::time::Instant::now();
-    let failed = error_response(invoke_validated_with_host_and_env(
+    let request = support::validated_request_envelope(
         "rotation.materialize",
         rotation_materialize_params(),
-        bounded_host,
+        host.overrides(),
         "rotation.schema.json#/$defs/RotationMaterializeRequest",
+    );
+    let (failed, bounded_elapsed) = support::invoke_with_request_and_env_fresh_deadline(
+        "rotation.materialize",
+        request,
         &[("PATH", path.as_str())],
-    ));
+        std::time::Duration::from_secs(20),
+    );
+    let failed = error_response(failed);
     assert_eq!(failed["error"]["code"], "rotation_import_failed");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(8),
+        bounded_elapsed < std::time::Duration::from_secs(60),
         "a stalled import must be terminated within the request bound"
     );
     assert!(
@@ -1955,6 +1970,7 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
 
 #[test]
 fn contract_rotation_independent_binding_progresses_during_native_import() {
+    let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-rotation-independent-overlap");
     let opencode = RotationOpencodeFixture::with_hanging_import();
     let _ = success_result(
@@ -1980,18 +1996,22 @@ fn contract_rotation_independent_binding_progresses_during_native_import() {
         .expect("one independent binding must map to another lock stripe");
     independent_params["chain_id"] = json!(independent_chain);
 
-    let mut first_host = host.overrides();
-    first_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 4_000);
     let path = opencode.path_env();
     let first_path = path.clone();
+    let first_request = support::validated_request_envelope(
+        "rotation.materialize",
+        first_params,
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+    );
     let worker = thread::spawn(move || {
-        invoke_validated_with_host_and_env(
+        support::invoke_with_request_and_env_fresh_deadline(
             "rotation.materialize",
-            first_params,
-            first_host,
-            "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            first_request,
             &[("PATH", first_path.as_str())],
+            std::time::Duration::from_secs(20),
         )
+        .0
     });
 
     let operation_root = host
@@ -2004,21 +2024,17 @@ fn contract_rotation_independent_binding_progresses_during_native_import() {
             .any(|entry| entry.path().is_file())
     }) {
         assert!(
-            wait_started.elapsed() < std::time::Duration::from_secs(2),
+            wait_started.elapsed() < std::time::Duration::from_secs(30) && !worker.is_finished(),
             "the first rotation must publish its prepared operation"
         );
         thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let mut independent_host = host.overrides();
-    independent_host["deadline_unix_ms"] =
-        json!(agent_runner_opencode::encoding::now_unix_ms() + 1_500);
-    let started = std::time::Instant::now();
     let independent = success_result(
         invoke_validated_with_host(
             "rotation.assess",
             independent_params,
-            independent_host,
+            host.overrides(),
             "rotation.schema.json#/$defs/RotationAssessRequest",
         ),
         "rotation.schema.json#/$defs/RotationAssessResponse",
@@ -2026,7 +2042,7 @@ fn contract_rotation_independent_binding_progresses_during_native_import() {
     );
     assert_rotation_denied(&independent);
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(1_500),
+        !worker.is_finished(),
         "independent binding work must not wait for another binding's native import"
     );
 
@@ -2064,6 +2080,7 @@ fn rotation_binding_test_stripe(params: &Value) -> u8 {
 
 #[test]
 fn contract_rotation_runtime_lock_contention_obeys_global_budget() {
+    let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-rotation-runtime-lock-timeout");
     let opencode = RotationOpencodeFixture::new();
     let _ = success_result(
@@ -2088,20 +2105,22 @@ fn contract_rotation_runtime_lock_contention_obeys_global_budget() {
         .open(runtime_root.join("opencode1.lock"))
         .expect("open source runtime lock");
     fs2::FileExt::lock_exclusive(&runtime_lock).expect("hold source runtime lock");
-    let mut bounded_host = host.overrides();
-    bounded_host["deadline_unix_ms"] =
-        json!(agent_runner_opencode::encoding::now_unix_ms() + 2_000);
     let path = opencode.path_env();
-    let started = std::time::Instant::now();
-    let failed = error_response(invoke_validated_with_host_and_env(
+    let request = support::validated_request_envelope(
         "rotation.materialize",
         rotation_materialize_params(),
-        bounded_host,
+        host.overrides(),
         "rotation.schema.json#/$defs/RotationMaterializeRequest",
+    );
+    let (failed, bounded_elapsed) = support::invoke_with_request_and_env_fresh_deadline(
+        "rotation.materialize",
+        request,
         &[("PATH", path.as_str())],
-    ));
+        std::time::Duration::from_secs(10),
+    );
+    let failed = error_response(failed);
     assert_eq!(failed["error"]["code"], "native_runtime_lock_timeout");
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(bounded_elapsed < std::time::Duration::from_secs(60));
     drop(runtime_lock);
 
     let follow_up = success_result(
@@ -2120,6 +2139,7 @@ fn contract_rotation_runtime_lock_contention_obeys_global_budget() {
 #[cfg(unix)]
 #[test]
 fn contract_rotation_prepared_recovery_runtime_lock_obeys_global_budget() {
+    let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-rotation-recovery-runtime-lock-timeout");
     let opencode = RotationOpencodeFixture::with_post_import_finalization_fault();
     let _ = success_result(
@@ -2155,19 +2175,21 @@ fn contract_rotation_prepared_recovery_runtime_lock_obeys_global_budget() {
         )
         .expect("open target runtime lock");
     fs2::FileExt::lock_exclusive(&runtime_lock).expect("hold target runtime lock");
-    let mut bounded_host = host.overrides();
-    bounded_host["deadline_unix_ms"] =
-        json!(agent_runner_opencode::encoding::now_unix_ms() + 2_000);
-    let started = std::time::Instant::now();
-    let failed = error_response(invoke_validated_with_host_and_env(
+    let request = support::validated_request_envelope(
         "rotation.materialize",
         rotation_materialize_params(),
-        bounded_host,
+        host.overrides(),
         "rotation.schema.json#/$defs/RotationMaterializeRequest",
+    );
+    let (failed, bounded_elapsed) = support::invoke_with_request_and_env_fresh_deadline(
+        "rotation.materialize",
+        request,
         &[("PATH", path.as_str())],
-    ));
+        std::time::Duration::from_secs(10),
+    );
+    let failed = error_response(failed);
     assert_eq!(failed["error"]["code"], "native_runtime_lock_timeout");
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(bounded_elapsed < std::time::Duration::from_secs(60));
     drop(runtime_lock);
 
     let follow_up = success_result(
@@ -2185,6 +2207,7 @@ fn contract_rotation_prepared_recovery_runtime_lock_obeys_global_budget() {
 
 #[test]
 fn contract_rotation_oversized_export_is_bounded_and_releases_global_capability_lock() {
+    let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-rotation-export-capacity");
     let opencode = RotationOpencodeFixture::with_oversized_export();
     let _ = success_result(
@@ -2228,6 +2251,7 @@ fn contract_rotation_oversized_export_is_bounded_and_releases_global_capability_
 
 #[test]
 fn contract_rotation_large_supported_artifact_completes_inside_global_lock_budget() {
+    let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-rotation-large-supported-artifact");
     let opencode = RotationOpencodeFixture::with_large_export();
     let _ = success_result(

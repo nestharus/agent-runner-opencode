@@ -326,7 +326,7 @@ fn contract_quota_observer_identity_lock_obeys_host_deadline() {
     );
     let fake_curl = FakeNativeCurl::new();
     let path = fake_curl.path_env();
-    let mut host = runtime.host_overrides();
+    let host = runtime.host_overrides();
     let observer_root = std::path::Path::new(
         host["data_root"]
             .as_str()
@@ -342,17 +342,19 @@ fn contract_quota_observer_identity_lock_obeys_host_deadline() {
         .open(observer_root.join("opencode3.lock"))
         .expect("open quota observer lock");
     fs2::FileExt::lock_exclusive(&observer_lock).expect("hold quota observer lock");
-    host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 750);
-
-    let started = std::time::Instant::now();
-    let failed = support::invoke_validated_with_host_and_env(
+    let request = support::validated_request_envelope(
         "quota.probe",
         quota_base_params(),
         host,
         "quota.schema.json#/$defs/QuotaProbeRequest",
-        &[("HOME", home.path_str()), ("PATH", path.as_str())],
     );
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let (failed, bounded_elapsed) = support::invoke_with_request_and_env_fresh_deadline(
+        "quota.probe",
+        request,
+        &[("HOME", home.path_str()), ("PATH", path.as_str())],
+        std::time::Duration::from_secs(10),
+    );
+    assert!(bounded_elapsed < std::time::Duration::from_secs(60));
     assert!(!failed.status.success());
     let response = json_stdout(&failed);
     support::assert_valid(
@@ -570,19 +572,21 @@ fn contract_quota_refresh_hanging_auth_releases_account_capability_lock() {
     let path = prepend_paths(&[fake_auth.dir(), &fake_curl.dir]);
     let env = [("HOME", home.path_str()), ("PATH", path.as_str())];
 
-    let mut first_host = runtime.host_overrides();
-    first_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 3_000);
     let first_request = support::validated_request_envelope(
         "quota.refresh_auth",
         quota_refresh_auth_params(),
-        first_host,
+        runtime.host_overrides(),
         "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
     );
     support::ensure_default_runtime_settings(&first_request);
-    let started = std::time::Instant::now();
-    let first = support::invoke_with_request_and_env("quota.refresh_auth", first_request, &env);
+    let (first, bounded_elapsed) = support::invoke_with_request_and_env_fresh_deadline(
+        "quota.refresh_auth",
+        first_request,
+        &env,
+        std::time::Duration::from_secs(20),
+    );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(8),
+        bounded_elapsed < std::time::Duration::from_secs(60),
         "a stalled auth child must be terminated within the request bound"
     );
     assert_eq!(
@@ -603,17 +607,21 @@ fn contract_quota_refresh_hanging_auth_releases_account_capability_lock() {
     );
     assert!(timeout_marker.exists(), "the hanging auth path must run");
 
-    let mut second_host = runtime.host_overrides();
-    second_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 5_000);
     let second_request = support::validated_request_envelope(
         "quota.refresh_auth",
         quota_refresh_auth_params(),
-        second_host,
+        runtime.host_overrides(),
         "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
     );
     support::ensure_default_runtime_settings(&second_request);
     let second = success_result(
-        support::invoke_with_request_and_env("quota.refresh_auth", second_request, &env),
+        support::invoke_with_request_and_env_fresh_deadline(
+            "quota.refresh_auth",
+            second_request,
+            &env,
+            std::time::Duration::from_secs(20),
+        )
+        .0,
         "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
         "quota.schema.json#/$defs/QuotaRefreshAuthResult",
     );

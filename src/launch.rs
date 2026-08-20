@@ -20,6 +20,7 @@ use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata
 use crate::operation_bounds;
 use crate::path_guard;
 use crate::policy;
+use crate::request_custody::{CustodyError, RequestCustody};
 use crate::resume_observation::{
     self, DurableResumeObservationRequest, ResumeObservation, ResumeObservationRequest,
 };
@@ -34,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
 
@@ -59,7 +60,7 @@ const RESUME_COMPLETION_UNRESOLVED_MARKER: &str = "oulipoly.resume_completion_un
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
-const LAUNCH_REQUEST_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const LAUNCH_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const LAUNCH_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ACTIVE_LAUNCH_REQUEST_RECORDS: usize = 64;
 const MAX_LAUNCH_REPLAY_RECORDS: usize = 4096;
@@ -166,18 +167,6 @@ struct LaunchRequestGuard {
     state_path: PathBuf,
     state: LaunchRequestState,
     _lock: fs::File,
-}
-
-#[derive(Default)]
-struct LaunchRequestCapacity {
-    active: usize,
-    replay: usize,
-}
-
-struct LaunchReplayCandidate {
-    modified: SystemTime,
-    lock_path: PathBuf,
-    state_path: PathBuf,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1101,7 +1090,7 @@ fn reconcile_existing_launch_request(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(launch_state_failure(request_id, error)),
     }
-    let _lock = acquire_launch_request_lock(host, &root, &state_path, false, request_id)?;
+    let lock = acquire_launch_request_lock(host, &root, &state_path, false, request_id)?;
     let bytes = durable_fs::read_file_bounded(&state_path, MAX_LAUNCH_STATE_BYTES)
         .map_err(|error| launch_state_failure(request_id, error))?;
     let expected_kind = if new_session {
@@ -1138,6 +1127,8 @@ fn reconcile_existing_launch_request(
                 match recover_prepared_launch(host, &state, declared_env, request_id)? {
                     PreparedLaunchRecovery::NoEffectObserved => {
                         remove_launch_request_state(&state_path, request_id)?;
+                        drop(lock);
+                        return retire_orphan_launch_request_lock(&state_path, request_id);
                     }
                     PreparedLaunchRecovery::SessionObserved(provider_session_id) => {
                         state.phase = LaunchRequestPhase::SessionObserved;
@@ -1155,7 +1146,6 @@ fn reconcile_existing_launch_request(
                 }
             }
         }
-        return Ok(());
     }
 
     let mut state: ResumeLaunchRequestState =
@@ -1204,7 +1194,9 @@ fn reconcile_existing_launch_request(
                 write_launch_request_state(&state_path, &state, request_id)?;
                 return Err(resume_launch_reconciliation_required(request_id, &state));
             }
-            remove_launch_request_state(&state_path, request_id)
+            remove_launch_request_state(&state_path, request_id)?;
+            drop(lock);
+            retire_orphan_launch_request_lock(&state_path, request_id)
         }
     }
 }
@@ -1556,6 +1548,9 @@ fn retire_orphan_launch_request_lock(
     if state_path.exists() {
         return Ok(());
     }
+    launch_request_custody(root)
+        .remove_active_marker(state_path)
+        .map_err(|error| launch_custody_failure(request_id, error))?;
     match fs::remove_file(&lock_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1924,22 +1919,61 @@ fn acquire_launch_request_lock(
 ) -> Result<fs::File, ProviderFailure> {
     let capacity_lock = acquire_launch_capacity_lock(root, host, request_id)?;
     let lock_path = state_path.with_extension("lock");
-    let existing_lock = lock_path.exists();
-    let capacity = maintain_launch_request_capacity(root, &lock_path, request_id)?;
-    if admit_new && !existing_lock && capacity.active >= MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
+    let observed_existing = lock_path.exists() || state_path.exists();
+    let custody = launch_request_custody(root);
+    let active = maintain_launch_request_capacity(&custody, &lock_path, request_id)?;
+    let reserved = admit_new && !observed_existing;
+    if reserved && active >= MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
         return Err(launch_state_capacity_exceeded(request_id));
     }
-    let lock = open_launch_state_lock(&lock_path)
-        .map_err(|error| launch_state_failure(request_id, error))?;
+    if reserved {
+        custody
+            .reserve_active(state_path)
+            .map_err(|error| launch_custody_failure(request_id, error))?;
+    }
+    let replay_pin = if observed_existing {
+        Some(
+            custody
+                .pin_existing(state_path)
+                .map_err(|error| launch_custody_failure(request_id, error))?,
+        )
+    } else {
+        None
+    };
+    let lock = match open_launch_state_lock(&lock_path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            if reserved {
+                custody
+                    .remove_active_marker(state_path)
+                    .map_err(|cleanup| launch_custody_failure(request_id, cleanup))?;
+            }
+            return Err(launch_state_failure(request_id, error));
+        }
+    };
     drop(capacity_lock);
-    let timeout =
-        operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
-            .ok_or_else(|| launch_state_lock_timeout(request_id))?;
-    if !operation_bounds::lock_exclusive_for(&lock, timeout)
-        .map_err(|error| launch_state_failure(request_id, error))?
-    {
+    let acquired =
+        match operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
+        {
+            Some(timeout) => operation_bounds::lock_exclusive_for(&lock, timeout)
+                .map_err(|error| launch_state_failure(request_id, error))?,
+            None => match fs2::FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) => return Err(launch_state_failure(request_id, error)),
+            },
+        };
+    if !acquired {
+        drop(lock);
+        if reserved {
+            retire_orphan_launch_request_lock(state_path, request_id)?;
+        }
         return Err(launch_state_lock_timeout(request_id));
     }
+    drop(replay_pin);
+    custody
+        .release_pin_after_lock(state_path)
+        .map_err(|error| launch_custody_failure(request_id, error))?;
     Ok(lock)
 }
 
@@ -1955,7 +1989,7 @@ fn acquire_launch_capacity_lock(
         open_launch_state_lock(&path).map_err(|error| launch_state_failure(request_id, error))?;
     let timeout =
         operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
-            .ok_or_else(|| launch_state_lock_timeout(request_id))?;
+            .unwrap_or(Duration::ZERO);
     if !operation_bounds::lock_exclusive_for(&lock, timeout)
         .map_err(|error| launch_state_failure(request_id, error))?
     {
@@ -1965,84 +1999,17 @@ fn acquire_launch_capacity_lock(
 }
 
 fn maintain_launch_request_capacity(
-    root: &Path,
+    custody: &RequestCustody,
     current_lock_path: &Path,
     request_id: &str,
-) -> Result<LaunchRequestCapacity, ProviderFailure> {
-    let mut capacity = LaunchRequestCapacity::default();
-    let mut replay_candidates = Vec::new();
-    let mut visited = 0_usize;
-    for entry in fs::read_dir(root).map_err(|error| launch_state_failure(request_id, error))? {
-        let entry = entry.map_err(|error| launch_state_failure(request_id, error))?;
-        let path = entry.path();
-        if path.file_name().and_then(|name| name.to_str()) == Some(".capacity.lock")
-            || path.extension().and_then(|extension| extension.to_str()) != Some("lock")
-        {
-            continue;
-        }
-        visited += 1;
-        if visited
-            > MAX_ACTIVE_LAUNCH_REQUEST_RECORDS
-                .saturating_add(MAX_LAUNCH_REPLAY_RECORDS)
-                .saturating_add(1)
-        {
-            return Err(launch_state_capacity_exceeded(request_id));
-        }
-        let state_path = path.with_extension("json");
-        let state_exists = state_path.exists();
-        let replay = launch_request_record_is_replay(&state_path, request_id)?;
-        if (replay || !state_exists)
-            && path != current_lock_path
-            && launch_request_record_expired(&path, &state_path)?
-            && remove_expired_launch_record(&path, &state_path, request_id)?
-        {
-            continue;
-        }
-        if replay {
-            capacity.replay += 1;
-            replay_candidates.push(LaunchReplayCandidate {
-                modified: launch_record_modified(&path, &state_path),
-                lock_path: path,
-                state_path,
-            });
-        } else {
-            capacity.active += 1;
-        }
-    }
-    replay_candidates.sort_by_key(|candidate| candidate.modified);
-    for candidate in replay_candidates {
-        if capacity.replay <= MAX_LAUNCH_REPLAY_RECORDS {
-            break;
-        }
-        if candidate.lock_path != current_lock_path
-            && remove_expired_launch_record(
-                &candidate.lock_path,
-                &candidate.state_path,
-                request_id,
-            )?
-        {
-            capacity.replay -= 1;
-        }
-    }
-    if capacity.active > MAX_ACTIVE_LAUNCH_REQUEST_RECORDS
-        || capacity.replay > MAX_LAUNCH_REPLAY_RECORDS
-    {
-        return Err(launch_state_capacity_exceeded(request_id));
-    }
-    Ok(capacity)
+) -> Result<usize, ProviderFailure> {
+    custody
+        .maintain(current_lock_path, launch_request_bytes_are_replay)
+        .map_err(|error| launch_custody_failure(request_id, error))
 }
 
-fn launch_request_record_is_replay(
-    state_path: &Path,
-    request_id: &str,
-) -> Result<bool, ProviderFailure> {
-    let bytes = match durable_fs::read_file_bounded(state_path, MAX_LAUNCH_STATE_BYTES) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(launch_state_failure(request_id, error)),
-    };
-    let state: Value =
-        serde_json::from_slice(&bytes).map_err(|error| launch_state_invalid(request_id, error))?;
+fn launch_request_bytes_are_replay(bytes: &[u8]) -> Result<bool, String> {
+    let state: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     Ok(matches!(
         state.get("phase").and_then(Value::as_str),
         Some(
@@ -2054,64 +2021,24 @@ fn launch_request_record_is_replay(
     ))
 }
 
-fn launch_request_record_expired(
-    lock_path: &Path,
-    state_path: &Path,
-) -> Result<bool, ProviderFailure> {
-    let state_metadata = match fs::metadata(state_path) {
-        Ok(metadata) if metadata.is_file() => Some(metadata),
-        Ok(_) => return Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return Ok(false),
-    };
-    let modified = match state_metadata.as_ref() {
-        Some(metadata) => metadata.modified().ok(),
-        None => fs::metadata(lock_path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok()),
-    };
-    let old_enough = modified
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age >= LAUNCH_REQUEST_RETENTION);
-    Ok(old_enough)
-}
-
-fn launch_record_modified(lock_path: &Path, state_path: &Path) -> SystemTime {
-    fs::metadata(state_path)
-        .or_else(|_| fs::metadata(lock_path))
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-}
-
-fn remove_expired_launch_record(
-    lock_path: &Path,
-    state_path: &Path,
-    request_id: &str,
-) -> Result<bool, ProviderFailure> {
-    let lock = open_launch_state_lock(lock_path)
-        .map_err(|error| launch_state_failure(request_id, error))?;
-    match fs2::FileExt::try_lock_exclusive(&lock) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
-        Err(error) => return Err(launch_state_failure(request_id, error)),
-    }
-    match fs::remove_file(state_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(launch_state_failure(request_id, error)),
-    }
-    match fs::remove_file(lock_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(launch_state_failure(request_id, error)),
-    }
-    durable_fs::sync_directory(
-        state_path
-            .parent()
-            .expect("launch request state always has a parent"),
+fn launch_request_custody(root: &Path) -> RequestCustody {
+    RequestCustody::new(
+        root.to_path_buf(),
+        root.to_path_buf(),
+        root.join(".custody-v2"),
+        MAX_LAUNCH_STATE_BYTES,
+        MAX_ACTIVE_LAUNCH_REQUEST_RECORDS,
+        MAX_LAUNCH_REPLAY_RECORDS,
+        LAUNCH_ORPHAN_RETENTION,
     )
-    .map_err(|error| launch_state_failure(request_id, error))?;
-    Ok(true)
+}
+
+fn launch_custody_failure(request_id: &str, error: CustodyError) -> ProviderFailure {
+    match error {
+        CustodyError::Capacity => launch_state_capacity_exceeded(request_id),
+        CustodyError::Invalid(error) => launch_state_invalid(request_id, error),
+        CustodyError::Io(error) => launch_state_failure(request_id, error),
+    }
 }
 
 fn open_launch_state_lock(path: &Path) -> std::io::Result<fs::File> {
@@ -3471,11 +3398,13 @@ extern "C" {
 #[cfg(test)]
 mod custody_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn completed_history_does_not_consume_active_launch_capacity() {
         let directory = tempfile::tempdir().expect("launch custody directory");
-        for index in 0..MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
+        let completed_records = 2;
+        for index in 0..completed_records {
             let stem = format!("{index:064x}");
             fs::write(directory.path().join(format!("{stem}.lock")), b"")
                 .expect("launch request lock");
@@ -3486,14 +3415,112 @@ mod custody_tests {
             .expect("completed launch record");
         }
 
-        let capacity = maintain_launch_request_capacity(
-            directory.path(),
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            directory.path().join(".custody-v2"),
+            MAX_LAUNCH_STATE_BYTES,
+            1,
+            completed_records,
+            LAUNCH_ORPHAN_RETENTION,
+        );
+        let active = maintain_launch_request_capacity(
+            &custody,
             &directory.path().join("new.lock"),
             "request-test",
         )
         .expect("classify bounded launch custody");
 
-        assert_eq!(capacity.active, 0);
-        assert_eq!(capacity.replay, MAX_ACTIVE_LAUNCH_REQUEST_RECORDS);
+        assert_eq!(active, 0);
+        let replay = fs::read_dir(directory.path().join(".custody-v2/replay"))
+            .expect("replay ring")
+            .count();
+        assert_eq!(replay, completed_records);
+
+        let temporary_residue = directory.path().join(".custody-v2/.write-tmp/residue");
+        fs::write(&temporary_residue, b"partial").expect("simulate interrupted publication");
+        let replay_parses = AtomicUsize::new(0);
+        let active = custody
+            .maintain(&directory.path().join("new.lock"), |bytes| {
+                replay_parses.fetch_add(1, Ordering::Relaxed);
+                launch_request_bytes_are_replay(bytes)
+            })
+            .expect("maintain indexed launch custody");
+        assert_eq!(active, 0);
+        assert_eq!(
+            replay_parses.load(Ordering::Relaxed),
+            0,
+            "steady-state admission must not parse replay payloads"
+        );
+        assert!(!temporary_residue.exists());
+    }
+
+    #[test]
+    fn exact_replay_pin_prevents_handoff_eviction() {
+        let directory = tempfile::tempdir().expect("launch custody directory");
+        let first = format!("{:064x}", 1);
+        let first_state = directory.path().join(format!("{first}.json"));
+        fs::write(directory.path().join(format!("{first}.lock")), b"").expect("first replay lock");
+        fs::write(&first_state, br#"{"phase":"session_observed"}"#).expect("first replay state");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            directory.path().join(".pin-test-custody"),
+            MAX_LAUNCH_STATE_BYTES,
+            2,
+            1,
+            LAUNCH_ORPHAN_RETENTION,
+        );
+        assert_eq!(
+            custody
+                .maintain(
+                    &directory.path().join("new.lock"),
+                    launch_request_bytes_are_replay
+                )
+                .expect("initialize one-slot replay ring"),
+            0
+        );
+        let pin = custody
+            .pin_existing(&first_state)
+            .expect("pin exact replay");
+
+        let second = format!("{:064x}", 2);
+        let second_state = directory.path().join(format!("{second}.json"));
+        fs::write(directory.path().join(format!("{second}.lock")), b"")
+            .expect("second replay lock");
+        fs::write(&second_state, br#"{"phase":"session_observed"}"#).expect("second replay state");
+        custody
+            .reserve_active(&second_state)
+            .expect("reserve second completion");
+        assert_eq!(
+            custody
+                .maintain(
+                    &directory.path().join("new.lock"),
+                    launch_request_bytes_are_replay
+                )
+                .expect("pinned replay remains in ring"),
+            1
+        );
+        assert!(first_state.exists());
+
+        drop(pin);
+        custody
+            .release_pin_after_lock(&first_state)
+            .expect("last exact waiter retires its pin");
+        assert!(!directory
+            .path()
+            .join(format!(".pin-test-custody/pins/{first}.pin"))
+            .exists());
+        assert_eq!(
+            custody
+                .maintain(
+                    &directory.path().join("new.lock"),
+                    launch_request_bytes_are_replay
+                )
+                .expect("retire unpinned replay"),
+            0
+        );
+        assert!(!first_state.exists());
+        assert!(second_state.exists());
     }
 }
