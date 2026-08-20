@@ -20,7 +20,13 @@ use serde_json::Value;
 use std::io::Write;
 
 #[derive(Clone, Copy)]
-enum Route {
+struct Route<'a> {
+    external_name: &'a str,
+    operation: Operation,
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
     Describe,
     Schema,
     DiscoveryModels,
@@ -37,6 +43,247 @@ enum Route {
     MigrationPlan,
     MigrationApply,
     Unknown,
+}
+
+struct EnvelopedOutcome {
+    result: Value,
+    activity_targets: ActivityTargets,
+}
+
+impl EnvelopedOutcome {
+    fn new(result: Value) -> Self {
+        Self {
+            result,
+            activity_targets: ActivityTargets::default(),
+        }
+    }
+
+    fn with_activity(result: Value, activity_targets: ActivityTargets) -> Self {
+        Self {
+            result,
+            activity_targets,
+        }
+    }
+}
+
+impl<'a> Route<'a> {
+    fn resolve(external_name: &'a str) -> Self {
+        let operation = match external_name {
+            "describe" => Operation::Describe,
+            "schema" => Operation::Schema,
+            "discovery.models" => Operation::DiscoveryModels,
+            "discovery.accounts" => Operation::DiscoveryAccounts,
+            "launch" => Operation::Launch,
+            "policy.evaluate" => Operation::PolicyEvaluate,
+            "terminal.classify" => Operation::TerminalClassify,
+            "session.locate_transcript" => Operation::Session(session::Command::LocateTranscript),
+            "session.read_turns" => Operation::Session(session::Command::ReadTurns),
+            "session.capture" => Operation::Session(session::Command::Capture),
+            "session.enumerate" => Operation::Session(session::Command::Enumerate),
+            "session.export" => Operation::Session(session::Command::Export),
+            "session.replace" => Operation::Session(session::Command::Replace),
+            "quota.source" => Operation::Quota(quota::Command::Source),
+            "quota.probe" => Operation::Quota(quota::Command::Probe),
+            "quota.refresh_auth" => Operation::Quota(quota::Command::RefreshAuth),
+            "settings.list" => Operation::Settings(settings::Command::List),
+            "settings.get" => Operation::Settings(settings::Command::Get),
+            "settings.create" => Operation::Settings(settings::Command::Create),
+            "settings.update" => Operation::Settings(settings::Command::Update),
+            "settings.delete" => Operation::Settings(settings::Command::Delete),
+            "settings.validate" => Operation::Settings(settings::Command::Validate),
+            "settings.migrate" => Operation::Settings(settings::Command::Migrate),
+            "setup.detect" => Operation::Setup(setup::Command::Detect),
+            "setup.install_plan" => Operation::Setup(setup::Command::InstallPlan),
+            "setup.sync_plan" => Operation::Setup(setup::Command::SyncPlan),
+            "setup_brain.turn" => Operation::Setup(setup::Command::BrainTurn),
+            "rotation.assess" => Operation::RotationAssess,
+            "rotation.materialize" => Operation::RotationMaterialize,
+            "migration.plan" => Operation::MigrationPlan,
+            "migration.apply" => Operation::MigrationApply,
+            _ => Operation::Unknown,
+        };
+        Self {
+            external_name,
+            operation,
+        }
+    }
+
+    fn write<W: Write>(
+        self,
+        request: RequestEnvelope,
+        writer: &mut W,
+    ) -> Result<i32, ProviderFailure> {
+        match self.operation {
+            Operation::Describe => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |request| {
+                    validate_empty_params(
+                        &request.params,
+                        &request.request_id,
+                        "invalid_describe_params",
+                    )?;
+                    Ok(EnvelopedOutcome::new(describe_result()))
+                },
+            ),
+            Operation::Schema => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |request| {
+                    schema_result_params(request.params, &request.request_id)
+                        .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::DiscoveryModels => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |_| Ok(EnvelopedOutcome::new(discovery::models())),
+            ),
+            Operation::DiscoveryAccounts => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |_| Ok(EnvelopedOutcome::new(discovery::accounts())),
+            ),
+            Operation::Launch => write_streaming_launch(self.external_name, request, writer),
+            Operation::PolicyEvaluate => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, _| policy::attempted_activity_targets(&request.params),
+                |request| {
+                    policy::evaluate_params_with_activity(
+                        &request.host,
+                        request.params,
+                        &request.request_id,
+                    )
+                    .map(|(result, targets)| EnvelopedOutcome::with_activity(result, targets))
+                },
+            ),
+            Operation::TerminalClassify => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |request| {
+                    terminal::classify_params(request.params, &request.request_id)
+                        .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::Session(command) => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                move |request, result| {
+                    session::activity_targets(
+                        command,
+                        &request.host,
+                        &request.params,
+                        result,
+                        &request.request_id,
+                    )
+                },
+                move |request| session::handle(command, request).map(EnvelopedOutcome::new),
+            ),
+            Operation::Quota(command) => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| {
+                    quota::activity_targets(
+                        &request.host,
+                        &request.params,
+                        result,
+                        &request.request_id,
+                    )
+                },
+                move |request| quota::handle(command, request).map(EnvelopedOutcome::new),
+            ),
+            Operation::Settings(command) => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                move |request, result| settings::activity_targets(command, &request.params, result),
+                move |request| settings::handle(command, request).map(EnvelopedOutcome::new),
+            ),
+            Operation::Setup(command) => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                move |request| setup::handle(command, request).map(EnvelopedOutcome::new),
+            ),
+            Operation::RotationAssess => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| rotation::activity_targets(&request.params, result),
+                |request| {
+                    rotation::assess_params(
+                        &request.host,
+                        request.params,
+                        &request.request_id,
+                        request.provider_instance_id.as_deref().unwrap_or(""),
+                    )
+                    .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::RotationMaterialize => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| rotation::activity_targets(&request.params, result),
+                |request| {
+                    rotation::materialize_params(
+                        &request.host,
+                        request.params,
+                        &request.request_id,
+                        request.provider_instance_id.as_deref().unwrap_or(""),
+                    )
+                    .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::MigrationPlan => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| migration::activity_targets(&request.params, result),
+                |request| {
+                    migration::plan_params(request.params, &request.request_id)
+                        .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::MigrationApply => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| migration::activity_targets(&request.params, result),
+                |request| {
+                    migration::apply_params(&request.host, request.params, &request.request_id)
+                        .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::Unknown => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |request| {
+                    Err(unknown_subcommand_failure(
+                        request.request_id,
+                        self.external_name,
+                    ))
+                },
+            ),
+        }
+    }
 }
 
 pub fn handle_invocation(args: &[String], stdin: &[u8]) -> (Vec<u8>, i32) {
@@ -71,189 +318,32 @@ pub fn decode_request(stdin: &[u8]) -> Result<RequestEnvelope, ProviderFailure> 
     validate_request_envelope(request)
 }
 
-pub fn handle_decoded_invocation(
+fn write_enveloped_operation<W: Write, P, H>(
+    external_name: &str,
     request: RequestEnvelope,
-    subcommand: &str,
-) -> Result<Value, ProviderFailure> {
-    handle_routed_invocation(request, route_for_subcommand(subcommand), subcommand)
-        .map(|(response, _)| response)
-}
-
-fn handle_routed_invocation(
-    request: RequestEnvelope,
-    route: Route,
-    subcommand: &str,
-) -> Result<(Value, Option<ActivityTargets>), ProviderFailure> {
-    match route {
-        Route::Describe => {
-            validate_empty_params(
-                &request.params,
-                &request.request_id,
-                "invalid_describe_params",
-            )?;
-            Ok(routed_success(&request.request_id, describe_result()))
-        }
-        Route::Schema => Ok(routed_success(
-            &request.request_id,
-            schema_result_params(request.params, &request.request_id)?,
-        )),
-        Route::DiscoveryModels => Ok(routed_success(&request.request_id, discovery::models())),
-        Route::DiscoveryAccounts => Ok(routed_success(&request.request_id, discovery::accounts())),
-        Route::Launch => Err(launch_requires_streaming_writer_failure(request.request_id)),
-        Route::PolicyEvaluate => {
-            let (result, targets) = policy::evaluate_params_with_activity(
-                &request.host,
-                request.params,
-                &request.request_id,
-            )?;
-            Ok((success_response(&request.request_id, result), Some(targets)))
-        }
-        Route::TerminalClassify => Ok(routed_success(
-            &request.request_id,
-            terminal::classify_params(request.params, &request.request_id)?,
-        )),
-        Route::Session(command) => {
-            let request_id = request.request_id.clone();
-            Ok(routed_success(
-                &request_id,
-                session::handle(command, request)?,
-            ))
-        }
-        Route::Quota(command) => {
-            let request_id = request.request_id.clone();
-            Ok(routed_success(
-                &request_id,
-                quota::handle(command, request)?,
-            ))
-        }
-        Route::Settings(command) => {
-            let request_id = request.request_id.clone();
-            Ok(routed_success(
-                &request_id,
-                settings::handle(command, request)?,
-            ))
-        }
-        Route::Setup(command) => {
-            let request_id = request.request_id.clone();
-            Ok(routed_success(
-                &request_id,
-                setup::handle(command, request)?,
-            ))
-        }
-        Route::RotationAssess => Ok(routed_success(
-            &request.request_id,
-            rotation::assess_params(
-                &request.host,
-                request.params,
-                &request.request_id,
-                request.provider_instance_id.as_deref().unwrap_or(""),
-            )?,
-        )),
-        Route::RotationMaterialize => Ok(routed_success(
-            &request.request_id,
-            rotation::materialize_params(
-                &request.host,
-                request.params,
-                &request.request_id,
-                request.provider_instance_id.as_deref().unwrap_or(""),
-            )?,
-        )),
-        Route::MigrationPlan => Ok(routed_success(
-            &request.request_id,
-            migration::plan_params(request.params, &request.request_id)?,
-        )),
-        Route::MigrationApply => Ok(routed_success(
-            &request.request_id,
-            migration::apply_params(&request.host, request.params, &request.request_id)?,
-        )),
-        Route::Unknown => Err(unknown_subcommand_failure(request.request_id, subcommand)),
-    }
-}
-
-fn routed_success(request_id: &str, result: Value) -> (Value, Option<ActivityTargets>) {
-    (success_response(request_id, result), None)
-}
-
-fn route_for_subcommand(subcommand: &str) -> Route {
-    match subcommand {
-        "describe" => Route::Describe,
-        "schema" => Route::Schema,
-        "discovery.models" => Route::DiscoveryModels,
-        "discovery.accounts" => Route::DiscoveryAccounts,
-        "launch" => Route::Launch,
-        "policy.evaluate" => Route::PolicyEvaluate,
-        "terminal.classify" => Route::TerminalClassify,
-        "session.locate_transcript" => Route::Session(session::Command::LocateTranscript),
-        "session.read_turns" => Route::Session(session::Command::ReadTurns),
-        "session.capture" => Route::Session(session::Command::Capture),
-        "session.enumerate" => Route::Session(session::Command::Enumerate),
-        "session.export" => Route::Session(session::Command::Export),
-        "session.replace" => Route::Session(session::Command::Replace),
-        "quota.source" => Route::Quota(quota::Command::Source),
-        "quota.probe" => Route::Quota(quota::Command::Probe),
-        "quota.refresh_auth" => Route::Quota(quota::Command::RefreshAuth),
-        "settings.list" => Route::Settings(settings::Command::List),
-        "settings.get" => Route::Settings(settings::Command::Get),
-        "settings.create" => Route::Settings(settings::Command::Create),
-        "settings.update" => Route::Settings(settings::Command::Update),
-        "settings.delete" => Route::Settings(settings::Command::Delete),
-        "settings.validate" => Route::Settings(settings::Command::Validate),
-        "settings.migrate" => Route::Settings(settings::Command::Migrate),
-        "setup.detect" => Route::Setup(setup::Command::Detect),
-        "setup.install_plan" => Route::Setup(setup::Command::InstallPlan),
-        "setup.sync_plan" => Route::Setup(setup::Command::SyncPlan),
-        "setup_brain.turn" => Route::Setup(setup::Command::BrainTurn),
-        "rotation.assess" => Route::RotationAssess,
-        "rotation.materialize" => Route::RotationMaterialize,
-        "migration.plan" => Route::MigrationPlan,
-        "migration.apply" => Route::MigrationApply,
-        _ => Route::Unknown,
-    }
-}
-
-fn write_invocation_result<W: Write>(
-    args: &[String],
-    stdin: &[u8],
     writer: &mut W,
-) -> Result<i32, ProviderFailure> {
-    let request = decode_request(stdin)?;
-    let subcommand = subcommand_from_args(args, &request.request_id)?;
-    let route = route_for_subcommand(subcommand);
-    let activity = ActivityContext::from_request(&request, subcommand);
-    let attempted_targets = activity_targets(route, &request, None);
+    project_activity: P,
+    handle: H,
+) -> Result<i32, ProviderFailure>
+where
+    P: Fn(&RequestEnvelope, Option<&Value>) -> ActivityTargets,
+    H: FnOnce(RequestEnvelope) -> Result<EnvelopedOutcome, ProviderFailure>,
+{
+    let activity = ActivityContext::from_request(&request, external_name);
+    let attempted_targets = project_activity(&request, None);
     if let Err(error) = activity.started(&attempted_targets) {
         eprintln!("provider activity start evidence warning: {error:?}");
     }
-    if matches!(route, Route::Launch) {
-        let result = launch::stream(&request.request_id, &request.host, request.params, writer);
-        match &result {
-            Ok(outcome) => {
-                let mut completed_targets = attempted_targets.clone();
-                completed_targets.extend(outcome.activity_targets.clone());
-                if let Err(error) = activity.succeeded(outcome.exit_code, &completed_targets) {
-                    eprintln!("provider activity completion evidence warning: {error:?}");
-                }
-            }
-            Err(failure) => {
-                if let Err(error) = activity.failed(failure, &attempted_targets) {
-                    eprintln!("provider activity completion evidence warning: {error:?}");
-                }
-            }
-        }
-        return result.map(|outcome| outcome.exit_code);
-    }
+    let request_id = request.request_id.clone();
     let request_snapshot = request.clone();
-    let response = match handle_routed_invocation(request, route, subcommand) {
-        Ok((response, typed_targets)) => {
-            let mut completed_targets =
-                activity_targets(route, &request_snapshot, response.get("result"));
-            if let Some(typed_targets) = typed_targets {
-                completed_targets.extend(typed_targets);
-            }
+    let outcome = match handle(request) {
+        Ok(outcome) => {
+            let mut completed_targets = project_activity(&request_snapshot, Some(&outcome.result));
+            completed_targets.extend(outcome.activity_targets.clone());
             if let Err(error) = activity.succeeded(0, &completed_targets) {
                 eprintln!("provider activity completion evidence warning: {error:?}");
             }
-            response
+            outcome
         }
         Err(failure) => {
             if let Err(error) = activity.failed(&failure, &attempted_targets) {
@@ -262,39 +352,53 @@ fn write_invocation_result<W: Write>(
             return Err(failure);
         }
     };
+    let response = success_response(&request_id, outcome.result);
     writer
         .write_all(&canonical_json_bytes(&response))
         .map_err(stdout_write_failure)?;
     Ok(0)
 }
 
-fn activity_targets(
-    route: Route,
-    request: &RequestEnvelope,
-    result: Option<&Value>,
-) -> ActivityTargets {
-    match route {
-        Route::Settings(command) => settings::activity_targets(command, &request.params, result),
-        Route::Session(command) => session::activity_targets(
-            command,
-            &request.host,
-            &request.params,
-            result,
-            &request.request_id,
-        ),
-        Route::Quota(_) => {
-            quota::activity_targets(&request.host, &request.params, result, &request.request_id)
-        }
-        Route::PolicyEvaluate => policy::attempted_activity_targets(&request.params),
-        Route::Launch => launch::attempted_activity_targets(&request.params),
-        Route::RotationAssess | Route::RotationMaterialize => {
-            rotation::activity_targets(&request.params, result)
-        }
-        Route::MigrationPlan | Route::MigrationApply => {
-            migration::activity_targets(&request.params, result)
-        }
-        _ => ActivityTargets::default(),
+fn write_streaming_launch<W: Write>(
+    external_name: &str,
+    request: RequestEnvelope,
+    writer: &mut W,
+) -> Result<i32, ProviderFailure> {
+    let activity = ActivityContext::from_request(&request, external_name);
+    let attempted_targets = launch::attempted_activity_targets(&request.params);
+    if let Err(error) = activity.started(&attempted_targets) {
+        eprintln!("provider activity start evidence warning: {error:?}");
     }
+    let result = launch::stream(&request.request_id, &request.host, request.params, writer);
+    match &result {
+        Ok(outcome) => {
+            let mut completed_targets = attempted_targets.clone();
+            completed_targets.extend(outcome.activity_targets.clone());
+            if let Err(error) = activity.succeeded(outcome.exit_code, &completed_targets) {
+                eprintln!("provider activity completion evidence warning: {error:?}");
+            }
+        }
+        Err(failure) => {
+            if let Err(error) = activity.failed(failure, &attempted_targets) {
+                eprintln!("provider activity completion evidence warning: {error:?}");
+            }
+        }
+    }
+    result.map(|outcome| outcome.exit_code)
+}
+
+fn no_activity_targets(_: &RequestEnvelope, _: Option<&Value>) -> ActivityTargets {
+    ActivityTargets::default()
+}
+
+fn write_invocation_result<W: Write>(
+    args: &[String],
+    stdin: &[u8],
+    writer: &mut W,
+) -> Result<i32, ProviderFailure> {
+    let request = decode_request(stdin)?;
+    let external_name = subcommand_from_args(args, &request.request_id)?;
+    Route::resolve(external_name).write(request, writer)
 }
 
 fn parse_raw_request(stdin: &[u8]) -> Result<Value, serde_json::Error> {
@@ -365,14 +469,6 @@ fn unknown_subcommand_failure(request_id: String, subcommand: &str) -> ProviderF
         request_id,
         "unknown_subcommand",
         format!("unknown provider subcommand: {subcommand}"),
-    )
-}
-
-fn launch_requires_streaming_writer_failure(request_id: String) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "launch_requires_streaming_writer",
-        "launch must be invoked through the streaming dispatch branch",
     )
 }
 
