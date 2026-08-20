@@ -8,7 +8,9 @@
 //!       - opaque settings version tokens and stale-write conflict detection
 //!       - opencode.settings/v1 semantic validation and legacy mapping
 
-use crate::account::{profile_for_settings_id, AccountProfile, ACCOUNTS};
+use crate::account::{
+    profile_for_settings_id, profile_for_wrapper_reference, AccountProfile, ACCOUNTS,
+};
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
 use crate::models::{default_model, model_alias, model_alias_matches, DEFAULT_MODEL_ALIAS};
@@ -1259,24 +1261,7 @@ fn settings_account_reference(value: &Value) -> Option<&str> {
 fn account_for_settings_reference(
     reference: &str,
 ) -> Option<&'static crate::account::AccountProfile> {
-    let basename = settings_reference_basename(reference);
-    ACCOUNTS
-        .iter()
-        .find(|account| account.opencode_wrapper == basename)
-        .or_else(|| account_one_for_plain_opencode(basename))
-}
-
-fn account_one_for_plain_opencode(
-    basename: &str,
-) -> Option<&'static crate::account::AccountProfile> {
-    (basename == "opencode").then_some(&ACCOUNTS[0])
-}
-
-fn settings_reference_basename(reference: &str) -> &str {
-    Path::new(reference)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(reference)
+    profile_for_wrapper_reference(reference)
 }
 
 fn normalize_account_settings_value(

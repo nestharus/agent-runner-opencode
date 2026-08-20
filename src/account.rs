@@ -6,6 +6,7 @@
 //!     Owns:
 //!       - static account profile declarations
 //!       - wrapper, OpenCode auth path, and account tag pairing
+//!       - canonical wrapper-shaped reference recognition and the bare opencode compatibility alias
 //!       - selected quota/auth attribution identity and probe route
 
 pub struct AccountProfile {
@@ -60,11 +61,15 @@ pub fn profile_for_settings_id(settings_id: &str) -> Option<&'static AccountProf
         .find(|account| settings_id_matches_account(settings_id, account))
 }
 
-pub fn profile_for_wrapper_command(command: &str) -> Option<&'static AccountProfile> {
-    let basename = std::path::Path::new(command)
+/// Resolve a wrapper-shaped reference from policy argv, persisted settings, or
+/// native-operation routing. Paths are recognized by basename. The unnumbered
+/// `opencode` name is a compatibility alias for account one; numbered wrapper
+/// names remain the canonical persisted identities.
+pub fn profile_for_wrapper_reference(reference: &str) -> Option<&'static AccountProfile> {
+    let basename = std::path::Path::new(reference)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(command);
+        .unwrap_or(reference);
     ACCOUNTS
         .iter()
         .find(|account| account.opencode_wrapper == basename)

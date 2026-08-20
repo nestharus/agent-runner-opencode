@@ -1,22 +1,12 @@
 //! Declared roles: validator, mapper, formatter, parser, filter, predicate
 
-use crate::account::profile_for_wrapper_command;
+use crate::account::profile_for_wrapper_reference;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::models::{model_alias, provider_args_match, ModelAlias};
 use crate::settings::{resolve_runtime_settings, RuntimeSettings};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::Path;
-
-const HOST_LAUNCH_COMMAND_BASENAMES: &[&str] = &[
-    "opencode",
-    "opencode1",
-    "opencode2",
-    "opencode3",
-    "opencode4",
-    "opencode5",
-];
 #[derive(Deserialize)]
 pub struct PolicyEvaluateParams {
     settings_id: String,
@@ -195,7 +185,7 @@ fn launch_command_diagnostics(
             "launch argv must begin with a configured OpenCode command".to_string(),
         )];
     };
-    if profile_for_wrapper_command(command)
+    if profile_for_wrapper_reference(command)
         .is_some_and(|account| account.opencode_wrapper == runtime.account.opencode_wrapper)
     {
         return Vec::new();
@@ -284,14 +274,7 @@ fn is_forbidden_launch_arg(arg: &str) -> bool {
 }
 
 fn intrinsic_host_launch_command(command: &str) -> bool {
-    HOST_LAUNCH_COMMAND_BASENAMES.contains(&command_basename(command))
-}
-
-fn command_basename(command: &str) -> &str {
-    Path::new(command)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command)
+    profile_for_wrapper_reference(command).is_some()
 }
 
 fn diagnostic(severity: &str, code: &str, message: String) -> Value {

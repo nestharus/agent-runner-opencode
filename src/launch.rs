@@ -9,7 +9,7 @@
 //!       - declared params.env entries and host-linkage env to env-cleared child env
 //!       - process terminal status to LaunchExitEvent
 
-use crate::account::profile_for_wrapper_command;
+use crate::account::profile_for_wrapper_reference;
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 use crate::models::model_alias;
@@ -1433,7 +1433,7 @@ fn completed_assistant_message(
 }
 
 fn export_for_resume_confirmation(confirmation: &ResumeConfirmation) -> Option<OpencodeExport> {
-    let account = profile_for_wrapper_command(&confirmation.account_wrapper)?;
+    let account = profile_for_wrapper_reference(&confirmation.account_wrapper)?;
     let timeout = remaining_resume_export_timeout(confirmation)?;
     opencode::export_with_timeout(&confirmation.session_id, account, timeout).ok()
 }
