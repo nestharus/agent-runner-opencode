@@ -433,8 +433,7 @@ fn acquire_rotation_lock(
     let root = rotation_state_root(host, request_id)?;
     let lock_path =
         confined_rotation_state_target(host, &root.join("materialize.lock"), request_id)?;
-    fs::create_dir_all(&root).map_err(|error| rotation_state_failure(request_id, error))?;
-    set_private_directory_permissions(&root)
+    create_private_directories_durable(&root)
         .map_err(|error| rotation_state_failure(request_id, error))?;
     let lock = OpenOptions::new()
         .read(true)
@@ -824,8 +823,7 @@ fn write_private_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> 
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "state path has no parent")
     })?;
-    fs::create_dir_all(parent)?;
-    set_private_directory_permissions(parent)?;
+    create_private_directories_durable(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.as_file_mut().write_all(bytes)?;
     temporary.as_file_mut().sync_all()?;
