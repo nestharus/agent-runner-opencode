@@ -13,7 +13,7 @@ use crate::activity::ActivityTargets;
 use crate::durable_fs;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
-use crate::models::{default_model, model_alias, DEFAULT_MODEL_ALIAS};
+use crate::models::{default_model, model_alias, DEFAULT_MODEL_ALIAS, MODEL_ALIASES};
 use crate::operation_bounds;
 use crate::path_guard;
 use crate::settings_definition::{model_name_value, validate_values, wrapper_value};
@@ -794,15 +794,9 @@ fn upgrade_persisted_store(
     }
     if store.schema_version < 2 {
         for record in &mut store.records {
-            record.values = upgrade_persisted_values(&record.values).ok_or_else(|| {
-                settings_store_upgrade_failure(
-                    request_id,
-                    format!(
-                        "settings record {} cannot be upgraded automatically; back up and recreate that record",
-                        record.id
-                    ),
-                )
-            })?;
+            if let Some(upgraded) = upgrade_persisted_values(&record.values) {
+                record.values = upgraded;
+            }
         }
     }
     store.schema_version = CURRENT_STORE_SCHEMA_VERSION;
@@ -856,6 +850,15 @@ fn persisted_model_alias(values: &Value) -> Option<&'static crate::models::Model
         .and_then(Value::as_str)
         .or_else(|| values.get("model").and_then(Value::as_str))
         .and_then(model_alias)
+        .or_else(|| {
+            let provider_model = values
+                .pointer("/model/provider_model")
+                .and_then(Value::as_str)?;
+            let effort = values.pointer("/model/variant").and_then(Value::as_str)?;
+            MODEL_ALIASES
+                .iter()
+                .find(|model| model.provider_model == provider_model && model.effort == effort)
+        })
 }
 
 fn copy_persisted_optional_field(source: &Value, target: &mut Value, field: &str) {
@@ -1086,11 +1089,19 @@ fn record_json(record: &SettingsRecord) -> Value {
 }
 
 fn summary_values(values: &Value) -> Value {
-    json!({
+    let mut summary = json!({
         "provider": values.get("provider").cloned().unwrap_or(Value::Null),
         "wrapper": values.get("wrapper").cloned().unwrap_or(Value::Null),
         "model": values.pointer("/model/name").cloned().unwrap_or(Value::Null),
-    })
+    });
+    let diagnostics = validate_values(values);
+    if !diagnostics.is_empty() {
+        summary["migration"] = json!({
+            "status": "repair_required",
+            "diagnostics": diagnostics,
+        });
+    }
+    summary
 }
 
 fn sanitize_value(value: &Value) -> Value {

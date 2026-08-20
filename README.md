@@ -43,8 +43,12 @@ or record-reducing delete is committed in predecessor recovery form; each later
 process can continue that in-band reduction, and the first mutation that fits
 the current envelope atomically writes the current schema. Oversized files that
 claim the current schema are not admitted through this compatibility path. An
-unrecognizable record fails the entire store with
-`settings_store_upgrade_required` instead of remaining listable but unusable.
+otherwise valid predecessor model tuple that omitted `model.name` is projected
+from its exact `provider_model` and `variant`. A residual predecessor record
+that cannot be routed remains listable with a `repair_required` migration
+summary instead of rejecting the shared store; selecting that record fails with
+its settings diagnostics, while its preserved ID and version allow an in-band
+update or delete. Unrelated projected records remain fully usable.
 Rotation assessment and materialization share one provider-state lock, so a
 decision cannot race native materialization. A denied assessment durably removes
 any earlier binding-matched authorization—including parent-directory

@@ -487,7 +487,13 @@ fn contract_quota_refresh_hanging_auth_releases_account_capability_lock() {
         started.elapsed() < std::time::Duration::from_secs(8),
         "a stalled auth child must be terminated within the request bound"
     );
-    assert_eq!(first.status.code(), Some(2));
+    assert_eq!(
+        first.status.code(),
+        Some(2),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
     let first_response = json_stdout(&first);
     support::assert_valid(
         &first_response,

@@ -1015,6 +1015,134 @@ fn contract_prior_settings_store_is_upgraded_without_losing_identity() {
 }
 
 #[test]
+fn contract_predecessor_model_tuple_and_unroutable_record_do_not_block_shared_store() {
+    let host = HostRoots::new("agent-runner-opencode-settings-predecessor-quarantine");
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(store_path.parent().expect("settings store parent"))
+        .expect("create predecessor settings store parent");
+    let mut tuple_values = opencode_settings_values(None);
+    tuple_values["model"]
+        .as_object_mut()
+        .expect("model object")
+        .remove("name");
+    let unroutable_values = json!({
+        "provider": "opencode",
+        "wrapper": "retired-opencode-profile",
+        "model": {
+            "provider_model": "openai/gpt-5.6-sol",
+            "variant": "high"
+        },
+        "quota": { "auth_path": "/retired/auth.json" }
+    });
+    fs::write(
+        &store_path,
+        serde_json::to_vec(&json!({
+            "records": [
+                {
+                    "id": "tuple-settings-id",
+                    "display_name": "Predecessor tuple settings",
+                    "version": "tuple-version",
+                    "values": tuple_values
+                },
+                {
+                    "id": "repair-required-id",
+                    "display_name": "Unroutable predecessor settings",
+                    "version": "repair-version",
+                    "values": unroutable_values
+                }
+            ]
+        }))
+        .expect("serialize predecessor mixed store"),
+    )
+    .expect("write predecessor mixed store");
+
+    let list = success_result(
+        invoke_validated_with_host(
+            "settings.list",
+            empty_request_params(),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsListRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsListResponse",
+        "settings.schema.json#/$defs/SettingsListResult",
+    );
+    let records = list["records"].as_array().expect("settings summaries");
+    assert_eq!(records.len(), 2);
+    let quarantined = records
+        .iter()
+        .find(|record| record["id"] == "repair-required-id")
+        .expect("repair-required predecessor summary");
+    assert_eq!(
+        quarantined["summary"]["migration"]["status"],
+        "repair_required"
+    );
+    assert!(!quarantined["summary"]["migration"]["diagnostics"]
+        .as_array()
+        .expect("repair diagnostics")
+        .is_empty());
+
+    let tuple = success_result(
+        invoke_validated_with_host(
+            "settings.get",
+            settings_get_params("tuple-settings-id"),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsGetRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsGetResponse",
+        "settings.schema.json#/$defs/SettingsGetResult",
+    );
+    assert_eq!(tuple["record"]["version"], "tuple-version");
+    assert_eq!(tuple["record"]["values"]["model"]["name"], "gpt-high");
+
+    let policy = success_result(
+        invoke_validated_with_host(
+            "policy.evaluate",
+            json!({
+                "settings_id": "tuple-settings-id",
+                "mode": "agent",
+                "model": {
+                    "name": "gpt-high",
+                    "provider_args": ["-m", "openai/gpt-5.6-sol", "--variant", "high"],
+                    "inputs": { "prompt": "ok", "named": {} }
+                },
+                "launch": {
+                    "argv": [
+                        "opencode1", "run", "--dangerously-skip-permissions",
+                        "-m", "openai/gpt-5.6-sol", "--variant", "high", "ok"
+                    ]
+                }
+            }),
+            host.overrides(),
+            "policy.schema.json#/$defs/PolicyEvaluateRequest",
+        ),
+        "policy.schema.json#/$defs/PolicyEvaluateResponse",
+        "policy.schema.json#/$defs/PolicyEvaluateResult",
+    );
+    assert_eq!(policy["accepted"], true, "{policy}");
+
+    let deleted = success_result(
+        invoke_validated_with_host(
+            "settings.delete",
+            settings_delete_params("repair-required-id", "repair-version"),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsDeleteRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsDeleteResponse",
+        "settings.schema.json#/$defs/SettingsDeleteResult",
+    );
+    assert_eq!(deleted["deleted"], true);
+
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store_path).expect("read repaired settings store"))
+            .expect("parse repaired settings store");
+    assert_eq!(persisted["schema_version"], 3);
+    assert_eq!(persisted["records"].as_array().expect("records").len(), 1);
+    assert_eq!(persisted["records"][0]["id"], "tuple-settings-id");
+}
+
+#[test]
 fn contract_settings_create_rejects_path_shaped_account_references() {
     let host = HostRoots::new("agent-runner-opencode-settings-reject-path-accounts");
     for (wrapper, _) in normalized_account_cases() {
