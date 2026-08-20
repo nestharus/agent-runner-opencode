@@ -9,18 +9,22 @@ use serde_json::{json, Value};
 use std::fs;
 use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env};
 
-struct RejectWrites;
+#[derive(Default)]
+struct RejectFlush {
+    accepted: Vec<u8>,
+}
 
-impl std::io::Write for RejectWrites {
-    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "simulated terminal enumeration response loss",
-        ))
+impl std::io::Write for RejectFlush {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.accepted.extend_from_slice(buffer);
+        Ok(buffer.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "simulated buffered terminal enumeration response loss",
+        ))
     }
 }
 
@@ -210,61 +214,104 @@ fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_hand
     let data_root = unique_temp_dir("agent-runner-opencode-response-loss-session-snapshot");
     fs::create_dir_all(&data_root).expect("create isolated session snapshot data root");
     let host = json!({"data_root": data_root.to_string_lossy()});
-    let first = success_result(
-        invoke_with_host_and_env(
-            "session.enumerate",
-            session_enumerate_limit_params(2),
-            host.clone(),
-            &[("PATH", path.as_str())],
-        ),
-        "session.schema.json#/$defs/SessionEnumerateResponse",
-        "session.schema.json#/$defs/SessionEnumerateResult",
-    );
-    let cursor = first["next_cursor"]
-        .as_str()
-        .expect("truncated page cursor");
-    let request = support::validated_request_envelope(
+    let mut first_request = support::validated_request_envelope(
         "session.enumerate",
-        session_enumerate_cursor_params(2, cursor),
+        session_enumerate_limit_params(2),
         host,
         "session.schema.json#/$defs/SessionEnumerateRequest",
     );
-    support::ensure_default_runtime_settings(&request);
+    first_request["request_id"] = json!("req-session-enumerate-flush-loss-first");
+    support::ensure_default_runtime_settings(&first_request);
     let prior_path = std::env::var_os("PATH");
     std::env::set_var("PATH", &path);
     let args = vec![
         "agent-runner-opencode".to_string(),
         "session.enumerate".to_string(),
     ];
+    let mut first_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&first_request).expect("serialize first enumeration request"),
+            &mut first_stdout,
+        ),
+        0
+    );
+    let first_response: Value = serde_json::from_slice(&first_stdout)
+        .expect("parse first enumeration response after successful flush");
+    support::assert_valid(
+        &first_response,
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+    );
+    let first = &first_response["result"];
+    support::assert_valid(first, "session.schema.json#/$defs/SessionEnumerateResult");
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("truncated page cursor");
+    let mut request = first_request;
+    request["request_id"] = json!("req-session-enumerate-flush-loss-terminal");
+    request["params"] = session_enumerate_cursor_params(2, cursor);
+    support::assert_valid_request_envelope(
+        &request,
+        "session.schema.json#/$defs/SessionEnumerateRequest",
+    );
+    let mut rejected_flush = RejectFlush::default();
     let lost_exit = agent_runner_opencode::write_invocation(
         &args,
         &serde_json::to_vec(&request).expect("serialize enumeration request"),
-        &mut RejectWrites,
+        &mut rejected_flush,
+    );
+    assert_eq!(
+        lost_exit,
+        1,
+        "failed buffered response handoff must fail the invocation; accepted={}",
+        String::from_utf8_lossy(&rejected_flush.accepted),
+    );
+    assert!(
+        !rejected_flush.accepted.is_empty(),
+        "the response bytes must be accepted before the simulated flush failure"
+    );
+
+    let mut retry_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&request).expect("serialize terminal enumeration retry"),
+            &mut retry_stdout,
+        ),
+        0
+    );
+    let retry_response: Value = serde_json::from_slice(&retry_stdout)
+        .expect("parse terminal enumeration response after successful flush");
+    support::assert_valid(
+        &retry_response,
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+    );
+    support::assert_valid(
+        &retry_response["result"],
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_second_enumerate_page(&retry_response["result"]);
+
+    let mut consumed_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&request).expect("serialize consumed enumeration cursor"),
+            &mut consumed_stdout,
+        ),
+        2
     );
     match prior_path {
         Some(value) => std::env::set_var("PATH", value),
         None => std::env::remove_var("PATH"),
     }
-    assert_eq!(
-        lost_exit, 1,
-        "closed response handoff must fail the invocation"
+    let consumed: Value =
+        serde_json::from_slice(&consumed_stdout).expect("parse consumed cursor response");
+    support::assert_valid(
+        &consumed,
+        "session.schema.json#/$defs/SessionEnumerateErrorResponse",
     );
-
-    let retry = success_result(
-        support::invoke_with_request_and_env(
-            "session.enumerate",
-            request.clone(),
-            &[("PATH", path.as_str())],
-        ),
-        "session.schema.json#/$defs/SessionEnumerateResponse",
-        "session.schema.json#/$defs/SessionEnumerateResult",
-    );
-    assert_second_enumerate_page(&retry);
-    let consumed = assert_error_envelope(support::invoke_with_request_and_env(
-        "session.enumerate",
-        request,
-        &[("PATH", path.as_str())],
-    ));
     assert_eq!(
         consumed["error"]["code"],
         "invalid_session_enumerate_cursor"

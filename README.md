@@ -292,8 +292,9 @@ cursor. Page size and admitted population are each capped at 256, list capture
 at 2 MiB, each row at 64 KiB, and each snapshot at 4 MiB. At most 32 abandoned
 snapshots are retained for 15 minutes; continuation cursors read only the
 requested rows. A terminal snapshot is retired only after the complete response
-is successfully written; a failed response handoff preserves the cursor for an
-exact retry, and a cleanup failure falls back to the existing 15-minute expiry.
+is successfully written and flushed; a failed write or flush preserves the
+cursor for an exact retry, and a cleanup failure falls back to the existing
+15-minute expiry.
 An above-bound native population fails explicitly.
 
 ## State, evidence, and authority

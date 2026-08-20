@@ -375,6 +375,7 @@ where
     writer
         .write_all(&canonical_json_bytes(&response))
         .map_err(stdout_write_failure)?;
+    writer.flush().map_err(stdout_write_failure)?;
     if let Some(post_write) = outcome.post_write {
         if let Err(error) = post_write.complete() {
             eprintln!("provider post-response session cleanup warning: {error}");
