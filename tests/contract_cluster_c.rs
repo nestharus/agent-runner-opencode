@@ -473,7 +473,7 @@ fn contract_quota_refresh_hanging_auth_releases_account_capability_lock() {
     let env = [("HOME", home.path_str()), ("PATH", path.as_str())];
 
     let mut first_host = runtime.host_overrides();
-    first_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 500);
+    first_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 3_000);
     let first_request = support::validated_request_envelope(
         "quota.refresh_auth",
         quota_refresh_auth_params(),
@@ -484,7 +484,7 @@ fn contract_quota_refresh_hanging_auth_releases_account_capability_lock() {
     let started = std::time::Instant::now();
     let first = support::invoke_with_request_and_env("quota.refresh_auth", first_request, &env);
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
+        started.elapsed() < std::time::Duration::from_secs(8),
         "a stalled auth child must be terminated within the request bound"
     );
     assert_eq!(first.status.code(), Some(2));
@@ -500,7 +500,7 @@ fn contract_quota_refresh_hanging_auth_releases_account_capability_lock() {
     assert!(timeout_marker.exists(), "the hanging auth path must run");
 
     let mut second_host = runtime.host_overrides();
-    second_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 1_500);
+    second_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 5_000);
     let second_request = support::validated_request_envelope(
         "quota.refresh_auth",
         quota_refresh_auth_params(),

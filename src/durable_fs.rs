@@ -8,7 +8,7 @@
 //!       - private directory permission persistence
 
 use std::fs;
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn create_directories(path: &Path) -> std::io::Result<()> {
@@ -25,6 +25,24 @@ pub(crate) fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
         path.parent()
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "file has no parent directory"))?,
     )?;
+    Ok(bytes)
+}
+
+pub(crate) fn read_file_bounded(path: &Path, maximum_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(maximum_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "file has no parent directory"))?,
+    )?;
+    if bytes.len() > maximum_bytes {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("file exceeds supported {maximum_bytes}-byte bound"),
+        ));
+    }
     Ok(bytes)
 }
 
@@ -156,5 +174,14 @@ mod tests {
         assert!(target.is_dir());
         assert!(retry_syncs.iter().any(|path| path == &first_directory));
         assert!(retry_syncs.iter().any(|path| path == temporary.path()));
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversized_files_without_loading_the_tail() {
+        let temporary = tempfile::tempdir().expect("create bounded-read root");
+        let path = temporary.path().join("bounded");
+        fs::write(&path, vec![b'x'; 33]).expect("write oversized fixture");
+        let error = read_file_bounded(&path, 32).expect_err("oversized file must fail");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 }

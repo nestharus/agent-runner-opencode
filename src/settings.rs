@@ -14,20 +14,27 @@ use crate::durable_fs;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
 use crate::models::{default_model, model_alias, DEFAULT_MODEL_ALIAS};
+use crate::operation_bounds;
 use crate::path_guard;
 use crate::settings_definition::{model_name_value, validate_values, wrapper_value};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const STORE_DIR: &str = "agent-runner-opencode";
 const STORE_FILE: &str = "settings-store.json";
 const STORE_LOCK_FILE: &str = ".settings-store.lock";
 const CURRENT_STORE_SCHEMA_VERSION: u32 = 3;
+const MAX_SETTINGS_STORE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SETTINGS_RECORDS: usize = 256;
+const MAX_SETTINGS_HISTORY_EVENTS: usize = 1_024;
+const MAX_SETTINGS_MUTATION_RECEIPTS: usize = 4_096;
+const SETTINGS_RECEIPT_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+const SETTINGS_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct SettingsCreateParams {
@@ -541,8 +548,13 @@ fn mutate_store(
         .write(true)
         .open(&lock_path)
         .map_err(|err| store_io_failure(request_id, "settings_store_lock_open_failed", err))?;
-    lock.lock_exclusive()
-        .map_err(|err| store_io_failure(request_id, "settings_store_lock_failed", err))?;
+    let timeout = operation_bounds::remaining_timeout(host.deadline_unix_ms, SETTINGS_LOCK_TIMEOUT)
+        .ok_or_else(|| settings_lock_timeout(request_id))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|err| store_io_failure(request_id, "settings_store_lock_failed", err))?
+    {
+        return Err(settings_lock_timeout(request_id));
+    }
     let mut store = read_store_path(&path, request_id)?;
     if let Some(receipt) = store.mutation_receipts.get(request_id) {
         if receipt.operation == operation && receipt.binding_sha256 == binding_sha256 {
@@ -555,8 +567,21 @@ fn mutate_store(
             receipt,
         ));
     }
+    prune_expired_settings_receipts(&mut store, now_unix_ms());
+    if store.mutation_receipts.len() >= MAX_SETTINGS_MUTATION_RECEIPTS {
+        return Err(settings_capacity_failure(
+            request_id,
+            "the 24-hour mutation receipt window is full",
+        ));
+    }
     let before = store.records.clone();
     let result = mutation(&mut store)?;
+    if store.records.len() > MAX_SETTINGS_RECORDS {
+        return Err(settings_capacity_failure(
+            request_id,
+            "the settings record limit is reached",
+        ));
+    }
     append_settings_history(
         &mut store,
         &before,
@@ -574,8 +599,20 @@ fn mutate_store(
             recorded_at_unix_ms: now_unix_ms(),
         },
     );
+    if serialize_store(&store, request_id)?.len() > MAX_SETTINGS_STORE_BYTES {
+        return Err(settings_capacity_failure(
+            request_id,
+            "the encoded settings store size limit is reached",
+        ));
+    }
     write_store_path(&path, &config_root, &store, request_id)?;
     Ok(result)
+}
+
+fn prune_expired_settings_receipts(store: &mut SettingsStore, now_unix_ms: u64) {
+    store.mutation_receipts.retain(|_, receipt| {
+        now_unix_ms.saturating_sub(receipt.recorded_at_unix_ms) <= SETTINGS_RECEIPT_RETENTION_MS
+    });
 }
 
 fn settings_mutation_binding_sha256(
@@ -610,8 +647,15 @@ fn append_settings_history(
         .and_then(|entry| entry.get("event_sha256"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let sequence = store
+        .history
+        .last()
+        .and_then(|entry| entry.get("sequence"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        + 1;
     let mut event = json!({
-        "sequence": store.history.len() + 1,
+        "sequence": sequence,
         "operation": operation,
         "request_id": request_id,
         "provider_instance_id": provider_instance_id,
@@ -625,6 +669,10 @@ fn append_settings_history(
     let event_sha256 = sha256_hex(event.to_string().as_bytes());
     event["event_sha256"] = json!(event_sha256);
     store.history.push(event);
+    if store.history.len() > MAX_SETTINGS_HISTORY_EVENTS {
+        let expired = store.history.len() - MAX_SETTINGS_HISTORY_EVENTS;
+        store.history.drain(..expired);
+    }
 }
 
 fn records_digest(records: &[SettingsRecord]) -> String {
@@ -681,7 +729,7 @@ fn store_path_exists(path: &Path) -> bool {
 }
 
 fn read_store_bytes(path: &Path, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
-    durable_fs::read_file(path)
+    durable_fs::read_file_bounded(path, MAX_SETTINGS_STORE_BYTES)
         .map_err(|err| store_io_failure(request_id, "settings_store_read_failed", err))
 }
 
@@ -850,6 +898,29 @@ fn store_io_failure(request_id: &str, code: &'static str, err: std::io::Error) -
         request_id,
         code,
         format!("provider settings store I/O failed: {err}"),
+    )
+}
+
+fn settings_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "settings_store_lock_timeout",
+        "settings store lock could not be acquired before the operation deadline",
+    )
+}
+
+fn settings_capacity_failure(request_id: &str, detail: &str) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "settings_capacity_exhausted",
+        format!("provider settings capacity is exhausted: {detail}"),
+        json!({
+            "maximum_store_bytes": MAX_SETTINGS_STORE_BYTES,
+            "maximum_records": MAX_SETTINGS_RECORDS,
+            "maximum_history_events": MAX_SETTINGS_HISTORY_EVENTS,
+            "maximum_mutation_receipts": MAX_SETTINGS_MUTATION_RECEIPTS,
+            "receipt_retention_ms": SETTINGS_RECEIPT_RETENTION_MS,
+        }),
     )
 }
 
@@ -1366,4 +1437,59 @@ fn legacy_providers_toml_text(legacy: &Value) -> Option<&str> {
 
 fn parse_legacy_providers_toml(providers_toml: &str) -> Option<toml::Value> {
     providers_toml.parse::<toml::Value>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_history_retains_a_bounded_contiguous_tail() {
+        let mut store = SettingsStore::default();
+        for index in 0..=MAX_SETTINGS_HISTORY_EVENTS {
+            append_settings_history(
+                &mut store,
+                &[],
+                "settings.test",
+                &format!("request-{index}"),
+                None,
+                "test-host",
+            );
+        }
+        assert_eq!(store.history.len(), MAX_SETTINGS_HISTORY_EVENTS);
+        assert_eq!(store.history[0]["sequence"], 2);
+        assert_eq!(
+            store
+                .history
+                .last()
+                .and_then(|event| event["sequence"].as_u64()),
+            Some((MAX_SETTINGS_HISTORY_EVENTS + 1) as u64)
+        );
+    }
+
+    #[test]
+    fn settings_receipts_expire_after_the_supported_retry_window() {
+        let mut store = SettingsStore::default();
+        store.mutation_receipts.insert(
+            "expired".to_string(),
+            SettingsMutationReceipt {
+                operation: "settings.test".to_string(),
+                binding_sha256: "expired".to_string(),
+                result: json!({}),
+                recorded_at_unix_ms: 1,
+            },
+        );
+        store.mutation_receipts.insert(
+            "retained".to_string(),
+            SettingsMutationReceipt {
+                operation: "settings.test".to_string(),
+                binding_sha256: "retained".to_string(),
+                result: json!({}),
+                recorded_at_unix_ms: SETTINGS_RECEIPT_RETENTION_MS + 1,
+            },
+        );
+        prune_expired_settings_receipts(&mut store, SETTINGS_RECEIPT_RETENTION_MS + 2);
+        assert!(!store.mutation_receipts.contains_key("expired"));
+        assert!(store.mutation_receipts.contains_key("retained"));
+    }
 }

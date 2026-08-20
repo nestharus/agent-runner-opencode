@@ -52,7 +52,8 @@ pub fn install_plan_params(params: Value, _request_id: &str) -> Result<Value, Pr
 
 pub fn sync_plan_params(params: Value, _request_id: &str) -> Result<Value, ProviderFailure> {
     let desired = desired_profiles(&params);
-    let operations = sync_operations(&desired);
+    let rebind = rebind_profiles(&params);
+    let operations = sync_operations(&desired, &rebind);
     let diagnostics = sync_diagnostics(&params);
     Ok(sync_plan_result(operations, diagnostics))
 }
@@ -234,6 +235,7 @@ fn setup_warnings(installed: bool) -> Vec<Value> {
 
 fn sync_diagnostics(params: &Value) -> Vec<Value> {
     let mut diagnostics = desired_profile_diagnostics(params);
+    diagnostics.extend(profile_reference_diagnostics(params, "rebind_profiles"));
     if params.get("settings_schema_id").and_then(Value::as_str) != Some("opencode.settings/v1") {
         diagnostics.push(settings_schema_mismatch_diagnostic());
     }
@@ -241,17 +243,21 @@ fn sync_diagnostics(params: &Value) -> Vec<Value> {
 }
 
 fn desired_profile_diagnostics(params: &Value) -> Vec<Value> {
+    profile_reference_diagnostics(params, "desired_profiles")
+}
+
+fn profile_reference_diagnostics(params: &Value, field: &str) -> Vec<Value> {
     params
-        .get("desired_profiles")
+        .get(field)
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
         .filter_map(|value| match value.as_str() {
             Some(reference) if profile_for_wrapper_reference(reference).is_none() => {
-                Some(unknown_profile_diagnostic(reference))
+                Some(unknown_profile_diagnostic(field, reference))
             }
-            None => Some(invalid_profile_type_diagnostic()),
+            None => Some(invalid_profile_type_diagnostic(field)),
             _ => None,
         })
         .collect()
@@ -357,8 +363,8 @@ fn default_profiles() -> Vec<String> {
         .collect()
 }
 
-fn sync_operations(desired: &[String]) -> Vec<Value> {
-    desired
+fn sync_operations(desired: &[String], rebind: &[String]) -> Vec<Value> {
+    let mut operations = desired
         .iter()
         .map(|profile| {
             json!({
@@ -367,6 +373,40 @@ fn sync_operations(desired: &[String]) -> Vec<Value> {
                 "schema_id": "opencode.settings/v1"
             })
         })
+        .collect::<Vec<_>>();
+    operations.extend(rebind.iter().map(|profile| {
+        json!({
+            "kind": "rebind_native_identity",
+            "profile": profile,
+            "maximum_drain_ms": 20_000,
+            "preconditions": [
+                "stop new admission for this profile",
+                "apply a host deadline of at most 20 seconds to in-flight provider work",
+                "reconcile every nonterminal launch, rotation, and quota-refresh operation",
+                "stage the replacement wrapper and curl without mutating admitted files in place"
+            ],
+            "state_files": [
+                format!("provider-state/opencode/native-runtimes/{profile}.json"),
+                format!("provider-state/opencode/quota-observers/{profile}.json")
+            ],
+            "cutover": "back up and remove both context files, then admit one probe and launch under the staged PATH/environment; restore the backups if admission fails"
+        })
+    }));
+    operations
+}
+
+fn rebind_profiles(params: &Value) -> Vec<String> {
+    params
+        .get("rebind_profiles")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(profile_for_wrapper_reference)
+        .map(|account| account.opencode_wrapper.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -383,19 +423,19 @@ fn settings_schema_mismatch_diagnostic() -> Value {
     })
 }
 
-fn unknown_profile_diagnostic(reference: &str) -> Value {
+fn unknown_profile_diagnostic(field: &str, reference: &str) -> Value {
     json!({
         "severity": "error",
-        "path": "desired_profiles",
+        "path": field,
         "message": format!("unknown OpenCode account wrapper reference: {reference}"),
         "code": "unknown_opencode_profile",
     })
 }
 
-fn invalid_profile_type_diagnostic() -> Value {
+fn invalid_profile_type_diagnostic(field: &str) -> Value {
     json!({
         "severity": "error",
-        "path": "desired_profiles",
+        "path": field,
         "message": "OpenCode account wrapper references must be strings",
         "code": "invalid_opencode_profile",
     })

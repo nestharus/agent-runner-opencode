@@ -7,6 +7,7 @@ mod support;
 use cluster_d::*;
 use serde_json::json;
 use std::fs;
+use std::fs::OpenOptions;
 use std::thread;
 use support::{
     invoke, invoke_validated, invoke_validated_with_host, invoke_validated_with_host_and_env,
@@ -638,6 +639,91 @@ fn contract_corrupt_activity_evidence_warns_without_denial() {
     );
 }
 
+#[test]
+fn contract_busy_activity_evidence_never_blocks_capability_dispatch() {
+    let host = HostRoots::new("agent-runner-opencode-activity-nonblocking");
+    let activity_root = host.data_root().join("provider-state/opencode/activity");
+    fs::create_dir_all(&activity_root).expect("create activity root");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(activity_root.join(".operations.lock"))
+        .expect("open activity lock");
+    fs2::FileExt::lock_exclusive(&lock).expect("hold activity lock");
+
+    let started = std::time::Instant::now();
+    let output = invoke_validated_with_host(
+        "describe",
+        json!({}),
+        host.overrides(),
+        "describe.schema.json#/$defs/DescribeRequest",
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "busy best-effort activity evidence must not delay capability dispatch"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("activity start evidence warning"),
+        "skipped evidence must remain observable"
+    );
+    let _ = success_result(
+        output,
+        "describe.schema.json#/$defs/DescribeResponse",
+        "describe.schema.json#/$defs/DescribeResult",
+    );
+}
+
+#[test]
+fn contract_settings_capacity_rejection_preserves_existing_routes() {
+    let host = HostRoots::new("agent-runner-opencode-settings-capacity");
+    let store_root = host.config_root().join("agent-runner-opencode");
+    fs::create_dir_all(&store_root).expect("create settings capacity root");
+    let values = opencode_settings_values(None);
+    let records = (0..256)
+        .map(|index| {
+            json!({
+                "id": format!("bounded-{index}"),
+                "display_name": format!("Bounded profile {index}"),
+                "version": "fixture-v1",
+                "values": values,
+            })
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        store_root.join("settings-store.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 3,
+            "records": records,
+            "history": [],
+            "mutation_receipts": {},
+        }))
+        .expect("serialize bounded settings store"),
+    )
+    .expect("write bounded settings store");
+
+    let rejected = error_response(invoke_validated_with_host(
+        "settings.create",
+        settings_create_params(None),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsCreateRequest",
+    ));
+    assert_eq!(rejected["error"]["code"], "settings_capacity_exhausted");
+
+    let existing = success_result(
+        invoke_validated_with_host(
+            "settings.get",
+            settings_get_params("bounded-0"),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsGetRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsGetResponse",
+        "settings.schema.json#/$defs/SettingsGetResult",
+    );
+    assert_eq!(existing["record"]["id"], "bounded-0");
+}
+
 fn assert_settings_history(host: &HostRoots, expected_events: usize) {
     let store_path = host
         .config_root()
@@ -1034,6 +1120,41 @@ fn contract_setup_sync_accepts_only_declared_account_references() {
             .count(),
         2
     );
+}
+
+#[test]
+fn contract_setup_sync_plans_bounded_identity_rebind() {
+    let result = success_result(
+        invoke_validated(
+            "setup.sync_plan",
+            setup_sync_rebind_params(),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    let rebind = result["operations"]
+        .as_array()
+        .expect("sync operations")
+        .iter()
+        .find(|operation| operation["kind"] == "rebind_native_identity")
+        .expect("identity rebind operation");
+    assert_eq!(rebind["profile"], "opencode3");
+    assert_eq!(rebind["maximum_drain_ms"], 20_000);
+    assert!(rebind["state_files"]
+        .as_array()
+        .expect("rebind state files")
+        .iter()
+        .any(|path| path
+            .as_str()
+            .is_some_and(|path| path.contains("native-runtimes/opencode3.json"))));
+    assert!(rebind["state_files"]
+        .as_array()
+        .expect("rebind state files")
+        .iter()
+        .any(|path| path
+            .as_str()
+            .is_some_and(|path| path.contains("quota-observers/opencode3.json"))));
 }
 
 #[test]

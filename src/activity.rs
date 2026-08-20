@@ -7,8 +7,8 @@
 use crate::durable_fs;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
+use crate::operation_bounds;
 use crate::path_guard;
-use fs2::FileExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
@@ -19,6 +19,9 @@ const ACTIVITY_DIR: &str = "provider-state/opencode/activity";
 const ACTIVITY_FILE: &str = "operations.jsonl";
 const ACTIVITY_LOCK: &str = ".operations.lock";
 const ACTIVITY_SCHEMA_VERSION: u32 = 2;
+const MAX_ACTIVITY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACTIVITY_EVENTS: usize = 4_096;
+const MAX_ACTIVITY_EVENT_BYTES: usize = 64 * 1024;
 
 pub struct ActivityContext {
     host: HostContextSnapshot,
@@ -228,7 +231,17 @@ fn write_activity(
         .read(true)
         .write(true)
         .open(lock_path)?;
-    lock.lock_exclusive()?;
+    if !operation_bounds::lock_exclusive_for(&lock, std::time::Duration::ZERO)? {
+        return Err(std::io::Error::new(
+            ErrorKind::WouldBlock,
+            "activity ledger is busy; best-effort evidence was skipped",
+        ));
+    }
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_ACTIVITY_BYTES as u64) {
+        return Err(invalid_ledger(
+            "activity ledger exceeds its supported retained-size bound; archive or remove it",
+        ));
+    }
     let existing = match fs::read_to_string(&path) {
         Ok(existing) => existing,
         Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
@@ -255,12 +268,19 @@ fn write_activity(
         "previous_event_sha256": previous_event_sha256,
     });
     event["event_sha256"] = json!(sha256_hex(event.to_string().as_bytes()));
+    let event_line = serde_json::to_string(&event)?;
+    if event_line.len() + 1 > MAX_ACTIVITY_EVENT_BYTES {
+        return Err(invalid_ledger(
+            "activity event exceeds its supported encoded-size bound",
+        ));
+    }
+    let retained = retained_activity(&existing, event_line.len() + 1);
     let mut temporary = tempfile::NamedTempFile::new_in(root)?;
-    temporary.write_all(existing.as_bytes())?;
-    if !existing.is_empty() && !existing.ends_with('\n') {
+    temporary.write_all(retained.as_bytes())?;
+    if !retained.is_empty() && !retained.ends_with('\n') {
         temporary.write_all(b"\n")?;
     }
-    serde_json::to_writer(&mut temporary, &event)?;
+    temporary.write_all(event_line.as_bytes())?;
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary.persist(&path).map_err(|error| error.error)?;
@@ -268,9 +288,27 @@ fn write_activity(
     durable_fs::sync_directory(root)
 }
 
+fn retained_activity(existing: &str, new_event_bytes: usize) -> String {
+    let lines = existing
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let mut retained_bytes = lines.iter().map(|line| line.len() + 1).sum::<usize>();
+    let mut first_retained = 0;
+    while first_retained < lines.len()
+        && (lines.len() - first_retained >= MAX_ACTIVITY_EVENTS
+            || retained_bytes.saturating_add(new_event_bytes) > MAX_ACTIVITY_BYTES)
+    {
+        retained_bytes = retained_bytes.saturating_sub(lines[first_retained].len() + 1);
+        first_retained += 1;
+    }
+    lines[first_retained..].join("\n")
+}
+
 fn validate_ledger(existing: &str) -> std::io::Result<(u64, String)> {
     let mut sequence = 0;
     let mut prior_hash = String::new();
+    let mut first = true;
     for line in existing.lines() {
         if line.trim().is_empty() {
             continue;
@@ -280,6 +318,17 @@ fn validate_ledger(existing: &str) -> std::io::Result<(u64, String)> {
         let event_sequence = event["sequence"]
             .as_u64()
             .ok_or_else(|| invalid_ledger("activity event lacks a sequence"))?;
+        if first {
+            if event_sequence == 0 {
+                return Err(invalid_ledger("activity event sequence must be positive"));
+            }
+            sequence = event_sequence - 1;
+            prior_hash = event["previous_event_sha256"]
+                .as_str()
+                .ok_or_else(|| invalid_ledger("activity event lacks its predecessor digest"))?
+                .to_string();
+            first = false;
+        }
         if event_sequence != sequence + 1
             || event["previous_event_sha256"].as_str() != Some(prior_hash.as_str())
         {
@@ -315,4 +364,22 @@ fn set_private_file(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_private_file(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_keeps_the_newest_bounded_event_window() {
+        let existing = (0..MAX_ACTIVITY_EVENTS)
+            .map(|index| format!("event-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let retained = retained_activity(&existing, 16);
+        let lines = retained.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), MAX_ACTIVITY_EVENTS - 1);
+        assert_eq!(lines.first().copied(), Some("event-1"));
+        assert_eq!(lines.last().copied(), Some("event-4095"));
+    }
 }

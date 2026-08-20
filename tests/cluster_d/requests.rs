@@ -28,6 +28,14 @@ pub fn empty_request_params() -> Value {
     json!({})
 }
 
+pub fn setup_sync_rebind_params() -> Value {
+    json!({
+        "settings_schema_id": "opencode.settings/v1",
+        "desired_profiles": ["opencode3"],
+        "rebind_profiles": ["opencode3"]
+    })
+}
+
 pub fn settings_create_params(secret: Option<&str>) -> Value {
     json!({
         "display_name": "Contract opencode profile",

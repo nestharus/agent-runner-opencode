@@ -225,7 +225,14 @@ hash-chained mutation history with request/provider identity, predecessor and
 result versions, value hashes, and tombstones. It also retains a request-bound
 mutation receipt, so an exact retry after response loss returns the committed
 create, update, delete, or migration result without repeating the mutation;
-reuse of that request identity with a different binding is rejected. Migration
+reuse of that request identity with a different binding is rejected. This
+idempotency guarantee has a declared 24-hour retention window. The store is
+bounded to 256 records, 1,024 retained history events, 4,096 live mutation
+receipts, and 4 MiB encoded; history keeps a hash-linked contiguous tail and
+expired receipts are removed before new admission. Capacity exhaustion rejects
+only a new settings mutation as `settings_capacity_exhausted`; existing bounded
+records remain readable and usable. Settings lock admission is bounded by the
+earlier of the host deadline and five seconds. Migration
 artifacts are content-addressed, atomically published, confined to
 provider-owned roots, and retain hashes for the complete legacy input plus its
 provider/model records.
@@ -244,6 +251,11 @@ artifact identities. This prevents generic JSON-path fallback from collapsing
 distinct source and target roles. Rotation authorizations, prepared/imported
 operation records, materialization receipts, and decision receipts live under
 the adjacent `provider-state/opencode/rotation` tree.
+Activity recording never waits for its global lock: contention or evidence I/O
+failure produces a warning and capability dispatch continues. Each event is at
+most 64 KiB and the retained ledger is capped at 4,096 events and 8 MiB. When a
+bound is reached, the recorder keeps the newest contiguous hash-chain tail; its
+first sequence and predecessor digest expose the retention boundary.
 
 Settings, migration, activity, and rotation all pass every provider-owned
 filesystem target through the same lexical and canonical confinement guard
@@ -281,6 +293,32 @@ ambient curl configuration, supplies credentials through stdin configuration,
 and accepts no environment-selected observer branch. Auth refresh binds both
 the native OpenCode runtime identity and this quota-observer identity before it
 admits a credential mutation.
+
+### Native dependency identity upgrades
+
+Wrapper and quota-observer files must not be replaced in place while their
+identity is admitted. `setup.sync_plan` accepts `rebind_profiles` and emits the
+exact per-profile binding files plus this bounded maintenance procedure:
+
+1. Stop new admission for the selected profile. Give every in-flight provider
+   request a deadline of at most 20 seconds and wait one such drain interval.
+2. Reconcile every nonterminal launch, rotation, and quota-refresh record. If
+   any effect remains ambiguous, abort the rollout and retain the old binding;
+   the cutover interval does not begin until obligations are settled.
+3. Stage the new wrapper and `curl` implementation without altering the files
+   named by the old binding. Back up and remove only
+   `native-runtimes/<profile>.json` and
+   `quota-observers/<profile>.json` under the provider state root.
+4. Restore admission and run one quota probe and one launch under the intended
+   `PATH` and stable environment. They durably admit the new identities. If
+   either admission fails, restore the two binding backups and the old staged
+   dependencies.
+
+After obligations are settled, the declared cutover bound is one
+20-second admission interval; rollback is the same bounded two-file maintenance
+operation. This drain/reconcile/reset boundary preserves the old identities for
+recovery while giving wrapper and observer upgrades an explicit restoration
+path.
 
 Rotation assessment and materialization likewise bound acquisition of their
 shared state lock. Native export and import performed while that lock is held
