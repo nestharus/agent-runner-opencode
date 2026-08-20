@@ -926,38 +926,18 @@ fn message_timestamp(message: &OpencodeMessage) -> String {
 }
 
 fn text_parts(message: &OpencodeMessage) -> Vec<Value> {
-    let parts = native_text_parts(&message.parts);
-    let texts = native_text_part_texts(parts);
-    texts.into_iter().map(contract_text_part).collect()
-}
-
-fn native_text_parts(parts: &[Value]) -> Vec<&Value> {
-    parts
+    message
+        .parts
         .iter()
-        .filter(|part| is_native_text_part(part))
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(|text| {
+            json!({
+                "type": "text",
+                "text": text,
+            })
+        })
         .collect()
-}
-
-fn is_native_text_part(part: &Value) -> bool {
-    part.get("type").and_then(Value::as_str) == Some("text")
-}
-
-fn native_text_part_texts(parts: Vec<&Value>) -> Vec<&str> {
-    parts
-        .into_iter()
-        .filter_map(native_text_part_text)
-        .collect()
-}
-
-fn native_text_part_text(part: &Value) -> Option<&str> {
-    part.get("text").and_then(Value::as_str)
-}
-
-fn contract_text_part(text: &str) -> Value {
-    json!({
-        "type": "text",
-        "text": text,
-    })
 }
 
 fn captured_session_id(

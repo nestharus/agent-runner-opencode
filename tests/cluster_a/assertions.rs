@@ -127,24 +127,67 @@ pub fn assert_contract_launch_stream_output(
 ) {
     assert_stderr_diagnostics_only(output);
     let events = launch_events_from_output(output, "launch stdout");
-    assert_contract_launch_events(&events, fixture_session_id);
+    assert_monotonic_launch_events(&events);
+    assert_eq!(
+        collect_stream_bytes(&events, "stdout"),
+        FAKE_LAUNCH_STDOUT,
+        "stdout events must byte-preserve the selected opencodeN wrapper output"
+    );
+    assert_eq!(
+        collect_stream_bytes(&events, "stderr"),
+        FAKE_LAUNCH_STDERR,
+        "stderr events must byte-preserve the selected opencodeN wrapper output"
+    );
+    assert_eq!(
+        expected_session_marker(&events, fixture_session_id)["value"],
+        true,
+        "session marker should use a truthy marker value"
+    );
+    assert_provider_session_marker(&events, fixture_session_id);
+    let final_event = final_launch_event(&events);
+    assert_eq!(
+        final_event["kind"], "exit",
+        "final launch line must be exit"
+    );
+    assert!(
+        final_event.get("status").is_some(),
+        "exit event must carry status"
+    );
+    assert!(
+        final_event.get("terminal_signal").is_some(),
+        "exit event must carry terminal_signal"
+    );
+    assert_process_status_kind(&final_event["status"]);
+    assert_eq!(
+        final_event["status"],
+        json!({ "kind": "exited", "code": 7 }),
+        "final status should truthfully report the controlled wrapper exit status"
+    );
+    assert_status_derived_terminal_signal(final_event);
+    assert!(
+        final_event.get("session").is_some(),
+        "exit event must carry captured session evidence"
+    );
+    assert!(
+        json_contains_string(&final_event["session"], fixture_session_id),
+        "exit.session must carry the same opencode sessionID evidence as the marker; session={}",
+        final_event["session"]
+    );
     assert_output_status_code(
         output,
         Some(7),
         "provider process should preserve nonzero child exit-code parity",
     );
-    assert_wrapper_log(wrapper_log_path);
-}
-
-pub fn assert_contract_launch_events(events: &[Value], fixture_session_id: &str) {
-    assert_monotonic_launch_events(events);
-    assert_launch_stream_bytes(events);
-    assert_session_marker(events, fixture_session_id);
-    assert_provider_session_marker(events, fixture_session_id);
-    assert_exit_event(
-        events,
-        json!({ "kind": "exited", "code": 7 }),
-        fixture_session_id,
+    let wrapper_log = wrapper_log_text(wrapper_log_path);
+    assert!(
+        wrapper_log
+            .lines()
+            .any(|line| { line == "argv0=opencode1" || line.ends_with("/opencode1") }),
+        "launch should cross the selected opencode1 wrapper boundary; log={wrapper_log:?}"
+    );
+    assert!(
+        wrapper_log.lines().any(|line| line == "arg=run"),
+        "wrapper should receive opencode run argv; log={wrapper_log:?}"
     );
 }
 
@@ -160,37 +203,6 @@ pub fn assert_launch_events_not_empty(events: &[Value], label: &str) {
     assert!(!events.is_empty(), "{label} must contain NDJSON events");
 }
 
-pub fn assert_launch_stream_bytes(events: &[Value]) {
-    assert_launch_stdout_bytes(&collect_stream_bytes(events, "stdout"));
-    assert_launch_stderr_bytes(&collect_stream_bytes(events, "stderr"));
-}
-
-pub fn assert_launch_stdout_bytes(stdout_bytes: &[u8]) {
-    assert_eq!(
-        stdout_bytes, FAKE_LAUNCH_STDOUT,
-        "stdout events must byte-preserve the selected opencodeN wrapper output"
-    );
-}
-
-pub fn assert_launch_stderr_bytes(stderr_bytes: &[u8]) {
-    assert_eq!(
-        stderr_bytes, FAKE_LAUNCH_STDERR,
-        "stderr events must byte-preserve the selected opencodeN wrapper output"
-    );
-}
-
-pub fn assert_session_marker(events: &[Value], fixture_session_id: &str) {
-    let session_marker = expected_session_marker(events, fixture_session_id);
-    assert_session_marker_truthy(session_marker);
-}
-
-pub fn assert_session_marker_truthy(session_marker: &Value) {
-    assert_eq!(
-        session_marker["value"], true,
-        "session marker should use a truthy marker value"
-    );
-}
-
 pub fn assert_provider_session_marker(events: &[Value], fixture_session_id: &str) {
     let marker = events
         .iter()
@@ -202,86 +214,11 @@ pub fn assert_provider_session_marker(events: &[Value], fixture_session_id: &str
     );
 }
 
-pub fn assert_exit_event(events: &[Value], expected_status: Value, fixture_session_id: &str) {
-    let final_event = final_launch_event(events);
-    assert_exit_event_kind(final_event);
-    assert_exit_event_status_present(final_event);
-    assert_exit_event_terminal_signal_present(final_event);
-    assert_process_status_kind(&final_event["status"]);
-    assert_exit_event_status(final_event, expected_status);
-    assert_status_derived_terminal_signal(final_event);
-    assert_exit_event_session_present(final_event);
-    assert_exit_event_session_contains(final_event, fixture_session_id);
-}
-
-pub fn assert_exit_event_kind(final_event: &Value) {
-    assert_eq!(
-        final_event["kind"], "exit",
-        "final launch line must be exit"
-    );
-}
-
-pub fn assert_exit_event_status_present(final_event: &Value) {
-    assert!(
-        final_event.get("status").is_some(),
-        "exit event must carry status"
-    );
-}
-
-pub fn assert_exit_event_terminal_signal_present(final_event: &Value) {
-    assert!(
-        final_event.get("terminal_signal").is_some(),
-        "exit event must carry terminal_signal"
-    );
-}
-
-pub fn assert_exit_event_status(final_event: &Value, expected_status: Value) {
-    assert_eq!(
-        final_event["status"], expected_status,
-        "final status should truthfully report the controlled wrapper exit status"
-    );
-}
-
-pub fn assert_exit_event_session_present(final_event: &Value) {
-    assert!(
-        final_event.get("session").is_some(),
-        "exit event must carry captured session evidence"
-    );
-}
-
-pub fn assert_exit_event_session_contains(final_event: &Value, fixture_session_id: &str) {
-    assert!(
-        json_contains_string(&final_event["session"], fixture_session_id),
-        "exit.session must carry the same opencode sessionID evidence as the marker; session={}",
-        final_event["session"]
-    );
-}
-
 pub fn assert_status_derived_terminal_signal(final_event: &Value) {
     assert_eq!(
         final_event["terminal_signal"]["kind"],
         expected_signal_kind_for_status(&final_event["status"]),
         "terminal_signal should be status-derived"
-    );
-}
-
-pub fn assert_wrapper_log(wrapper_log_path: &Path) {
-    let wrapper_log = wrapper_log_text(wrapper_log_path);
-    assert_selected_wrapper_invoked(&wrapper_log);
-    assert_wrapper_run_arg(&wrapper_log);
-}
-
-pub fn assert_selected_wrapper_invoked(wrapper_log: &str) {
-    assert!(
-        wrapper_log_has_selected_wrapper(wrapper_log),
-        "launch should cross the selected opencode1 wrapper boundary; log={wrapper_log:?}"
-    );
-}
-
-pub fn assert_wrapper_run_arg(wrapper_log: &str) {
-    assert!(
-        wrapper_log_has_run_arg(wrapper_log),
-        "wrapper should receive opencode run argv; log={wrapper_log:?}"
     );
 }
 
@@ -659,7 +596,7 @@ pub fn assert_argv_session_before_notification_payload(argv: &[&str]) {
     let session_flag = argv_arg_index(argv, OPENCODE_SESSION_FLAG_FOR_TEST);
     let payload = argv_arg_index_containing(argv, NOTIFICATION_PAYLOAD_NEEDLE_FOR_TEST);
     assert!(
-        argv_index_before(session_flag, payload),
+        session_flag < payload,
         "--session must be before notification payload; argv={argv:?}"
     );
 }

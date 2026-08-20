@@ -285,7 +285,7 @@ pub fn create_params(
         "settings.create",
         |store| {
             let record = new_record(store, params.display_name, values, request_id);
-            insert_record(store, record.clone());
+            store.records.push(record.clone());
             Ok(record)
         },
     )?;
@@ -310,7 +310,7 @@ pub fn update_params(
         "settings.update",
         |store| {
             let index = record_index(store, &params.id, request_id)?;
-            ensure_version(indexed_record(store, index), &params.version, request_id)?;
+            ensure_version(&store.records[index], &params.version, request_id)?;
             Ok(update_record(store, index, &params.id, values, request_id))
         },
     )?;
@@ -332,8 +332,8 @@ pub fn delete_params(
         "settings.delete",
         |store| {
             let index = record_index(store, &params.id, request_id)?;
-            ensure_version(indexed_record(store, index), &params.version, request_id)?;
-            remove_record(store, index);
+            ensure_version(&store.records[index], &params.version, request_id)?;
+            store.records.remove(index);
             Ok(())
         },
     )?;
@@ -763,11 +763,11 @@ fn find_record<'a>(
     id: &str,
     request_id: &str,
 ) -> Result<&'a SettingsRecord, ProviderFailure> {
-    selected_record(store, id).ok_or_else(|| settings_not_found_failure(request_id))
-}
-
-fn selected_record<'a>(store: &'a SettingsStore, id: &str) -> Option<&'a SettingsRecord> {
-    store.records.iter().find(|record| record.id == id)
+    store
+        .records
+        .iter()
+        .find(|record| record.id == id)
+        .ok_or_else(|| settings_not_found_failure(request_id))
 }
 
 fn record_index(
@@ -775,23 +775,11 @@ fn record_index(
     id: &str,
     request_id: &str,
 ) -> Result<usize, ProviderFailure> {
-    selected_record_index(store, id).ok_or_else(|| settings_not_found_failure(request_id))
-}
-
-fn selected_record_index(store: &SettingsStore, id: &str) -> Option<usize> {
-    store.records.iter().position(|record| record.id == id)
-}
-
-fn indexed_record(store: &SettingsStore, index: usize) -> &SettingsRecord {
-    &store.records[index]
-}
-
-fn indexed_record_mut(store: &mut SettingsStore, index: usize) -> &mut SettingsRecord {
-    &mut store.records[index]
-}
-
-fn insert_record(store: &mut SettingsStore, record: SettingsRecord) {
-    store.records.push(record);
+    store
+        .records
+        .iter()
+        .position(|record| record.id == id)
+        .ok_or_else(|| settings_not_found_failure(request_id))
 }
 
 fn update_record(
@@ -802,17 +790,10 @@ fn update_record(
     request_id: &str,
 ) -> SettingsRecord {
     let version = version_token(id, &values, request_id);
-    replace_record(indexed_record_mut(store, index), version, values);
-    indexed_record(store, index).clone()
-}
-
-fn replace_record(record: &mut SettingsRecord, version: String, values: Value) {
+    let record = &mut store.records[index];
     record.version = version;
     record.values = values;
-}
-
-fn remove_record(store: &mut SettingsStore, index: usize) {
-    store.records.remove(index);
+    record.clone()
 }
 
 fn ensure_version(
@@ -853,7 +834,7 @@ fn unique_settings_id(store: &SettingsStore, values: &Value, request_id: &str) -
     let base = settings_id_base(values);
     (0_u64..)
         .map(|attempt| settings_id_for_base(base, request_id, attempt))
-        .find(|candidate| selected_record(store, candidate).is_none())
+        .find(|candidate| !store.records.iter().any(|record| record.id == *candidate))
         .expect("unbounded settings identifier search must find a free identity")
 }
 
@@ -1013,34 +994,20 @@ fn child_object<'a>(object: &'a mut Map<String, Value>, key: &str) -> &'a mut Ma
 
 fn legacy_actions(legacy: &Value) -> Vec<Value> {
     let providers = legacy_provider_names(legacy);
-    legacy_actions_for_providers(&providers)
-}
-
-fn legacy_actions_for_providers(providers: &[String]) -> Vec<Value> {
-    let mut actions = legacy_provider_actions(providers);
-    if legacy_providers_empty(providers) {
+    let mut actions = providers
+        .iter()
+        .map(|provider| {
+            json!({
+                "kind": "settings_profile",
+                "provider": provider,
+                "operation": "create_or_update_provider_owned_profile",
+            })
+        })
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
         actions.push(legacy_inspect_tables_action());
     }
     actions
-}
-
-fn legacy_provider_actions(providers: &[String]) -> Vec<Value> {
-    providers
-        .iter()
-        .map(|provider| legacy_provider_action(provider))
-        .collect()
-}
-
-fn legacy_provider_action(provider: &str) -> Value {
-    json!({
-        "kind": "settings_profile",
-        "provider": provider,
-        "operation": "create_or_update_provider_owned_profile",
-    })
-}
-
-fn legacy_providers_empty(providers: &[String]) -> bool {
-    providers.is_empty()
 }
 
 fn legacy_inspect_tables_action() -> Value {
@@ -1051,40 +1018,26 @@ fn legacy_inspect_tables_action() -> Value {
 }
 
 fn legacy_warnings(legacy: &Value) -> Vec<Value> {
-    let models = legacy_models(legacy);
-    legacy_warnings_for_model_state(legacy_models_empty(&models))
-}
-
-fn legacy_warnings_for_model_state(models_empty: bool) -> Vec<Value> {
     let mut warnings = vec![json!(
         "legacy live provider/model TOML is design input only; no live route cutover is performed"
     )];
-    if models_empty {
+    if legacy_models(legacy).is_empty() {
         warnings.push(json!("legacy input did not include model TOML entries"));
     }
     warnings
 }
 
-fn legacy_models_empty(models: &[String]) -> bool {
-    models.is_empty()
-}
-
 fn legacy_diagnostics(legacy: &Value) -> Vec<Value> {
     let providers = legacy_provider_names(legacy);
-    let mut diagnostics = legacy_diagnostics_for_providers(&providers);
+    let mut diagnostics = Vec::new();
+    if providers.is_empty() {
+        diagnostics.push(legacy_providers_missing_diagnostic());
+    }
     diagnostics.extend(
         legacy_unrecognized_provider_names(legacy)
             .into_iter()
             .map(legacy_unrecognized_provider_diagnostic),
     );
-    diagnostics
-}
-
-fn legacy_diagnostics_for_providers(providers: &[String]) -> Vec<Value> {
-    let mut diagnostics = Vec::new();
-    if providers.is_empty() {
-        diagnostics.push(legacy_providers_missing_diagnostic());
-    }
     diagnostics
 }
 
@@ -1119,28 +1072,11 @@ fn legacy_provider_names(legacy: &Value) -> Vec<String> {
     let Some(parsed) = legacy_providers_toml(legacy) else {
         return Vec::new();
     };
-    legacy_provider_names_from_toml(&parsed)
-}
-
-fn legacy_provider_names_from_toml(parsed: &toml::Value) -> Vec<String> {
-    legacy_provider_names_from_table(legacy_provider_table(parsed))
-}
-
-fn legacy_provider_table(parsed: &toml::Value) -> Option<&toml::Table> {
-    parsed.as_table()
-}
-
-fn legacy_provider_names_from_table(table: Option<&toml::Table>) -> Vec<String> {
-    let Some(table) = table else {
+    let Some(table) = parsed.as_table() else {
         return Vec::new();
     };
-    legacy_opencode_provider_names(table.iter())
-}
-
-fn legacy_opencode_provider_names<'a>(
-    providers: impl Iterator<Item = (&'a String, &'a toml::Value)>,
-) -> Vec<String> {
-    providers
+    table
+        .iter()
         .filter_map(|(_, value)| legacy_provider_account(value))
         .map(|account| account.opencode_wrapper.to_string())
         .collect::<std::collections::BTreeSet<_>>()
@@ -1159,7 +1095,7 @@ fn legacy_unrecognized_provider_names(legacy: &Value) -> Vec<String> {
     let Some(parsed) = legacy_providers_toml(legacy) else {
         return Vec::new();
     };
-    let Some(table) = legacy_provider_table(&parsed) else {
+    let Some(table) = parsed.as_table() else {
         return Vec::new();
     };
     table
@@ -1245,7 +1181,7 @@ fn upsert_migrated_record(
         values,
         request_id,
     );
-    insert_record(store, record);
+    store.records.push(record);
     Ok(())
 }
 

@@ -52,18 +52,17 @@ impl FixtureCoverage {
 }
 
 pub fn parse_opencode_fixture_events(fixture: &str) -> Vec<NumberedFixtureEvent> {
-    numbered_fixture_lines(non_empty_fixture_lines(fixture))
-        .into_iter()
-        .map(parse_numbered_fixture_line)
+    fixture
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let line_number = index + 1;
+            let event = serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("fixture line {line_number} is invalid JSON: {err}"));
+            NumberedFixtureEvent { line_number, event }
+        })
         .collect()
-}
-
-pub fn non_empty_fixture_lines(fixture: &str) -> Vec<&str> {
-    non_empty_lines(fixture_lines(fixture))
-}
-
-pub fn fixture_lines(fixture: &str) -> Vec<&str> {
-    fixture.lines().collect()
 }
 
 pub fn non_empty_lines(lines: Vec<&str>) -> Vec<&str> {
@@ -75,24 +74,6 @@ pub fn non_empty_lines(lines: Vec<&str>) -> Vec<&str> {
 
 pub fn line_has_text(line: &str) -> bool {
     !line.trim().is_empty()
-}
-
-pub fn numbered_fixture_lines(lines: Vec<&str>) -> Vec<(usize, &str)> {
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(index, line)| (index + 1, line))
-        .collect()
-}
-
-pub fn parse_numbered_fixture_line((line_number, line): (usize, &str)) -> NumberedFixtureEvent {
-    parse_opencode_fixture_event(line_number, line)
-}
-
-pub fn parse_opencode_fixture_event(line_number: usize, line: &str) -> NumberedFixtureEvent {
-    let event = serde_json::from_str(line)
-        .unwrap_or_else(|err| panic!("fixture line {line_number} is invalid JSON: {err}"));
-    NumberedFixtureEvent { line_number, event }
 }
 
 pub fn fixture_event_type(numbered: &NumberedFixtureEvent) -> &str {
@@ -160,66 +141,22 @@ pub fn wrapper_nul_log_args(wrapper_log_path: &Path) -> Vec<String> {
 }
 
 pub fn wrapper_log_args(wrapper_log: &str) -> Vec<&str> {
-    wrapper_log_arg_values(wrapper_log_arg_lines(wrapper_log))
-}
-
-pub fn wrapper_log_arg_lines(wrapper_log: &str) -> Vec<&str> {
-    arg_log_lines(wrapper_log_lines(wrapper_log))
-}
-
-pub fn wrapper_log_lines(wrapper_log: &str) -> Vec<&str> {
-    wrapper_log.lines().collect()
-}
-
-pub fn arg_log_lines(lines: Vec<&str>) -> Vec<&str> {
-    lines
-        .into_iter()
-        .filter(|line| is_wrapper_log_arg_line(line))
+    wrapper_log
+        .lines()
+        .filter_map(|line| line.strip_prefix("arg="))
         .collect()
 }
 
-pub fn is_wrapper_log_arg_line(line: &str) -> bool {
-    line.starts_with("arg=")
-}
-
-pub fn wrapper_log_arg_values(lines: Vec<&str>) -> Vec<&str> {
-    lines.into_iter().map(wrapper_log_arg_value).collect()
-}
-
-pub fn wrapper_log_arg_value(line: &str) -> &str {
-    line.strip_prefix("arg=").expect("wrapper arg log line")
-}
-
 pub fn argv_arg_index(argv: &[&str], needle: &str) -> usize {
-    required_argv_arg_index(optional_argv_arg_index(argv, needle), needle, argv)
-}
-
-pub fn optional_argv_arg_index(argv: &[&str], needle: &str) -> Option<usize> {
-    argv.iter().position(|arg| *arg == needle)
+    argv.iter()
+        .position(|arg| *arg == needle)
+        .unwrap_or_else(|| panic!("argv missing {needle:?}: {argv:?}"))
 }
 
 pub fn argv_arg_index_containing(argv: &[&str], needle: &str) -> usize {
-    required_argv_arg_index(
-        optional_argv_arg_index_containing(argv, needle),
-        needle,
-        argv,
-    )
-}
-
-pub fn optional_argv_arg_index_containing(argv: &[&str], needle: &str) -> Option<usize> {
-    argv.iter().position(|arg| arg.contains(needle))
-}
-
-pub fn required_argv_arg_index(index: Option<usize>, needle: &str, argv: &[&str]) -> usize {
-    index.unwrap_or_else(|| missing_argv_arg_index(needle, argv))
-}
-
-pub fn missing_argv_arg_index(needle: &str, argv: &[&str]) -> ! {
-    panic!("argv missing {needle:?}: {argv:?}")
-}
-
-pub fn argv_index_before(left: usize, right: usize) -> bool {
-    left < right
+    argv.iter()
+        .position(|arg| arg.contains(needle))
+        .unwrap_or_else(|| panic!("argv missing {needle:?}: {argv:?}"))
 }
 
 pub fn wrapper_arg_log_line(value: &str) -> String {
@@ -228,32 +165,6 @@ pub fn wrapper_arg_log_line(value: &str) -> String {
 
 pub fn wrapper_stdin_log_line(value: &str) -> String {
     format!("stdin={value}")
-}
-
-pub fn wrapper_log_has_selected_wrapper(wrapper_log: &str) -> bool {
-    wrapper_log_lines_has_selected_wrapper(&wrapper_log_lines(wrapper_log))
-}
-
-pub fn wrapper_log_has_run_arg(wrapper_log: &str) -> bool {
-    wrapper_log_lines_has_run_arg(&wrapper_log_lines(wrapper_log))
-}
-
-pub fn wrapper_log_lines_has_selected_wrapper(lines: &[&str]) -> bool {
-    lines
-        .iter()
-        .any(|line| wrapper_log_line_is_selected_wrapper(line))
-}
-
-pub fn wrapper_log_line_is_selected_wrapper(line: &str) -> bool {
-    line == "argv0=opencode1" || line.ends_with("/opencode1")
-}
-
-pub fn wrapper_log_lines_has_run_arg(lines: &[&str]) -> bool {
-    lines.iter().any(|line| wrapper_log_line_is_run_arg(line))
-}
-
-pub fn wrapper_log_line_is_run_arg(line: &str) -> bool {
-    line == "arg=run"
 }
 
 pub fn declared_env_log_text(wrapper_log_path: &Path) -> String {

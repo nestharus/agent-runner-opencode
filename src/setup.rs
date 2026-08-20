@@ -263,79 +263,25 @@ fn wrapper_names() -> Vec<&'static str> {
 }
 
 fn string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
-    non_empty_param_string(param_string(raw_param(params, key)))
-}
-
-fn raw_param<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
-    params.get(key)
-}
-
-fn param_string(value: Option<&Value>) -> Option<&str> {
-    value.and_then(Value::as_str)
-}
-
-fn non_empty_param_string(value: Option<&str>) -> Option<&str> {
-    value.filter(|value| !value.trim().is_empty())
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn find_on_path(program: &str) -> Option<PathBuf> {
-    let path = path_env()?;
-    first_existing_path_candidate(path_candidates(path_entries(&path), program))
-}
-
-fn path_env() -> Option<std::ffi::OsString> {
-    std::env::var_os("PATH")
-}
-
-fn path_entries(path: &std::ffi::OsStr) -> Vec<PathBuf> {
-    std::env::split_paths(path).collect()
-}
-
-fn path_candidates(entries: Vec<PathBuf>, program: &str) -> Vec<PathBuf> {
-    entries
-        .into_iter()
-        .map(|dir| path_candidate(&dir, program))
-        .collect()
-}
-
-fn path_candidate(dir: &Path, program: &str) -> PathBuf {
-    dir.join(program)
-}
-
-fn first_existing_path_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
-    candidates
-        .into_iter()
-        .find(|candidate| path_candidate_is_file(candidate))
-}
-
-fn path_candidate_is_file(candidate: &Path) -> bool {
-    candidate.is_file()
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(program))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
-    let Some(relative) = tilde_relative(path) else {
-        return literal_path(path);
-    };
-    let Some(home) = home_dir() else {
-        return literal_path(path);
-    };
-    home_relative_path(&home, relative)
-}
-
-fn tilde_relative(path: &str) -> Option<&str> {
-    path.strip_prefix("~/")
-}
-
-fn home_dir() -> Option<std::ffi::OsString> {
-    std::env::var_os("HOME")
-}
-
-fn home_relative_path(home: &std::ffi::OsStr, relative: &str) -> PathBuf {
-    Path::new(home).join(relative)
-}
-
-fn literal_path(path: &str) -> PathBuf {
-    PathBuf::from(path)
+    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(relative), Some(home)) => Path::new(&home).join(relative),
+        _ => PathBuf::from(path),
+    }
 }
 
 fn unknown_setup_subcommand_failure(request_id: String, unknown: &str) -> ProviderFailure {

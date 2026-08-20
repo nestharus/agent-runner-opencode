@@ -489,28 +489,11 @@ fn invalid_session_list_json_error(err: serde_json::Error) -> OpencodeSessionLis
 }
 
 fn non_empty_lines(drained: &[u8]) -> Vec<Vec<u8>> {
-    let lines = byte_lines(drained);
-    let lines = select_non_empty_lines(lines);
-    owned_byte_lines(lines)
-}
-
-fn byte_lines(drained: &[u8]) -> Vec<&[u8]> {
-    drained.split(|byte| *byte == b'\n').collect()
-}
-
-fn select_non_empty_lines(lines: Vec<&[u8]>) -> Vec<&[u8]> {
-    lines
-        .into_iter()
-        .filter(|line| is_non_empty_line(line))
+    drained
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.trim_ascii().is_empty())
+        .map(Vec::from)
         .collect()
-}
-
-fn is_non_empty_line(line: &[u8]) -> bool {
-    !line.trim_ascii().is_empty()
-}
-
-fn owned_byte_lines(lines: Vec<&[u8]>) -> Vec<Vec<u8>> {
-    lines.into_iter().map(Vec::from).collect()
 }
 
 fn pinned_native_event(event: OpencodeEventMetadata) -> Option<OpencodeEventMetadata> {

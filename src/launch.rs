@@ -376,14 +376,11 @@ fn resume_observation_request(
 }
 
 fn known_provider_session_id(params: &LaunchParams) -> Option<&str> {
-    nonblank_optional_text(raw_known_provider_session_id(params))
-}
-
-fn raw_known_provider_session_id(params: &LaunchParams) -> Option<&str> {
     params
         .session
         .as_ref()
         .and_then(|session| session.known_provider_session_id.as_deref())
+        .filter(|session_id| !session_id.trim().is_empty())
 }
 
 fn validate_launch_session(params: &LaunchParams, request_id: &str) -> Result<(), ProviderFailure> {
@@ -391,7 +388,10 @@ fn validate_launch_session(params: &LaunchParams, request_id: &str) -> Result<()
         return Ok(());
     };
     match (
-        nonblank_optional_text(session.known_provider_session_id.as_deref()),
+        session
+            .known_provider_session_id
+            .as_deref()
+            .filter(|session_id| !session_id.trim().is_empty()),
         session.start_mode.as_deref(),
     ) {
         (None, None) => Ok(()),
@@ -426,65 +426,19 @@ fn submitted_resume_payload(
     stdin: Option<&[u8]>,
     prompt: Option<&str>,
 ) -> Option<String> {
-    stdin_payload_text(stdin)
+    stdin
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
         .or_else(|| prompt_arg_payload(argv, prompt))
         .or_else(|| argv_payload_after_resume_session_insert_index(argv).map(str::to_string))
 }
 
-fn stdin_payload_text(stdin: Option<&[u8]>) -> Option<String> {
-    let bytes = stdin_payload_bytes(stdin)?;
-    payload_string(bytes)
-}
-
-fn stdin_payload_bytes(stdin: Option<&[u8]>) -> Option<&[u8]> {
-    nonempty_payload_bytes(stdin?)
-}
-
-fn nonempty_payload_bytes(bytes: &[u8]) -> Option<&[u8]> {
-    (!bytes_are_empty_payload(bytes)).then_some(bytes)
-}
-
-fn bytes_are_empty_payload(bytes: &[u8]) -> bool {
-    payload_text_or_bytes_are_empty(bytes, payload_utf8_text(bytes))
-}
-
-fn payload_text_or_bytes_are_empty(bytes: &[u8], text: Option<&str>) -> bool {
-    text.map_or_else(|| bytes.is_empty(), text_is_blank)
-}
-
-fn payload_string(bytes: &[u8]) -> Option<String> {
-    payload_utf8_text(bytes).map(owned_text)
-}
-
-fn payload_utf8_text(bytes: &[u8]) -> Option<&str> {
-    std::str::from_utf8(bytes).ok()
-}
-
-fn owned_text(text: &str) -> String {
-    text.to_string()
-}
-
-fn nonblank_optional_text(value: Option<&str>) -> Option<&str> {
-    value.filter(|text| is_nonblank_text(text))
-}
-
-fn is_nonblank_text(text: &str) -> bool {
-    !text_is_blank(text)
-}
-
-fn text_is_blank(text: &str) -> bool {
-    text.trim().is_empty()
-}
-
 fn prompt_arg_payload(argv: &[String], prompt: Option<&str>) -> Option<String> {
-    let prompt = nonempty_prompt(prompt)?;
+    let prompt = prompt.filter(|text| !text.trim().is_empty())?;
     argv.iter()
         .any(|arg| arg == prompt)
         .then(|| prompt.to_string())
-}
-
-fn nonempty_prompt(prompt: Option<&str>) -> Option<&str> {
-    nonblank_optional_text(prompt)
 }
 
 fn argv_payload_after_resume_session_insert_index(argv: &[String]) -> Option<&str> {
@@ -1509,7 +1463,9 @@ fn opencode_error_message_value(error: &opencode::OpencodeEventError) -> Option<
 }
 
 fn nonblank_text_or<'a>(value: Option<&'a str>, fallback: &'a str) -> &'a str {
-    nonblank_optional_text(value).unwrap_or(fallback)
+    value
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(fallback)
 }
 
 fn launch_exit_event(request_id: &str, seq: u64, status: &ProcessStatus, signal: Value) -> Value {
