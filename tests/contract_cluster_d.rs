@@ -1032,6 +1032,112 @@ fn contract_rotation_assess_materialize() {
     host_owned.assert_unchanged();
 }
 
+#[cfg(unix)]
+#[test]
+fn contract_rotation_recovers_post_import_pre_receipt_failure_without_reimport() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-post-import-recovery");
+    let opencode = RotationOpencodeFixture::with_post_import_finalization_fault();
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let path = opencode.path_env();
+    let failed = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(failed["error"]["code"], "rotation_state_failed");
+    assert_eq!(opencode.import_count(), 1);
+
+    opencode.restore_operation_state_writes(host.data_root());
+    let recovered = success_result(
+        invoke_validated_with_host_and_env(
+            "rotation.materialize",
+            rotation_materialize_params(),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            &[("PATH", path.as_str())],
+        ),
+        "rotation.schema.json#/$defs/RotationMaterializeResponse",
+        "rotation.schema.json#/$defs/RotationMaterializeResult",
+    );
+    assert_rotation_materialized(&recovered);
+    assert_eq!(
+        recovered["target_provider_session_id"],
+        ROTATION_SOURCE_SESSION
+    );
+    assert_eq!(
+        opencode.import_count(),
+        1,
+        "recovery must reconcile the durable prepared operation without repeating import"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_rotation_requires_and_validates_changed_target_identity_during_recovery() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-changed-id-recovery");
+    let target_session_id = "ses_target_rekeyed_contract_d";
+    let opencode = RotationOpencodeFixture::with_post_import_finalization_fault_and_target_id(
+        target_session_id,
+    );
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let path = opencode.path_env();
+    let _ = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(opencode.import_count(), 1);
+    opencode.restore_operation_state_writes(host.data_root());
+
+    let unresolved = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(unresolved["error"]["code"], "rotation_recovery_required");
+    assert_eq!(opencode.import_count(), 1);
+
+    let mut recovery = rotation_materialize_params();
+    recovery["recovery_target_session_id"] = json!(target_session_id);
+    let recovered = success_result(
+        invoke_validated_with_host_and_env(
+            "rotation.materialize",
+            recovery,
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            &[("PATH", path.as_str())],
+        ),
+        "rotation.schema.json#/$defs/RotationMaterializeResponse",
+        "rotation.schema.json#/$defs/RotationMaterializeResult",
+    );
+    assert_eq!(recovered["target_provider_session_id"], target_session_id);
+    assert_eq!(opencode.import_count(), 1);
+}
+
 #[test]
 fn contract_rotation_materialize_requires_matching_prior_assessment() {
     let host = HostRoots::new("agent-runner-opencode-rotation-no-assessment");

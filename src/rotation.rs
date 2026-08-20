@@ -8,6 +8,7 @@ use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
 use crate::path_guard;
 use crate::runtime_selection::resolve_runtime_selection;
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::fs::OpenOptions;
@@ -52,10 +53,16 @@ pub fn materialize_params(
     let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
     let working_directory = rotation_working_directory(host, request_id)?;
     let _lock = acquire_rotation_lock(host, request_id)?;
-    let authorization = require_fresh_authorization(host, &binding, request_id)?;
     if let Some(result) = read_materialization_receipt(host, &binding, request_id)? {
         return Ok(result);
     }
+    if let Some(mut operation) = read_rotation_operation(host, &binding, request_id)? {
+        if operation.phase == RotationOperationPhase::Prepared {
+            reconcile_prepared_operation(host, &params, &binding, &mut operation, request_id)?;
+        }
+        return finalize_rotation_operation(host, &binding, &operation, request_id);
+    }
+    let authorization = require_fresh_authorization(host, &binding, request_id)?;
     let native = opencode::export(&binding.source_session_id, binding.source_account)
         .map_err(|error| rotation_export_failure(request_id, &binding.source_session_id, error))?;
     validate_rotation_export(&native, &binding.source_session_id, request_id)?;
@@ -66,38 +73,38 @@ pub fn materialize_params(
     let artifact_path = rotation_artifact_path(host, &artifact_bytes, request_id)?;
     write_artifact_atomic(&artifact_path, &artifact_bytes)
         .map_err(|error| rotation_artifact_failure(request_id, error))?;
+    let mut operation = RotationOperation {
+        schema_version: 1,
+        binding_sha256: binding_digest(&binding),
+        binding: binding_value(&binding),
+        authorization_id: authorization["authorization_id"]
+            .as_str()
+            .expect("validated authorization id")
+            .to_string(),
+        assessment_request_id: authorization["assessment_request_id"]
+            .as_str()
+            .expect("validated assessment request id")
+            .to_string(),
+        materialization_request_id: request_id.to_string(),
+        artifact_path: artifact_path.display().to_string(),
+        artifact_sha256: sha256_hex(&artifact_bytes),
+        boundary,
+        prepared_at_unix_ms: now_unix_ms(),
+        phase: RotationOperationPhase::Prepared,
+        target_session_id: None,
+        imported_at_unix_ms: None,
+    };
+    write_rotation_operation(host, &binding, &operation, request_id)?;
     let target_session_id =
         opencode::import_session(&artifact_path, binding.target_account, working_directory)
             .map_err(|error| {
                 rotation_import_failure(request_id, &binding.target_provider_id, error)
             })?;
-    let artifact = rotation_artifact(&artifact_path, &artifact_bytes);
-    let decision_artifact = write_rotation_decision_receipt(
-        host,
-        &binding,
-        &authorization,
-        &target_session_id,
-        target_session_id == binding.source_session_id,
-        request_id,
-    )?;
-    let host_state_plan = host_state_plan(HostStatePlanInput {
-        chain_id: &binding.chain_id,
-        source_provider: &binding.source_provider_id,
-        target_provider: &binding.target_provider_id,
-        source_session_id: &binding.source_session_id,
-        target_session_id: &target_session_id,
-        transition_reason: &binding.transition_reason,
-        boundary: &boundary,
-        artifacts: [&artifact, &decision_artifact],
-    });
-    let result = json!({
-        "changed": true,
-        "target_provider_session_id": target_session_id,
-        "artifacts": [artifact, decision_artifact],
-        "host_state_plan": host_state_plan,
-    });
-    write_materialization_receipt(host, &binding, &result, request_id)?;
-    Ok(result)
+    operation.phase = RotationOperationPhase::Imported;
+    operation.target_session_id = Some(target_session_id);
+    operation.imported_at_unix_ms = Some(now_unix_ms());
+    write_rotation_operation(host, &binding, &operation, request_id)?;
+    finalize_rotation_operation(host, &binding, &operation, request_id)
 }
 
 pub(crate) fn activity_targets(params: &Value, result: Option<&Value>) -> ActivityTargets {
@@ -248,6 +255,32 @@ struct RotationBinding {
     transition_reason: String,
     provider_instance_id: String,
     host_app: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RotationOperation {
+    schema_version: u32,
+    binding_sha256: String,
+    binding: Value,
+    authorization_id: String,
+    assessment_request_id: String,
+    materialization_request_id: String,
+    artifact_path: String,
+    artifact_sha256: String,
+    boundary: String,
+    prepared_at_unix_ms: u64,
+    phase: RotationOperationPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imported_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RotationOperationPhase {
+    Prepared,
+    Imported,
 }
 
 fn rotation_binding(
@@ -437,6 +470,17 @@ fn materialization_receipt_path(
     confined_rotation_state_target(host, &path, request_id)
 }
 
+fn rotation_operation_path(
+    host: &HostContext,
+    binding: &RotationBinding,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let path = rotation_state_root(host, request_id)?
+        .join("operations")
+        .join(format!("{}.json", binding_digest(binding)));
+    confined_rotation_state_target(host, &path, request_id)
+}
+
 fn rotation_state_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
     let data_root = rotation_data_root(host, request_id)?;
     let path = data_root.join(ROTATION_STATE_DIR);
@@ -483,23 +527,243 @@ fn read_materialization_receipt(
     };
     let receipt: Value = serde_json::from_slice(&bytes)
         .map_err(|error| rotation_state_failure(request_id, error))?;
-    if receipt["binding_sha256"].as_str() != Some(binding_digest(binding).as_str()) {
+    if receipt["binding_sha256"].as_str() != Some(binding_digest(binding).as_str())
+        || receipt["binding"] != binding_value(binding)
+    {
         return Err(rotation_authorization_invalid(request_id));
     }
     Ok(receipt.get("result").cloned())
+}
+
+fn read_rotation_operation(
+    host: &HostContext,
+    binding: &RotationBinding,
+    request_id: &str,
+) -> Result<Option<RotationOperation>, ProviderFailure> {
+    let path = rotation_operation_path(host, binding, request_id)?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(rotation_state_failure(request_id, error)),
+    };
+    let operation: RotationOperation = serde_json::from_slice(&bytes)
+        .map_err(|error| rotation_operation_invalid(request_id, error))?;
+    validate_rotation_operation(host, binding, &operation, request_id)?;
+    Ok(Some(operation))
+}
+
+fn validate_rotation_operation(
+    host: &HostContext,
+    binding: &RotationBinding,
+    operation: &RotationOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let phase_valid = match operation.phase {
+        RotationOperationPhase::Prepared => {
+            operation.target_session_id.is_none() && operation.imported_at_unix_ms.is_none()
+        }
+        RotationOperationPhase::Imported => {
+            operation
+                .target_session_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && operation.imported_at_unix_ms.is_some()
+        }
+    };
+    if operation.schema_version != 1
+        || operation.binding_sha256 != binding_digest(binding)
+        || operation.binding != binding_value(binding)
+        || operation.authorization_id.trim().is_empty()
+        || operation.assessment_request_id.trim().is_empty()
+        || operation.materialization_request_id.trim().is_empty()
+        || operation.boundary.trim().is_empty()
+        || !phase_valid
+    {
+        return Err(rotation_operation_invalid(
+            request_id,
+            "operation identity or phase is inconsistent",
+        ));
+    }
+    read_rotation_operation_artifact(host, operation, request_id).map(|_| ())
+}
+
+fn read_rotation_operation_artifact(
+    host: &HostContext,
+    operation: &RotationOperation,
+    request_id: &str,
+) -> Result<Vec<u8>, ProviderFailure> {
+    let data_root = rotation_data_root(host, request_id)?;
+    let path = path_guard::confined_target(data_root, Path::new(&operation.artifact_path))
+        .map_err(|error| rotation_operation_invalid(request_id, error))?;
+    let bytes = fs::read(path).map_err(|error| rotation_operation_invalid(request_id, error))?;
+    if sha256_hex(&bytes) != operation.artifact_sha256 {
+        return Err(rotation_operation_invalid(
+            request_id,
+            "operation artifact digest does not match durable preparation",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn write_rotation_operation(
+    host: &HostContext,
+    binding: &RotationBinding,
+    operation: &RotationOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    write_private_json_atomic(
+        &rotation_operation_path(host, binding, request_id)?,
+        &serde_json::to_value(operation)
+            .map_err(|error| rotation_state_failure(request_id, error))?,
+    )
+    .map_err(|error| rotation_state_failure(request_id, error))
+}
+
+fn reconcile_prepared_operation(
+    host: &HostContext,
+    params: &Value,
+    binding: &RotationBinding,
+    operation: &mut RotationOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let supplied_target = optional_string(params, "recovery_target_session_id");
+    let candidate_session_id = supplied_target.unwrap_or(&binding.source_session_id);
+    let target = match opencode::export(candidate_session_id, binding.target_account) {
+        Ok(target) => target,
+        Err(error) => {
+            return Err(rotation_recovery_required(
+                request_id,
+                binding,
+                operation,
+                supplied_target,
+                Some(format!("target export failed: {error:?}")),
+            ));
+        }
+    };
+    if target.info.id != candidate_session_id
+        || target
+            .messages
+            .iter()
+            .any(|message| message.info.session_id.as_deref() != Some(candidate_session_id))
+    {
+        return Err(rotation_recovery_required(
+            request_id,
+            binding,
+            operation,
+            supplied_target,
+            Some("target export does not carry the proposed target session identity".to_string()),
+        ));
+    }
+    let source_bytes = read_rotation_operation_artifact(host, operation, request_id)?;
+    let source: Value = serde_json::from_slice(&source_bytes)
+        .map_err(|error| rotation_operation_invalid(request_id, error))?;
+    if normalized_rotation_session(source)
+        != normalized_rotation_session(target.native_json().clone())
+    {
+        return Err(rotation_recovery_required(
+            request_id,
+            binding,
+            operation,
+            supplied_target,
+            Some("target export content does not match the prepared source artifact".to_string()),
+        ));
+    }
+    operation.phase = RotationOperationPhase::Imported;
+    operation.target_session_id = Some(candidate_session_id.to_string());
+    operation.imported_at_unix_ms = Some(now_unix_ms());
+    write_rotation_operation(host, binding, operation, request_id)
+}
+
+fn normalized_rotation_session(mut native: Value) -> Value {
+    if let Some(info) = native.get_mut("info").and_then(Value::as_object_mut) {
+        info.insert("id".to_string(), Value::String("<session>".to_string()));
+        info.remove("directory");
+    }
+    normalize_nested_session_ids(&mut native);
+    native
+}
+
+fn normalize_nested_session_ids(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("sessionID") {
+                object.insert(
+                    "sessionID".to_string(),
+                    Value::String("<session>".to_string()),
+                );
+            }
+            for value in object.values_mut() {
+                normalize_nested_session_ids(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                normalize_nested_session_ids(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn finalize_rotation_operation(
+    host: &HostContext,
+    binding: &RotationBinding,
+    operation: &RotationOperation,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
+    if operation.phase != RotationOperationPhase::Imported {
+        return Err(rotation_operation_invalid(
+            request_id,
+            "only an imported operation can be finalized",
+        ));
+    }
+    let target_session_id = operation
+        .target_session_id
+        .as_deref()
+        .expect("validated imported operation has a target session id");
+    let artifact_bytes = read_rotation_operation_artifact(host, operation, request_id)?;
+    let artifact_path = Path::new(&operation.artifact_path);
+    let artifact = rotation_artifact(artifact_path, &artifact_bytes);
+    let decision_artifact = write_rotation_decision_receipt(host, binding, operation, request_id)?;
+    let host_state_plan = host_state_plan(HostStatePlanInput {
+        chain_id: &binding.chain_id,
+        source_provider: &binding.source_provider_id,
+        target_provider: &binding.target_provider_id,
+        source_session_id: &binding.source_session_id,
+        target_session_id,
+        transition_reason: &binding.transition_reason,
+        boundary: &operation.boundary,
+        artifacts: [&artifact, &decision_artifact],
+    });
+    let result = json!({
+        "changed": true,
+        "target_provider_session_id": target_session_id,
+        "artifacts": [artifact, decision_artifact],
+        "host_state_plan": host_state_plan,
+    });
+    write_materialization_receipt(
+        host,
+        binding,
+        &result,
+        &operation.materialization_request_id,
+        request_id,
+    )?;
+    Ok(result)
 }
 
 fn write_materialization_receipt(
     host: &HostContext,
     binding: &RotationBinding,
     result: &Value,
+    materialization_request_id: &str,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     let receipt = json!({
         "schema_version": 1,
         "binding_sha256": binding_digest(binding),
         "binding": binding_value(binding),
-        "materialization_request_id": request_id,
+        "materialization_request_id": materialization_request_id,
+        "finalization_request_id": request_id,
         "recorded_at_unix_ms": now_unix_ms(),
         "result": result,
     });
@@ -513,24 +777,27 @@ fn write_materialization_receipt(
 fn write_rotation_decision_receipt(
     host: &HostContext,
     binding: &RotationBinding,
-    authorization: &Value,
-    target_session_id: &str,
-    identity_matched: bool,
+    operation: &RotationOperation,
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
+    let target_session_id = operation
+        .target_session_id
+        .as_deref()
+        .expect("validated imported operation has a target session id");
+    let identity_matched = target_session_id == binding.source_session_id;
     let record = json!({
         "schema_version": 1,
         "operation": "rotation.materialize",
         "binding_sha256": binding_digest(binding),
         "binding": binding_value(binding),
-        "authorization_id": authorization["authorization_id"],
-        "assessment_request_id": authorization["assessment_request_id"],
-        "materialization_request_id": request_id,
+        "authorization_id": operation.authorization_id,
+        "assessment_request_id": operation.assessment_request_id,
+        "materialization_request_id": operation.materialization_request_id,
         "expected_target_session_id": binding.source_session_id,
         "actual_target_session_id": target_session_id,
         "identity_matched": identity_matched,
         "outcome": if identity_matched { "settled" } else { "recoverable_identity_change" },
-        "recorded_at_unix_ms": now_unix_ms(),
+        "recorded_at_unix_ms": operation.imported_at_unix_ms,
     });
     let bytes =
         serde_json::to_vec(&record).map_err(|error| rotation_state_failure(request_id, error))?;
@@ -888,6 +1155,37 @@ fn rotation_state_failure(request_id: &str, error: impl std::fmt::Display) -> Pr
         request_id,
         "rotation_state_failed",
         format!("failed to maintain provider-owned rotation state: {error}"),
+    )
+}
+
+fn rotation_operation_invalid(request_id: &str, error: impl std::fmt::Display) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "rotation_operation_invalid",
+        format!("durable rotation operation state is invalid: {error}"),
+    )
+}
+
+fn rotation_recovery_required(
+    request_id: &str,
+    binding: &RotationBinding,
+    operation: &RotationOperation,
+    supplied_target: Option<&str>,
+    observation: Option<String>,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "rotation_recovery_required",
+        "a prepared rotation may already have imported the target session; automatic re-import is blocked until the target identity is reconciled",
+        json!({
+            "binding_sha256": operation.binding_sha256,
+            "target_account": binding.target_account.opencode_wrapper,
+            "expected_target_session_id": binding.source_session_id,
+            "supplied_recovery_target_session_id": supplied_target,
+            "prepared_artifact_path": operation.artifact_path,
+            "recovery": "retry with recovery_target_session_id after confirming the imported target session; if import never occurred, import the prepared artifact once and supply the resulting session id",
+            "observation": observation,
+        }),
     )
 }
 

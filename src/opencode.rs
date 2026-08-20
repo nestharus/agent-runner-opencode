@@ -10,6 +10,7 @@
 //!       - opencode auth list status plus observed credential-file effect
 
 use crate::account::AccountProfile;
+use crate::child_custody::ChildCustody;
 use crate::shell;
 use crate::shell::ShellOutput;
 use serde::Deserialize;
@@ -258,17 +259,17 @@ pub fn export_with_timeout(
         .arg(session_id)
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(export_spawn_error)?;
-    let completed = child
+    let child = command.spawn().map_err(export_spawn_error)?;
+    let mut custody = ChildCustody::new(child);
+    let completed = custody
+        .child_mut()
         .wait_timeout(timeout)
         .map_err(export_spawn_error)?
         .is_some();
     if !completed {
-        let _ = child.kill();
-        let _ = child.wait();
         return Err(OpencodeExportError::TimedOut);
     }
-    let output = child.wait_with_output().map_err(export_spawn_error)?;
+    let output = custody.wait_with_output().map_err(export_spawn_error)?;
     validate_export_status(&output)?;
     stdout
         .seek(SeekFrom::Start(0))

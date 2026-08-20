@@ -7,6 +7,7 @@
 //!       - explicit chatgpt-usage test-override stdout to QuotaObservation
 //!       - source-specific transport and protocol failures to QuotaObservationFailure
 
+use crate::child_custody::ChildCustody;
 use crate::shell::{self, ShellOutput};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
@@ -261,18 +262,20 @@ fn run_curl_usage(tokens: &AuthTokens) -> std::io::Result<ShellOutput> {
     let (program, args) = argv
         .split_first()
         .expect("curl usage argv is constructed with a program");
-    let mut child = shell::command(program)
+    let child = shell::command(program)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    child
+    let mut custody = ChildCustody::new(child);
+    custody
+        .child_mut()
         .stdin
         .as_mut()
         .expect("curl stdin is piped")
         .write_all(curl_usage_config(tokens).as_bytes())?;
-    let output = child.wait_with_output()?;
+    let output = custody.wait_with_output()?;
     Ok(ShellOutput {
         stdout: output.stdout,
         stderr: output.stderr,

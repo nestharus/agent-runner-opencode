@@ -2,6 +2,7 @@
 
 pub mod account;
 pub mod activity;
+mod child_custody;
 pub mod discovery;
 pub mod dispatch;
 pub mod encoding;

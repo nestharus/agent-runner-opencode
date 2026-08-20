@@ -10,6 +10,7 @@
 //!       - process terminal status to LaunchExitEvent
 
 use crate::activity::ActivityTargets;
+use crate::child_custody::ChildCustody;
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
@@ -121,7 +122,9 @@ pub(crate) fn stream<W: Write>(
             })
         }
     };
-    let mut custody = ChildCustody::new(child);
+    let mut custody = ChildCustody::with_cleanup(child, |child| {
+        let _ = terminate_child(child);
+    });
     if let Err(err) = write_child_stdin(custody.child_mut(), effective.stdin.as_ref()) {
         return stream_spawn_error(request_id, writer, err).map(|exit_code| LaunchOutcome {
             exit_code,
@@ -595,26 +598,6 @@ fn write_child_stdin(child: &mut Child, stdin: Option<&Vec<u8>>) -> std::io::Res
         child_stdin.write_all(input)?;
     }
     Ok(())
-}
-
-struct ChildCustody {
-    child: Child,
-}
-
-impl ChildCustody {
-    fn new(child: Child) -> Self {
-        Self { child }
-    }
-
-    fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
-    }
-}
-
-impl Drop for ChildCustody {
-    fn drop(&mut self) {
-        let _ = terminate_child(&mut self.child);
-    }
 }
 
 fn stream_child<W: Write>(

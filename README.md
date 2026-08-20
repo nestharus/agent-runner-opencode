@@ -100,9 +100,11 @@ agent-runner-opencode <subcommand>
 
 Each invocation reads one JSON envelope from stdin. Non-launch commands write
 one JSON response. `launch` writes NDJSON events ending in an `exit` event.
-Child processes run in a provider-owned process group; every return path owns
-termination and direct-child reaping. Drain queues and terminal-capture tails
-are bounded. Pipe read failures, malformed native events, and capture
+Launch children run in a provider-owned process group, while export and quota
+helpers remain direct children. One custody boundary is installed immediately
+after every manual spawn and owns termination and reaping on every fallible
+return until a successful wait discharges it. Drain queues and terminal-capture
+tails are bounded. Pipe read failures, malformed native events, and capture
 truncation are emitted as explicit evidence markers. Independent stdout and
 stderr pipes are sequenced in provider receipt order; the provider makes no
 claim about an unknowable pre-receipt cross-pipe emission order.
@@ -129,8 +131,15 @@ Generic canonical `session.replace` remains unsupported: OpenCode has no
 stable canonical-transcript replacement API. Rotation's native full-session
 export/import is a separate, representation-bounded capability. It requires a
 fresh provider-issued assessment authorization, emits a decision receipt,
-preserves an observed post-import session ID as recoverable state, and uses a
-durable receipt so retries do not repeat the import.
+and persists a binding-keyed prepared operation before import. A successful
+import durably advances that operation with the observed target session before
+decision and materialization receipts are finalized. A retry resumes an
+imported operation without repeating the effect. If execution stopped in the
+irreducibly ambiguous prepared-to-imported window, automatic re-import remains
+blocked: the provider first probes the expected target session, or the caller
+supplies `recovery_target_session_id`; the exported target must match the
+prepared source artifact before finalization. The recovery error retains the
+prepared artifact path for a one-time manual import when no effect occurred.
 
 ## State, evidence, and authority
 
@@ -152,9 +161,9 @@ its own domain identities into typed targets: start evidence preserves every
 attempted identity and its source, while completion evidence adds canonical,
 resolved, or generated settings, account, model, provider, session, and
 artifact identities. This prevents generic JSON-path fallback from collapsing
-distinct source and target roles. Rotation authorizations, idempotency records,
-and decision receipts live under the adjacent `provider-state/opencode/rotation`
-tree.
+distinct source and target roles. Rotation authorizations, prepared/imported
+operation records, materialization receipts, and decision receipts live under
+the adjacent `provider-state/opencode/rotation` tree.
 
 Settings, migration, activity, and rotation all pass every provider-owned
 filesystem target through the same lexical and canonical confinement guard

@@ -129,25 +129,50 @@ pub struct RotationOpencodeFixture {
     import_record: PathBuf,
     import_cwd_record: PathBuf,
     import_count_record: PathBuf,
+    finalization_fault_marker: Option<PathBuf>,
 }
 
 impl RotationOpencodeFixture {
     pub fn new() -> Self {
+        Self::configured(false, None)
+    }
+
+    pub fn with_post_import_finalization_fault() -> Self {
+        Self::configured(true, None)
+    }
+
+    pub fn with_post_import_finalization_fault_and_target_id(target_session_id: &str) -> Self {
+        Self::configured(true, Some(target_session_id))
+    }
+
+    fn configured(inject_fault: bool, target_session_id: Option<&str>) -> Self {
         let root = unique_temp_dir("agent-runner-opencode-rotation-native");
         fs::create_dir_all(&root).expect("create rotation native fixture");
         let import_record = root.join("imported-session.json");
         let import_cwd_record = root.join("imported-session.cwd");
         let import_count_record = root.join("imported-session.count");
+        let finalization_fault_marker =
+            inject_fault.then(|| root.join("fail-post-import-finalization"));
+        if let Some(marker) = &finalization_fault_marker {
+            fs::write(marker, b"armed\n").expect("arm post-import finalization fault");
+        }
         write_executable(&root.join("opencode1"), &rotation_source_script());
         write_executable(
             &root.join("opencode2"),
-            &rotation_target_script(&import_record, &import_cwd_record, &import_count_record),
+            &rotation_target_script(
+                &import_record,
+                &import_cwd_record,
+                &import_count_record,
+                finalization_fault_marker.as_deref(),
+                target_session_id,
+            ),
         );
         Self {
             root,
             import_record,
             import_cwd_record,
             import_count_record,
+            finalization_fault_marker,
         }
     }
 
@@ -178,6 +203,22 @@ impl RotationOpencodeFixture {
 
     pub fn import_was_attempted(&self) -> bool {
         self.import_record.exists() || self.import_count_record.exists()
+    }
+
+    pub fn restore_operation_state_writes(&self, data_root: &Path) {
+        let operation_root = data_root.join("provider-state/opencode/rotation/operations");
+        fs::remove_file(&operation_root).expect("remove blocked operation-state path");
+        fs::rename(
+            operation_root.with_file_name("operations-blocked"),
+            &operation_root,
+        )
+        .expect("restore prepared operation-state directory");
+        assert!(
+            self.finalization_fault_marker
+                .as_ref()
+                .is_some_and(|marker| !marker.exists()),
+            "target import should consume the armed finalization fault"
+        );
     }
 }
 
@@ -225,28 +266,62 @@ fn rotation_target_script(
     import_record: &Path,
     import_cwd_record: &Path,
     import_count_record: &Path,
+    finalization_fault_marker: Option<&Path>,
+    target_session_id: Option<&str>,
 ) -> String {
+    let fault_marker = finalization_fault_marker
+        .map(path_string)
+        .unwrap_or_default();
     format!(
         r#"#!/usr/bin/python3
 import json
 import pathlib
 import sys
 
-if len(sys.argv) != 3 or sys.argv[1] != "import":
+if len(sys.argv) != 3:
+    raise SystemExit(64)
+if sys.argv[1] == "export":
+    if not pathlib.Path({record}).exists():
+        raise SystemExit(2)
+    native = json.loads(pathlib.Path({record}).read_text())
+    if native["info"]["id"] != sys.argv[2]:
+        raise SystemExit(2)
+    print(json.dumps(native, separators=(",", ":")))
+    raise SystemExit(0)
+if sys.argv[1] != "import":
     raise SystemExit(64)
 native = json.loads(pathlib.Path(sys.argv[2]).read_text())
+target_session_id = {target_session_id}
+if target_session_id:
+    native["info"]["id"] = target_session_id
+    for message in native.get("messages", []):
+        message.get("info", {{}})["sessionID"] = target_session_id
 pathlib.Path({record}).write_text(json.dumps(native, separators=(",", ":")))
 pathlib.Path({cwd_record}).write_text(str(pathlib.Path.cwd()))
 count_path = pathlib.Path({count_record})
 count = int(count_path.read_text()) if count_path.exists() else 0
 count_path.write_text(str(count + 1))
+fault_marker = pathlib.Path({fault_marker}) if {fault_enabled} else None
+if fault_marker is not None and fault_marker.exists():
+    operation_root = pathlib.Path(sys.argv[2]).parents[3] / "provider-state" / "opencode" / "rotation" / "operations"
+    operation_root.rename(operation_root.with_name("operations-blocked"))
+    operation_root.write_text("blocked\n")
+    fault_marker.unlink()
 print("Imported session: " + native["info"]["id"])
 "#,
         record = serde_json::to_string(&path_string(import_record)).expect("record path JSON"),
         cwd_record =
             serde_json::to_string(&path_string(import_cwd_record)).expect("cwd record path JSON"),
         count_record = serde_json::to_string(&path_string(import_count_record))
-            .expect("count record path JSON")
+            .expect("count record path JSON"),
+        fault_marker = serde_json::to_string(&fault_marker).expect("fault marker path JSON"),
+        fault_enabled = if finalization_fault_marker.is_some() {
+            "True"
+        } else {
+            "False"
+        },
+        target_session_id =
+            serde_json::to_string(target_session_id.unwrap_or("")).expect("target session id JSON"),
     )
 }
 
