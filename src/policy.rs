@@ -3,7 +3,7 @@
 use crate::account::profile_for_wrapper_reference;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::models::{model_alias, provider_args_match, ModelAlias};
-use crate::settings::{resolve_runtime_settings, RuntimeSettings};
+use crate::runtime_selection::{resolve_runtime_selection, RuntimeSelection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -50,15 +50,15 @@ pub fn evaluate(
     params: PolicyEvaluateParams,
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
-    let runtime = resolve_runtime_settings(host, &params.settings_id, request_id)?;
+    let selection = resolve_runtime_selection(host, &params.settings_id, request_id)?;
     let model = resolved_model(&params);
-    let diagnostics = diagnostics_for_policy(&params, &runtime, model);
-    Ok(policy_result(&params, &runtime, model, diagnostics))
+    let diagnostics = diagnostics_for_policy(&params, &selection, model);
+    Ok(policy_result(&params, &selection, model, diagnostics))
 }
 
 fn policy_result(
     params: &PolicyEvaluateParams,
-    runtime: &RuntimeSettings,
+    selection: &RuntimeSelection,
     model: Option<&ModelAlias>,
     diagnostics: Vec<Value>,
 ) -> Value {
@@ -70,7 +70,7 @@ fn policy_result(
         "stdin": params.launch.stdin.clone(),
         "prompt": params.model.inputs.prompt.clone(),
         "diagnostics": diagnostics,
-        "markers": policy_markers(configured_launch_command(params), params, runtime, model),
+        "markers": policy_markers(configured_launch_command(params), params, selection, model),
     })
 }
 
@@ -129,17 +129,17 @@ fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, S
 
 fn diagnostics_for_policy(
     params: &PolicyEvaluateParams,
-    runtime: &RuntimeSettings,
+    selection: &RuntimeSelection,
     model: Option<&ModelAlias>,
 ) -> Vec<Value> {
-    let mut diagnostics = launch_command_diagnostics(params, runtime);
+    let mut diagnostics = launch_command_diagnostics(params, selection);
     if model.is_none() {
         diagnostics.push(invalid_model_diagnostic(params));
-    } else if runtime.model.is_some() && runtime.model != model {
-        diagnostics.push(settings_model_mismatch_diagnostic(runtime, model));
+    } else if selection.model.is_some() && selection.model != model {
+        diagnostics.push(settings_model_mismatch_diagnostic(selection, model));
     }
-    if model.is_some_and(|model| !model.supports_account(runtime.account)) {
-        diagnostics.push(model_account_ineligible_diagnostic(runtime, model));
+    if model.is_some_and(|model| !model.supports_account(selection.account)) {
+        diagnostics.push(model_account_ineligible_diagnostic(selection, model));
     }
     diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(
         params, model,
@@ -148,17 +148,18 @@ fn diagnostics_for_policy(
 }
 
 fn model_account_ineligible_diagnostic(
-    runtime: &RuntimeSettings,
+    selection: &RuntimeSelection,
     requested: Option<&ModelAlias>,
 ) -> Value {
     diagnostic(
         "error",
         "model_account_ineligible",
         format!(
-            "model {} is not eligible for account {} selected by settings_id {}",
+            "model {} is not eligible for account {} selected by runtime reference {} ({})",
             requested.map(|model| model.name).unwrap_or("<invalid>"),
-            runtime.account.opencode_wrapper,
-            runtime.settings_id
+            selection.account.opencode_wrapper,
+            selection.requested_reference,
+            selection.origin_label(),
         ),
     )
 }
@@ -176,7 +177,7 @@ fn invalid_model_diagnostic(params: &PolicyEvaluateParams) -> Value {
 
 fn launch_command_diagnostics(
     params: &PolicyEvaluateParams,
-    runtime: &RuntimeSettings,
+    selection: &RuntimeSelection,
 ) -> Vec<Value> {
     let Some(command) = configured_launch_command(params) else {
         return vec![diagnostic(
@@ -186,7 +187,7 @@ fn launch_command_diagnostics(
         )];
     };
     if profile_for_wrapper_reference(command)
-        .is_some_and(|account| account.opencode_wrapper == runtime.account.opencode_wrapper)
+        .is_some_and(|account| account.opencode_wrapper == selection.account.opencode_wrapper)
     {
         return Vec::new();
     }
@@ -194,23 +195,26 @@ fn launch_command_diagnostics(
         "error",
         "settings_command_mismatch",
         format!(
-            "launch command must resolve to account {} selected by settings_id {}",
-            runtime.account.opencode_wrapper, runtime.settings_id
+            "launch command must resolve to account {} selected by runtime reference {} ({})",
+            selection.account.opencode_wrapper,
+            selection.requested_reference,
+            selection.origin_label(),
         ),
     )]
 }
 
 fn settings_model_mismatch_diagnostic(
-    runtime: &RuntimeSettings,
+    selection: &RuntimeSelection,
     requested: Option<&ModelAlias>,
 ) -> Value {
     diagnostic(
         "error",
         "settings_model_mismatch",
         format!(
-            "model {} does not match the model stored by settings_id {}",
+            "model {} does not match the route stored by runtime reference {} ({})",
             requested.map(|model| model.name).unwrap_or("<invalid>"),
-            runtime.settings_id
+            selection.requested_reference,
+            selection.origin_label(),
         ),
     )
 }
@@ -292,14 +296,16 @@ fn is_error_diagnostic(diagnostic: &Value) -> bool {
 fn policy_markers(
     command: Option<&str>,
     params: &PolicyEvaluateParams,
-    runtime: &RuntimeSettings,
+    selection: &RuntimeSelection,
     model: Option<&ModelAlias>,
 ) -> Vec<Value> {
     vec![
         json!({ "name": "opencode.command", "value": command.unwrap_or("") }),
         json!({ "name": "opencode.mode", "value": params.mode }),
-        json!({ "name": "opencode.account", "value": runtime.account.opencode_wrapper }),
-        json!({ "name": "opencode.account_hash", "value": runtime.account.account_hash }),
+        json!({ "name": "opencode.runtime_selection_reference", "value": selection.requested_reference }),
+        json!({ "name": "opencode.runtime_selection_origin", "value": selection.origin_label() }),
+        json!({ "name": "opencode.account", "value": selection.account.opencode_wrapper }),
+        json!({ "name": "opencode.account_hash", "value": selection.account.account_hash }),
         json!({ "name": "opencode.model_alias", "value": model.map(|model| model.name).unwrap_or("") }),
         json!({ "name": "opencode.provider_model", "value": model.map(|model| model.provider_model).unwrap_or("") }),
         json!({ "name": "opencode.effort", "value": model.map(|model| model.effort).unwrap_or("") }),

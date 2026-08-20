@@ -55,10 +55,12 @@ pub const ACCOUNTS: [AccountProfile; 5] = [
     },
 ];
 
-pub fn profile_for_settings_id(settings_id: &str) -> Option<&'static AccountProfile> {
+/// Resolve a declared account reference. This does not resolve opaque
+/// provider-owned settings-record IDs.
+pub fn profile_for_account_reference(reference: &str) -> Option<&'static AccountProfile> {
     ACCOUNTS
         .iter()
-        .find(|account| settings_id_matches_account(settings_id, account))
+        .find(|account| account_reference_matches(reference, account))
 }
 
 /// Resolve a wrapper-shaped reference from policy argv, persisted settings, or
@@ -90,10 +92,10 @@ impl AccountProfile {
     }
 }
 
-fn settings_id_matches_account(settings_id: &str, account: &AccountProfile) -> bool {
-    account.opencode_wrapper == settings_id || account_one_provider_alias(settings_id, account)
+fn account_reference_matches(reference: &str, account: &AccountProfile) -> bool {
+    account.opencode_wrapper == reference || account_one_provider_alias(reference, account)
 }
 
-fn account_one_provider_alias(settings_id: &str, account: &AccountProfile) -> bool {
-    settings_id == "opencode" && account.opencode_index == 1
+fn account_one_provider_alias(reference: &str, account: &AccountProfile) -> bool {
+    reference == "opencode" && account.opencode_index == 1
 }

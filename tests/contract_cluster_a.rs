@@ -594,6 +594,14 @@ fn contract_policy_evaluate_accepts_luna_for_every_declared_account() {
             .expect("policy markers")
             .iter()
             .any(|marker| { marker["name"] == "opencode.account" && marker["value"] == account }));
+        assert!(response["result"]["markers"]
+            .as_array()
+            .expect("policy markers")
+            .iter()
+            .any(|marker| {
+                marker["name"] == "opencode.runtime_selection_origin"
+                    && marker["value"] == format!("declared account {account}")
+            }));
     }
 }
 

@@ -4,7 +4,7 @@ use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
 use crate::path_guard;
-use crate::settings::resolve_runtime_settings;
+use crate::runtime_selection::resolve_runtime_selection;
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::fs;
@@ -27,7 +27,9 @@ pub fn assess_params(
     let facts_allow = facts_allow_rotation(&params);
     let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
     validate_rotation_accounts(host, &binding, request_id)?;
-    let allowed = met && facts_allow && binding.source_provider != binding.target_provider;
+    let allowed = met
+        && facts_allow
+        && binding.source_selection_reference != binding.target_selection_reference;
     let authorization = persist_assessment_decision(host, &binding, allowed, request_id)?;
     Ok(assess_result(
         allowed,
@@ -45,12 +47,18 @@ pub fn materialize_params(
     provider_instance_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
-    let source_account = resolve_runtime_settings(host, &binding.source_provider, request_id)
-        .map_err(|_| unknown_rotation_account(request_id, "source", &binding.source_provider))?
-        .account;
-    let target_account = resolve_runtime_settings(host, &binding.target_provider, request_id)
-        .map_err(|_| unknown_rotation_account(request_id, "target", &binding.target_provider))?
-        .account;
+    let source_account =
+        resolve_runtime_selection(host, &binding.source_selection_reference, request_id)
+            .map_err(|_| {
+                unknown_rotation_account(request_id, "source", &binding.source_selection_reference)
+            })?
+            .account;
+    let target_account =
+        resolve_runtime_selection(host, &binding.target_selection_reference, request_id)
+            .map_err(|_| {
+                unknown_rotation_account(request_id, "target", &binding.target_selection_reference)
+            })?
+            .account;
     let working_directory = rotation_working_directory(host, request_id)?;
     let _lock = acquire_rotation_lock(host, request_id)?;
     let authorization = require_fresh_authorization(host, &binding, request_id)?;
@@ -69,7 +77,7 @@ pub fn materialize_params(
         .map_err(|error| rotation_artifact_failure(request_id, error))?;
     let target_session_id =
         opencode::import_session(&artifact_path, target_account, working_directory).map_err(
-            |error| rotation_import_failure(request_id, &binding.target_provider, error),
+            |error| rotation_import_failure(request_id, &binding.target_selection_reference, error),
         )?;
     let artifact = rotation_artifact(&artifact_path, &artifact_bytes);
     let decision_artifact = write_rotation_decision_receipt(
@@ -82,8 +90,8 @@ pub fn materialize_params(
     )?;
     let host_state_plan = host_state_plan(HostStatePlanInput {
         chain_id: &binding.chain_id,
-        source_provider: &binding.source_provider,
-        target_provider: &binding.target_provider,
+        source_provider: &binding.source_selection_reference,
+        target_provider: &binding.target_selection_reference,
         source_session_id: &binding.source_session_id,
         target_session_id: &target_session_id,
         transition_reason: &binding.transition_reason,
@@ -137,8 +145,8 @@ fn facts_allow_rotation(params: &Value) -> bool {
 #[derive(Clone)]
 struct RotationBinding {
     chain_id: String,
-    source_provider: String,
-    target_provider: String,
+    source_selection_reference: String,
+    target_selection_reference: String,
     source_session_id: String,
     model_name: String,
     settings_id: String,
@@ -155,8 +163,10 @@ fn rotation_binding(
 ) -> Result<RotationBinding, ProviderFailure> {
     Ok(RotationBinding {
         chain_id: required_string(params, "chain_id", request_id)?.to_string(),
-        source_provider: required_string(params, "source_provider", request_id)?.to_string(),
-        target_provider: required_string(params, "target_provider", request_id)?.to_string(),
+        source_selection_reference: required_string(params, "source_provider", request_id)?
+            .to_string(),
+        target_selection_reference: required_string(params, "target_provider", request_id)?
+            .to_string(),
         source_session_id: required_string(params, "source_session_id", request_id)?.to_string(),
         model_name: optional_string(params, "model_name")
             .unwrap_or("")
@@ -180,8 +190,8 @@ fn optional_string<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
 fn binding_value(binding: &RotationBinding) -> Value {
     json!({
         "chain_id": binding.chain_id,
-        "source_provider": binding.source_provider,
-        "target_provider": binding.target_provider,
+        "source_provider": binding.source_selection_reference,
+        "target_provider": binding.target_selection_reference,
         "source_session_id": binding.source_session_id,
         "model_name": binding.model_name,
         "settings_id": binding.settings_id,
@@ -200,10 +210,12 @@ fn validate_rotation_accounts(
     binding: &RotationBinding,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    resolve_runtime_settings(host, &binding.source_provider, request_id)
-        .map_err(|_| unknown_rotation_account(request_id, "source", &binding.source_provider))?;
-    resolve_runtime_settings(host, &binding.target_provider, request_id)
-        .map_err(|_| unknown_rotation_account(request_id, "target", &binding.target_provider))?;
+    resolve_runtime_selection(host, &binding.source_selection_reference, request_id).map_err(
+        |_| unknown_rotation_account(request_id, "source", &binding.source_selection_reference),
+    )?;
+    resolve_runtime_selection(host, &binding.target_selection_reference, request_id).map_err(
+        |_| unknown_rotation_account(request_id, "target", &binding.target_selection_reference),
+    )?;
     Ok(())
 }
 

@@ -1,13 +1,11 @@
 //! Declared roles: formatter, parser, validator, accessor, mapper, predicate
 
-use crate::account::{AccountProfile, ACCOUNTS};
 use crate::envelope::{ProviderFailure, CONTRACT};
-use crate::models::{ModelAlias, DEFAULT_MODEL_ALIAS, MODEL_ALIASES};
+use crate::settings_definition;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub const SETTINGS_SCHEMA_ID: &str = "opencode.settings/v1";
-const SETTINGS_SCHEMA_URI: &str = "https://schemas.oulipoly.dev/opencode.settings/v1.json";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,109 +58,7 @@ pub fn describe_result() -> Value {
 }
 
 pub fn opencode_settings_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": SETTINGS_SCHEMA_URI,
-        "title": "OpenCode Provider Settings",
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "provider": {
-                "const": "opencode",
-                "default": "opencode"
-            },
-            "profile": {
-                "type": "string",
-                "enum": account_values(account_wrapper),
-                "default": default_account_value(account_wrapper)
-            },
-            "wrapper": {
-                "type": "string",
-                "enum": account_values(account_wrapper),
-                "default": default_account_value(account_wrapper),
-                "description": "Canonical account wrapper consumed by policy, launch, session, rotation, and quota."
-            },
-            "model": {
-                "type": "object",
-                "oneOf": model_schema_variants(),
-                "default": default_model_schema_value(),
-                "description": "One exact provider-owned alias, OpenCode model, and effort tuple. Every advertised tuple is eligible for every declared OpenCode account profile."
-            },
-            "launch": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "dangerously_skip_permissions": { "type": "boolean", "default": true },
-                    "format": { "type": "string", "enum": ["json"], "default": "json" },
-                    "preserve_pure_wrapper": { "type": "boolean", "default": true }
-                },
-                "required": ["dangerously_skip_permissions", "format"]
-            },
-            "quota": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "source": { "const": "opencode_auth", "default": "opencode_auth" },
-                    "auth_path": { "type": "string", "enum": account_values(quota_auth_path) },
-                    "probe": { "const": "native_chatgpt_usage", "default": "native_chatgpt_usage" }
-                },
-                "required": ["source", "auth_path", "probe"]
-            },
-            "extra_env": {
-                "type": "object",
-                "additionalProperties": { "type": "string" },
-                "default": {}
-            },
-            "working_directory": { "type": "string", "minLength": 1 },
-            "mode": { "type": "string", "enum": ["interactive", "non_interactive"], "default": "non_interactive" }
-        },
-        "required": ["provider", "wrapper", "model", "quota", "launch"]
-    })
-}
-
-fn account_values(field: fn(&AccountProfile) -> &'static str) -> Vec<&'static str> {
-    ACCOUNTS.iter().map(field).collect()
-}
-
-fn account_wrapper(account: &AccountProfile) -> &'static str {
-    account.opencode_wrapper
-}
-
-fn quota_auth_path(account: &AccountProfile) -> &'static str {
-    account.quota_auth_path()
-}
-
-fn model_schema_variants() -> Vec<Value> {
-    MODEL_ALIASES.iter().map(model_schema_variant).collect()
-}
-
-fn model_schema_variant(model: &ModelAlias) -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "name": { "const": model.name },
-            "provider_model": { "const": model.provider_model },
-            "variant": { "const": model.effort }
-        },
-        "required": ["name", "provider_model", "variant"]
-    })
-}
-
-fn default_model_schema_value() -> Value {
-    let model = MODEL_ALIASES
-        .iter()
-        .find(|model| model.name == DEFAULT_MODEL_ALIAS)
-        .expect("default model alias must exist");
-    json!({
-        "name": model.name,
-        "provider_model": model.provider_model,
-        "variant": model.effort,
-    })
-}
-
-fn default_account_value(field: fn(&AccountProfile) -> &'static str) -> &'static str {
-    field(&ACCOUNTS[0])
+    settings_definition::opencode_settings_schema()
 }
 
 fn parse_schema_params(params: Value, request_id: &str) -> Result<SchemaParams, ProviderFailure> {

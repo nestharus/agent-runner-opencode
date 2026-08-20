@@ -11,7 +11,7 @@ use crate::account::AccountProfile;
 use crate::encoding::{bounded_text, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::quota_adapter::{self, ChatgptUsageWindow};
-use crate::settings::resolve_runtime_settings;
+use crate::runtime_selection::resolve_runtime_selection;
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -262,7 +262,7 @@ fn account_for_settings_id(
     settings_id: &str,
     request_id: &str,
 ) -> Result<&'static AccountProfile, ProviderFailure> {
-    resolve_runtime_settings(host, settings_id, request_id).map(|settings| settings.account)
+    resolve_runtime_selection(host, settings_id, request_id).map(|selection| selection.account)
 }
 
 fn resolved_auth_path(account: &AccountProfile) -> PathBuf {

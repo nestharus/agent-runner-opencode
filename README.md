@@ -19,11 +19,15 @@ name is a compatibility alias for account one; numbered wrappers are canonical
 persisted identities. Setup plans and legacy-provider migration both resolve
 their inputs through this same catalog and emit canonical numbered identities;
 unknown OpenCode-shaped references are diagnostic errors and are never mapped
-to account one. Persisted opaque settings IDs are operational IDs and can be
-used anywhere a `settings_id` is accepted. Stores written by the prior schema
-are compatibility-projected to the current OpenCode-owned account, quota, and
-model shape while preserving record IDs and versions; the next mutation writes
-the upgraded store schema. An unrecognizable record fails the entire store with
+to account one. A contract field named `settings_id` is interpreted internally
+as an explicit runtime selection: its origin is either a declared account
+reference (with that account's default route) or an opaque persisted settings
+record (with record ID, version, account, and stored model route). Policy
+evidence publishes that origin instead of treating both token kinds as one
+settings-record identity. Stores written by the prior schema are
+compatibility-projected to the current OpenCode-owned account, quota, and model
+shape while preserving record IDs and versions; the next mutation writes the
+upgraded store schema. An unrecognizable record fails the entire store with
 `settings_store_upgrade_required` instead of remaining listable but unusable.
 
 ## Model routes
@@ -74,6 +78,10 @@ For resumed sessions, model switching is allowed per turn. Delivery and
 completion are credited only when bounded native export observes the submitted
 payload and a completed assistant message for the requested session, provider
 model, and variant. A bare native `step_finish` is not completion authority.
+The named resume-observation boundary owns this transcript traversal and
+returns either evidence-backed completion or explicit uncertainty; launch only
+orchestrates its probes alongside process supervision and projects the result
+to contract markers.
 If a lingering OpenCode process is terminated after response confirmation,
 the exit event retains the real process signal while a separate marker records
 the confirmed application response.
@@ -93,6 +101,9 @@ hash-chained mutation history with request/provider identity, predecessor and
 result versions, value hashes, and tombstones. Migration artifacts are
 content-addressed, atomically published, confined to provider-owned roots, and
 retain hashes for the complete legacy input plus its provider/model records.
+`src/settings_definition.rs` is the sole owner of both the published
+`opencode.settings/v1` JSON schema and its executable domain validation;
+`schema` projects that definition and `settings` owns record lifecycle.
 
 When `host.data_root` is present, a redacted hash-chained activity ledger is
 written under `provider-state/opencode/activity`. It joins requests across

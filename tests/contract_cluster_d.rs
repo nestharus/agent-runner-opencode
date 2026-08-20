@@ -228,6 +228,16 @@ fn contract_generated_settings_id_is_usable_by_policy() {
             .is_empty(),
         "{policy}"
     );
+    let origin = policy["markers"]
+        .as_array()
+        .expect("policy markers")
+        .iter()
+        .find(|marker| marker["name"] == "opencode.runtime_selection_origin")
+        .expect("runtime selection origin marker")["value"]
+        .as_str()
+        .expect("runtime selection origin text");
+    assert!(origin.starts_with("settings record "), "{origin}");
+    assert!(origin.contains(" at version "), "{origin}");
 }
 
 #[test]

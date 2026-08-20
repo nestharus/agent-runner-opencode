@@ -6,15 +6,14 @@
 //!     Owns:
 //!       - profile record persistence rooted at host.config_root
 //!       - opaque settings version tokens and stale-write conflict detection
-//!       - opencode.settings/v1 semantic validation and legacy mapping
+//!       - record normalization, sanitization, and legacy-store mapping
 
-use crate::account::{
-    profile_for_settings_id, profile_for_wrapper_reference, AccountProfile, ACCOUNTS,
-};
+use crate::account::{profile_for_wrapper_reference, AccountProfile};
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
-use crate::models::{default_model, model_alias, model_alias_matches, DEFAULT_MODEL_ALIAS};
+use crate::models::{default_model, model_alias, DEFAULT_MODEL_ALIAS};
 use crate::path_guard;
+use crate::settings_definition::{model_name_value, validate_values, wrapper_value};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -118,35 +117,29 @@ struct SettingsRecord {
     values: Value,
 }
 
-pub struct RuntimeSettings {
-    pub settings_id: String,
+pub(crate) struct PersistedRuntimeRecord {
+    pub record_id: String,
+    pub record_version: String,
     pub account: &'static AccountProfile,
     pub model: Option<&'static crate::models::ModelAlias>,
 }
 
-pub fn resolve_runtime_settings(
+pub(crate) fn resolve_persisted_runtime_record(
     host: &HostContext,
-    settings_id: &str,
+    reference: &str,
     request_id: &str,
-) -> Result<RuntimeSettings, ProviderFailure> {
-    if let Some(account) = profile_for_settings_id(settings_id) {
-        return Ok(RuntimeSettings {
-            settings_id: settings_id.to_string(),
-            account,
-            model: None,
-        });
-    }
+) -> Result<PersistedRuntimeRecord, ProviderFailure> {
     let store = read_store(host, request_id)?;
-    let record = find_record(&store, settings_id, request_id)
-        .map_err(|_| unknown_runtime_settings_id_failure(request_id, settings_id))?;
+    let record = find_record(&store, reference, request_id)?;
     let diagnostics = validate_values(&record.values);
     ensure_valid_settings(request_id, &diagnostics)?;
     let wrapper = wrapper_value(&record.values);
     let account = account_for_settings_reference(wrapper)
-        .ok_or_else(|| unknown_runtime_settings_id_failure(request_id, settings_id))?;
+        .ok_or_else(|| settings_not_found_failure(request_id))?;
     let model = model_name_value(&record.values).and_then(model_alias);
-    Ok(RuntimeSettings {
-        settings_id: record.id.clone(),
+    Ok(PersistedRuntimeRecord {
+        record_id: record.id.clone(),
+        record_version: record.version.clone(),
         account,
         model,
     })
@@ -813,316 +806,6 @@ fn summary_values(values: &Value) -> Value {
     })
 }
 
-fn validate_values(values: &Value) -> Vec<Value> {
-    let mut diagnostics = Vec::new();
-    require_object_shape(
-        values,
-        "values",
-        &[
-            "provider",
-            "profile",
-            "wrapper",
-            "model",
-            "quota",
-            "launch",
-            "extra_env",
-            "working_directory",
-            "mode",
-        ],
-        &mut diagnostics,
-    );
-    require_string(values, "provider", "opencode", &mut diagnostics);
-    require_known_wrapper(values, &mut diagnostics);
-    require_matching_profile(values, &mut diagnostics);
-    require_model(values, &mut diagnostics);
-    require_quota(values, &mut diagnostics);
-    require_launch(values, &mut diagnostics);
-    require_optional_fields(values, &mut diagnostics);
-    diagnostics
-}
-
-fn require_object_shape(value: &Value, path: &str, allowed: &[&str], diagnostics: &mut Vec<Value>) {
-    let Some(object) = value.as_object() else {
-        diagnostics.push(shape_diagnostic(path, "must be an object"));
-        return;
-    };
-    for key in object.keys().filter(|key| !allowed.contains(&key.as_str())) {
-        diagnostics.push(shape_diagnostic(
-            format!("{path}.{key}"),
-            "field is not part of opencode.settings/v1",
-        ));
-    }
-}
-
-fn shape_diagnostic(path: impl Into<String>, message: impl Into<String>) -> Value {
-    diagnostic("error", path, message, "invalid_settings_schema_shape")
-}
-
-fn require_string(values: &Value, key: &str, expected: &str, diagnostics: &mut Vec<Value>) {
-    if has_expected_string(values, key, expected) {
-        return;
-    }
-    diagnostics.push(required_string_diagnostic(key, expected));
-}
-
-fn has_expected_string(values: &Value, key: &str, expected: &str) -> bool {
-    values.get(key).and_then(Value::as_str) == Some(expected)
-}
-
-fn required_string_diagnostic(key: &str, expected: &str) -> Value {
-    diagnostic(
-        "error",
-        format!("values.{key}"),
-        format!("{key} must be {expected}"),
-        "invalid_settings_value",
-    )
-}
-
-fn require_known_wrapper(values: &Value, diagnostics: &mut Vec<Value>) {
-    if known_wrapper(wrapper_value(values)) {
-        return;
-    }
-    diagnostics.push(invalid_wrapper_diagnostic());
-}
-
-fn wrapper_value(values: &Value) -> &str {
-    values
-        .get("wrapper")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-}
-
-fn known_wrapper(wrapper: &str) -> bool {
-    ACCOUNTS
-        .iter()
-        .any(|account| account.opencode_wrapper == wrapper)
-}
-
-fn invalid_wrapper_diagnostic() -> Value {
-    diagnostic(
-        "error",
-        "values.wrapper",
-        "wrapper must be one of opencode1 through opencode5",
-        "invalid_wrapper",
-    )
-}
-
-fn require_matching_profile(values: &Value, diagnostics: &mut Vec<Value>) {
-    if values.get("profile").is_none()
-        || values.get("profile").and_then(Value::as_str) == Some(wrapper_value(values))
-    {
-        return;
-    }
-    diagnostics.push(shape_diagnostic(
-        "values.profile",
-        "profile must identify the same OpenCode account as wrapper",
-    ));
-}
-
-fn require_model(values: &Value, diagnostics: &mut Vec<Value>) {
-    require_object_shape(
-        values.get("model").unwrap_or(&Value::Null),
-        "values.model",
-        &["name", "provider_model", "variant"],
-        diagnostics,
-    );
-    let Some(name) = model_name_value(values) else {
-        diagnostics.push(invalid_model_alias_diagnostic(""));
-        return;
-    };
-    let Some(model) = model_alias(name) else {
-        diagnostics.push(invalid_model_alias_diagnostic(name));
-        return;
-    };
-    if model_alias_matches(
-        name,
-        provider_model_value(values),
-        model_variant_value(values),
-    ) {
-        return;
-    }
-    if provider_model_value(values) != Some(model.provider_model) {
-        diagnostics.push(invalid_provider_model_diagnostic(
-            name,
-            model.provider_model,
-        ));
-    }
-    if model_variant_value(values) != Some(model.effort) {
-        diagnostics.push(invalid_model_variant_diagnostic(name, model.effort));
-    }
-}
-
-fn model_name_value(values: &Value) -> Option<&str> {
-    values.pointer("/model/name").and_then(Value::as_str)
-}
-
-fn provider_model_value(values: &Value) -> Option<&str> {
-    values
-        .pointer("/model/provider_model")
-        .and_then(Value::as_str)
-}
-
-fn invalid_model_alias_diagnostic(name: &str) -> Value {
-    diagnostic(
-        "error",
-        "values.model.name",
-        format!("unknown provider model alias: {name}"),
-        "invalid_model_alias",
-    )
-}
-
-fn invalid_provider_model_diagnostic(name: &str, expected: &str) -> Value {
-    diagnostic(
-        "error",
-        "values.model.provider_model",
-        format!("provider_model for {name} must be {expected}"),
-        "invalid_provider_model",
-    )
-}
-
-fn model_variant_value(values: &Value) -> Option<&str> {
-    values.pointer("/model/variant").and_then(Value::as_str)
-}
-
-fn invalid_model_variant_diagnostic(name: &str, expected: &str) -> Value {
-    diagnostic(
-        "error",
-        "values.model.variant",
-        format!("variant for {name} must be {expected}"),
-        "invalid_model_variant",
-    )
-}
-
-fn require_quota(values: &Value, diagnostics: &mut Vec<Value>) {
-    require_object_shape(
-        values.get("quota").unwrap_or(&Value::Null),
-        "values.quota",
-        &["source", "auth_path", "probe"],
-        diagnostics,
-    );
-    let Some(account) = settings_value_account(values) else {
-        diagnostics.push(invalid_quota_auth_path_diagnostic());
-        return;
-    };
-    if quota_source(values) == Some(account.quota_source_kind())
-        && quota_auth_path(values) == Some(account.quota_auth_path())
-        && quota_probe(values) == Some(account.quota_probe_kind())
-    {
-        return;
-    }
-    diagnostics.push(invalid_quota_auth_path_diagnostic());
-}
-
-fn require_launch(values: &Value, diagnostics: &mut Vec<Value>) {
-    let launch = values.get("launch").unwrap_or(&Value::Null);
-    require_object_shape(
-        launch,
-        "values.launch",
-        &[
-            "dangerously_skip_permissions",
-            "format",
-            "preserve_pure_wrapper",
-        ],
-        diagnostics,
-    );
-    if launch.get("format").and_then(Value::as_str) != Some("json") {
-        diagnostics.push(shape_diagnostic(
-            "values.launch.format",
-            "format must be json",
-        ));
-    }
-    if launch
-        .get("dangerously_skip_permissions")
-        .and_then(Value::as_bool)
-        != Some(true)
-    {
-        diagnostics.push(shape_diagnostic(
-            "values.launch.dangerously_skip_permissions",
-            "dangerously_skip_permissions must be true",
-        ));
-    }
-    if launch.get("preserve_pure_wrapper").is_some()
-        && launch
-            .get("preserve_pure_wrapper")
-            .and_then(Value::as_bool)
-            .is_none()
-    {
-        diagnostics.push(shape_diagnostic(
-            "values.launch.preserve_pure_wrapper",
-            "preserve_pure_wrapper must be a boolean",
-        ));
-    }
-}
-
-fn require_optional_fields(values: &Value, diagnostics: &mut Vec<Value>) {
-    if let Some(extra_env) = values.get("extra_env") {
-        match extra_env.as_object() {
-            Some(entries) if entries.values().all(Value::is_string) => {}
-            _ => diagnostics.push(shape_diagnostic(
-                "values.extra_env",
-                "extra_env must map names to string values",
-            )),
-        }
-    }
-    if values.get("working_directory").is_some()
-        && values
-            .get("working_directory")
-            .and_then(Value::as_str)
-            .is_none_or(|directory| directory.is_empty())
-    {
-        diagnostics.push(shape_diagnostic(
-            "values.working_directory",
-            "working_directory must be a non-empty string",
-        ));
-    }
-    if values.get("mode").is_some()
-        && !matches!(
-            values.get("mode").and_then(Value::as_str),
-            Some("interactive" | "non_interactive")
-        )
-    {
-        diagnostics.push(shape_diagnostic(
-            "values.mode",
-            "mode must be interactive or non_interactive",
-        ));
-    }
-}
-
-fn quota_source(values: &Value) -> Option<&str> {
-    values.pointer("/quota/source").and_then(Value::as_str)
-}
-
-fn quota_auth_path(values: &Value) -> Option<&str> {
-    values.pointer("/quota/auth_path").and_then(Value::as_str)
-}
-
-fn quota_probe(values: &Value) -> Option<&str> {
-    values.pointer("/quota/probe").and_then(Value::as_str)
-}
-
-fn invalid_quota_auth_path_diagnostic() -> Value {
-    diagnostic(
-        "error",
-        "values.quota.auth_path",
-        "quota source, auth_path, and probe must match the selected OpenCode account",
-        "invalid_quota_auth_path",
-    )
-}
-
-fn diagnostic(
-    severity: &str,
-    path: impl Into<String>,
-    message: impl Into<String>,
-    code: &str,
-) -> Value {
-    json!({
-        "severity": severity,
-        "path": path.into(),
-        "message": message.into(),
-        "code": code,
-    })
-}
-
 fn sanitize_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => sanitize_object(object),
@@ -1311,6 +994,20 @@ fn legacy_providers_missing_diagnostic() -> Value {
 
 fn is_error_diagnostic(diagnostic: &Value) -> bool {
     diagnostic.get("severity").and_then(Value::as_str) == Some("error")
+}
+
+fn diagnostic(
+    severity: &str,
+    path: impl Into<String>,
+    message: impl Into<String>,
+    code: &str,
+) -> Value {
+    json!({
+        "severity": severity,
+        "path": path.into(),
+        "message": message.into(),
+        "code": code,
+    })
 }
 
 fn legacy_provider_names(legacy: &Value) -> Vec<String> {
@@ -1523,14 +1220,6 @@ fn missing_config_root_failure(request_id: &str) -> ProviderFailure {
         request_id,
         "missing_config_root",
         "settings store requires host.config_root",
-    )
-}
-
-fn unknown_runtime_settings_id_failure(request_id: &str, settings_id: &str) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "unknown_settings_id",
-        format!("unknown opencode settings_id: {settings_id}"),
     )
 }
 

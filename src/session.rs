@@ -23,7 +23,7 @@ use crate::envelope::{ProviderFailure, RequestEnvelope};
 use crate::opencode::{
     self, OpencodeExport, OpencodeExportError, OpencodeMessage, OpencodeSessionListError,
 };
-use crate::settings::resolve_runtime_settings;
+use crate::runtime_selection::resolve_runtime_selection;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1021,7 +1021,7 @@ fn session_account(
     settings_id: &str,
     request_id: &str,
 ) -> Result<&'static crate::account::AccountProfile, ProviderFailure> {
-    resolve_runtime_settings(host, settings_id, request_id).map(|settings| settings.account)
+    resolve_runtime_selection(host, settings_id, request_id).map(|selection| selection.account)
 }
 
 fn session_export_id_mismatch_failure(

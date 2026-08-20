@@ -9,14 +9,12 @@
 //!       - declared params.env entries and host-linkage env to env-cleared child env
 //!       - process terminal status to LaunchExitEvent
 
-use crate::account::profile_for_wrapper_reference;
-use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, sha256_hex};
+use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 use crate::models::model_alias;
-use crate::opencode::{
-    self, first_session_id, EventParser, OpencodeEventMetadata, OpencodeExport, OpencodeMessage,
-};
+use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
 use crate::policy;
+use crate::resume_observation::{self, ResumeObservationRequest};
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -31,9 +29,7 @@ const TERMINATION_GRACE: Duration = Duration::from_millis(100);
 const COMPLETED_RESUME_GRACE: Duration = Duration::from_millis(500);
 const RESUME_COMPLETION_PROBE_DELAY: Duration = Duration::from_secs(1);
 const RESUME_COMPLETION_PROBE_INTERVAL: Duration = Duration::from_millis(500);
-const RESUME_MESSAGE_CLOCK_TOLERANCE_MS: u64 = 5_000;
 const MAX_RESUME_COMPLETION_PROBES: usize = 3;
-const RESUME_EXPORT_TIMEOUT: Duration = Duration::from_millis(750);
 const DRAIN_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 const DRAIN_CHANNEL_CAPACITY: usize = 32;
 const TERMINAL_CAPTURE_LIMIT: usize = 1024 * 1024;
@@ -50,10 +46,7 @@ const POLICY_MANAGED_FLAGS_WITH_VALUE: &[&str] = &["--format", "-m", "--variant"
 const POLICY_MANAGED_FLAGS_WITHOUT_VALUE: &[&str] = &["--dangerously-skip-permissions"];
 const PRODUCED_ASSISTANT_RESPONSE_MARKER: &str = "oulipoly.produced_assistant_response";
 const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
-const SUBMITTED_USER_TURN_SOURCE: &str = "opencode.export";
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
-const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
-const DELIVERY_NONCE_SUFFIX: char = ']';
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
 
@@ -121,7 +114,7 @@ pub fn stream<W: Write>(
         request_id,
         host,
         custody.child_mut(),
-        effective.resume_confirmation,
+        effective.resume_observation_request,
         effective.route_evidence,
         writer,
     )
@@ -136,21 +129,8 @@ struct EffectiveLaunch {
     env: BTreeMap<String, String>,
     stdin: Option<Vec<u8>>,
     _prompt: Option<String>,
-    resume_confirmation: Option<ResumeConfirmation>,
+    resume_observation_request: Option<ResumeObservationRequest>,
     route_evidence: Value,
-}
-
-#[derive(Clone)]
-struct ResumeConfirmation {
-    account_wrapper: String,
-    session_id: String,
-    prompt: String,
-    delivery_nonce: Option<String>,
-    started_at_unix_ms: u64,
-    deadline_unix_ms: Option<u64>,
-    provider_id: String,
-    model_id: String,
-    variant: String,
 }
 
 enum PolicyLaunch {
@@ -209,7 +189,7 @@ fn project_effective_launch(
         prompt.as_deref(),
         request_id,
     )?;
-    let resume_confirmation = resume_confirmation(
+    let resume_observation_request = resume_observation_request(
         params,
         stdin.as_deref(),
         prompt.as_deref(),
@@ -222,7 +202,7 @@ fn project_effective_launch(
         env: effective_env_from_policy(result, request_id)?,
         stdin,
         _prompt: prompt,
-        resume_confirmation,
+        resume_observation_request,
         route_evidence: result.get("markers").cloned().unwrap_or_else(|| json!([])),
     })
 }
@@ -288,29 +268,27 @@ fn resume_argv(
     Ok(argv)
 }
 
-fn resume_confirmation(
+fn resume_observation_request(
     params: &LaunchParams,
     stdin: Option<&[u8]>,
     prompt: Option<&str>,
     argv: &[String],
     deadline_unix_ms: Option<u64>,
-) -> Option<ResumeConfirmation> {
+) -> Option<ResumeObservationRequest> {
     let session_id = known_provider_session_id(params)?;
     let prompt = submitted_resume_payload(argv, stdin, prompt)?;
-    let delivery_nonce = delivery_nonce_from_prompt(&prompt);
     let route = model_alias(params.model.get("name")?.as_str()?)?;
     let (provider_id, model_id) = route.provider_model.split_once('/')?;
-    Some(ResumeConfirmation {
-        account_wrapper: argv.first()?.clone(),
-        session_id: session_id.to_string(),
+    Some(ResumeObservationRequest::new(
+        argv.first()?.clone(),
+        session_id.to_string(),
         prompt,
-        delivery_nonce,
-        started_at_unix_ms: now_unix_ms(),
+        now_unix_ms(),
         deadline_unix_ms,
-        provider_id: provider_id.to_string(),
-        model_id: model_id.to_string(),
-        variant: route.effort.to_string(),
-    })
+        provider_id.to_string(),
+        model_id.to_string(),
+        route.effort.to_string(),
+    ))
 }
 
 fn known_provider_session_id(params: &LaunchParams) -> Option<&str> {
@@ -702,14 +680,14 @@ fn stream_child<W: Write>(
     request_id: &str,
     host: &HostContext,
     child: &mut Child,
-    resume_confirmation: Option<ResumeConfirmation>,
+    resume_observation_request: Option<ResumeObservationRequest>,
     route_evidence: Value,
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
     let mut state = LaunchState::new(
         request_id,
         host.deadline_unix_ms,
-        resume_confirmation,
+        resume_observation_request,
         route_evidence,
     );
     let receiver = start_drains(child);
@@ -920,7 +898,7 @@ struct LaunchState {
     next_resume_completion_probe: Option<Instant>,
     resume_completion_probes: usize,
     session_id: Option<String>,
-    resume_confirmation: Option<ResumeConfirmation>,
+    resume_observation_request: Option<ResumeObservationRequest>,
     deadline_unix_ms: Option<u64>,
     next_heartbeat: Instant,
     route_evidence: Value,
@@ -930,10 +908,10 @@ impl LaunchState {
     fn new(
         request_id: &str,
         deadline_unix_ms: Option<u64>,
-        resume_confirmation: Option<ResumeConfirmation>,
+        resume_observation_request: Option<ResumeObservationRequest>,
         route_evidence: Value,
     ) -> Self {
-        let next_resume_completion_probe = resume_confirmation
+        let next_resume_completion_probe = resume_observation_request
             .as_ref()
             .map(|_| Instant::now() + RESUME_COMPLETION_PROBE_DELAY);
         Self {
@@ -955,7 +933,7 @@ impl LaunchState {
             next_resume_completion_probe,
             resume_completion_probes: 0,
             session_id: None,
-            resume_confirmation,
+            resume_observation_request,
             deadline_unix_ms,
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
             route_evidence,
@@ -1159,10 +1137,10 @@ impl LaunchState {
             return;
         }
         self.resume_completion_probes += 1;
-        let Some(confirmation) = self.resume_confirmation.as_ref() else {
+        let Some(request) = self.resume_observation_request.as_ref() else {
             return;
         };
-        if exported_resume_is_complete(confirmation) {
+        if resume_observation::observe(request).completion_observed() {
             self.completed_resume_at = Some(Instant::now());
         }
     }
@@ -1225,8 +1203,8 @@ impl LaunchState {
     }
 
     fn submitted_user_turn_marker_value(&self) -> Option<Value> {
-        let confirmation = self.resume_confirmation.as_ref()?;
-        submitted_user_turn_marker_value(confirmation)
+        let request = self.resume_observation_request.as_ref()?;
+        resume_observation::observe(request).submitted_user_turn
     }
 
     fn finished_status(&self) -> ProcessStatus {
@@ -1362,264 +1340,6 @@ impl LaunchState {
         self.stdout_done = true;
         self.stderr_done = true;
     }
-}
-
-fn submitted_user_turn_marker_value(confirmation: &ResumeConfirmation) -> Option<Value> {
-    let message_id = exported_submitted_message_id(confirmation)?;
-    Some(submitted_user_turn_marker(
-        confirmation,
-        Some(message_id.as_str()),
-    ))
-}
-
-fn exported_submitted_message_id(confirmation: &ResumeConfirmation) -> Option<String> {
-    let native = export_for_resume_confirmation(confirmation)?;
-    if !export_session_matches_confirmation(&native, confirmation) {
-        return None;
-    }
-    submitted_user_turn_message(&native.messages, confirmation)
-        .map(|message| message.info.id.as_str().to_string())
-}
-
-fn exported_resume_is_complete(confirmation: &ResumeConfirmation) -> bool {
-    let Some(native) = export_for_resume_confirmation(confirmation) else {
-        return false;
-    };
-    if !export_session_matches_confirmation(&native, confirmation) {
-        return false;
-    }
-    let Some(submitted_index) = native
-        .messages
-        .iter()
-        .rposition(|message| current_launch_user_message(message, confirmation))
-    else {
-        return false;
-    };
-    native.messages[submitted_index + 1..]
-        .iter()
-        .any(|message| completed_assistant_message(message, confirmation))
-}
-
-fn current_launch_user_message(
-    message: &OpencodeMessage,
-    confirmation: &ResumeConfirmation,
-) -> bool {
-    submitted_user_message_matches(message, confirmation)
-        && message
-            .info
-            .time
-            .as_ref()
-            .and_then(|time| time.created)
-            .is_some_and(|created| {
-                created
-                    >= confirmation
-                        .started_at_unix_ms
-                        .saturating_sub(RESUME_MESSAGE_CLOCK_TOLERANCE_MS)
-            })
-}
-
-fn completed_assistant_message(
-    message: &OpencodeMessage,
-    confirmation: &ResumeConfirmation,
-) -> bool {
-    message.info.role == "assistant"
-        && message.info.session_id.as_deref() == Some(confirmation.session_id.as_str())
-        && message_model_matches_confirmation(message, confirmation)
-        && message
-            .info
-            .time
-            .as_ref()
-            .is_some_and(|time| time.completed.is_some())
-}
-
-fn export_for_resume_confirmation(confirmation: &ResumeConfirmation) -> Option<OpencodeExport> {
-    let account = profile_for_wrapper_reference(&confirmation.account_wrapper)?;
-    let timeout = remaining_resume_export_timeout(confirmation)?;
-    opencode::export_with_timeout(&confirmation.session_id, account, timeout).ok()
-}
-
-fn remaining_resume_export_timeout(confirmation: &ResumeConfirmation) -> Option<Duration> {
-    let Some(deadline) = confirmation.deadline_unix_ms else {
-        return Some(RESUME_EXPORT_TIMEOUT);
-    };
-    let remaining_ms = deadline.saturating_sub(now_unix_ms());
-    (remaining_ms > 0)
-        .then(|| Duration::from_millis(remaining_ms.min(RESUME_EXPORT_TIMEOUT.as_millis() as u64)))
-}
-
-fn message_model_matches_confirmation(
-    message: &OpencodeMessage,
-    confirmation: &ResumeConfirmation,
-) -> bool {
-    let (provider_id, model_id, variant) = message.info.model_identity();
-    provider_id == Some(confirmation.provider_id.as_str())
-        && model_id == Some(confirmation.model_id.as_str())
-        && variant == Some(confirmation.variant.as_str())
-}
-
-fn export_session_matches_confirmation(
-    native: &OpencodeExport,
-    confirmation: &ResumeConfirmation,
-) -> bool {
-    native.info.id.as_str() == confirmation.session_id.as_str()
-}
-
-fn submitted_user_turn_message<'a>(
-    messages: &'a [OpencodeMessage],
-    confirmation: &ResumeConfirmation,
-) -> Option<&'a OpencodeMessage> {
-    messages
-        .iter()
-        .find(|message| submitted_user_message_matches(message, confirmation))
-}
-
-fn submitted_user_turn_marker(
-    confirmation: &ResumeConfirmation,
-    message_id: Option<&str>,
-) -> Value {
-    let marker = submitted_user_turn_marker_base(confirmation, message_id);
-    marker_with_delivery_nonce(marker, confirmation.delivery_nonce.as_deref())
-}
-
-fn submitted_user_turn_marker_base(
-    confirmation: &ResumeConfirmation,
-    message_id: Option<&str>,
-) -> Value {
-    let mut marker = json!({
-        "provider_session_id": confirmation.session_id.as_str(),
-        "prompt_sha256": sha256_hex(confirmation.prompt.as_bytes()),
-        "source": SUBMITTED_USER_TURN_SOURCE,
-    });
-    if let Some(message_id) = message_id {
-        marker["message_id"] = json!(message_id);
-    }
-    marker
-}
-
-fn marker_with_delivery_nonce(mut marker: Value, delivery_nonce: Option<&str>) -> Value {
-    if let Some(delivery_nonce) = delivery_nonce {
-        marker["delivery_nonce"] = json!(delivery_nonce);
-    }
-    marker
-}
-
-fn submitted_user_message_matches(
-    message: &OpencodeMessage,
-    confirmation: &ResumeConfirmation,
-) -> bool {
-    message.info.role.as_str() == "user"
-        && message.info.session_id.as_deref() == Some(confirmation.session_id.as_str())
-        && message_model_matches_confirmation(message, confirmation)
-        && message_confirms_resume_payload(message, confirmation)
-}
-
-fn message_confirms_resume_payload(
-    message: &OpencodeMessage,
-    confirmation: &ResumeConfirmation,
-) -> bool {
-    if let Some(delivery_nonce) = confirmation.delivery_nonce.as_deref() {
-        return message_contains_delivery_nonce(message, delivery_nonce);
-    }
-    message_has_exact_text_part(message, &confirmation.prompt)
-}
-
-fn message_has_exact_text_part(message: &OpencodeMessage, prompt: &str) -> bool {
-    message.parts.iter().any(|part| {
-        part.get("text")
-            .and_then(Value::as_str)
-            .is_some_and(|text| text_matches_prompt(text, prompt))
-    })
-}
-
-fn text_matches_prompt(text: &str, prompt: &str) -> bool {
-    text == prompt
-        || text
-            .strip_prefix('"')
-            .and_then(|quoted| quoted.strip_suffix('"'))
-            .is_some_and(|unquoted| unquoted == prompt)
-        || serde_json::from_str::<String>(text).is_ok_and(|decoded| decoded.as_str() == prompt)
-}
-
-fn message_contains_delivery_nonce(message: &OpencodeMessage, delivery_nonce: &str) -> bool {
-    let marker = delivery_marker(delivery_nonce);
-    message_string_fields_contain(message, &marker)
-}
-
-fn message_string_fields_contain(message: &OpencodeMessage, needle: &str) -> bool {
-    let fields = message_string_fields(message);
-    string_fields_contain_needle(&fields, needle)
-        || text_contains_needle(&joined_string_fields(&fields), needle)
-}
-
-fn message_string_fields(message: &OpencodeMessage) -> Vec<&str> {
-    message.parts.iter().flat_map(value_string_fields).collect()
-}
-
-fn value_string_fields(value: &Value) -> Vec<&str> {
-    if let Some(text) = value_text(value) {
-        return single_string_field(text);
-    }
-    if let Some(values) = value_array(value) {
-        return array_string_fields(values);
-    }
-    if let Some(values) = value_object(value) {
-        return object_string_fields(values);
-    }
-    empty_string_fields()
-}
-
-fn value_text(value: &Value) -> Option<&str> {
-    value.as_str()
-}
-
-fn value_array(value: &Value) -> Option<&Vec<Value>> {
-    value.as_array()
-}
-
-fn value_object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
-    value.as_object()
-}
-
-fn single_string_field(text: &str) -> Vec<&str> {
-    vec![text]
-}
-
-fn empty_string_fields() -> Vec<&'static str> {
-    Vec::new()
-}
-
-fn array_string_fields(values: &[Value]) -> Vec<&str> {
-    values.iter().flat_map(value_string_fields).collect()
-}
-
-fn object_string_fields(values: &serde_json::Map<String, Value>) -> Vec<&str> {
-    values.values().flat_map(value_string_fields).collect()
-}
-
-fn string_fields_contain_needle(fields: &[&str], needle: &str) -> bool {
-    fields
-        .iter()
-        .any(|field| text_contains_needle(field, needle))
-}
-
-fn joined_string_fields(fields: &[&str]) -> String {
-    fields.concat()
-}
-
-fn text_contains_needle(text: &str, needle: &str) -> bool {
-    text.contains(needle)
-}
-
-fn delivery_nonce_from_prompt(prompt: &str) -> Option<String> {
-    let start = prompt.find(DELIVERY_NONCE_PREFIX)? + DELIVERY_NONCE_PREFIX.len();
-    let tail = &prompt[start..];
-    let end = tail.find(DELIVERY_NONCE_SUFFIX)?;
-    let nonce = tail[..end].trim();
-    (!nonce.is_empty()).then(|| nonce.to_string())
-}
-
-fn delivery_marker(delivery_nonce: &str) -> String {
-    format!("{DELIVERY_NONCE_PREFIX}{delivery_nonce}{DELIVERY_NONCE_SUFFIX}")
 }
 
 fn invalid_launch_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
@@ -2082,17 +1802,4 @@ const SIGKILL: i32 = 9;
 extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::text_matches_prompt;
-
-    #[test]
-    fn quoted_native_text_matches_prompt_with_literal_newline() {
-        let prompt = "Print exactly LIVE_ROTATION_OK and nothing else.\n";
-        let native = format!("\"{prompt}\"");
-
-        assert!(text_matches_prompt(&native, prompt));
-    }
 }
