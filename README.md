@@ -81,6 +81,12 @@ to quota orchestration. Refresh availability is decided from the typed probe,
 and the quota command projects the observation or failure once into the public
 result.
 
+The OpenCode auth crossing does not equate a zero-exit `auth list` with a
+refresh. It returns a typed observation that distinguishes command success from
+an observed before/after change in the selected credential source. Automatic
+retry and the public `refreshed` flag require that credential change;
+post-operation quota availability is reported independently.
+
 ## Invocation and lifecycle
 
 The one-shot invocation form is:

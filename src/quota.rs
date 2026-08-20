@@ -10,6 +10,7 @@
 use crate::account::AccountProfile;
 use crate::encoding::{bounded_text, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
+use crate::opencode::{OpencodeAuthEffect, OpencodeAuthObservation};
 use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
 use crate::runtime_selection::resolve_runtime_selection;
 use chrono::DateTime;
@@ -17,9 +18,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-
-const REFRESH_DETAIL: &str =
-    "opencode auth list completed; agent-runner never mutates tokens directly";
 
 #[derive(Deserialize)]
 struct QuotaBaseParams {
@@ -74,10 +72,14 @@ pub fn refresh_auth_params(
 ) -> Result<Value, ProviderFailure> {
     let params = parse_refresh_params(params, request_id)?;
     let account = account_from_settings_record(host, &params.settings_id, request_id)?;
+    let auth_path = resolved_auth_path(account);
     let checked_at_unix_ms = now_unix_ms();
-    let refresh = run_account_auth_refresh(account);
+    let refresh = run_account_auth_refresh(account, &auth_path);
     let refreshed = refresh_succeeded(&refresh);
-    let available = refreshed && refresh_available(account);
+    let available = refresh
+        .as_ref()
+        .is_ok_and(OpencodeAuthObservation::command_succeeded)
+        && refresh_available(account);
     Ok(refresh_auth_result(
         refreshed,
         available,
@@ -134,22 +136,27 @@ fn probe_after_auth_refresh(
     auth_path: &Path,
     first: QuotaObservationFailure,
 ) -> Value {
-    match run_account_auth_refresh(account) {
-        Ok(refresh) if refresh.status == 0 => probe_observation_result(run_probe(auth_path)),
-        Ok(refresh) => unavailable_result(auth_refresh_failed_detail(&first, &refresh)),
+    match run_account_auth_refresh(account, auth_path) {
+        Ok(refresh) if refresh.credentials_refreshed() => {
+            probe_observation_result(run_probe(auth_path))
+        }
+        Ok(refresh) => unavailable_result(auth_refresh_not_observed_detail(&first, &refresh)),
         Err(err) => unavailable_result(auth_refresh_spawn_failed_detail(&first, err)),
     }
 }
 
-fn auth_refresh_failed_detail(
+fn auth_refresh_not_observed_detail(
     first: &QuotaObservationFailure,
-    refresh: &crate::shell::ShellOutput,
+    refresh: &OpencodeAuthObservation,
 ) -> String {
-    format!(
-        "{} (opencode auth refresh failed: {})",
-        first.detail,
-        opencode_command_failure_detail(refresh)
-    )
+    if !refresh.command_succeeded() {
+        return format!(
+            "{} (opencode auth list failed: {})",
+            first.detail,
+            opencode_command_failure_detail(&refresh.output)
+        );
+    }
+    format!("{} ({})", first.detail, auth_effect_detail(refresh.effect))
 }
 
 fn auth_refresh_spawn_failed_detail(
@@ -301,22 +308,41 @@ fn quota_observation_without_refresh(
 
 fn run_account_auth_refresh(
     account: &AccountProfile,
-) -> std::io::Result<crate::shell::ShellOutput> {
-    crate::opencode::refresh_auth(account)
+    auth_path: &Path,
+) -> std::io::Result<OpencodeAuthObservation> {
+    crate::opencode::observe_auth_list(account, auth_path)
 }
 
-fn refresh_succeeded(refresh: &std::io::Result<crate::shell::ShellOutput>) -> bool {
-    refresh.as_ref().is_ok_and(|output| output.status == 0)
+fn refresh_succeeded(refresh: &std::io::Result<OpencodeAuthObservation>) -> bool {
+    refresh
+        .as_ref()
+        .is_ok_and(OpencodeAuthObservation::credentials_refreshed)
 }
 
-fn refresh_detail(refresh: Result<&crate::shell::ShellOutput, &std::io::Error>) -> String {
+fn refresh_detail(refresh: Result<&OpencodeAuthObservation, &std::io::Error>) -> String {
     match refresh {
-        Ok(output) if output.status == 0 => REFRESH_DETAIL.to_string(),
-        Ok(output) => format!(
+        Ok(observation) if observation.command_succeeded() => {
+            auth_effect_detail(observation.effect).to_string()
+        }
+        Ok(observation) => format!(
             "opencode auth list failed: {}",
-            opencode_command_failure_detail(output)
+            opencode_command_failure_detail(&observation.output)
         ),
         Err(err) => format!("failed to run opencode auth list: {err}"),
+    }
+}
+
+fn auth_effect_detail(effect: OpencodeAuthEffect) -> &'static str {
+    match effect {
+        OpencodeAuthEffect::CredentialsChanged => {
+            "the selected credential source changed during opencode auth list"
+        }
+        OpencodeAuthEffect::CredentialsUnchanged => {
+            "opencode auth list completed without an observed credential change"
+        }
+        OpencodeAuthEffect::CredentialStateUnobservable => {
+            "opencode auth list completed but credential state could not be compared"
+        }
     }
 }
 

@@ -652,8 +652,19 @@ impl FakeOpencodeAuth {
         Self::with_script(wrapper, fake_opencode_auth_success_script())
     }
 
-    pub fn touches_marker(wrapper: &str, marker: &Path) -> Self {
-        Self::with_script(wrapper, fake_opencode_auth_touch_script(marker))
+    pub fn rewrites_auth(wrapper: &str, auth_path: &Path) -> Self {
+        Self::with_script(wrapper, fake_opencode_auth_rewrite_script(auth_path))
+    }
+
+    pub fn touches_marker_and_rewrites_auth(
+        wrapper: &str,
+        marker: &Path,
+        auth_path: &Path,
+    ) -> Self {
+        Self::with_script(
+            wrapper,
+            fake_opencode_auth_touch_and_rewrite_script(marker, auth_path),
+        )
     }
 
     pub fn with_script(wrapper: &str, script: String) -> Self {
@@ -755,7 +766,7 @@ impl RefreshAuthFixture {
             home.write_paired_auth(opencode_auth_json("refresh-sentinel", "acct").as_bytes());
         let before = file_sha256(&auth_path);
         let fake_usage = FakeChatgptUsage::failure(17, "probe unavailable during refresh");
-        let fake_auth = FakeOpencodeAuth::success("opencode3");
+        let fake_auth = FakeOpencodeAuth::rewrites_auth("opencode3", &auth_path);
         let path = prepend_paths(&[fake_auth.dir(), fake_usage.dir()]);
         Self {
             home,
@@ -779,11 +790,11 @@ impl RefreshAuthFixture {
         ]
     }
 
-    pub fn assert_auth_unchanged(&self) {
-        assert_eq!(
+    pub fn assert_auth_changed(&self) {
+        assert_ne!(
             file_sha256(&self.auth_path),
             self.before,
-            "test fake auth command must not mutate auth tokens directly"
+            "the fake OpenCode auth operation must expose an observed credential change"
         );
     }
 
@@ -864,15 +875,31 @@ exit 0\n"
         .to_string()
 }
 
-pub fn fake_opencode_auth_touch_script(marker: &Path) -> String {
+pub fn fake_opencode_auth_rewrite_script(auth_path: &Path) -> String {
     format!(
         "#!/bin/sh\n\
 if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
   printf 'auth argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
 fi\n\
-: > {marker}\n\
+printf '%s' {} > {}\n\
 exit 0\n",
-        marker = shell_single_quote(&marker.to_string_lossy())
+        shell_single_quote(&opencode_auth_json("sentinel-refreshed", "acct")),
+        shell_single_quote(&auth_path.to_string_lossy()),
+    )
+}
+
+pub fn fake_opencode_auth_touch_and_rewrite_script(marker: &Path, auth_path: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
+  printf 'auth argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
+fi\n\
+: > {}\n\
+printf '%s' {} > {}\n\
+exit 0\n",
+        shell_single_quote(&marker.to_string_lossy()),
+        shell_single_quote(&opencode_auth_json("sentinel-refreshed", "acct")),
+        shell_single_quote(&auth_path.to_string_lossy()),
     )
 }
 

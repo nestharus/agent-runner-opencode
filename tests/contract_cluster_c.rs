@@ -260,13 +260,14 @@ fn contract_native_quota_failure_names_wham_boundary() {
 #[test]
 fn contract_native_wham_401_carries_typed_refresh_advice() {
     let home = HomeFixture::new("agent-runner-opencode-native-quota-401-home");
-    home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
+    let auth_path = home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
     let marker = home.path.join("native-wham-refresh-ran");
     let curl = FakeNativeCurl::http_failure(
         401,
         r#"{"detail":"Provided authentication token is expired."}"#,
     );
-    let fake_auth = FakeOpencodeAuth::touches_marker("opencode3", &marker);
+    let fake_auth =
+        FakeOpencodeAuth::touches_marker_and_rewrites_auth("opencode3", &marker, &auth_path);
     let path = prepend_paths(&[fake_auth.dir(), &curl.dir]);
     let result = success_result(
         invoke_with_env(
@@ -299,7 +300,8 @@ fn contract_quota_probe_refreshes_native_auth_on_401_then_retries() {
         &marker,
         CHATGPT_USAGE_WINDOWS_RAW,
     ));
-    let fake_auth = FakeOpencodeAuth::touches_marker("opencode3", &marker);
+    let fake_auth =
+        FakeOpencodeAuth::touches_marker_and_rewrites_auth("opencode3", &marker, &auth_path);
     let path = prepend_paths(&[fake_auth.dir(), fake_usage.dir()]);
 
     let result = success_result(
@@ -343,8 +345,40 @@ fn contract_quota_refresh_auth() {
         "quota.schema.json#/$defs/QuotaRefreshAuthResult",
     );
     assert_refresh_auth_result(&result);
-    fixture.assert_auth_unchanged();
+    fixture.assert_auth_changed();
     fixture.assert_auth_command_invoked();
+}
+
+#[test]
+fn contract_auth_list_without_credential_change_is_not_reported_as_refresh() {
+    let home = HomeFixture::new("agent-runner-opencode-quota-list-only-home");
+    home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
+    let fake_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
+    let fake_auth = FakeOpencodeAuth::success("opencode3");
+    let path = prepend_paths(&[fake_auth.dir(), fake_usage.dir()]);
+    let result = success_result(
+        invoke_with_env(
+            "quota.refresh_auth",
+            quota_refresh_auth_params(),
+            &[
+                ("HOME", home.path_str()),
+                ("PATH", path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
+                (
+                    "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
+                    fake_usage.log_path_str(),
+                ),
+            ],
+        ),
+        "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+        "quota.schema.json#/$defs/QuotaRefreshAuthResult",
+    );
+
+    assert_eq!(result["refreshed"], false);
+    assert_eq!(result["available"], true);
+    assert!(result["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("without an observed credential change")));
 }
 
 #[test]

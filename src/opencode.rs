@@ -7,12 +7,14 @@
 //!       - opencode sessionID launch marker metadata
 //!       - opencode event type/timestamp/part metadata
 //!       - opencode export native session JSON
+//!       - opencode auth list status plus observed credential-file effect
 
 use crate::account::AccountProfile;
 use crate::shell;
 use crate::shell::ShellOutput;
 use serde::Deserialize;
 use serde_json::Value;
+use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::Stdio;
@@ -163,6 +165,29 @@ pub enum OpencodeImportError {
     MissingSessionId(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpencodeAuthEffect {
+    CredentialsChanged,
+    CredentialsUnchanged,
+    CredentialStateUnobservable,
+}
+
+#[derive(Debug)]
+pub struct OpencodeAuthObservation {
+    pub output: ShellOutput,
+    pub effect: OpencodeAuthEffect,
+}
+
+impl OpencodeAuthObservation {
+    pub fn command_succeeded(&self) -> bool {
+        self.output.status == 0
+    }
+
+    pub fn credentials_refreshed(&self) -> bool {
+        self.command_succeeded() && self.effect == OpencodeAuthEffect::CredentialsChanged
+    }
+}
+
 impl EventParser {
     pub fn ingest(&mut self, bytes: &[u8]) -> Vec<OpencodeEventMetadata> {
         self.pending.extend_from_slice(bytes);
@@ -288,16 +313,38 @@ pub fn import_session(
     parse_import_stdout(&output.stdout)
 }
 
-pub fn refresh_auth(account: &AccountProfile) -> std::io::Result<ShellOutput> {
-    crate::shell::run(&refresh_auth_argv(account))
+pub fn observe_auth_list(
+    account: &AccountProfile,
+    auth_path: &Path,
+) -> std::io::Result<OpencodeAuthObservation> {
+    let before = credential_snapshot(auth_path);
+    let output = crate::shell::run(&auth_list_argv(account))?;
+    let after = credential_snapshot(auth_path);
+    Ok(OpencodeAuthObservation {
+        output,
+        effect: observed_auth_effect(before, after),
+    })
 }
 
-fn refresh_auth_argv(account: &AccountProfile) -> Vec<String> {
+fn auth_list_argv(account: &AccountProfile) -> Vec<String> {
     vec![
         account.opencode_wrapper.to_string(),
         "auth".to_string(),
         "list".to_string(),
     ]
+}
+
+fn credential_snapshot(path: &Path) -> Option<Vec<u8>> {
+    fs::read(path).ok()
+}
+
+fn observed_auth_effect(before: Option<Vec<u8>>, after: Option<Vec<u8>>) -> OpencodeAuthEffect {
+    match (before, after) {
+        (Some(before), Some(after)) if before != after => OpencodeAuthEffect::CredentialsChanged,
+        (Some(_), Some(_)) => OpencodeAuthEffect::CredentialsUnchanged,
+        (None, Some(_)) => OpencodeAuthEffect::CredentialsChanged,
+        _ => OpencodeAuthEffect::CredentialStateUnobservable,
+    }
 }
 
 pub fn parse_export_stdout(stdout: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {
