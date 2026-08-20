@@ -119,7 +119,12 @@ The OpenCode auth crossing does not equate a zero-exit `auth list` with a
 refresh. It returns a typed observation that distinguishes command success from
 an observed before/after change in the selected credential source. The public
 `refreshed` flag requires that credential change; post-operation quota
-availability is reported independently.
+availability is reported independently. If the credential source changed but
+the command then exits nonzero or exceeds its output bound, the provider
+durably preserves that partial effect as `reconciliation_required` instead of
+publishing `refreshed: false`. Post-spawn observation failures and an
+unobservable credential state use the same fail-closed handoff; failures proven
+to occur before child effect capability may settle as no refresh.
 
 `quota.refresh_auth` also takes durable custody of each request before admitting
 the native auth command. The request binding includes the complete parameter

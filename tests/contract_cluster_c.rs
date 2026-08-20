@@ -558,6 +558,97 @@ fn contract_quota_refresh_auth() {
 }
 
 #[test]
+fn contract_quota_refresh_changed_credentials_with_nonzero_exit_require_reconciliation() {
+    assert_changed_auth_requires_reconciliation(
+        "nonzero-exit",
+        fake_opencode_auth_rewrite_then_fail_script,
+        "credential_changed_with_command_failure",
+    );
+}
+
+#[test]
+fn contract_quota_refresh_changed_credentials_with_oversized_output_require_reconciliation() {
+    assert_changed_auth_requires_reconciliation(
+        "oversized-output",
+        fake_opencode_auth_rewrite_then_oversize_script,
+        "credential_changed_with_oversized_output",
+    );
+}
+
+fn assert_changed_auth_requires_reconciliation(
+    case: &str,
+    script: fn(&std::path::Path) -> String,
+    expected_reason: &str,
+) {
+    let runtime = IsolatedQuotaSettings::new();
+    let home = HomeFixture::new(&format!("agent-runner-opencode-quota-refresh-{case}-home"));
+    let auth_path =
+        home.write_paired_auth(opencode_auth_json("refresh-sentinel", "acct").as_bytes());
+    let before = file_sha256(&auth_path);
+    let usage_log = home.path.join("quota-operation.log");
+    let fake_curl = FakeNativeCurl::transport_failure(17, "probe must not settle refresh");
+    let fake_auth = FakeOpencodeAuth::with_script("opencode3", script(&auth_path));
+    let path = prepend_paths(&[fake_auth.dir(), &fake_curl.dir]);
+    let env = [
+        ("HOME", home.path_str()),
+        ("PATH", path.as_str()),
+        (
+            "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
+            usage_log.to_str().expect("quota log path UTF-8"),
+        ),
+    ];
+    let request = support::validated_request_envelope(
+        "quota.refresh_auth",
+        quota_refresh_auth_params(),
+        runtime.host_overrides(),
+        "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
+    );
+    support::ensure_default_runtime_settings(&request);
+
+    for attempt in 0..2 {
+        let output =
+            support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &env);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "attempt={attempt} stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response = json_stdout(&output);
+        support::assert_valid(
+            &response,
+            "quota.schema.json#/$defs/QuotaRefreshAuthErrorResponse",
+        );
+        assert_eq!(
+            response["error"]["code"],
+            "quota_refresh_reconciliation_required"
+        );
+        assert_eq!(
+            response["error"]["details"]["reconciliation_evidence"]["reason"],
+            expected_reason
+        );
+        assert_eq!(
+            response["error"]["details"]["reconciliation_evidence"]["credential_effect"],
+            "credentials_changed"
+        );
+    }
+
+    assert_ne!(
+        file_sha256(&auth_path),
+        before,
+        "the native participant must expose the changed credential effect"
+    );
+    assert_eq!(
+        optional_usage_log(&usage_log)
+            .matches("auth argv=auth list")
+            .count(),
+        1,
+        "exact reconciliation replay must not repeat the changed credential effect"
+    );
+}
+
+#[test]
 fn contract_quota_refresh_hanging_auth_releases_account_capability_lock() {
     let runtime = IsolatedQuotaSettings::new();
     let home = HomeFixture::new("agent-runner-opencode-quota-refresh-timeout-home");

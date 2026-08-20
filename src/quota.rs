@@ -13,7 +13,7 @@ use crate::durable_fs;
 use crate::encoding::{bounded_text, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::native_runtime::{self, NativeRuntimeContext};
-use crate::opencode::{OpencodeAuthEffect, OpencodeAuthObservation};
+use crate::opencode::{OpencodeAuthEffect, OpencodeAuthFailure, OpencodeAuthObservation};
 use crate::operation_bounds;
 use crate::path_guard;
 use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
@@ -64,6 +64,8 @@ struct QuotaRefreshOperation {
     committed_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reconciliation: Option<Value>,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -188,7 +190,12 @@ pub fn refresh_auth_params(
                     }
                     QuotaRefreshOperationPhase::NativeEffectAdmitted => {
                         let mut unresolved = operation;
-                        unresolved.phase = QuotaRefreshOperationPhase::ReconciliationRequired;
+                        require_quota_refresh_reconciliation(
+                            &mut unresolved,
+                            "provider_interrupted_after_effect_admission",
+                            "unobserved",
+                            "the provider did not preserve a terminal credential observation",
+                        );
                         write_quota_refresh_operation(host, &unresolved, request_id)?;
                         return Err(quota_refresh_reconciliation_required(
                             request_id,
@@ -234,6 +241,7 @@ pub fn refresh_auth_params(
                     native_effect_admitted_at_unix_ms: None,
                     committed_at_unix_ms: None,
                     result: None,
+                    reconciliation: None,
                 };
                 write_quota_refresh_operation(host, &operation, request_id)?;
                 (operation, account, runtime, observer, auth_path)
@@ -246,11 +254,13 @@ pub fn refresh_auth_params(
     write_quota_refresh_operation(host, &operation, request_id)?;
     let checked_at_unix_ms = now_unix_ms();
     let refresh = run_account_auth_refresh(&runtime, &auth_path, native_timeout);
-    if refresh
-        .as_ref()
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
-    {
-        operation.phase = QuotaRefreshOperationPhase::ReconciliationRequired;
+    if let Some(reconciliation) = refresh_reconciliation(&refresh) {
+        require_quota_refresh_reconciliation(
+            &mut operation,
+            reconciliation.reason,
+            reconciliation.credential_effect,
+            &reconciliation.detail,
+        );
         write_quota_refresh_operation(host, &operation, request_id)?;
         return Err(quota_refresh_reconciliation_required(
             request_id, &operation,
@@ -259,7 +269,7 @@ pub fn refresh_auth_params(
     let refreshed = refresh_succeeded(&refresh);
     let available = refresh
         .as_ref()
-        .is_ok_and(OpencodeAuthObservation::command_succeeded)
+        .is_ok_and(OpencodeAuthObservation::observation_succeeded)
         && refresh_available(account, &runtime, &observer);
     let result = refresh_auth_result(
         refreshed,
@@ -270,6 +280,7 @@ pub fn refresh_auth_params(
     operation.phase = QuotaRefreshOperationPhase::Committed;
     operation.committed_at_unix_ms = Some(now_unix_ms());
     operation.result = Some(result.clone());
+    operation.reconciliation = None;
     write_quota_refresh_operation(host, &operation, request_id)?;
     Ok(result)
 }
@@ -718,14 +729,24 @@ fn validate_quota_refresh_operation(
     operation: &QuotaRefreshOperation,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
+    let reconciliation_valid = operation
+        .reconciliation
+        .as_ref()
+        .is_none_or(valid_quota_refresh_reconciliation);
     let phase_valid = match operation.phase {
         QuotaRefreshOperationPhase::Prepared => {
             operation.native_effect_admitted_at_unix_ms.is_none()
                 && operation.committed_at_unix_ms.is_none()
                 && operation.result.is_none()
+                && operation.reconciliation.is_none()
         }
-        QuotaRefreshOperationPhase::NativeEffectAdmitted
-        | QuotaRefreshOperationPhase::ReconciliationRequired => {
+        QuotaRefreshOperationPhase::NativeEffectAdmitted => {
+            operation.native_effect_admitted_at_unix_ms.is_some()
+                && operation.committed_at_unix_ms.is_none()
+                && operation.result.is_none()
+                && operation.reconciliation.is_none()
+        }
+        QuotaRefreshOperationPhase::ReconciliationRequired => {
             operation.native_effect_admitted_at_unix_ms.is_some()
                 && operation.committed_at_unix_ms.is_none()
                 && operation.result.is_none()
@@ -734,6 +755,7 @@ fn validate_quota_refresh_operation(
             operation.native_effect_admitted_at_unix_ms.is_some()
                 && operation.committed_at_unix_ms.is_some()
                 && operation.result.is_some()
+                && operation.reconciliation.is_none()
         }
     };
     if operation.schema_version != QUOTA_REFRESH_SCHEMA_VERSION
@@ -741,6 +763,7 @@ fn validate_quota_refresh_operation(
         || operation.request_id != request_id
         || operation.binding_sha256 != quota_refresh_binding_sha256(&operation.binding)
         || operation.binding_sha256.trim().is_empty()
+        || !reconciliation_valid
         || !phase_valid
     {
         return Err(quota_refresh_operation_invalid(
@@ -749,6 +772,27 @@ fn validate_quota_refresh_operation(
         ));
     }
     Ok(())
+}
+
+fn valid_quota_refresh_reconciliation(reconciliation: &Value) -> bool {
+    reconciliation
+        .get("reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.trim().is_empty())
+        && matches!(
+            reconciliation
+                .get("credential_effect")
+                .and_then(Value::as_str),
+            Some("credentials_changed" | "unobservable" | "unobserved")
+        )
+        && reconciliation
+            .get("detail")
+            .and_then(Value::as_str)
+            .is_some_and(|detail| !detail.trim().is_empty() && detail.len() <= 500)
+        && reconciliation
+            .get("observed_at_unix_ms")
+            .and_then(Value::as_u64)
+            .is_some()
 }
 
 fn write_quota_refresh_operation(
@@ -815,6 +859,7 @@ fn quota_refresh_reconciliation_required(
             "settings_version": operation.binding["settings_version"],
             "account": operation.binding["account"],
             "auth_source_path": operation.binding["auth_source_path"],
+            "reconciliation_evidence": operation.reconciliation,
             "recovery": "inspect the bound credential source and submit a new request_id only after reconciling the prior native auth attempt",
         }),
     )
@@ -1079,27 +1124,93 @@ fn run_account_auth_refresh(
     runtime: &NativeRuntimeContext,
     auth_path: &Path,
     timeout: Duration,
-) -> std::io::Result<OpencodeAuthObservation> {
+) -> Result<OpencodeAuthObservation, OpencodeAuthFailure> {
     crate::opencode::observe_auth_list(runtime, auth_path, timeout)
 }
 
-fn refresh_succeeded(refresh: &std::io::Result<OpencodeAuthObservation>) -> bool {
+fn refresh_succeeded(refresh: &Result<OpencodeAuthObservation, OpencodeAuthFailure>) -> bool {
     refresh
         .as_ref()
         .is_ok_and(OpencodeAuthObservation::credentials_refreshed)
 }
 
-fn refresh_detail(refresh: Result<&OpencodeAuthObservation, &std::io::Error>) -> String {
+struct RefreshReconciliation {
+    reason: &'static str,
+    credential_effect: &'static str,
+    detail: String,
+}
+
+fn refresh_reconciliation(
+    refresh: &Result<OpencodeAuthObservation, OpencodeAuthFailure>,
+) -> Option<RefreshReconciliation> {
     match refresh {
-        Ok(observation) if observation.command_succeeded() => {
+        Ok(observation)
+            if observation.effect == OpencodeAuthEffect::CredentialStateUnobservable =>
+        {
+            Some(RefreshReconciliation {
+                reason: "credential_state_unobservable",
+                credential_effect: "unobservable",
+                detail: refresh_detail(Ok(observation)),
+            })
+        }
+        Ok(observation)
+            if observation.effect == OpencodeAuthEffect::CredentialsChanged
+                && !observation.observation_succeeded() =>
+        {
+            Some(RefreshReconciliation {
+                reason: if observation.output_exceeded_bound {
+                    "credential_changed_with_oversized_output"
+                } else {
+                    "credential_changed_with_command_failure"
+                },
+                credential_effect: "credentials_changed",
+                detail: refresh_detail(Ok(observation)),
+            })
+        }
+        Err(error) if error.effect_was_possible() => Some(RefreshReconciliation {
+            reason: if error.kind() == std::io::ErrorKind::TimedOut {
+                "native_auth_timed_out"
+            } else {
+                "native_auth_observation_failed"
+            },
+            credential_effect: "unobserved",
+            detail: refresh_detail(Err(error)),
+        }),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+fn refresh_detail(refresh: Result<&OpencodeAuthObservation, &OpencodeAuthFailure>) -> String {
+    match refresh {
+        Ok(observation) if observation.observation_succeeded() => {
             auth_effect_detail(observation.effect).to_string()
         }
+        Ok(observation) if observation.output_exceeded_bound => format!(
+            "opencode auth list output exceeded the supported bound; {}",
+            auth_effect_detail(observation.effect)
+        ),
         Ok(observation) => format!(
-            "opencode auth list failed: {}",
-            opencode_command_failure_detail(&observation.output)
+            "opencode auth list failed: {}; {}",
+            opencode_command_failure_detail(&observation.output),
+            auth_effect_detail(observation.effect)
         ),
         Err(err) => format!("failed to run opencode auth list: {err}"),
     }
+}
+
+fn require_quota_refresh_reconciliation(
+    operation: &mut QuotaRefreshOperation,
+    reason: &str,
+    credential_effect: &str,
+    detail: &str,
+) {
+    operation.phase = QuotaRefreshOperationPhase::ReconciliationRequired;
+    operation.reconciliation = Some(json!({
+        "reason": reason,
+        "credential_effect": credential_effect,
+        "detail": bounded_text(detail, 500),
+        "observed_at_unix_ms": now_unix_ms(),
+    }));
 }
 
 fn auth_effect_detail(effect: OpencodeAuthEffect) -> &'static str {
@@ -1210,6 +1321,7 @@ mod custody_tests {
                 native_effect_admitted_at_unix_ms: Some(2),
                 committed_at_unix_ms: Some(3),
                 result: Some(json!({"available": true})),
+                reconciliation: None,
             };
             fs::write(
                 request_root.join(format!("{stem}.json")),

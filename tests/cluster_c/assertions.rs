@@ -666,6 +666,33 @@ exit 0\n",
     )
 }
 
+pub fn fake_opencode_auth_rewrite_then_fail_script(auth_path: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
+  printf 'auth argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
+fi\n\
+printf '%s' {} > {}\n\
+exit 17\n",
+        shell_single_quote(&opencode_auth_json("sentinel-refreshed", "acct")),
+        shell_single_quote(&auth_path.to_string_lossy()),
+    )
+}
+
+pub fn fake_opencode_auth_rewrite_then_oversize_script(auth_path: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
+  printf 'auth argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
+fi\n\
+printf '%s' {} > {}\n\
+/usr/bin/dd if=/dev/zero bs=1024 count=65 2>/dev/null\n\
+exit 0\n",
+        shell_single_quote(&opencode_auth_json("sentinel-refreshed", "acct")),
+        shell_single_quote(&auth_path.to_string_lossy()),
+    )
+}
+
 pub fn fake_opencode_auth_touch_and_rewrite_script(marker: &Path, auth_path: &Path) -> String {
     format!(
         "#!/bin/sh\n\

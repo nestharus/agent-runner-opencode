@@ -205,6 +205,7 @@ pub enum OpencodeAuthEffect {
 pub struct OpencodeAuthObservation {
     pub output: ShellOutput,
     pub effect: OpencodeAuthEffect,
+    pub output_exceeded_bound: bool,
 }
 
 impl OpencodeAuthObservation {
@@ -212,8 +213,51 @@ impl OpencodeAuthObservation {
         self.output.status == 0
     }
 
+    pub fn observation_succeeded(&self) -> bool {
+        self.command_succeeded() && !self.output_exceeded_bound
+    }
+
     pub fn credentials_refreshed(&self) -> bool {
-        self.command_succeeded() && self.effect == OpencodeAuthEffect::CredentialsChanged
+        self.observation_succeeded() && self.effect == OpencodeAuthEffect::CredentialsChanged
+    }
+}
+
+#[derive(Debug)]
+pub enum OpencodeAuthFailure {
+    BeforeEffect(std::io::Error),
+    EffectUnsettled(std::io::Error),
+}
+
+impl OpencodeAuthFailure {
+    pub fn effect_was_possible(&self) -> bool {
+        matches!(self, Self::EffectUnsettled(_))
+    }
+
+    pub fn kind(&self) -> std::io::ErrorKind {
+        match self {
+            Self::BeforeEffect(error) | Self::EffectUnsettled(error) => error.kind(),
+        }
+    }
+}
+
+impl std::fmt::Display for OpencodeAuthFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeEffect(error) => {
+                write!(formatter, "before native effect capability: {error}")
+            }
+            Self::EffectUnsettled(error) => {
+                write!(formatter, "after native effect capability: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OpencodeAuthFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BeforeEffect(error) | Self::EffectUnsettled(error) => Some(error),
+        }
     }
 }
 
@@ -444,36 +488,31 @@ pub fn observe_auth_list(
     runtime: &NativeRuntimeContext,
     auth_path: &Path,
     timeout: Duration,
-) -> std::io::Result<OpencodeAuthObservation> {
-    let before = credential_snapshot(auth_path)?;
+) -> Result<OpencodeAuthObservation, OpencodeAuthFailure> {
+    let before = credential_snapshot(auth_path).map_err(OpencodeAuthFailure::BeforeEffect)?;
     let mut command = runtime.command();
     command
         .arg("auth")
         .arg("list")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command.spawn()?;
+    let child = command.spawn().map_err(OpencodeAuthFailure::BeforeEffect)?;
     let output = ChildCustody::new(child)
         .wait_with_bounded_output_timeout(
             timeout,
             MAX_NATIVE_COMMAND_OUTPUT_BYTES,
             MAX_NATIVE_COMMAND_OUTPUT_BYTES,
-        )?
+        )
+        .map_err(OpencodeAuthFailure::EffectUnsettled)?
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "opencode auth list timed out")
+            OpencodeAuthFailure::EffectUnsettled(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "opencode auth list timed out",
+            ))
         })?;
-    if output.stdout.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES
-        || output.stderr.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "opencode auth list output exceeds supported {}-byte per-stream bound",
-                MAX_NATIVE_COMMAND_OUTPUT_BYTES
-            ),
-        ));
-    }
-    let after = credential_snapshot(auth_path)?;
+    let output_exceeded_bound = output.stdout.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES
+        || output.stderr.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES;
+    let after = credential_snapshot(auth_path).map_err(OpencodeAuthFailure::EffectUnsettled)?;
     Ok(OpencodeAuthObservation {
         output: ShellOutput {
             stdout: output.stdout,
@@ -481,6 +520,7 @@ pub fn observe_auth_list(
             status: output.status.code().unwrap_or(1),
         },
         effect: observed_auth_effect(before, after),
+        output_exceeded_bound,
     })
 }
 
