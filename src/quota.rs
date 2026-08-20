@@ -30,18 +30,24 @@ struct QuotaRefreshAuthParams {
     settings_id: String,
 }
 
-pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+#[derive(Clone, Copy)]
+pub(crate) enum Command {
+    Source,
+    Probe,
+    RefreshAuth,
+}
+
+pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
     let RequestEnvelope {
         host,
         params,
         request_id,
         ..
     } = request;
-    match subcommand {
-        "quota.source" => source_params(&host, params, &request_id),
-        "quota.probe" => probe_params(&host, params, &request_id),
-        "quota.refresh_auth" => refresh_auth_params(&host, params, &request_id),
-        unknown => Err(unknown_quota_subcommand_failure(request_id, unknown)),
+    match command {
+        Command::Source => source_params(&host, params, &request_id),
+        Command::Probe => probe_params(&host, params, &request_id),
+        Command::RefreshAuth => refresh_auth_params(&host, params, &request_id),
     }
 }
 
@@ -401,14 +407,6 @@ fn available_probe_result(windows: &[QuotaWindow]) -> Value {
         "checked_at_unix_ms": now_unix_ms(),
         "windows": quota_windows(windows),
     })
-}
-
-fn unknown_quota_subcommand_failure(request_id: String, unknown: &str) -> ProviderFailure {
-    ProviderFailure::unsupported(
-        request_id,
-        "unknown_quota_subcommand",
-        format!("unknown quota subcommand: {unknown}"),
-    )
 }
 
 fn invalid_quota_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {

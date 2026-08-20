@@ -193,6 +193,7 @@ fn contract_generated_settings_id_is_usable_by_policy() {
         "settings.schema.json#/$defs/SettingsCreateResult",
     );
     let settings_id = settings_create_id(&created);
+    let expected_settings_id = settings_id.clone();
     let policy = success_result(
         invoke_validated_with_host(
             "policy.evaluate",
@@ -238,6 +239,35 @@ fn contract_generated_settings_id_is_usable_by_policy() {
         .expect("settings record identity text");
     assert!(identity.starts_with("settings record "), "{identity}");
     assert!(identity.contains(" at version "), "{identity}");
+
+    let events = read_activity_events(&host);
+    let completed_policy = events
+        .iter()
+        .find(|event| event["subcommand"] == "policy.evaluate" && event["phase"] == "completed")
+        .expect("completed policy activity event");
+    let identities = activity_identities(completed_policy);
+    for (kind, value, provenance) in [
+        (
+            "settings_record",
+            expected_settings_id.as_str(),
+            "policy.route.settings_record",
+        ),
+        ("account", "opencode1", "policy.route.account"),
+        (
+            "provider_model",
+            "openai/gpt-5.6-sol",
+            "policy.route.provider_model",
+        ),
+        ("model_alias", "gpt-high", "policy.route.model_alias"),
+        ("effort", "high", "policy.route.effort"),
+    ] {
+        assert!(identities.iter().any(|identity| {
+            identity["kind"] == kind
+                && identity["value"] == value
+                && identity["status"] == "resolved"
+                && identity["provenance"] == provenance
+        }));
+    }
 }
 
 #[test]

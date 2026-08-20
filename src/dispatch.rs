@@ -19,6 +19,26 @@ use crate::{launch, migration, policy, quota, rotation, session, settings, setup
 use serde_json::Value;
 use std::io::Write;
 
+#[derive(Clone, Copy)]
+enum Route {
+    Describe,
+    Schema,
+    DiscoveryModels,
+    DiscoveryAccounts,
+    Launch,
+    PolicyEvaluate,
+    TerminalClassify,
+    Session(session::Command),
+    Quota(quota::Command),
+    Settings(settings::Command),
+    Setup(setup::Command),
+    RotationAssess,
+    RotationMaterialize,
+    MigrationPlan,
+    MigrationApply,
+    Unknown,
+}
+
 pub fn handle_invocation(args: &[String], stdin: &[u8]) -> (Vec<u8>, i32) {
     let mut stdout = Vec::new();
     let exit_code = write_invocation(args, stdin, &mut stdout);
@@ -55,47 +75,72 @@ pub fn handle_decoded_invocation(
     request: RequestEnvelope,
     subcommand: &str,
 ) -> Result<Value, ProviderFailure> {
-    match subcommand {
-        "describe" => {
+    handle_routed_invocation(request, route_for_subcommand(subcommand), subcommand)
+        .map(|(response, _)| response)
+}
+
+fn handle_routed_invocation(
+    request: RequestEnvelope,
+    route: Route,
+    subcommand: &str,
+) -> Result<(Value, Option<ActivityTargets>), ProviderFailure> {
+    match route {
+        Route::Describe => {
             validate_empty_params(
                 &request.params,
                 &request.request_id,
                 "invalid_describe_params",
             )?;
-            Ok(success_response(&request.request_id, describe_result()))
+            Ok(routed_success(&request.request_id, describe_result()))
         }
-        "schema" => Ok(success_response(
+        Route::Schema => Ok(routed_success(
             &request.request_id,
             schema_result_params(request.params, &request.request_id)?,
         )),
-        "discovery.models" => Ok(success_response(&request.request_id, discovery::models())),
-        "discovery.accounts" => Ok(success_response(&request.request_id, discovery::accounts())),
-        "launch" => Err(launch_requires_streaming_writer_failure(request.request_id)),
-        "policy.evaluate" => Ok(success_response(
-            &request.request_id,
-            policy::evaluate_params(&request.host, request.params, &request.request_id)?,
-        )),
-        "terminal.classify" => Ok(success_response(
+        Route::DiscoveryModels => Ok(routed_success(&request.request_id, discovery::models())),
+        Route::DiscoveryAccounts => Ok(routed_success(&request.request_id, discovery::accounts())),
+        Route::Launch => Err(launch_requires_streaming_writer_failure(request.request_id)),
+        Route::PolicyEvaluate => {
+            let (result, targets) = policy::evaluate_params_with_activity(
+                &request.host,
+                request.params,
+                &request.request_id,
+            )?;
+            Ok((success_response(&request.request_id, result), Some(targets)))
+        }
+        Route::TerminalClassify => Ok(routed_success(
             &request.request_id,
             terminal::classify_params(request.params, &request.request_id)?,
         )),
-        "session.locate_transcript"
-        | "session.read_turns"
-        | "session.capture"
-        | "session.enumerate"
-        | "session.export"
-        | "session.replace" => handle_capability(subcommand, request, session::handle),
-        "quota.source" | "quota.probe" | "quota.refresh_auth" => {
-            handle_capability(subcommand, request, quota::handle)
+        Route::Session(command) => {
+            let request_id = request.request_id.clone();
+            Ok(routed_success(
+                &request_id,
+                session::handle(command, request)?,
+            ))
         }
-        "settings.list" | "settings.get" | "settings.create" | "settings.update"
-        | "settings.delete" | "settings.validate" | "settings.migrate" => {
-            handle_capability(subcommand, request, settings::handle)
+        Route::Quota(command) => {
+            let request_id = request.request_id.clone();
+            Ok(routed_success(
+                &request_id,
+                quota::handle(command, request)?,
+            ))
         }
-        "setup.detect" | "setup.install_plan" | "setup.sync_plan" | "setup_brain.turn" => {
-            handle_capability(subcommand, request, setup::handle)
+        Route::Settings(command) => {
+            let request_id = request.request_id.clone();
+            Ok(routed_success(
+                &request_id,
+                settings::handle(command, request)?,
+            ))
         }
-        "rotation.assess" => Ok(success_response(
+        Route::Setup(command) => {
+            let request_id = request.request_id.clone();
+            Ok(routed_success(
+                &request_id,
+                setup::handle(command, request)?,
+            ))
+        }
+        Route::RotationAssess => Ok(routed_success(
             &request.request_id,
             rotation::assess_params(
                 &request.host,
@@ -104,7 +149,7 @@ pub fn handle_decoded_invocation(
                 request.provider_instance_id.as_deref().unwrap_or(""),
             )?,
         )),
-        "rotation.materialize" => Ok(success_response(
+        Route::RotationMaterialize => Ok(routed_success(
             &request.request_id,
             rotation::materialize_params(
                 &request.host,
@@ -113,15 +158,56 @@ pub fn handle_decoded_invocation(
                 request.provider_instance_id.as_deref().unwrap_or(""),
             )?,
         )),
-        "migration.plan" => Ok(success_response(
+        Route::MigrationPlan => Ok(routed_success(
             &request.request_id,
             migration::plan_params(request.params, &request.request_id)?,
         )),
-        "migration.apply" => Ok(success_response(
+        Route::MigrationApply => Ok(routed_success(
             &request.request_id,
             migration::apply_params(&request.host, request.params, &request.request_id)?,
         )),
-        unknown => Err(unknown_subcommand_failure(request.request_id, unknown)),
+        Route::Unknown => Err(unknown_subcommand_failure(request.request_id, subcommand)),
+    }
+}
+
+fn routed_success(request_id: &str, result: Value) -> (Value, Option<ActivityTargets>) {
+    (success_response(request_id, result), None)
+}
+
+fn route_for_subcommand(subcommand: &str) -> Route {
+    match subcommand {
+        "describe" => Route::Describe,
+        "schema" => Route::Schema,
+        "discovery.models" => Route::DiscoveryModels,
+        "discovery.accounts" => Route::DiscoveryAccounts,
+        "launch" => Route::Launch,
+        "policy.evaluate" => Route::PolicyEvaluate,
+        "terminal.classify" => Route::TerminalClassify,
+        "session.locate_transcript" => Route::Session(session::Command::LocateTranscript),
+        "session.read_turns" => Route::Session(session::Command::ReadTurns),
+        "session.capture" => Route::Session(session::Command::Capture),
+        "session.enumerate" => Route::Session(session::Command::Enumerate),
+        "session.export" => Route::Session(session::Command::Export),
+        "session.replace" => Route::Session(session::Command::Replace),
+        "quota.source" => Route::Quota(quota::Command::Source),
+        "quota.probe" => Route::Quota(quota::Command::Probe),
+        "quota.refresh_auth" => Route::Quota(quota::Command::RefreshAuth),
+        "settings.list" => Route::Settings(settings::Command::List),
+        "settings.get" => Route::Settings(settings::Command::Get),
+        "settings.create" => Route::Settings(settings::Command::Create),
+        "settings.update" => Route::Settings(settings::Command::Update),
+        "settings.delete" => Route::Settings(settings::Command::Delete),
+        "settings.validate" => Route::Settings(settings::Command::Validate),
+        "settings.migrate" => Route::Settings(settings::Command::Migrate),
+        "setup.detect" => Route::Setup(setup::Command::Detect),
+        "setup.install_plan" => Route::Setup(setup::Command::InstallPlan),
+        "setup.sync_plan" => Route::Setup(setup::Command::SyncPlan),
+        "setup_brain.turn" => Route::Setup(setup::Command::BrainTurn),
+        "rotation.assess" => Route::RotationAssess,
+        "rotation.materialize" => Route::RotationMaterialize,
+        "migration.plan" => Route::MigrationPlan,
+        "migration.apply" => Route::MigrationApply,
+        _ => Route::Unknown,
     }
 }
 
@@ -132,39 +218,38 @@ fn write_invocation_result<W: Write>(
 ) -> Result<i32, ProviderFailure> {
     let request = decode_request(stdin)?;
     let subcommand = subcommand_from_args(args, &request.request_id)?;
+    let route = route_for_subcommand(subcommand);
     let activity = ActivityContext::from_request(&request, subcommand);
-    let attempted_targets = activity_targets(subcommand, &request, None);
+    let attempted_targets = activity_targets(route, &request, None);
     if let Err(error) = activity.started(&attempted_targets) {
         eprintln!("provider activity start evidence warning: {error:?}");
     }
-    if subcommand == "launch" {
-        let params_snapshot = request.params.clone();
+    if matches!(route, Route::Launch) {
         let result = launch::stream(&request.request_id, &request.host, request.params, writer);
-        let completed_targets = launch::activity_targets(
-            &request.host,
-            &params_snapshot,
-            result.is_ok(),
-            &request.request_id,
-        );
         match &result {
-            Ok(exit_code) => {
-                if let Err(error) = activity.succeeded(*exit_code, &completed_targets) {
+            Ok(outcome) => {
+                let mut completed_targets = attempted_targets.clone();
+                completed_targets.extend(outcome.activity_targets.clone());
+                if let Err(error) = activity.succeeded(outcome.exit_code, &completed_targets) {
                     eprintln!("provider activity completion evidence warning: {error:?}");
                 }
             }
             Err(failure) => {
-                if let Err(error) = activity.failed(failure, &completed_targets) {
+                if let Err(error) = activity.failed(failure, &attempted_targets) {
                     eprintln!("provider activity completion evidence warning: {error:?}");
                 }
             }
         }
-        return result;
+        return result.map(|outcome| outcome.exit_code);
     }
     let request_snapshot = request.clone();
-    let response = match handle_decoded_invocation(request, subcommand) {
-        Ok(response) => {
-            let completed_targets =
-                activity_targets(subcommand, &request_snapshot, response.get("result"));
+    let response = match handle_routed_invocation(request, route, subcommand) {
+        Ok((response, typed_targets)) => {
+            let mut completed_targets =
+                activity_targets(route, &request_snapshot, response.get("result"));
+            if let Some(typed_targets) = typed_targets {
+                completed_targets.extend(typed_targets);
+            }
             if let Err(error) = activity.succeeded(0, &completed_targets) {
                 eprintln!("provider activity completion evidence warning: {error:?}");
             }
@@ -184,43 +269,28 @@ fn write_invocation_result<W: Write>(
 }
 
 fn activity_targets(
-    subcommand: &str,
+    route: Route,
     request: &RequestEnvelope,
     result: Option<&Value>,
 ) -> ActivityTargets {
-    match subcommand {
-        "settings.list" | "settings.get" | "settings.create" | "settings.update"
-        | "settings.delete" | "settings.validate" | "settings.migrate" => {
-            settings::activity_targets(subcommand, &request.params, result)
-        }
-        "session.locate_transcript"
-        | "session.read_turns"
-        | "session.capture"
-        | "session.enumerate"
-        | "session.export"
-        | "session.replace" => session::activity_targets(
-            subcommand,
+    match route {
+        Route::Settings(command) => settings::activity_targets(command, &request.params, result),
+        Route::Session(command) => session::activity_targets(
+            command,
             &request.host,
             &request.params,
             result,
             &request.request_id,
         ),
-        "quota.source" | "quota.probe" | "quota.refresh_auth" => {
+        Route::Quota(_) => {
             quota::activity_targets(&request.host, &request.params, result, &request.request_id)
         }
-        "policy.evaluate" => {
-            policy::activity_targets(&request.host, &request.params, result, &request.request_id)
-        }
-        "launch" => launch::activity_targets(
-            &request.host,
-            &request.params,
-            result.is_some(),
-            &request.request_id,
-        ),
-        "rotation.assess" | "rotation.materialize" => {
+        Route::PolicyEvaluate => policy::attempted_activity_targets(&request.params),
+        Route::Launch => launch::attempted_activity_targets(&request.params),
+        Route::RotationAssess | Route::RotationMaterialize => {
             rotation::activity_targets(&request.params, result)
         }
-        "migration.plan" | "migration.apply" => {
+        Route::MigrationPlan | Route::MigrationApply => {
             migration::activity_targets(&request.params, result)
         }
         _ => ActivityTargets::default(),
@@ -288,15 +358,6 @@ fn validate_request_envelope(request: RequestEnvelope) -> Result<RequestEnvelope
         return Err(invalid_host_failure(request.request_id));
     }
     Ok(request)
-}
-
-fn handle_capability(
-    subcommand: &str,
-    request: RequestEnvelope,
-    handle: fn(&str, RequestEnvelope) -> Result<Value, ProviderFailure>,
-) -> Result<Value, ProviderFailure> {
-    let request_id = request.request_id.clone();
-    Ok(success_response(&request_id, handle(subcommand, request)?))
 }
 
 fn unknown_subcommand_failure(request_id: String, subcommand: &str) -> ProviderFailure {

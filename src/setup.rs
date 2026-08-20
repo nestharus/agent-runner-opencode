@@ -8,19 +8,26 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+#[derive(Clone, Copy)]
+pub(crate) enum Command {
+    Detect,
+    InstallPlan,
+    SyncPlan,
+    BrainTurn,
+}
+
+pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
     let RequestEnvelope {
         host,
         params,
         request_id,
         ..
     } = request;
-    match subcommand {
-        "setup.detect" => detect_params(&host, params, &request_id),
-        "setup.install_plan" => install_plan_params(params, &request_id),
-        "setup.sync_plan" => sync_plan_params(params, &request_id),
-        "setup_brain.turn" => Err(brain_unsupported(request_id)),
-        unknown => Err(unknown_setup_subcommand_failure(request_id, unknown)),
+    match command {
+        Command::Detect => detect_params(&host, params, &request_id),
+        Command::InstallPlan => install_plan_params(params, &request_id),
+        Command::SyncPlan => sync_plan_params(params, &request_id),
+        Command::BrainTurn => Err(brain_unsupported(request_id)),
     }
 }
 
@@ -282,14 +289,6 @@ fn expand_tilde(path: &str) -> PathBuf {
         (Some(relative), Some(home)) => Path::new(&home).join(relative),
         _ => PathBuf::from(path),
     }
-}
-
-fn unknown_setup_subcommand_failure(request_id: String, unknown: &str) -> ProviderFailure {
-    ProviderFailure::unsupported(
-        request_id,
-        "unknown_setup_subcommand",
-        format!("unknown setup subcommand: {unknown}"),
-    )
 }
 
 fn setup_installed(opencode: &Value, curl: &Value, profiles: &[Value]) -> bool {

@@ -7,48 +7,23 @@ pub fn forbidden_live_route_paths(
     before: &BTreeMap<PathBuf, String>,
     after: &BTreeMap<PathBuf, String>,
 ) -> BTreeSet<PathBuf> {
-    clone_paths(filter_forbidden_live_route_paths(merged_tree_keys(
-        before, after,
-    )))
-}
-
-pub fn merged_tree_keys<'a>(
-    before: &'a BTreeMap<PathBuf, String>,
-    after: &'a BTreeMap<PathBuf, String>,
-) -> Vec<&'a PathBuf> {
-    before.keys().chain(after.keys()).collect()
-}
-
-pub fn filter_forbidden_live_route_paths(paths: Vec<&PathBuf>) -> Vec<&PathBuf> {
-    paths
-        .into_iter()
+    before
+        .keys()
+        .chain(after.keys())
         .filter(|path| is_forbidden_live_route_path(path))
+        .cloned()
         .collect()
-}
-
-pub fn clone_paths(paths: Vec<&PathBuf>) -> BTreeSet<PathBuf> {
-    paths.into_iter().cloned().collect()
 }
 
 pub fn changed_tree_paths(
     before: &BTreeMap<PathBuf, String>,
     after: &BTreeMap<PathBuf, String>,
 ) -> BTreeSet<PathBuf> {
-    clone_paths(filter_changed_tree_paths(
-        merged_tree_keys(before, after),
-        before,
-        after,
-    ))
-}
-
-pub fn filter_changed_tree_paths<'a>(
-    paths: Vec<&'a PathBuf>,
-    before: &BTreeMap<PathBuf, String>,
-    after: &BTreeMap<PathBuf, String>,
-) -> Vec<&'a PathBuf> {
-    paths
-        .into_iter()
+    before
+        .keys()
+        .chain(after.keys())
         .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
         .collect()
 }
 
@@ -68,43 +43,22 @@ pub fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, String> {
 }
 
 pub fn collect_tree_hashes(root: &Path, current: &Path, files: &mut BTreeMap<PathBuf, String>) {
-    for path in directory_paths(current) {
-        collect_tree_path_hash(root, &path, files);
+    let entries =
+        fs::read_dir(current).unwrap_or_else(|err| panic!("read_dir {}: {err}", current.display()));
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|err| panic!("read_dir entry {}: {err}", current.display()))
+            .path();
+        if path.is_dir() {
+            collect_tree_hashes(root, &path, files);
+        } else {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or_else(|err| panic!("strip prefix {}: {err}", path.display()))
+                .to_path_buf();
+            files.insert(relative, file_sha256(&path));
+        }
     }
-}
-
-pub fn collect_tree_path_hash(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, String>) {
-    if path.is_dir() {
-        collect_tree_hashes(root, path, files);
-    } else {
-        insert_tree_file_hash(root, path, files);
-    }
-}
-
-pub fn insert_tree_file_hash(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, String>) {
-    files.insert(relative_tree_path(root, path), file_sha256(path));
-}
-
-pub fn directory_paths(current: &Path) -> Vec<PathBuf> {
-    read_directory(current)
-        .map(|entry| directory_entry_path(current, entry))
-        .collect()
-}
-
-pub fn read_directory(current: &Path) -> fs::ReadDir {
-    fs::read_dir(current).unwrap_or_else(|err| panic!("read_dir {}: {err}", current.display()))
-}
-
-pub fn directory_entry_path(current: &Path, entry: std::io::Result<fs::DirEntry>) -> PathBuf {
-    entry
-        .unwrap_or_else(|err| panic!("read_dir entry {}: {err}", current.display()))
-        .path()
-}
-
-pub fn relative_tree_path(root: &Path, path: &Path) -> PathBuf {
-    path.strip_prefix(root)
-        .unwrap_or_else(|err| panic!("strip prefix {}: {err}", path.display()))
-        .to_path_buf()
 }
 
 pub fn file_hashes<'a>(paths: impl IntoIterator<Item = &'a Path>) -> BTreeMap<PathBuf, String> {
@@ -115,11 +69,8 @@ pub fn file_hashes<'a>(paths: impl IntoIterator<Item = &'a Path>) -> BTreeMap<Pa
 }
 
 pub fn file_sha256(path: &Path) -> String {
-    sha256_hex(&file_bytes(path))
-}
-
-pub fn file_bytes(path: &Path) -> Vec<u8> {
-    fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+    let bytes = fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    sha256_hex(&bytes)
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {

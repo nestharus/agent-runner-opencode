@@ -63,7 +63,18 @@ struct SettingsMigrateParams {
     legacy: Value,
 }
 
-pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Command {
+    List,
+    Get,
+    Create,
+    Update,
+    Delete,
+    Validate,
+    Migrate,
+}
+
+pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
     let RequestEnvelope {
         host,
         params,
@@ -71,36 +82,32 @@ pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, Provi
         provider_instance_id,
         ..
     } = request;
-    match subcommand {
-        "settings.list" => list_params(&host, &request_id),
-        "settings.get" => get_params(&host, params, &request_id),
-        "settings.create" => {
+    match command {
+        Command::List => list_params(&host, &request_id),
+        Command::Get => get_params(&host, params, &request_id),
+        Command::Create => {
             create_params(&host, params, &request_id, provider_instance_id.as_deref())
         }
-        "settings.update" => {
+        Command::Update => {
             update_params(&host, params, &request_id, provider_instance_id.as_deref())
         }
-        "settings.delete" => {
+        Command::Delete => {
             delete_params(&host, params, &request_id, provider_instance_id.as_deref())
         }
-        "settings.validate" => validate_params(params, &request_id),
-        "settings.migrate" => {
+        Command::Validate => validate_params(params, &request_id),
+        Command::Migrate => {
             migrate_params(&host, params, &request_id, provider_instance_id.as_deref())
         }
-        unknown => Err(unknown_settings_subcommand_failure(request_id, unknown)),
     }
 }
 
 pub(crate) fn activity_targets(
-    subcommand: &str,
+    command: Command,
     params: &Value,
     result: Option<&Value>,
 ) -> ActivityTargets {
     let mut targets = ActivityTargets::default();
-    if matches!(
-        subcommand,
-        "settings.get" | "settings.update" | "settings.delete"
-    ) {
+    if matches!(command, Command::Get | Command::Update | Command::Delete) {
         if let Some(id) = non_empty_value(params.get("id")) {
             targets.attempted("settings_record", id, "params.id");
         }
@@ -112,18 +119,14 @@ pub(crate) fn activity_targets(
         return targets;
     };
     if let Some(record) = result.get("record") {
-        append_settings_record_activity_targets(
-            &mut targets,
-            record,
-            subcommand == "settings.create",
-        );
+        append_settings_record_activity_targets(&mut targets, record, command == Command::Create);
     }
     if let Some(records) = result.get("records").and_then(Value::as_array) {
         for record in records {
             append_settings_record_activity_targets(&mut targets, record, false);
         }
     }
-    if subcommand == "settings.delete" {
+    if command == Command::Delete {
         if let Some(id) = non_empty_value(result.get("id")) {
             targets.resolved("settings_record", id, "result.id");
         }
@@ -1214,14 +1217,6 @@ fn migrated_values_for_account(account: &crate::account::AccountProfile) -> Valu
             "dangerously_skip_permissions": true
         }
     })
-}
-
-fn unknown_settings_subcommand_failure(request_id: String, unknown: &str) -> ProviderFailure {
-    ProviderFailure::unsupported(
-        request_id,
-        "unknown_settings_subcommand",
-        format!("unknown settings subcommand: {unknown}"),
-    )
 }
 
 fn invalid_settings_params_failure(

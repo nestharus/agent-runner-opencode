@@ -492,38 +492,15 @@ pub fn write_executable_chmod_error(path: &Path, err: &std::io::Error) -> String
 }
 
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(unique_temp_dir_name(prefix))
-}
-
-pub fn unique_temp_dir_name(prefix: &str) -> String {
-    formatted_temp_dir_name(prefix, current_time_nanos(), current_process_id())
-}
-
-pub fn current_time_nanos() -> u128 {
-    SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
-        .as_nanos()
-}
-
-pub fn current_process_id() -> u32 {
-    std::process::id()
-}
-
-pub fn formatted_temp_dir_name(prefix: &str, nanos: u128, process_id: u32) -> String {
-    format!("{prefix}-{process_id}-{nanos}")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
 pub fn prepend_path(dir: &Path) -> String {
-    joined_path_string(prepended_path_entries(dir))
-}
-
-pub fn prepended_path_entries(dir: &Path) -> Vec<PathBuf> {
-    vec![dir.to_path_buf()]
-}
-
-pub fn joined_path_string(paths: Vec<PathBuf>) -> String {
-    std::env::join_paths(paths)
+    std::env::join_paths([dir])
         .expect("join PATH entries")
         .to_string_lossy()
         .into_owned()

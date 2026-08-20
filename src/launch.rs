@@ -12,11 +12,9 @@
 use crate::activity::ActivityTargets;
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
-use crate::models::{model_alias, provider_args_match};
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
 use crate::policy;
 use crate::resume_observation::{self, ResumeObservationRequest};
-use crate::runtime_selection::append_resolved_activity_targets;
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -86,17 +84,27 @@ enum DrainMessage {
     ReadError { stdout: bool, message: String },
 }
 
-pub fn stream<W: Write>(
+pub(crate) struct LaunchOutcome {
+    pub exit_code: i32,
+    pub activity_targets: ActivityTargets,
+}
+
+pub(crate) fn stream<W: Write>(
     request_id: &str,
     host: &HostContext,
     params: Value,
     writer: &mut W,
-) -> Result<i32, ProviderFailure> {
+) -> Result<LaunchOutcome, ProviderFailure> {
     let params = parse_launch_params(params, request_id)?;
     let effective = match launch_argv(&params, host, request_id)? {
         PolicyLaunch::Accepted(effective) => *effective,
         PolicyLaunch::Rejected(reason) => {
-            return stream_policy_rejection(request_id, writer, reason)
+            return stream_policy_rejection(request_id, writer, reason).map(|exit_code| {
+                LaunchOutcome {
+                    exit_code,
+                    activity_targets: ActivityTargets::default(),
+                }
+            })
         }
     };
     let child = match spawn_child(
@@ -106,11 +114,19 @@ pub fn stream<W: Write>(
         effective.stdin.is_some(),
     ) {
         Ok(child) => child,
-        Err(err) => return stream_spawn_error(request_id, writer, err),
+        Err(err) => {
+            return stream_spawn_error(request_id, writer, err).map(|exit_code| LaunchOutcome {
+                exit_code,
+                activity_targets: effective.activity_targets,
+            })
+        }
     };
     let mut custody = ChildCustody::new(child);
     if let Err(err) = write_child_stdin(custody.child_mut(), effective.stdin.as_ref()) {
-        return stream_spawn_error(request_id, writer, err);
+        return stream_spawn_error(request_id, writer, err).map(|exit_code| LaunchOutcome {
+            exit_code,
+            activity_targets: effective.activity_targets,
+        });
     }
     stream_child(
         request_id,
@@ -120,14 +136,13 @@ pub fn stream<W: Write>(
         effective.route_evidence,
         writer,
     )
+    .map(|exit_code| LaunchOutcome {
+        exit_code,
+        activity_targets: effective.activity_targets,
+    })
 }
 
-pub(crate) fn activity_targets(
-    host: &HostContext,
-    params: &Value,
-    completed: bool,
-    request_id: &str,
-) -> ActivityTargets {
+pub(crate) fn attempted_activity_targets(params: &Value) -> ActivityTargets {
     let mut targets = ActivityTargets::default();
     let settings_id = params
         .get("settings_id")
@@ -157,49 +172,7 @@ pub(crate) fn activity_targets(
             "params.session.known_provider_session_id",
         );
     }
-    if !completed {
-        return targets;
-    }
-    if let Some(settings_id) = settings_id {
-        append_resolved_activity_targets(
-            &mut targets,
-            host,
-            settings_id,
-            request_id,
-            "runtime_selection.settings_record",
-        );
-    }
-    append_resolved_launch_model(&mut targets, params);
     targets
-}
-
-fn append_resolved_launch_model(targets: &mut ActivityTargets, params: &Value) {
-    let Some(name) = params.pointer("/model/name").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(provider_args) = params
-        .pointer("/model/provider_args")
-        .and_then(Value::as_array)
-        .map(|args| {
-            args.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-    else {
-        return;
-    };
-    let Some(model) = model_alias(name).filter(|model| provider_args_match(model, &provider_args))
-    else {
-        return;
-    };
-    targets.resolved("model_alias", model.name, "model_catalog.name");
-    targets.resolved(
-        "provider_model",
-        model.provider_model,
-        "model_catalog.provider_model",
-    );
-    targets.resolved("effort", model.effort, "model_catalog.effort");
 }
 
 fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, ProviderFailure> {
@@ -213,6 +186,7 @@ struct EffectiveLaunch {
     _prompt: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
     route_evidence: Value,
+    activity_targets: ActivityTargets,
 }
 
 enum PolicyLaunch {
@@ -281,6 +255,8 @@ fn effective_launch(
         deadline_unix_ms,
         &route,
     );
+    let mut activity_targets = ActivityTargets::default();
+    policy::append_route_activity_targets(&mut activity_targets, &route);
     let argv = split_oversized_prompt_argv(argv, request_id)?;
     Ok(EffectiveLaunch {
         argv,
@@ -289,6 +265,7 @@ fn effective_launch(
         _prompt: prompt,
         resume_observation_request,
         route_evidence: json!(markers),
+        activity_targets,
     })
 }
 

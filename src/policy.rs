@@ -4,9 +4,7 @@ use crate::account::profile_for_wrapper_reference;
 use crate::activity::ActivityTargets;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::models::{model_alias, provider_args_match, ModelAlias};
-use crate::runtime_selection::{
-    append_resolved_activity_targets, resolve_runtime_selection, RuntimeSelection,
-};
+use crate::runtime_selection::{resolve_runtime_selection, RuntimeSelection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -93,13 +91,22 @@ pub(crate) struct PolicyRejection {
     prompt: Option<String>,
     diagnostics: Vec<PolicyDiagnostic>,
     markers: Vec<PolicyMarker>,
+    selection: PolicySelectionIdentity,
 }
 
+#[derive(Clone)]
 pub(crate) struct PolicyRouteIdentity {
+    pub settings_record_id: String,
     pub account_wrapper: String,
+    pub model_alias: String,
     pub provider_id: String,
     pub model_id: String,
     pub effort: String,
+}
+
+struct PolicySelectionIdentity {
+    settings_record_id: String,
+    account_wrapper: String,
 }
 
 pub(crate) enum PolicyDecision {
@@ -132,17 +139,21 @@ pub fn evaluate_params(
     params: Value,
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
-    let wire = parse_policy_params(params, request_id)?;
-    let decision = evaluate(host, wire.into(), request_id)?;
-    Ok(project_policy_result(decision))
+    evaluate_params_with_activity(host, params, request_id).map(|(result, _)| result)
 }
 
-pub(crate) fn activity_targets(
+pub(crate) fn evaluate_params_with_activity(
     host: &HostContext,
-    params: &Value,
-    result: Option<&Value>,
+    params: Value,
     request_id: &str,
-) -> ActivityTargets {
+) -> Result<(Value, ActivityTargets), ProviderFailure> {
+    let wire = parse_policy_params(params, request_id)?;
+    let decision = evaluate(host, wire.into(), request_id)?;
+    let targets = decision.activity_targets();
+    Ok((project_policy_result(decision), targets))
+}
+
+pub(crate) fn attempted_activity_targets(params: &Value) -> ActivityTargets {
     let mut targets = ActivityTargets::default();
     let settings_id = params
         .get("settings_id")
@@ -161,51 +172,7 @@ pub(crate) fn activity_targets(
     if let Some(provider_args) = params.pointer("/model/provider_args") {
         targets.provider_args(provider_args);
     }
-    let Some(result) = result else {
-        return targets;
-    };
-    if let Some(settings_id) = settings_id {
-        append_resolved_activity_targets(
-            &mut targets,
-            host,
-            settings_id,
-            request_id,
-            "runtime_selection.settings_record",
-        );
-    }
-    if result.get("accepted").and_then(Value::as_bool) == Some(true) {
-        append_resolved_policy_model(&mut targets, params);
-    }
     targets
-}
-
-fn append_resolved_policy_model(targets: &mut ActivityTargets, params: &Value) {
-    let Some(name) = params.pointer("/model/name").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(provider_args) = params
-        .pointer("/model/provider_args")
-        .and_then(Value::as_array)
-        .map(|args| {
-            args.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-    else {
-        return;
-    };
-    let Some(model) = model_alias(name).filter(|model| provider_args_match(model, &provider_args))
-    else {
-        return;
-    };
-    targets.resolved("model_alias", model.name, "model_catalog.name");
-    targets.resolved(
-        "provider_model",
-        model.provider_model,
-        "model_catalog.provider_model",
-    );
-    targets.resolved("effort", model.effort, "model_catalog.effort");
 }
 
 pub(crate) fn evaluate_launch(
@@ -242,7 +209,7 @@ fn evaluate(
         Some(model) if policy_accepted(&plan.diagnostics) => Ok(PolicyDecision::Accepted(
             plan.into_accepted(&selection, model),
         )),
-        _ => Ok(PolicyDecision::Rejected(plan.into_rejection())),
+        _ => Ok(PolicyDecision::Rejected(plan.into_rejection(&selection))),
     }
 }
 
@@ -308,7 +275,7 @@ impl PolicyPlanCandidate {
         }
     }
 
-    fn into_rejection(self) -> PolicyRejection {
+    fn into_rejection(self, selection: &RuntimeSelection) -> PolicyRejection {
         PolicyRejection {
             argv: self.argv,
             env: self.env,
@@ -316,8 +283,61 @@ impl PolicyPlanCandidate {
             prompt: self.prompt,
             diagnostics: self.diagnostics,
             markers: self.markers,
+            selection: PolicySelectionIdentity {
+                settings_record_id: selection.settings_id.clone(),
+                account_wrapper: selection.account.opencode_wrapper.to_string(),
+            },
         }
     }
+}
+
+impl PolicyDecision {
+    fn activity_targets(&self) -> ActivityTargets {
+        let mut targets = ActivityTargets::default();
+        match self {
+            Self::Accepted(plan) => append_route_activity_targets(&mut targets, &plan.route),
+            Self::Rejected(plan) => {
+                targets.resolved(
+                    "settings_record",
+                    plan.selection.settings_record_id.clone(),
+                    "policy.selection.settings_record",
+                );
+                targets.resolved(
+                    "account",
+                    plan.selection.account_wrapper.clone(),
+                    "policy.selection.account",
+                );
+            }
+        }
+        targets
+    }
+}
+
+pub(crate) fn append_route_activity_targets(
+    targets: &mut ActivityTargets,
+    route: &PolicyRouteIdentity,
+) {
+    targets.resolved(
+        "settings_record",
+        route.settings_record_id.clone(),
+        "policy.route.settings_record",
+    );
+    targets.resolved(
+        "account",
+        route.account_wrapper.clone(),
+        "policy.route.account",
+    );
+    targets.resolved(
+        "provider_model",
+        format!("{}/{}", route.provider_id, route.model_id),
+        "policy.route.provider_model",
+    );
+    targets.resolved(
+        "model_alias",
+        route.model_alias.clone(),
+        "policy.route.model_alias",
+    );
+    targets.resolved("effort", route.effort.clone(), "policy.route.effort");
 }
 
 impl PolicyRejection {
@@ -360,7 +380,9 @@ fn resolved_route_identity(
         .split_once('/')
         .expect("catalog provider model includes provider and model ids");
     PolicyRouteIdentity {
+        settings_record_id: selection.settings_id.clone(),
         account_wrapper: selection.account.opencode_wrapper.to_string(),
+        model_alias: model.name.to_string(),
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
         effort: model.effort.to_string(),

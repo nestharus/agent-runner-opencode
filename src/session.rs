@@ -98,26 +98,35 @@ struct SessionIdentityCandidate {
     source: &'static str,
 }
 
-pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Command {
+    LocateTranscript,
+    ReadTurns,
+    Capture,
+    Enumerate,
+    Export,
+    Replace,
+}
+
+pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
     let RequestEnvelope {
         host,
         params,
         request_id,
         ..
     } = request;
-    match subcommand {
-        "session.locate_transcript" => locate_transcript_params(params, &request_id),
-        "session.read_turns" => read_turns_params(&host, params, &request_id),
-        "session.capture" => capture_params(&host, params, &request_id),
-        "session.enumerate" => enumerate_params(&host, params, &request_id),
-        "session.export" => export_params(&host, params, &request_id),
-        "session.replace" => replace_params(params, &request_id),
-        unknown => Err(unknown_session_subcommand_failure(request_id, unknown)),
+    match command {
+        Command::LocateTranscript => locate_transcript_params(params, &request_id),
+        Command::ReadTurns => read_turns_params(&host, params, &request_id),
+        Command::Capture => capture_params(&host, params, &request_id),
+        Command::Enumerate => enumerate_params(&host, params, &request_id),
+        Command::Export => export_params(&host, params, &request_id),
+        Command::Replace => replace_params(params, &request_id),
     }
 }
 
 pub(crate) fn activity_targets(
-    subcommand: &str,
+    command: Command,
     host: &crate::envelope::HostContext,
     params: &Value,
     result: Option<&Value>,
@@ -131,7 +140,7 @@ pub(crate) fn activity_targets(
     if let Some(settings_id) = settings_id {
         targets.attempted("settings_record", settings_id, "params.settings_id");
     }
-    if subcommand == "session.capture" {
+    if command == Command::Capture {
         append_capture_activity_candidates(&mut targets, params, request_id);
     } else if let Some(session_id) = params
         .get("session_id")
@@ -143,8 +152,7 @@ pub(crate) fn activity_targets(
     let Some(result) = result else {
         return targets;
     };
-    if let Some(settings_id) = settings_id.filter(|_| session_resolves_runtime(subcommand, params))
-    {
+    if let Some(settings_id) = settings_id.filter(|_| session_resolves_runtime(command, params)) {
         append_resolved_activity_targets(
             &mut targets,
             host,
@@ -153,7 +161,7 @@ pub(crate) fn activity_targets(
             "runtime_selection.settings_record",
         );
     }
-    append_completed_session_activity_targets(&mut targets, subcommand, params, result);
+    append_completed_session_activity_targets(&mut targets, command, params, result);
     targets
 }
 
@@ -177,20 +185,20 @@ fn append_capture_activity_candidates(
     }
 }
 
-fn session_resolves_runtime(subcommand: &str, params: &Value) -> bool {
+fn session_resolves_runtime(command: Command, params: &Value) -> bool {
     matches!(
-        subcommand,
-        "session.read_turns" | "session.enumerate" | "session.export"
-    ) || (subcommand == "session.capture" && params.get("live_report").is_some())
+        command,
+        Command::ReadTurns | Command::Enumerate | Command::Export
+    ) || (command == Command::Capture && params.get("live_report").is_some())
 }
 
 fn append_completed_session_activity_targets(
     targets: &mut ActivityTargets,
-    subcommand: &str,
+    command: Command,
     params: &Value,
     result: &Value,
 ) {
-    if subcommand == "session.capture" {
+    if command == Command::Capture {
         if let Some(provider_session_id) = result
             .get("provider_session_id")
             .and_then(Value::as_str)
@@ -209,7 +217,7 @@ fn append_completed_session_activity_targets(
         }
         return;
     }
-    if subcommand == "session.enumerate" {
+    if command == Command::Enumerate {
         if let Some(sessions) = result.get("sessions").and_then(Value::as_array) {
             for session in sessions {
                 if let Some(provider_session_id) = session
@@ -227,7 +235,7 @@ fn append_completed_session_activity_targets(
         }
         return;
     }
-    if matches!(subcommand, "session.read_turns" | "session.export") {
+    if matches!(command, Command::ReadTurns | Command::Export) {
         if let Some(session_id) = params
             .get("session_id")
             .and_then(Value::as_str)
@@ -1056,14 +1064,6 @@ fn source_id(session_id: Option<&str>) -> String {
     session_id
         .map(|id| format!("{SOURCE_KIND}:{id}"))
         .unwrap_or_else(|| SOURCE_KIND.to_string())
-}
-
-fn unknown_session_subcommand_failure(request_id: String, unknown: &str) -> ProviderFailure {
-    ProviderFailure::unsupported(
-        request_id,
-        "unknown_session_subcommand",
-        format!("unknown session subcommand: {unknown}"),
-    )
 }
 
 fn locate_transcript_result(session_id: Option<&str>) -> Value {

@@ -916,26 +916,11 @@ pub fn optional_usage_log(log_path: &Path) -> String {
 }
 
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(unique_temp_dir_name(prefix))
-}
-
-pub fn unique_temp_dir_name(prefix: &str) -> String {
-    formatted_temp_dir_name(prefix, current_time_nanos(), current_process_id())
-}
-
-pub fn current_time_nanos() -> u128 {
-    SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
-        .as_nanos()
-}
-
-pub fn current_process_id() -> u32 {
-    std::process::id()
-}
-
-pub fn formatted_temp_dir_name(prefix: &str, nanos: u128, process_id: u32) -> String {
-    format!("{prefix}-{process_id}-{nanos}")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
 pub fn prepend_path(dir: &Path) -> String {
@@ -943,11 +928,7 @@ pub fn prepend_path(dir: &Path) -> String {
 }
 
 pub fn prepend_paths(dirs: &[&Path]) -> String {
-    joined_path_string(dirs.iter().map(|dir| (*dir).to_path_buf()).collect())
-}
-
-pub fn joined_path_string(paths: Vec<PathBuf>) -> String {
-    std::env::join_paths(paths)
+    std::env::join_paths(dirs.iter().copied())
         .expect("join PATH entries")
         .to_string_lossy()
         .into_owned()
@@ -958,25 +939,9 @@ pub fn shell_single_quote(value: &str) -> String {
 }
 
 pub fn file_sha256(path: &Path) -> String {
-    sha256_hex(&file_bytes(path))
-}
-
-pub fn file_bytes(path: &Path) -> Vec<u8> {
-    fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
-}
-
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex_bytes(&sha256_digest(bytes))
-}
-
-pub fn sha256_digest(bytes: &[u8]) -> Vec<u8> {
-    Sha256::digest(bytes).to_vec()
-}
-
-pub fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(hex_byte).collect()
-}
-
-pub fn hex_byte(byte: &u8) -> String {
-    format!("{byte:02x}")
+    let bytes = fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
