@@ -13,6 +13,7 @@
         "launch": {
           "type": "object",
           "properties": {
+            "system_prompt_override": { "type": "string" },
             "tool_restrictions": { "type": "object" }
           },
           "additionalProperties": true

@@ -36,6 +36,7 @@ struct PolicyLaunchInput {
     argv: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
     stdin: Option<String>,
+    system_prompt_override: Option<String>,
     tool_restrictions: Option<Value>,
 }
 
@@ -191,6 +192,7 @@ pub(crate) fn evaluate_launch(
                 argv: Some(request.argv),
                 env: request.env,
                 stdin: request.stdin,
+                system_prompt_override: None,
                 tool_restrictions: None,
             },
         },
@@ -447,6 +449,9 @@ fn diagnostics_for_policy(
     if model.is_some_and(|model| !model.supports_account(selection.account)) {
         diagnostics.push(model_account_ineligible_diagnostic(selection, model));
     }
+    if params.launch.system_prompt_override.is_some() {
+        diagnostics.push(unsupported_system_prompt_override_diagnostic());
+    }
     if params.launch.tool_restrictions.is_some() {
         diagnostics.push(unsupported_tool_restrictions_diagnostic());
     }
@@ -454,6 +459,15 @@ fn diagnostics_for_policy(
         params, model,
     )));
     diagnostics
+}
+
+fn unsupported_system_prompt_override_diagnostic() -> PolicyDiagnostic {
+    diagnostic(
+        "error",
+        "unsupported_system_prompt_override",
+        "OpenCode cannot faithfully enforce the configured system_prompt_override; refusing launch without the owner's prompt policy"
+            .to_string(),
+    )
 }
 
 fn unsupported_tool_restrictions_diagnostic() -> PolicyDiagnostic {

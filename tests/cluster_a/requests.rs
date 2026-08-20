@@ -224,6 +224,13 @@ pub fn policy_evaluate_params_with_tool_restrictions() -> Value {
     params
 }
 
+pub fn policy_evaluate_params_with_system_prompt_override() -> Value {
+    let mut params = policy_evaluate_params_with_host_candidate_argv();
+    params["launch"]["system_prompt_override"] =
+        json!("Do not use a built-in child invocation mechanism.");
+    params
+}
+
 pub fn policy_evaluate_params_with_host_candidate_command(command: &str) -> Value {
     let mut params = policy_evaluate_params();
     params["launch"]["argv"] = json!(host_candidate_argv_for_command(command, "low"));
