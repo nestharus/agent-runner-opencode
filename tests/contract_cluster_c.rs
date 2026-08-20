@@ -317,6 +317,56 @@ fn contract_quota_observer_identity_is_reused_across_provider_processes() {
 }
 
 #[test]
+fn contract_quota_observer_identity_lock_obeys_host_deadline() {
+    let runtime = IsolatedQuotaSettings::new();
+    let home = HomeFixture::new("agent-runner-opencode-quota-observer-lock-home");
+    home.write_auth_at(
+        ".opencode3/opencode/auth.json",
+        opencode_auth_json("sentinel", "acct").as_bytes(),
+    );
+    let fake_curl = FakeNativeCurl::new();
+    let path = fake_curl.path_env();
+    let mut host = runtime.host_overrides();
+    let observer_root = std::path::Path::new(
+        host["data_root"]
+            .as_str()
+            .expect("isolated quota data root"),
+    )
+    .join("provider-state/opencode/quota-observers");
+    std::fs::create_dir_all(&observer_root).expect("create quota observer state root");
+    let observer_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(observer_root.join("opencode3.lock"))
+        .expect("open quota observer lock");
+    fs2::FileExt::lock_exclusive(&observer_lock).expect("hold quota observer lock");
+    host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 750);
+
+    let started = std::time::Instant::now();
+    let failed = support::invoke_validated_with_host_and_env(
+        "quota.probe",
+        quota_base_params(),
+        host,
+        "quota.schema.json#/$defs/QuotaProbeRequest",
+        &[("HOME", home.path_str()), ("PATH", path.as_str())],
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(!failed.status.success());
+    let response = json_stdout(&failed);
+    support::assert_valid(
+        &response,
+        "quota.schema.json#/$defs/QuotaProbeErrorResponse",
+    );
+    assert_eq!(response["error"]["code"], "quota_observer_lock_timeout");
+    assert!(
+        !fake_curl.invocation_path.exists(),
+        "quota transport must not start before observer identity admission"
+    );
+}
+
+#[test]
 fn contract_quota_observer_rejects_curl_config_injection_before_spawn() {
     let home = HomeFixture::new("agent-runner-opencode-quota-config-injection-home");
     let auth = serde_json::to_vec(&json!({

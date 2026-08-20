@@ -2,8 +2,10 @@
 
 use crate::account::{profile_for_wrapper_reference, ACCOUNTS};
 use crate::child_custody::ChildCustody;
+use crate::durable_fs;
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::operation_bounds;
+use crate::settings::{self, SettingsTransitionReadiness};
 use crate::shell;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -30,8 +32,8 @@ pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value
     } = request;
     match command {
         Command::Detect => detect_params(&host, params, &request_id),
-        Command::InstallPlan => install_plan_params(params, &request_id),
-        Command::SyncPlan => sync_plan_params(params, &request_id),
+        Command::InstallPlan => install_plan_params(&host, params, &request_id),
+        Command::SyncPlan => sync_plan_params(&host, params, &request_id),
         Command::BrainTurn => Err(brain_unsupported(request_id)),
     }
 }
@@ -39,27 +41,44 @@ pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value
 pub fn detect_params(
     host: &HostContext,
     params: Value,
-    _request_id: &str,
+    request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let data_root = string_param(&params, "data_root").or(host.data_root.as_deref());
     let profile_root = string_param(&params, "profile_root");
     let opencode = executable_evidence("opencode", host.deadline_unix_ms);
     let curl = executable_evidence("curl", host.deadline_unix_ms);
     let profiles = profile_evidence(data_root, profile_root, host.deadline_unix_ms);
-    let installed = setup_installed(&opencode, &curl, &profiles);
-    Ok(detect_result(opencode, curl, profiles, installed))
+    let settings_store = settings::transition_readiness(host, request_id);
+    let installed = setup_installed(&opencode, &curl, &profiles, &settings_store);
+    Ok(detect_result(
+        opencode,
+        curl,
+        profiles,
+        settings_store,
+        installed,
+    ))
 }
 
-pub fn install_plan_params(params: Value, _request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn install_plan_params(
+    host: &HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let target = string_param(&params, "target").unwrap_or("local");
-    Ok(install_plan_result(target))
+    let settings_store = settings::transition_readiness(host, request_id);
+    Ok(install_plan_result(target, &settings_store))
 }
 
-pub fn sync_plan_params(params: Value, _request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn sync_plan_params(
+    host: &HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let desired = desired_profiles(&params);
     let rebind = rebind_profiles(&params);
     let operations = sync_operations(&desired, &rebind);
-    let diagnostics = sync_diagnostics(&params);
+    let settings_store = settings::transition_readiness(host, request_id);
+    let diagnostics = sync_diagnostics(&params, &settings_store);
     Ok(sync_plan_result(operations, diagnostics))
 }
 
@@ -79,6 +98,23 @@ fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
     ) {
         (Some(path), Some(timeout)) => {
             let program = path.to_string_lossy().into_owned();
+            if path.metadata().is_ok_and(|metadata| {
+                metadata.len() as usize > durable_fs::MAX_BOUND_EXECUTABLE_BYTES
+            }) {
+                return json!({
+                    "program": program,
+                    "present": true,
+                    "path": path.to_string_lossy().into_owned(),
+                    "version": {
+                        "present": true,
+                        "ready": false,
+                        "error": format!(
+                            "executable exceeds the supported {}-byte identity bound",
+                            durable_fs::MAX_BOUND_EXECUTABLE_BYTES
+                        ),
+                    },
+                });
+            }
             let mut command = shell::command(&program);
             command
                 .arg("--version")
@@ -175,7 +211,12 @@ fn auth_summary() -> String {
     format!("OpenCode auth metadata only; {present}; quota probe native_chatgpt_usage")
 }
 
-fn setup_warnings(opencode: &Value, curl: &Value, profiles: &[Value]) -> Vec<Value> {
+fn setup_warnings(
+    opencode: &Value,
+    curl: &Value,
+    profiles: &[Value],
+    settings_store: &SettingsTransitionReadiness,
+) -> Vec<Value> {
     let mut warnings = Vec::new();
     if !evidence_ready(opencode) {
         warnings.push(json!(
@@ -205,14 +246,25 @@ fn setup_warnings(opencode: &Value, curl: &Value, profiles: &[Value]) -> Vec<Val
             "{name} is not ready: wrapper_ready={wrapper_ready}, opencode_auth_present={auth_present}"
         )));
     }
+    if let Some(message) = settings_store.blocking_message() {
+        warnings.push(json!(message));
+    }
     warnings
 }
 
-fn sync_diagnostics(params: &Value) -> Vec<Value> {
+fn sync_diagnostics(params: &Value, settings_store: &SettingsTransitionReadiness) -> Vec<Value> {
     let mut diagnostics = desired_profile_diagnostics(params);
     diagnostics.extend(profile_reference_diagnostics(params, "rebind_profiles"));
     if params.get("settings_schema_id").and_then(Value::as_str) != Some("opencode.settings/v1") {
         diagnostics.push(settings_schema_mismatch_diagnostic());
+    }
+    if let Some(message) = settings_store.blocking_message() {
+        diagnostics.push(json!({
+            "severity": "error",
+            "path": "host.config_root",
+            "message": message,
+            "code": "settings_transition_blocked",
+        }));
     }
     diagnostics
 }
@@ -267,9 +319,15 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-fn setup_installed(opencode: &Value, curl: &Value, profiles: &[Value]) -> bool {
+fn setup_installed(
+    opencode: &Value,
+    curl: &Value,
+    profiles: &[Value],
+    settings_store: &SettingsTransitionReadiness,
+) -> bool {
     evidence_ready(opencode)
         && evidence_ready(curl)
+        && settings_store.ready
         && profiles
             .iter()
             .all(|profile| profile.get("profile_ready").and_then(Value::as_bool) == Some(true))
@@ -287,8 +345,14 @@ fn evidence_ready(evidence: &Value) -> bool {
         && evidence.pointer("/version/ready").and_then(Value::as_bool) == Some(true)
 }
 
-fn detect_result(opencode: Value, curl: Value, profiles: Vec<Value>, installed: bool) -> Value {
-    let warnings = setup_warnings(&opencode, &curl, &profiles);
+fn detect_result(
+    opencode: Value,
+    curl: Value,
+    profiles: Vec<Value>,
+    settings_store: SettingsTransitionReadiness,
+    installed: bool,
+) -> Value {
+    let warnings = setup_warnings(&opencode, &curl, &profiles, &settings_store);
     json!({
         "installed": installed,
         "binary": {
@@ -297,13 +361,20 @@ fn detect_result(opencode: Value, curl: Value, profiles: Vec<Value>, installed: 
         },
         "auth": auth_summary(),
         "profiles": profiles,
+        "settings_store": settings_store.evidence(),
         "warnings": warnings,
     })
 }
 
-fn install_plan_result(target: &str) -> Value {
+fn install_plan_result(target: &str, settings_store: &SettingsTransitionReadiness) -> Value {
     json!({
         "steps": [
+            {
+                "kind": "verify_settings_transition",
+                "target": target,
+                "blocking": !settings_store.ready,
+                "settings_store": settings_store.evidence(),
+            },
             {"kind": "verify_tool", "target": target, "command": "opencode --version"},
             {"kind": "verify_tool", "target": target, "command": "curl --version"},
             {"kind": "verify_wrappers", "target": target, "wrappers": wrapper_names()},

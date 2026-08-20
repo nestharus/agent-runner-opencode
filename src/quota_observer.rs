@@ -12,8 +12,8 @@ use crate::account::AccountProfile;
 use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
+use crate::operation_bounds;
 use crate::path_guard;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -21,10 +21,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const QUOTA_OBSERVER_STATE_DIR: &str = "provider-state/opencode/quota-observers";
 const QUOTA_OBSERVER_SCHEMA_VERSION: u32 = 1;
 const QUOTA_OBSERVER_CONTRACT: &str = "chatgpt_wham_curl/v1";
+const QUOTA_OBSERVER_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_QUOTA_OBSERVER_STATE_BYTES: usize = 1024 * 1024;
 const OBSERVER_ENV_KEYS: &[&str] = &["PATH", "HOME"];
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -43,7 +46,10 @@ pub fn resolve(
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<QuotaObserverContext, ProviderFailure> {
-    let _lock = acquire_observer_lock(host, account, request_id)?;
+    let timeout =
+        operation_bounds::remaining_timeout(host.deadline_unix_ms, QUOTA_OBSERVER_LOCK_TIMEOUT)
+            .ok_or_else(|| quota_observer_lock_timeout(request_id))?;
+    let _lock = acquire_observer_lock(host, account, timeout, request_id)?;
     if let Some(context) = read_observer_context(host, account, request_id)? {
         validate_observer_context(&context, account, request_id)?;
         return Ok(context);
@@ -92,7 +98,8 @@ fn candidate_context(
         ));
     }
     let program_bytes =
-        fs::read(&program).map_err(|error| quota_observer_failure(request_id, error))?;
+        durable_fs::read_file_bounded(&program, durable_fs::MAX_BOUND_EXECUTABLE_BYTES)
+            .map_err(|error| quota_observer_failure(request_id, error))?;
     let program = program.to_str().ok_or_else(|| {
         quota_observer_failure(request_id, "quota observer path is not valid UTF-8")
     })?;
@@ -180,8 +187,11 @@ fn validate_observer_context(
             ),
         ));
     }
-    let bytes =
-        fs::read(&context.program).map_err(|error| quota_observer_failure(request_id, error))?;
+    let bytes = durable_fs::read_file_bounded(
+        Path::new(&context.program),
+        durable_fs::MAX_BOUND_EXECUTABLE_BYTES,
+    )
+    .map_err(|error| quota_observer_failure(request_id, error))?;
     if sha256_hex(&bytes) != context.program_sha256 {
         return Err(ProviderFailure::conflict(
             request_id,
@@ -203,6 +213,7 @@ fn validate_observer_context(
 fn acquire_observer_lock(
     host: &HostContext,
     account: &AccountProfile,
+    timeout: Duration,
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
     let root = observer_state_root(host, request_id)?;
@@ -223,8 +234,11 @@ fn acquire_observer_lock(
     let lock = options
         .open(lock_path)
         .map_err(|error| quota_observer_failure(request_id, error))?;
-    lock.lock_exclusive()
-        .map_err(|error| quota_observer_failure(request_id, error))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| quota_observer_failure(request_id, error))?
+    {
+        return Err(quota_observer_lock_timeout(request_id));
+    }
     Ok(lock)
 }
 
@@ -234,7 +248,7 @@ fn read_observer_context(
     request_id: &str,
 ) -> Result<Option<QuotaObserverContext>, ProviderFailure> {
     let path = observer_context_path(host, account, request_id)?;
-    let bytes = match durable_fs::read_file(&path) {
+    let bytes = match durable_fs::read_file_bounded(&path, MAX_QUOTA_OBSERVER_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(quota_observer_failure(request_id, error)),
@@ -258,6 +272,9 @@ fn write_observer_context(
         .map_err(|error| quota_observer_failure(request_id, error))?;
     let bytes = serde_json::to_vec_pretty(context)
         .map_err(|error| quota_observer_failure(request_id, error))?;
+    if bytes.len() > MAX_QUOTA_OBSERVER_STATE_BYTES {
+        return Err(quota_observer_state_capacity(request_id, bytes.len()));
+    }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| quota_observer_failure(request_id, error))?;
     temporary
@@ -319,5 +336,23 @@ fn quota_observer_failure(request_id: &str, error: impl std::fmt::Display) -> Pr
         request_id,
         "quota_observer_state_failed",
         format!("quota observer identity failed: {error}"),
+    )
+}
+
+fn quota_observer_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "quota_observer_lock_timeout",
+        "quota observer identity lock could not be acquired before the operation deadline",
+    )
+}
+
+fn quota_observer_state_capacity(request_id: &str, observed_bytes: usize) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "quota_observer_state_capacity_exceeded",
+        format!(
+            "quota observer identity state is {observed_bytes} bytes; the supported maximum is {MAX_QUOTA_OBSERVER_STATE_BYTES} bytes"
+        ),
     )
 }

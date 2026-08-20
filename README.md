@@ -53,6 +53,12 @@ that cannot be routed remains listable with a `repair_required` migration
 summary instead of rejecting the shared store; selecting that record fails with
 its settings diagnostics, while its preserved ID and version allow an in-band
 update or delete. Unrelated projected records remain fully usable.
+`setup.detect` runs this same bounded, parsed-schema transition preflight
+against the exact `host.config_root` store. Provider-wide `installed=true`
+requires that preflight to pass; install plans expose it as a blocking step and
+sync plans emit an error diagnostic until an above-envelope store is reduced
+with the predecessor provider. This prevents cutover from removing every
+settings-selected route before its required reducer has run.
 Rotation assessment and materialization share one provider-state lock, so a
 decision cannot race native materialization. A denied assessment durably removes
 any earlier binding-matched authorization—including parent-directory
@@ -334,6 +340,11 @@ Wrapper and quota-observer files must not be replaced in place while their
 identity is admitted. `setup.sync_plan` accepts `rebind_profiles` and emits the
 exact per-profile binding files plus this bounded maintenance procedure:
 
+Wrapper and quota-observer identity state reads and writes are capped at 1 MiB, executable
+identity hashing is capped at 64 MiB, and their per-account lock admission is
+bounded by the earlier host deadline or five seconds. A lock timeout fails the
+request with a named identity-lock result rather than waiting indefinitely.
+
 1. Stop new admission for the selected profile. Give every in-flight provider
    request a deadline of at most 20 seconds and wait one such drain interval.
 2. Reconcile every nonterminal launch, rotation, and quota-refresh record. If
@@ -358,7 +369,10 @@ Rotation assessment and materialization likewise bound acquisition of their
 shared state lock. One monotonic budget—the earlier of the host deadline and a
 20-second provider ceiling—covers lock admission and every action while the
 lock is held: state reads, bounded native export, parsing and hashing, artifact
-publication, native import, reconciliation, and receipt finalization. Each
+publication, native import, reconciliation, and receipt finalization. Nested
+native-runtime identity admission receives that same remaining budget, so a
+contended account lock cannot extend ownership of the global rotation lane.
+Each
 phase checks the remaining absolute budget, native children are terminated and
 reaped at expiry, artifacts are read back through the same 16 MiB bound, and
 provider-owned rotation state records are capped at 1 MiB. An expired operation

@@ -11,6 +11,8 @@ use std::fs;
 use std::io::{Error, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
+pub(crate) const MAX_BOUND_EXECUTABLE_BYTES: usize = 64 * 1024 * 1024;
+
 pub(crate) fn create_directories(path: &Path) -> std::io::Result<()> {
     create_directory_chain(path, false)
 }

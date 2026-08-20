@@ -12,8 +12,8 @@ use crate::account::AccountProfile;
 use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
+use crate::operation_bounds;
 use crate::path_guard;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -21,9 +21,12 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const NATIVE_RUNTIME_STATE_DIR: &str = "provider-state/opencode/native-runtimes";
 const NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 1;
+const NATIVE_RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_NATIVE_RUNTIME_STATE_BYTES: usize = 1024 * 1024;
 const STABLE_AMBIENT_ENV_KEYS: &[&str] = &[
     "PATH",
     "HOME",
@@ -57,7 +60,17 @@ pub fn resolve_for_account(
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
-    let _lock = acquire_runtime_lock(host, account, request_id)?;
+    let timeout = runtime_lock_timeout(host, request_id)?;
+    resolve_for_account_with_timeout(host, account, timeout, request_id)
+}
+
+pub(crate) fn resolve_for_account_with_timeout(
+    host: &HostContext,
+    account: &AccountProfile,
+    timeout: Duration,
+    request_id: &str,
+) -> Result<NativeRuntimeContext, ProviderFailure> {
+    let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
     if let Some(context) = read_runtime_context(host, account, request_id)? {
         validate_runtime_context(&context, account, request_id)?;
         return Ok(context);
@@ -98,7 +111,8 @@ pub fn resolve_for_launch(
     }
     let candidate =
         candidate_context(account, stable_launch_environment(declared_env), request_id)?;
-    let _lock = acquire_runtime_lock(host, account, request_id)?;
+    let timeout = runtime_lock_timeout(host, request_id)?;
+    let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
     if let Some(context) = read_runtime_context(host, account, request_id)? {
         validate_runtime_context(&context, account, request_id)?;
         if context.identity_sha256 != candidate.identity_sha256 {
@@ -194,7 +208,8 @@ fn candidate_context(
         ));
     }
     let program_bytes =
-        fs::read(&program).map_err(|error| native_runtime_failure(request_id, error))?;
+        durable_fs::read_file_bounded(&program, durable_fs::MAX_BOUND_EXECUTABLE_BYTES)
+            .map_err(|error| native_runtime_failure(request_id, error))?;
     let program = program.to_str().ok_or_else(|| {
         native_runtime_failure(request_id, "native wrapper path is not valid UTF-8")
     })?;
@@ -315,8 +330,11 @@ fn validate_runtime_context(
             ),
         ));
     }
-    let bytes =
-        fs::read(&context.program).map_err(|error| native_runtime_failure(request_id, error))?;
+    let bytes = durable_fs::read_file_bounded(
+        Path::new(&context.program),
+        durable_fs::MAX_BOUND_EXECUTABLE_BYTES,
+    )
+    .map_err(|error| native_runtime_failure(request_id, error))?;
     if sha256_hex(&bytes) != context.program_sha256 {
         return Err(ProviderFailure::conflict(
             request_id,
@@ -338,6 +356,7 @@ fn validate_runtime_context(
 fn acquire_runtime_lock(
     host: &HostContext,
     account: &AccountProfile,
+    timeout: Duration,
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
     let root = runtime_state_root(host, request_id)?;
@@ -358,9 +377,17 @@ fn acquire_runtime_lock(
     let lock = options
         .open(lock_path)
         .map_err(|error| native_runtime_failure(request_id, error))?;
-    lock.lock_exclusive()
-        .map_err(|error| native_runtime_failure(request_id, error))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| native_runtime_failure(request_id, error))?
+    {
+        return Err(native_runtime_lock_timeout(request_id));
+    }
     Ok(lock)
+}
+
+fn runtime_lock_timeout(host: &HostContext, request_id: &str) -> Result<Duration, ProviderFailure> {
+    operation_bounds::remaining_timeout(host.deadline_unix_ms, NATIVE_RUNTIME_LOCK_TIMEOUT)
+        .ok_or_else(|| native_runtime_lock_timeout(request_id))
 }
 
 fn read_runtime_context(
@@ -369,7 +396,7 @@ fn read_runtime_context(
     request_id: &str,
 ) -> Result<Option<NativeRuntimeContext>, ProviderFailure> {
     let path = runtime_context_path(host, account, request_id)?;
-    let bytes = match durable_fs::read_file(&path) {
+    let bytes = match durable_fs::read_file_bounded(&path, MAX_NATIVE_RUNTIME_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(native_runtime_failure(request_id, error)),
@@ -393,6 +420,9 @@ fn write_runtime_context(
         .map_err(|error| native_runtime_failure(request_id, error))?;
     let bytes = serde_json::to_vec_pretty(context)
         .map_err(|error| native_runtime_failure(request_id, error))?;
+    if bytes.len() > MAX_NATIVE_RUNTIME_STATE_BYTES {
+        return Err(native_runtime_state_capacity(request_id, bytes.len()));
+    }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| native_runtime_failure(request_id, error))?;
     temporary
@@ -454,5 +484,23 @@ fn native_runtime_failure(request_id: &str, error: impl std::fmt::Display) -> Pr
         request_id,
         "native_runtime_state_failed",
         format!("native runtime identity failed: {error}"),
+    )
+}
+
+fn native_runtime_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "native_runtime_lock_timeout",
+        "native runtime identity lock could not be acquired before the operation deadline",
+    )
+}
+
+fn native_runtime_state_capacity(request_id: &str, observed_bytes: usize) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "native_runtime_state_capacity_exceeded",
+        format!(
+            "native runtime identity state is {observed_bytes} bytes; the supported maximum is {MAX_NATIVE_RUNTIME_STATE_BYTES} bytes"
+        ),
     )
 }

@@ -893,6 +893,46 @@ fn contract_predecessor_store_above_transition_record_envelope_fails_explicitly(
 }
 
 #[test]
+fn contract_oversized_current_schema_cannot_use_predecessor_prefix_admission() {
+    let host = HostRoots::new("agent-runner-opencode-settings-current-schema-prefix");
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(store_path.parent().expect("settings store parent"))
+        .expect("create settings root");
+    let mut values = opencode_settings_values(None);
+    values["extra_env"] = json!({
+        "CURRENT_SCHEMA_PAYLOAD": "x".repeat(5 * 1024 * 1024)
+    });
+    let record = serde_json::to_string(&json!({
+        "id": "current-schema-prefix-0",
+        "display_name": "Current schema prefix",
+        "version": "current-v1",
+        "values": values,
+    }))
+    .expect("serialize current-schema record");
+    let bytes = format!(
+        "{{\"records\":[{record}],\"schema_version\":3,\"history\":[],\"mutation_receipts\":{{}}}}"
+    )
+    .into_bytes();
+    assert!(bytes.starts_with(br#"{"records":["#));
+    assert!(bytes.len() > 4 * 1024 * 1024);
+    assert!(bytes.len() < 16 * 1024 * 1024);
+    fs::write(&store_path, bytes).expect("write reordered current-schema store");
+
+    let rejected = error_response(invoke_validated_with_host(
+        "settings.list",
+        empty_request_params(),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsListRequest",
+    ));
+    assert_eq!(
+        rejected["error"]["code"],
+        "settings_store_capacity_unsupported"
+    );
+}
+
+#[test]
 fn contract_record_heavy_predecessor_recovery_continues_across_processes() {
     let host = HostRoots::new("agent-runner-opencode-settings-predecessor-record-recovery");
     let store_path = host
@@ -1613,6 +1653,102 @@ fn contract_setup_detect_bounds_hanging_version_probe() {
 }
 
 #[test]
+fn contract_setup_blocks_cutover_above_predecessor_transition_envelope() {
+    let host = HostRoots::new("agent-runner-opencode-setup-settings-transition-block");
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(store_path.parent().expect("settings store parent"))
+        .expect("create predecessor settings root");
+    let mut values = opencode_settings_values(None);
+    values["extra_env"] = json!({
+        "PREDECESSOR_PAYLOAD": "x".repeat(16 * 1024 * 1024)
+    });
+    fs::write(
+        &store_path,
+        serde_json::to_vec(&json!({
+            "records": [{
+                "id": "setup-blocked-predecessor-0",
+                "display_name": "Setup-blocked predecessor",
+                "version": "predecessor-v1",
+                "values": values,
+            }]
+        }))
+        .expect("serialize above-envelope predecessor store"),
+    )
+    .expect("write above-envelope predecessor store");
+    let toolchain = FakeToolchain::new();
+    let home = HomeFixture::new("agent-runner-opencode-setup-settings-transition-home");
+    home.write_all_opencode_auths();
+    let path = prepend_path(toolchain.dir());
+    let data_root = path_string(host.data_root());
+    let profile_root = path_string(host.config_root());
+
+    let detect = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.detect",
+            setup_detect_params(&data_root, &profile_root),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupDetectRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupDetectResponse",
+        "setup.schema.json#/$defs/SetupDetectResult",
+    );
+    assert_eq!(detect["installed"], false);
+    assert_eq!(detect["settings_store"]["ready"], false);
+    assert_eq!(
+        detect["settings_store"]["code"],
+        "settings_store_capacity_unsupported"
+    );
+    assert!(detect["warnings"]
+        .as_array()
+        .expect("setup warnings")
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|warning| warning.contains("predecessor provider"))));
+
+    let install = success_result(
+        invoke_validated_with_host(
+            "setup.install_plan",
+            setup_install_plan_params(&data_root, &profile_root),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupInstallPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupInstallPlanResponse",
+        "setup.schema.json#/$defs/SetupInstallPlanResult",
+    );
+    let transition_step = install["steps"]
+        .as_array()
+        .expect("install steps")
+        .iter()
+        .find(|step| step["kind"] == "verify_settings_transition")
+        .expect("settings transition install step");
+    assert_eq!(transition_step["blocking"], true);
+    assert_eq!(transition_step["settings_store"]["ready"], false);
+
+    let sync = success_result(
+        invoke_validated_with_host(
+            "setup.sync_plan",
+            setup_sync_plan_params(&data_root, &profile_root),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    assert!(sync["diagnostics"]
+        .as_array()
+        .expect("sync diagnostics")
+        .iter()
+        .any(
+            |diagnostic| diagnostic["code"] == "settings_transition_blocked"
+                && diagnostic["severity"] == "error"
+        ));
+}
+
+#[test]
 fn contract_setup_install_sync_plan_missing_prerequisite() {
     let host = HostRoots::new("agent-runner-opencode-setup-plan-missing-prerequisite");
     let empty_path = unique_temp_dir("agent-runner-opencode-empty-path");
@@ -1809,6 +1945,125 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
             "rotation.assess",
             rotation_assess_params(false),
             follow_up_host,
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    assert_rotation_denied(&follow_up);
+}
+
+#[test]
+fn contract_rotation_runtime_lock_contention_obeys_global_budget() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-runtime-lock-timeout");
+    let opencode = RotationOpencodeFixture::new();
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let runtime_root = host
+        .data_root()
+        .join("provider-state/opencode/native-runtimes");
+    fs::create_dir_all(&runtime_root).expect("create native runtime state root");
+    let runtime_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(runtime_root.join("opencode1.lock"))
+        .expect("open source runtime lock");
+    fs2::FileExt::lock_exclusive(&runtime_lock).expect("hold source runtime lock");
+    let mut bounded_host = host.overrides();
+    bounded_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 750);
+    let path = opencode.path_env();
+    let started = std::time::Instant::now();
+    let failed = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        bounded_host,
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(failed["error"]["code"], "native_runtime_lock_timeout");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    drop(runtime_lock);
+
+    let follow_up = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_params(false),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    assert_rotation_denied(&follow_up);
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_rotation_prepared_recovery_runtime_lock_obeys_global_budget() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-recovery-runtime-lock-timeout");
+    let opencode = RotationOpencodeFixture::with_post_import_finalization_fault();
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let path = opencode.path_env();
+    let first = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(first["error"]["code"], "rotation_state_failed");
+    assert_eq!(opencode.import_count(), 1);
+    opencode.restore_operation_state_writes(host.data_root());
+
+    let runtime_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(
+            host.data_root()
+                .join("provider-state/opencode/native-runtimes/opencode2.lock"),
+        )
+        .expect("open target runtime lock");
+    fs2::FileExt::lock_exclusive(&runtime_lock).expect("hold target runtime lock");
+    let mut bounded_host = host.overrides();
+    bounded_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 750);
+    let started = std::time::Instant::now();
+    let failed = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        bounded_host,
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(failed["error"]["code"], "native_runtime_lock_timeout");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    drop(runtime_lock);
+
+    let follow_up = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_params(false),
+            host.overrides(),
             "rotation.schema.json#/$defs/RotationAssessRequest",
         ),
         "rotation.schema.json#/$defs/RotationAssessResponse",

@@ -18,9 +18,10 @@
         "binary": { "type": "object", "additionalProperties": true },
         "auth": { "type": "string" },
         "profiles": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "settings_store": { "type": "object", "additionalProperties": true },
         "warnings": { "type": "array", "items": true }
       },
-      "required": ["installed", "warnings"],
+      "required": ["installed", "settings_store", "warnings"],
       "additionalProperties": false
     },
     "SetupDetectResponse": {

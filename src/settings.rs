@@ -223,6 +223,41 @@ struct SettingsStore {
     predecessor_capacity_recovery: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct SettingsTransitionReadiness {
+    pub(crate) ready: bool,
+    state: &'static str,
+    code: Option<String>,
+    message: Option<String>,
+    store_bytes: Option<usize>,
+    record_count: Option<usize>,
+}
+
+impl SettingsTransitionReadiness {
+    pub(crate) fn evidence(&self) -> Value {
+        json!({
+            "ready": self.ready,
+            "state": self.state,
+            "code": self.code,
+            "message": self.message,
+            "store_bytes": self.store_bytes,
+            "record_count": self.record_count,
+            "maximum_current_bytes": MAX_SETTINGS_STORE_BYTES,
+            "maximum_current_records": MAX_SETTINGS_RECORDS,
+            "maximum_predecessor_bytes": MAX_PREDECESSOR_SETTINGS_STORE_BYTES,
+            "maximum_predecessor_records": MAX_PREDECESSOR_SETTINGS_RECORDS,
+        })
+    }
+
+    pub(crate) fn blocking_message(&self) -> Option<&str> {
+        if self.ready {
+            None
+        } else {
+            self.message.as_deref()
+        }
+    }
+}
+
 impl Default for SettingsStore {
     fn default() -> Self {
         Self {
@@ -523,6 +558,62 @@ fn read_store(host: &HostContext, request_id: &str) -> Result<SettingsStore, Pro
     read_store_path(&path, request_id)
 }
 
+pub(crate) fn transition_readiness(
+    host: &HostContext,
+    request_id: &str,
+) -> SettingsTransitionReadiness {
+    let path = match store_path(host, request_id) {
+        Ok(path) => path,
+        Err(failure) => return transition_failure(failure),
+    };
+    if !store_path_exists(&path) {
+        return SettingsTransitionReadiness {
+            ready: true,
+            state: "absent",
+            code: None,
+            message: None,
+            store_bytes: Some(0),
+            record_count: Some(0),
+        };
+    }
+    let (bytes, predecessor_capacity_recovery) = match read_store_bytes(&path, request_id) {
+        Ok(result) => result,
+        Err(failure) => return transition_failure(failure),
+    };
+    let byte_count = bytes.len();
+    match parse_store_bytes(&bytes, predecessor_capacity_recovery, request_id) {
+        Ok(store) => SettingsTransitionReadiness {
+            ready: true,
+            state: if store.predecessor_capacity_recovery {
+                "predecessor_recovery"
+            } else {
+                "current"
+            },
+            code: None,
+            message: None,
+            store_bytes: Some(byte_count),
+            record_count: Some(store.records.len()),
+        },
+        Err(failure) => transition_failure(failure),
+    }
+}
+
+fn transition_failure(failure: ProviderFailure) -> SettingsTransitionReadiness {
+    let action = if failure.code == "settings_store_capacity_unsupported" {
+        "keep or restore the predecessor provider, reduce the store into the declared transition envelope, and rerun setup detection before installation"
+    } else {
+        "repair or restore the settings store and rerun setup detection before installation"
+    };
+    SettingsTransitionReadiness {
+        ready: false,
+        state: "blocked",
+        code: Some(failure.code.to_string()),
+        message: Some(format!("{}; {action}", failure.message)),
+        store_bytes: None,
+        record_count: None,
+    }
+}
+
 fn read_store_path(path: &Path, request_id: &str) -> Result<SettingsStore, ProviderFailure> {
     if !store_path_exists(path) {
         return Ok(SettingsStore::default());
@@ -780,6 +871,15 @@ fn parse_store_bytes(
     let store: SettingsStore = serde_json::from_slice(bytes)
         .map_err(|err| settings_store_parse_failure(request_id, err))?;
     let predecessor_schema = store.schema_version == 0;
+    if predecessor_capacity_recovery && !predecessor_schema {
+        return Err(settings_store_capacity_unsupported(
+            request_id,
+            format!(
+                "an oversized store declares current schema {}; only schema-less predecessor or provider-authored schema-zero recovery state can use the transition envelope",
+                store.schema_version
+            ),
+        ));
+    }
     if predecessor_schema && store.records.len() > MAX_PREDECESSOR_SETTINGS_RECORDS {
         return Err(settings_store_capacity_unsupported(
             request_id,

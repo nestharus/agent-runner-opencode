@@ -99,8 +99,12 @@ pub fn materialize_params(
     if let Some(mut operation) = read_rotation_operation(host, &binding, request_id)? {
         budget.checkpoint(request_id)?;
         if operation.phase == RotationOperationPhase::Prepared {
-            let target_runtime =
-                native_runtime::resolve_for_account(host, binding.target_account, request_id)?;
+            let target_runtime = native_runtime::resolve_for_account_with_timeout(
+                host,
+                binding.target_account,
+                budget.remaining(request_id)?,
+                request_id,
+            )?;
             reconcile_prepared_operation(
                 host,
                 &params,
@@ -116,10 +120,20 @@ pub fn materialize_params(
     let authorization = require_fresh_authorization(host, &binding, request_id)?;
     budget.checkpoint(request_id)?;
     let working_directory = rotation_working_directory(host, request_id)?;
-    let source_runtime =
-        native_runtime::resolve_for_account(host, binding.source_account, request_id)?;
-    let target_runtime =
-        native_runtime::resolve_for_account(host, binding.target_account, request_id)?;
+    let source_runtime = native_runtime::resolve_for_account_with_timeout(
+        host,
+        binding.source_account,
+        budget.remaining(request_id)?,
+        request_id,
+    )?;
+    budget.checkpoint(request_id)?;
+    let target_runtime = native_runtime::resolve_for_account_with_timeout(
+        host,
+        binding.target_account,
+        budget.remaining(request_id)?,
+        request_id,
+    )?;
+    budget.checkpoint(request_id)?;
     let native = opencode::export_with_timeout(
         &binding.source_session_id,
         &source_runtime,
@@ -924,6 +938,12 @@ fn write_private_json_atomic(path: &Path, value: &Value) -> std::io::Result<()> 
 }
 
 fn write_private_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if bytes.len() > MAX_ROTATION_STATE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("rotation state exceeds supported {MAX_ROTATION_STATE_BYTES}-byte bound"),
+        ));
+    }
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "state path has no parent")
     })?;
