@@ -3,6 +3,8 @@
 use std::io::{self, Read};
 use std::process::{Child, Output};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 pub(crate) struct ChildCustody {
     child: Option<Child>,
@@ -42,6 +44,38 @@ impl ChildCustody {
             stdout,
             stderr,
         })
+    }
+
+    pub(crate) fn wait_with_output_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> io::Result<Option<Output>> {
+        self.child_mut().stdin.take();
+        let stdout = self.child_mut().stdout.take().map(spawn_drain);
+        let stderr = self.child_mut().stderr.take().map(spawn_drain);
+        let status = match self.child_mut().wait_timeout(timeout) {
+            Ok(Some(status)) => {
+                self.child.take();
+                Some(status)
+            }
+            Ok(None) => {
+                self.cleanup_now();
+                None
+            }
+            Err(error) => {
+                self.cleanup_now();
+                let _ = join_drain(stdout);
+                let _ = join_drain(stderr);
+                return Err(error);
+            }
+        };
+        let stdout = join_drain(stdout)?;
+        let stderr = join_drain(stderr)?;
+        Ok(status.map(|status| Output {
+            status,
+            stdout,
+            stderr,
+        }))
     }
 
     fn cleanup_now(&mut self) {

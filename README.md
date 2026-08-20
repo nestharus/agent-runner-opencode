@@ -112,6 +112,11 @@ observation is committed, the request is durably marked for reconciliation;
 retries return an actionable conflict instead of guessing whether it is safe to
 repeat the credential operation. Account-scoped locks serialize observable auth
 refreshes while their provider invocation remains alive.
+Request/account lock admission and the native auth child are bounded by the
+earlier of `host.deadline_unix_ms` and a 20-second provider ceiling. A timed-out
+child is terminated and reaped, the admitted operation becomes
+`reconciliation_required`, and the account lane is released for an authorized
+follow-up instead of remaining monopolized by the stalled process.
 Exact refresh retries inspect this immutable request record before resolving
 live settings. Deleting or updating the former settings record therefore cannot
 hide either a committed result or an admitted-effect reconciliation handoff;
@@ -276,6 +281,13 @@ ambient curl configuration, supplies credentials through stdin configuration,
 and accepts no environment-selected observer branch. Auth refresh binds both
 the native OpenCode runtime identity and this quota-observer identity before it
 admits a credential mutation.
+
+Rotation assessment and materialization likewise bound acquisition of their
+shared state lock. Native export and import performed while that lock is held
+use the earlier of the host deadline and a 20-second provider ceiling; a stalled
+import is terminated and reaped while its prepared record remains available for
+identity-safe reconciliation. Unrelated rotation actors can therefore regain
+the shared capability without terminating the provider manually.
 
 Activity evidence is operational and explicitly best-effort. A directory,
 lock, write, or chain-validation failure is emitted as a stderr warning but

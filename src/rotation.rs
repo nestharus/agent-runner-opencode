@@ -7,9 +7,9 @@ use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::native_runtime;
 use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
+use crate::operation_bounds;
 use crate::path_guard;
 use crate::runtime_selection::resolve_runtime_selection;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const AUTHORIZATION_TTL: Duration = Duration::from_secs(10 * 60);
+const ROTATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 const ROTATION_STATE_DIR: &str = "provider-state/opencode/rotation";
 
 pub fn assess_params(
@@ -79,8 +80,12 @@ pub fn materialize_params(
         native_runtime::resolve_for_account(host, binding.source_account, request_id)?;
     let target_runtime =
         native_runtime::resolve_for_account(host, binding.target_account, request_id)?;
-    let native = opencode::export(&binding.source_session_id, &source_runtime)
-        .map_err(|error| rotation_export_failure(request_id, &binding.source_session_id, error))?;
+    let native = opencode::export_with_timeout(
+        &binding.source_session_id,
+        &source_runtime,
+        rotation_operation_timeout(host, request_id)?,
+    )
+    .map_err(|error| rotation_export_failure(request_id, &binding.source_session_id, error))?;
     validate_rotation_export(&native, &binding.source_session_id, request_id)?;
     let boundary = crate::session::rotation_boundary_timestamp(&native)
         .ok_or_else(|| rotation_boundary_missing(request_id, &binding.source_session_id))?;
@@ -111,10 +116,13 @@ pub fn materialize_params(
         imported_at_unix_ms: None,
     };
     write_rotation_operation(host, &binding, &operation, request_id)?;
-    let target_session_id =
-        opencode::import_session(&artifact_path, &target_runtime, working_directory).map_err(
-            |error| rotation_import_failure(request_id, &binding.target_provider_id, error),
-        )?;
+    let target_session_id = opencode::import_session(
+        &artifact_path,
+        &target_runtime,
+        working_directory,
+        rotation_operation_timeout(host, request_id)?,
+    )
+    .map_err(|error| rotation_import_failure(request_id, &binding.target_provider_id, error))?;
     operation.phase = RotationOperationPhase::Imported;
     operation.target_session_id = Some(target_session_id);
     operation.imported_at_unix_ms = Some(now_unix_ms());
@@ -466,9 +474,21 @@ fn acquire_rotation_lock(
         .truncate(false)
         .open(lock_path)
         .map_err(|error| rotation_state_failure(request_id, error))?;
-    lock.lock_exclusive()
-        .map_err(|error| rotation_state_failure(request_id, error))?;
+    let timeout = rotation_operation_timeout(host, request_id)?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| rotation_state_failure(request_id, error))?
+    {
+        return Err(rotation_lock_timeout(request_id));
+    }
     Ok(lock)
+}
+
+fn rotation_operation_timeout(
+    host: &HostContext,
+    request_id: &str,
+) -> Result<Duration, ProviderFailure> {
+    operation_bounds::remaining_timeout(host.deadline_unix_ms, ROTATION_OPERATION_TIMEOUT)
+        .ok_or_else(|| rotation_deadline_exceeded(request_id))
 }
 
 fn authorization_path(
@@ -653,7 +673,11 @@ fn reconcile_prepared_operation(
 ) -> Result<(), ProviderFailure> {
     let supplied_target = optional_string(params, "recovery_target_session_id");
     let candidate_session_id = supplied_target.unwrap_or(&binding.source_session_id);
-    let target = match opencode::export(candidate_session_id, target_runtime) {
+    let target = match opencode::export_with_timeout(
+        candidate_session_id,
+        target_runtime,
+        rotation_operation_timeout(host, request_id)?,
+    ) {
         Ok(target) => target,
         Err(error) => {
             return Err(rotation_recovery_required(
@@ -1159,6 +1183,22 @@ fn rotation_import_failure(
         request_id,
         "rotation_import_failed",
         format!("failed to import session into {target_provider}: {error:?}"),
+    )
+}
+
+fn rotation_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "rotation_lock_timeout",
+        "rotation lock could not be acquired before the operation deadline",
+    )
+}
+
+fn rotation_deadline_exceeded(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "rotation_deadline_exceeded",
+        "rotation operation deadline was reached before the next native effect",
     )
 }
 

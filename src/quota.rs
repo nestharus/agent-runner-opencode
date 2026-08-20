@@ -14,6 +14,7 @@ use crate::encoding::{bounded_text, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::native_runtime::{self, NativeRuntimeContext};
 use crate::opencode::{OpencodeAuthEffect, OpencodeAuthObservation};
+use crate::operation_bounds;
 use crate::path_guard;
 use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
 use crate::quota_observer::{self, QuotaObserverContext};
@@ -21,15 +22,16 @@ use crate::runtime_selection::{
     append_resolved_activity_targets, resolve_runtime_selection, RuntimeSelection,
 };
 use chrono::DateTime;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const QUOTA_REFRESH_STATE_DIR: &str = "provider-state/opencode/quota/auth-refresh";
 const QUOTA_REFRESH_SCHEMA_VERSION: u32 = 1;
+const QUOTA_REFRESH_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Deserialize)]
 struct QuotaBaseParams {
@@ -232,11 +234,22 @@ pub fn refresh_auth_params(
             }
         };
     let _account_lock = acquire_quota_refresh_account_lock(host, account, &auth_path, request_id)?;
+    let native_timeout = quota_refresh_operation_timeout(host, request_id)?;
     operation.phase = QuotaRefreshOperationPhase::NativeEffectAdmitted;
     operation.native_effect_admitted_at_unix_ms = Some(now_unix_ms());
     write_quota_refresh_operation(host, &operation, request_id)?;
     let checked_at_unix_ms = now_unix_ms();
-    let refresh = run_account_auth_refresh(&runtime, &auth_path);
+    let refresh = run_account_auth_refresh(&runtime, &auth_path, native_timeout);
+    if refresh
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+    {
+        operation.phase = QuotaRefreshOperationPhase::ReconciliationRequired;
+        write_quota_refresh_operation(host, &operation, request_id)?;
+        return Err(quota_refresh_reconciliation_required(
+            request_id, &operation,
+        ));
+    }
     let refreshed = refresh_succeeded(&refresh);
     let available = refresh
         .as_ref()
@@ -459,9 +472,21 @@ fn acquire_quota_refresh_lock(
         .write(true)
         .open(path)
         .map_err(|error| quota_refresh_state_failure(request_id, error))?;
-    lock.lock_exclusive()
-        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    let timeout = quota_refresh_operation_timeout(host, request_id)?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?
+    {
+        return Err(quota_refresh_lock_timeout(request_id));
+    }
     Ok(lock)
+}
+
+fn quota_refresh_operation_timeout(
+    host: &HostContext,
+    request_id: &str,
+) -> Result<Duration, ProviderFailure> {
+    operation_bounds::remaining_timeout(host.deadline_unix_ms, QUOTA_REFRESH_OPERATION_TIMEOUT)
+        .ok_or_else(|| quota_refresh_deadline_exceeded(request_id))
 }
 
 fn quota_refresh_operation_path(
@@ -643,6 +668,22 @@ fn quota_refresh_state_failure(request_id: &str, error: impl std::fmt::Display) 
         request_id,
         "quota_refresh_state_failed",
         format!("failed to preserve quota.refresh_auth request state: {error}"),
+    )
+}
+
+fn quota_refresh_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "quota_refresh_lock_timeout",
+        "quota refresh lock could not be acquired before the operation deadline",
+    )
+}
+
+fn quota_refresh_deadline_exceeded(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "quota_refresh_deadline_exceeded",
+        "quota refresh deadline was reached before the next native effect",
     )
 }
 
@@ -861,8 +902,9 @@ fn quota_observation_without_refresh(
 fn run_account_auth_refresh(
     runtime: &NativeRuntimeContext,
     auth_path: &Path,
+    timeout: Duration,
 ) -> std::io::Result<OpencodeAuthObservation> {
-    crate::opencode::observe_auth_list(runtime, auth_path)
+    crate::opencode::observe_auth_list(runtime, auth_path, timeout)
 }
 
 fn refresh_succeeded(refresh: &std::io::Result<OpencodeAuthObservation>) -> bool {

@@ -164,6 +164,7 @@ pub enum OpencodeImportError {
     Spawn(String),
     Failed { status: Option<i32>, stderr: String },
     MissingSessionId(String),
+    TimedOut,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,14 +327,20 @@ pub fn import_session(
     path: &Path,
     runtime: &NativeRuntimeContext,
     working_directory: &Path,
+    timeout: Duration,
 ) -> Result<String, OpencodeImportError> {
-    let output = runtime
-        .command()
+    let mut command = runtime.command();
+    command
         .current_dir(working_directory)
         .arg("import")
         .arg(path)
-        .output()
-        .map_err(import_spawn_error)?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().map_err(import_spawn_error)?;
+    let output = ChildCustody::new(child)
+        .wait_with_output_timeout(timeout)
+        .map_err(import_spawn_error)?
+        .ok_or(OpencodeImportError::TimedOut)?;
     validate_import_status(&output)?;
     parse_import_stdout(&output.stdout)
 }
@@ -341,9 +348,21 @@ pub fn import_session(
 pub fn observe_auth_list(
     runtime: &NativeRuntimeContext,
     auth_path: &Path,
+    timeout: Duration,
 ) -> std::io::Result<OpencodeAuthObservation> {
     let before = credential_snapshot(auth_path);
-    let output = runtime.command().arg("auth").arg("list").output()?;
+    let mut command = runtime.command();
+    command
+        .arg("auth")
+        .arg("list")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn()?;
+    let output = ChildCustody::new(child)
+        .wait_with_output_timeout(timeout)?
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "opencode auth list timed out")
+        })?;
     let after = credential_snapshot(auth_path);
     Ok(OpencodeAuthObservation {
         output: ShellOutput {

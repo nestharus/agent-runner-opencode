@@ -458,6 +458,65 @@ fn contract_quota_refresh_auth() {
 }
 
 #[test]
+fn contract_quota_refresh_hanging_auth_releases_account_capability_lock() {
+    let runtime = IsolatedQuotaSettings::new();
+    let home = HomeFixture::new("agent-runner-opencode-quota-refresh-timeout-home");
+    let auth_path =
+        home.write_paired_auth(opencode_auth_json("refresh-sentinel", "acct").as_bytes());
+    let timeout_marker = home.path.join("auth-timeout-observed");
+    let fake_curl = FakeNativeCurl::transport_failure(17, "probe unavailable during refresh");
+    let fake_auth = FakeOpencodeAuth::with_script(
+        "opencode3",
+        fake_opencode_auth_timeout_once_script(&timeout_marker, &auth_path),
+    );
+    let path = prepend_paths(&[fake_auth.dir(), &fake_curl.dir]);
+    let env = [("HOME", home.path_str()), ("PATH", path.as_str())];
+
+    let mut first_host = runtime.host_overrides();
+    first_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 500);
+    let first_request = support::validated_request_envelope(
+        "quota.refresh_auth",
+        quota_refresh_auth_params(),
+        first_host,
+        "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
+    );
+    support::ensure_default_runtime_settings(&first_request);
+    let started = std::time::Instant::now();
+    let first = support::invoke_with_request_and_env("quota.refresh_auth", first_request, &env);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a stalled auth child must be terminated within the request bound"
+    );
+    assert_eq!(first.status.code(), Some(2));
+    let first_response = json_stdout(&first);
+    support::assert_valid(
+        &first_response,
+        "quota.schema.json#/$defs/QuotaRefreshAuthErrorResponse",
+    );
+    assert_eq!(
+        first_response["error"]["code"],
+        "quota_refresh_reconciliation_required"
+    );
+    assert!(timeout_marker.exists(), "the hanging auth path must run");
+
+    let mut second_host = runtime.host_overrides();
+    second_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 1_500);
+    let second_request = support::validated_request_envelope(
+        "quota.refresh_auth",
+        quota_refresh_auth_params(),
+        second_host,
+        "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
+    );
+    support::ensure_default_runtime_settings(&second_request);
+    let second = success_result(
+        support::invoke_with_request_and_env("quota.refresh_auth", second_request, &env),
+        "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+        "quota.schema.json#/$defs/QuotaRefreshAuthResult",
+    );
+    assert_refresh_auth_result(&second);
+}
+
+#[test]
 fn contract_quota_refresh_auth_replays_committed_observation_after_response_loss() {
     let runtime = IsolatedQuotaSettings::new();
     let fixture = RefreshAuthFixture::new();

@@ -678,6 +678,22 @@ exit 0\n",
     )
 }
 
+pub fn fake_opencode_auth_timeout_once_script(marker: &Path, auth_path: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ ! -e {} ]; then\n\
+  : > {}\n\
+  exec /bin/sleep 30\n\
+fi\n\
+printf '%s' {} > {}\n\
+exit 0\n",
+        shell_single_quote(&marker.to_string_lossy()),
+        shell_single_quote(&marker.to_string_lossy()),
+        shell_single_quote(&opencode_auth_json("sentinel-refreshed", "acct")),
+        shell_single_quote(&auth_path.to_string_lossy()),
+    )
+}
+
 pub fn optional_usage_log(log_path: &Path) -> String {
     fs::read_to_string(log_path).unwrap_or_default()
 }

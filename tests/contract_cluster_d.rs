@@ -1215,6 +1215,57 @@ fn contract_rotation_assess_materialize() {
     host_owned.assert_unchanged();
 }
 
+#[test]
+fn contract_rotation_hanging_import_releases_global_capability_lock() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-import-timeout");
+    let opencode = RotationOpencodeFixture::with_hanging_import();
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let mut bounded_host = host.overrides();
+    bounded_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 500);
+    let path = opencode.path_env();
+    let started = std::time::Instant::now();
+    let failed = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        bounded_host,
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(failed["error"]["code"], "rotation_import_failed");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a stalled import must be terminated within the request bound"
+    );
+    assert!(
+        !opencode.import_was_attempted(),
+        "the timed-out import must be killed before the fixture records an effect"
+    );
+
+    let mut follow_up_host = host.overrides();
+    follow_up_host["deadline_unix_ms"] =
+        json!(agent_runner_opencode::encoding::now_unix_ms() + 500);
+    let follow_up = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_params(false),
+            follow_up_host,
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    assert_rotation_denied(&follow_up);
+}
+
 #[cfg(unix)]
 #[test]
 fn contract_rotation_recovers_post_import_pre_receipt_failure_without_reimport() {

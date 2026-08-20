@@ -134,18 +134,22 @@ pub struct RotationOpencodeFixture {
 
 impl RotationOpencodeFixture {
     pub fn new() -> Self {
-        Self::configured(false, None)
+        Self::configured(false, None, false)
     }
 
     pub fn with_post_import_finalization_fault() -> Self {
-        Self::configured(true, None)
+        Self::configured(true, None, false)
     }
 
     pub fn with_post_import_finalization_fault_and_target_id(target_session_id: &str) -> Self {
-        Self::configured(true, Some(target_session_id))
+        Self::configured(true, Some(target_session_id), false)
     }
 
-    fn configured(inject_fault: bool, target_session_id: Option<&str>) -> Self {
+    pub fn with_hanging_import() -> Self {
+        Self::configured(false, None, true)
+    }
+
+    fn configured(inject_fault: bool, target_session_id: Option<&str>, hang_import: bool) -> Self {
         let root = unique_temp_dir("agent-runner-opencode-rotation-native");
         fs::create_dir_all(&root).expect("create rotation native fixture");
         let import_record = root.join("imported-session.json");
@@ -165,6 +169,7 @@ impl RotationOpencodeFixture {
                 &import_count_record,
                 finalization_fault_marker.as_deref(),
                 target_session_id,
+                hang_import,
             ),
         );
         Self {
@@ -268,6 +273,7 @@ fn rotation_target_script(
     import_count_record: &Path,
     finalization_fault_marker: Option<&Path>,
     target_session_id: Option<&str>,
+    hang_import: bool,
 ) -> String {
     let fault_marker = finalization_fault_marker
         .map(path_string)
@@ -277,6 +283,7 @@ fn rotation_target_script(
 import json
 import pathlib
 import sys
+import time
 
 if len(sys.argv) != 3:
     raise SystemExit(64)
@@ -290,6 +297,8 @@ if sys.argv[1] == "export":
     raise SystemExit(0)
 if sys.argv[1] != "import":
     raise SystemExit(64)
+if {hang_import}:
+    time.sleep(30)
 native = json.loads(pathlib.Path(sys.argv[2]).read_text())
 target_session_id = {target_session_id}
 if target_session_id:
@@ -322,6 +331,7 @@ print("Imported session: " + native["info"]["id"])
         },
         target_session_id =
             serde_json::to_string(target_session_id.unwrap_or("")).expect("target session id JSON"),
+        hang_import = if hang_import { "True" } else { "False" },
     )
 }
 
