@@ -33,6 +33,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
+#[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);
 const COMPLETED_RESUME_GRACE: Duration = Duration::from_millis(500);
 const RESUME_COMPLETION_PROBE_DELAY: Duration = Duration::from_secs(1);
@@ -104,6 +105,7 @@ struct LaunchRequestState {
     prompt_sha256: Option<String>,
     recovery: LaunchRecoveryIdentity,
     phase: LaunchRequestPhase,
+    actor_process_group_id: Option<u32>,
     provider_session_id: Option<String>,
     terminal_status: Option<Value>,
     prepared_at_unix_ms: u64,
@@ -161,6 +163,7 @@ struct ResumeLaunchRequestState {
     observation: DurableResumeObservationRequest,
     recovery: LaunchRecoveryIdentity,
     phase: ResumeLaunchRequestPhase,
+    actor_process_group_id: Option<u32>,
     terminal_status: Option<Value>,
     prepared_at_unix_ms: u64,
     observed_at_unix_ms: Option<u64>,
@@ -318,6 +321,13 @@ pub(crate) fn stream<W: Write>(
     let mut custody = ChildCustody::with_cleanup(child, |child| {
         let _ = terminate_child(child);
     });
+    let actor_process_group_id = custody.child_mut().id();
+    if let Some(launch_request) = state.launch_request.as_mut() {
+        launch_request.observe_actor(actor_process_group_id)?;
+    }
+    if let Some(launch_request) = state.resume_launch_request.as_mut() {
+        launch_request.observe_actor(actor_process_group_id)?;
+    }
     stream_child(custody.child_mut(), &mut state, writer).map(|exit_code| LaunchOutcome {
         exit_code,
         activity_targets: effective.activity_targets,
@@ -726,6 +736,7 @@ fn utf8_payload_bytes(payload: &BytePayload) -> Vec<u8> {
     payload.data.as_bytes().to_vec()
 }
 
+#[cfg(unix)]
 fn spawn_child(
     argv: &[String],
     working_directory: &str,
@@ -740,6 +751,20 @@ fn spawn_child(
     command.spawn()
 }
 
+#[cfg(not(unix))]
+fn spawn_child(
+    _argv: &[String],
+    _working_directory: &str,
+    _env: &BTreeMap<String, String>,
+    _stdin: Stdio,
+) -> std::io::Result<Child> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native launch requires Unix process-group custody",
+    ))
+}
+
+#[cfg(unix)]
 fn child_command(argv: &[String], working_directory: &str, stdin: Stdio) -> Command {
     let mut command = Command::new(&argv[0]);
     command
@@ -762,6 +787,7 @@ fn prepared_child_stdin(stdin: Option<&[u8]>) -> std::io::Result<Stdio> {
     Ok(Stdio::from(staged))
 }
 
+#[cfg(unix)]
 fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut env = launch_passthrough_env();
     // Explicitly declared values take precedence over ambient passthrough.
@@ -973,6 +999,11 @@ impl LaunchRequestGuard {
                 match state.phase {
                     LaunchRequestPhase::Prepared => {
                         validate_launch_recovery_context(&state.recovery, &recovery, request_id)?;
+                        require_prior_actor_terminal(
+                            state.actor_process_group_id,
+                            request_id,
+                            &state.binding_sha256,
+                        )?;
                         match recover_prepared_launch(&state, &recovery.declared_env, request_id)? {
                             PreparedLaunchRecovery::NoEffectObserved => {
                                 remove_launch_request_state(&state_path, request_id)?;
@@ -1013,6 +1044,7 @@ impl LaunchRequestGuard {
             prompt_sha256,
             recovery: recovery.identity,
             phase: LaunchRequestPhase::Prepared,
+            actor_process_group_id: None,
             provider_session_id: None,
             terminal_status: None,
             prepared_at_unix_ms: now_unix_ms(),
@@ -1045,6 +1077,16 @@ impl LaunchRequestGuard {
         self.state.provider_session_id = Some(provider_session_id.to_string());
         self.state.terminal_status = None;
         self.state.observed_at_unix_ms = Some(now_unix_ms());
+        write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
+    }
+
+    fn observe_actor(&mut self, process_group_id: u32) -> Result<(), ProviderFailure> {
+        observe_launch_actor(
+            &mut self.state.actor_process_group_id,
+            process_group_id,
+            &self.state.request_id,
+            &self.state.binding_sha256,
+        )?;
         write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
     }
 
@@ -1114,6 +1156,13 @@ impl ResumeLaunchRequestGuard {
                     ResumeLaunchRequestPhase::Prepared
                     | ResumeLaunchRequestPhase::Unresolved
                     | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
+                        if state.phase == ResumeLaunchRequestPhase::Prepared {
+                            require_prior_actor_terminal(
+                                state.actor_process_group_id,
+                                request_id,
+                                &state.binding_sha256,
+                            )?;
+                        }
                         let recovered = observe_durable_resume(
                             &state.observation,
                             &state.recovery,
@@ -1150,6 +1199,7 @@ impl ResumeLaunchRequestGuard {
             observation,
             recovery: recovery.identity,
             phase: ResumeLaunchRequestPhase::Prepared,
+            actor_process_group_id: None,
             terminal_status: None,
             prepared_at_unix_ms: now_unix_ms(),
             observed_at_unix_ms: None,
@@ -1169,6 +1219,16 @@ impl ResumeLaunchRequestGuard {
             &self.state.recovery,
             &self.declared_env,
         )
+    }
+
+    fn observe_actor(&mut self, process_group_id: u32) -> Result<(), ProviderFailure> {
+        observe_launch_actor(
+            &mut self.state.actor_process_group_id,
+            process_group_id,
+            &self.state.request_id,
+            &self.state.binding_sha256,
+        )?;
+        write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
     }
 
     fn settle(
@@ -1291,6 +1351,55 @@ fn observe_durable_resume(
         &recovery.working_directory,
         &env,
     )
+}
+
+fn observe_launch_actor(
+    committed: &mut Option<u32>,
+    observed: u32,
+    request_id: &str,
+    binding_sha256: &str,
+) -> Result<(), ProviderFailure> {
+    match *committed {
+        Some(existing) if existing == observed => Ok(()),
+        Some(existing) => Err(ProviderFailure::conflict(
+            request_id,
+            "launch_actor_conflict",
+            "one launch request observed conflicting native process-group identities",
+            json!({
+                "binding_sha256": binding_sha256,
+                "committed_process_group_id": existing,
+                "observed_process_group_id": observed,
+            }),
+        )),
+        None => {
+            *committed = Some(observed);
+            Ok(())
+        }
+    }
+}
+
+fn require_prior_actor_terminal(
+    process_group_id: Option<u32>,
+    request_id: &str,
+    binding_sha256: &str,
+) -> Result<(), ProviderFailure> {
+    let Some(process_group_id) = process_group_id else {
+        return Err(launch_actor_reconciliation_required(
+            request_id,
+            binding_sha256,
+            None,
+            "the provider stopped before durably publishing the admitted native actor",
+        ));
+    };
+    if launch_process_group_is_live(process_group_id) {
+        return Err(launch_actor_reconciliation_required(
+            request_id,
+            binding_sha256,
+            Some(process_group_id),
+            "the previously admitted native process group is still alive",
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_launch_program(
@@ -1569,11 +1678,13 @@ fn validate_launch_request_state(
                 .provider_session_id
                 .as_deref()
                 .is_some_and(|session_id| !session_id.trim().is_empty())
+                && state.actor_process_group_id.is_some_and(|id| id > 0)
                 && state.terminal_status.is_none()
                 && state.observed_at_unix_ms.is_some()
         }
         LaunchRequestPhase::TerminalWithoutSession => {
             state.provider_session_id.is_none()
+                && state.actor_process_group_id.is_some_and(|id| id > 0)
                 && state.terminal_status.as_ref().is_some_and(Value::is_object)
                 && state.observed_at_unix_ms.is_some()
         }
@@ -1588,6 +1699,7 @@ fn validate_launch_request_state(
         && !state.recovery.provider_id.trim().is_empty()
         && !state.recovery.model_id.trim().is_empty()
         && !state.recovery.effort.trim().is_empty()
+        && state.actor_process_group_id.is_none_or(|id| id > 0)
         && phase_valid
     {
         return Ok(());
@@ -1610,7 +1722,8 @@ fn validate_resume_launch_request_state(
         | ResumeLaunchRequestPhase::CompletionObserved
         | ResumeLaunchRequestPhase::Unresolved
         | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
-            state.observed_at_unix_ms.is_some()
+            state.actor_process_group_id.is_some_and(|id| id > 0)
+                && state.observed_at_unix_ms.is_some()
                 && state.terminal_status.as_ref().is_none_or(Value::is_object)
         }
     };
@@ -1631,6 +1744,7 @@ fn validate_resume_launch_request_state(
         && state.recovery.provider_id == observation.provider_id
         && state.recovery.model_id == observation.model_id
         && state.recovery.effort == observation.variant
+        && state.actor_process_group_id.is_none_or(|id| id > 0)
         && phase_valid
     {
         return Ok(());
@@ -1734,6 +1848,25 @@ fn launch_terminal_reconciliation_required(
             "prompt_sha256": state.prompt_sha256,
             "terminal_status": state.terminal_status,
             "required_action": "reconcile the durable terminal before deciding whether a distinct request should retry",
+        }),
+    )
+}
+
+fn launch_actor_reconciliation_required(
+    request_id: &str,
+    binding_sha256: &str,
+    process_group_id: Option<u32>,
+    reason: &str,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "launch_actor_reconciliation_required",
+        "prepared launch still has an unresolved native actor and will not spawn independent work",
+        json!({
+            "binding_sha256": binding_sha256,
+            "process_group_id": process_group_id,
+            "reason": reason,
+            "required_action": "confirm the prior native actor is terminal and reconcile any provider effect before submitting a distinct request",
         }),
     )
 }
@@ -2758,8 +2891,21 @@ fn process_group_setup_failed(result: i32) -> bool {
     result == -1
 }
 
+#[cfg(unix)]
+fn launch_process_group_is_live(process_group_id: u32) -> bool {
+    let Ok(process_group_id) = i32::try_from(process_group_id) else {
+        return true;
+    };
+    if unsafe { kill(-process_group_id, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 #[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
+fn launch_process_group_is_live(_process_group_id: u32) -> bool {
+    true
+}
 
 #[cfg(unix)]
 fn terminate_child(child: &mut Child) -> Option<ExitStatus> {

@@ -118,8 +118,14 @@ write cannot discard the responsible successor. An exact retry returns an
 observed session or terminal for reconciliation. A request left merely
 prepared by an interrupted provider invocation runs native session discovery,
 using the original passthrough environment plus the exact request-bound
-declared environment. It binds a matching session when present and readmits
+declared environment. Every Unix child process group is durably attached to
+the prepared request before supervision. Recovery refuses readmission while
+that actor is live, and an interruption before actor publication remains
+explicitly unresolved rather than guessing that no child exists. Once the
+actor is terminal, recovery binds a matching session when present and readmits
 the request only after an exhaustive same-context list proves no effect.
+Non-Unix builds do not admit native launch because they cannot provide this
+process-group custody contract.
 Reusing the request ID with different launch inputs is rejected as a conflict.
 
 For resumed sessions, model switching is allowed per turn. Delivery and

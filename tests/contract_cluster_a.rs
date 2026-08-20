@@ -5,7 +5,14 @@ mod support;
 
 use cluster_a::*;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use support::{invoke_validated, invoke_with_env, invoke_with_host_and_env, json_stdout};
+
+#[cfg(unix)]
+extern "C" {
+    fn setpgid(pid: i32, pgid: i32) -> i32;
+}
 
 struct FailAfterFirstLaunchEvent {
     completed_events: usize,
@@ -236,7 +243,8 @@ fn contract_launch_route_handoff_failure_releases_request_before_spawn() {
 }
 
 #[test]
-fn contract_launch_prepared_recovery_proves_no_effect_before_readmission() {
+#[cfg(unix)]
+fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() {
     let provider_session_id = "ses_prepared_recovery_readmission";
     let fake_wrapper = FakeOpencodeWrapper::with_counted_new_session(provider_session_id);
     let path = prepend_path(fake_wrapper.dir());
@@ -302,32 +310,81 @@ fn contract_launch_prepared_recovery_proves_no_effect_before_readmission() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("current time")
         .as_millis() as u64;
+    let mut prepared_state = serde_json::json!({
+        "schema_version": 4,
+        "operation_kind": "new_session",
+        "request_id": request_id,
+        "binding_sha256": binding_sha256,
+        "prompt_sha256": prompt_sha256,
+        "recovery": {
+            "program": fake_wrapper.dir().join("opencode1").to_string_lossy(),
+            "passthrough_env": {},
+            "declared_env_sha256": declared_env_sha256,
+            "working_directory": env!("CARGO_MANIFEST_DIR"),
+            "provider_id": "openai",
+            "model_id": "gpt-5.6-sol",
+            "effort": "low"
+        },
+        "phase": "prepared",
+        "actor_process_group_id": null,
+        "provider_session_id": null,
+        "terminal_status": null,
+        "prepared_at_unix_ms": prepared_at_unix_ms,
+        "observed_at_unix_ms": null
+    });
     fs::write(
-        state_path,
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 4,
-            "operation_kind": "new_session",
-            "request_id": request_id,
-            "binding_sha256": binding_sha256,
-            "prompt_sha256": prompt_sha256,
-            "recovery": {
-                "program": fake_wrapper.dir().join("opencode1").to_string_lossy(),
-                "passthrough_env": {},
-                "declared_env_sha256": declared_env_sha256,
-                "working_directory": env!("CARGO_MANIFEST_DIR"),
-                "provider_id": "openai",
-                "model_id": "gpt-5.6-sol",
-                "effort": "low"
-            },
-            "phase": "prepared",
-            "provider_session_id": null,
-            "terminal_status": null,
-            "prepared_at_unix_ms": prepared_at_unix_ms,
-            "observed_at_unix_ms": null
-        }))
-        .expect("serialize prepared launch state"),
+        &state_path,
+        serde_json::to_vec(&prepared_state).expect("serialize prepared launch state"),
     )
     .expect("write prepared launch state");
+
+    let unpublished = json_stdout(&support::invoke_with_request("launch", request.clone()));
+    assert_eq!(
+        unpublished["error"]["code"],
+        "launch_actor_reconciliation_required"
+    );
+    assert!(unpublished["error"]["details"]["process_group_id"].is_null());
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "an ambiguously unpublished actor must prevent a second native spawn"
+    );
+
+    let mut prior_actor_command = std::process::Command::new("/bin/sleep");
+    prior_actor_command.arg("30");
+    unsafe {
+        prior_actor_command.pre_exec(|| {
+            if setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut prior_actor = prior_actor_command
+        .spawn()
+        .expect("spawn prior launch actor");
+    prepared_state["actor_process_group_id"] = serde_json::json!(prior_actor.id());
+    fs::write(
+        &state_path,
+        serde_json::to_vec(&prepared_state).expect("serialize actor-bound launch state"),
+    )
+    .expect("write actor-bound launch state");
+
+    let held = json_stdout(&support::invoke_with_request("launch", request.clone()));
+    assert_eq!(
+        held["error"]["code"],
+        "launch_actor_reconciliation_required"
+    );
+    assert_eq!(
+        held["error"]["details"]["process_group_id"],
+        prior_actor.id()
+    );
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "a live prior actor must prevent a second native spawn"
+    );
+
+    prior_actor.kill().expect("terminate prior launch actor");
+    prior_actor.wait().expect("reap prior launch actor");
 
     let replay = support::invoke_with_request("launch", request);
     assert_output_success(&replay, "recovered prepared launch");
