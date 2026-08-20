@@ -734,7 +734,7 @@ fn contract_oversized_predecessor_store_stays_routable_during_in_band_recovery()
         .expect("create predecessor settings root");
     let mut values = opencode_settings_values(None);
     values["extra_env"] = json!({
-        "PREDECESSOR_PAYLOAD": "x".repeat(4 * 1024 * 1024)
+        "PREDECESSOR_PAYLOAD": "x".repeat(15 * 1024 * 1024)
     });
     let predecessor_bytes = serde_json::to_vec(&json!({
         "records": [{
@@ -746,6 +746,7 @@ fn contract_oversized_predecessor_store_stays_routable_during_in_band_recovery()
     }))
     .expect("serialize predecessor store");
     assert!(predecessor_bytes.len() > 4 * 1024 * 1024);
+    assert!(predecessor_bytes.len() < 16 * 1024 * 1024);
     assert!(predecessor_bytes.starts_with(br#"{"records":["#));
     fs::write(&store_path, predecessor_bytes).expect("write predecessor settings store");
 
@@ -817,6 +818,78 @@ fn contract_oversized_predecessor_store_stays_routable_during_in_band_recovery()
         "settings.schema.json#/$defs/SettingsGetResult",
     );
     assert_eq!(remaining["record"]["id"], "predecessor-0");
+}
+
+#[test]
+fn contract_predecessor_store_above_transition_envelope_fails_explicitly() {
+    let host = HostRoots::new("agent-runner-opencode-settings-predecessor-capacity-unsupported");
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(store_path.parent().expect("settings store parent"))
+        .expect("create predecessor settings root");
+    let mut values = opencode_settings_values(None);
+    values["extra_env"] = json!({
+        "PREDECESSOR_PAYLOAD": "x".repeat(16 * 1024 * 1024)
+    });
+    let predecessor_bytes = serde_json::to_vec(&json!({
+        "records": [{
+            "id": "unsupported-predecessor-0",
+            "display_name": "Unsupported predecessor profile",
+            "version": "predecessor-v1",
+            "values": values,
+        }]
+    }))
+    .expect("serialize predecessor store above transition envelope");
+    assert!(predecessor_bytes.len() > 16 * 1024 * 1024);
+    fs::write(&store_path, predecessor_bytes).expect("write unsupported predecessor store");
+
+    let rejected = error_response(invoke_validated_with_host(
+        "settings.list",
+        empty_request_params(),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsListRequest",
+    ));
+    assert_eq!(
+        rejected["error"]["code"],
+        "settings_store_capacity_unsupported"
+    );
+}
+
+#[test]
+fn contract_predecessor_store_above_transition_record_envelope_fails_explicitly() {
+    let host = HostRoots::new("agent-runner-opencode-settings-predecessor-record-unsupported");
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(store_path.parent().expect("settings store parent"))
+        .expect("create predecessor settings root");
+    let values = opencode_settings_values(None);
+    let records = (0..4_097)
+        .map(|index| {
+            json!({
+                "id": format!("unsupported-record-{index}"),
+                "display_name": format!("Unsupported predecessor profile {index}"),
+                "version": "predecessor-v1",
+                "values": values,
+            })
+        })
+        .collect::<Vec<_>>();
+    let predecessor_bytes =
+        serde_json::to_vec(&json!({ "records": records })).expect("serialize predecessor store");
+    assert!(predecessor_bytes.len() < 16 * 1024 * 1024);
+    fs::write(&store_path, predecessor_bytes).expect("write unsupported predecessor store");
+
+    let rejected = error_response(invoke_validated_with_host(
+        "settings.list",
+        empty_request_params(),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsListRequest",
+    ));
+    assert_eq!(
+        rejected["error"]["code"],
+        "settings_store_capacity_unsupported"
+    );
 }
 
 #[test]
@@ -1742,6 +1815,92 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
         "rotation.schema.json#/$defs/RotationAssessResult",
     );
     assert_rotation_denied(&follow_up);
+}
+
+#[test]
+fn contract_rotation_oversized_export_is_bounded_and_releases_global_capability_lock() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-export-capacity");
+    let opencode = RotationOpencodeFixture::with_oversized_export();
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let path = opencode.path_env();
+    let started = std::time::Instant::now();
+    let failed = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(failed["error"]["code"], "rotation_export_capacity_exceeded");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "an oversized export must be drained with bounded retention and rejected promptly"
+    );
+    assert!(!opencode.import_was_attempted());
+
+    let follow_up = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_params(false),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    assert_rotation_denied(&follow_up);
+}
+
+#[test]
+fn contract_rotation_large_supported_artifact_completes_inside_global_lock_budget() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-large-supported-artifact");
+    let opencode = RotationOpencodeFixture::with_large_export();
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let path = opencode.path_env();
+    let started = std::time::Instant::now();
+    let materialized = success_result(
+        invoke_validated_with_host_and_env(
+            "rotation.materialize",
+            rotation_materialize_params(),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            &[("PATH", path.as_str())],
+        ),
+        "rotation.schema.json#/$defs/RotationMaterializeResponse",
+        "rotation.schema.json#/$defs/RotationMaterializeResult",
+    );
+    assert_rotation_materialized(&materialized);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "a supported near-envelope artifact must complete within the provider budget"
+    );
+    let artifact_path = materialized["artifacts"][0]["path"]
+        .as_str()
+        .expect("rotation source artifact path");
+    let artifact_bytes = fs::metadata(artifact_path)
+        .expect("rotation source artifact metadata")
+        .len();
+    assert!(artifact_bytes > 15 * 1024 * 1024);
+    assert!(artifact_bytes < 16 * 1024 * 1024);
+    assert_eq!(opencode.import_count(), 1);
 }
 
 #[cfg(unix)]

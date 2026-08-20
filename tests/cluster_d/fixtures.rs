@@ -130,22 +130,35 @@ pub struct RotationOpencodeFixture {
 
 impl RotationOpencodeFixture {
     pub fn new() -> Self {
-        Self::configured(false, None, false)
+        Self::configured(false, None, false, 0)
     }
 
     pub fn with_post_import_finalization_fault() -> Self {
-        Self::configured(true, None, false)
+        Self::configured(true, None, false, 0)
     }
 
     pub fn with_post_import_finalization_fault_and_target_id(target_session_id: &str) -> Self {
-        Self::configured(true, Some(target_session_id), false)
+        Self::configured(true, Some(target_session_id), false, 0)
     }
 
     pub fn with_hanging_import() -> Self {
-        Self::configured(false, None, true)
+        Self::configured(false, None, true, 0)
     }
 
-    fn configured(inject_fault: bool, target_session_id: Option<&str>, hang_import: bool) -> Self {
+    pub fn with_oversized_export() -> Self {
+        Self::configured(false, None, false, 16 * 1024 * 1024)
+    }
+
+    pub fn with_large_export() -> Self {
+        Self::configured(false, None, false, 15 * 1024 * 1024)
+    }
+
+    fn configured(
+        inject_fault: bool,
+        target_session_id: Option<&str>,
+        hang_import: bool,
+        export_payload_bytes: usize,
+    ) -> Self {
         let root = unique_temp_dir("agent-runner-opencode-rotation-native");
         fs::create_dir_all(&root).expect("create rotation native fixture");
         let import_record = root.join("imported-session.json");
@@ -156,7 +169,10 @@ impl RotationOpencodeFixture {
         if let Some(marker) = &finalization_fault_marker {
             fs::write(marker, b"armed\n").expect("arm post-import finalization fault");
         }
-        write_executable(&root.join("opencode1"), &rotation_source_script());
+        write_executable(
+            &root.join("opencode1"),
+            &rotation_source_script(export_payload_bytes),
+        );
         write_executable(
             &root.join("opencode2"),
             &rotation_target_script(
@@ -229,7 +245,7 @@ impl Drop for RotationOpencodeFixture {
     }
 }
 
-fn rotation_source_script() -> String {
+fn rotation_source_script(export_payload_bytes: usize) -> String {
     r#"#!/usr/bin/python3
 import json
 import sys
@@ -257,10 +273,15 @@ native = {
     }],
     "nativeRoot": {"preserved": True}
 }
+if __EXPORT_PAYLOAD_BYTES__:
+    native["nativeRoot"]["payload"] = "x" * __EXPORT_PAYLOAD_BYTES__
 print("Exporting session: " + session_id)
 print(json.dumps(native))
 "#
-    .to_string()
+    .replace(
+        "__EXPORT_PAYLOAD_BYTES__",
+        &export_payload_bytes.to_string(),
+    )
 }
 
 fn rotation_target_script(

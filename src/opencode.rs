@@ -16,11 +16,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use wait_timeout::ChildExt;
+
+pub const MAX_EXPORT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_NATIVE_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 pub struct EventParser {
@@ -147,8 +150,15 @@ impl OpencodeExport {
 #[derive(Debug)]
 pub enum OpencodeExportError {
     Spawn(String),
-    Failed { status: Option<i32>, stderr: String },
+    Failed {
+        status: Option<i32>,
+        stderr: String,
+    },
     InvalidJson(String),
+    OutputTooLarge {
+        stream: &'static str,
+        maximum_bytes: usize,
+    },
     TimedOut,
 }
 
@@ -162,8 +172,15 @@ pub enum OpencodeSessionListError {
 #[derive(Debug)]
 pub enum OpencodeImportError {
     Spawn(String),
-    Failed { status: Option<i32>, stderr: String },
+    Failed {
+        status: Option<i32>,
+        stderr: String,
+    },
     MissingSessionId(String),
+    OutputTooLarge {
+        stream: &'static str,
+        maximum_bytes: usize,
+    },
     TimedOut,
 }
 
@@ -274,6 +291,7 @@ pub fn export_with_launch_context(
     run_export_command(command, timeout)
 }
 
+#[cfg(unix)]
 fn run_export_command(
     mut command: Command,
     timeout: Duration,
@@ -283,26 +301,44 @@ fn run_export_command(
     command
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::piped());
+    constrain_export_file_size(&mut command);
     let child = command.spawn().map_err(export_spawn_error)?;
-    let mut custody = ChildCustody::new(child);
-    let completed = custody
-        .child_mut()
-        .wait_timeout(timeout)
+    let output = ChildCustody::new(child)
+        .wait_with_bounded_output_timeout(timeout, 0, MAX_NATIVE_COMMAND_OUTPUT_BYTES)
         .map_err(export_spawn_error)?
-        .is_some();
-    if !completed {
-        return Err(OpencodeExportError::TimedOut);
-    }
-    let output = custody.wait_with_output().map_err(export_spawn_error)?;
+        .ok_or(OpencodeExportError::TimedOut)?;
+    let stdout_bytes = stdout.metadata().map_err(export_capture_error)?.len() as usize;
+    validate_bounded_export_output(&output, stdout_bytes)?;
     validate_export_status(&output)?;
     stdout
         .seek(SeekFrom::Start(0))
         .map_err(export_capture_error)?;
-    let mut bytes = Vec::new();
-    stdout
+    let mut bytes = Vec::with_capacity(stdout_bytes);
+    (&mut stdout)
+        .take(MAX_EXPORT_OUTPUT_BYTES.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .map_err(export_capture_error)?;
     parse_export_stdout(&bytes)
+}
+
+#[cfg(not(unix))]
+fn run_export_command(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<OpencodeExport, OpencodeExportError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().map_err(export_spawn_error)?;
+    let output = ChildCustody::new(child)
+        .wait_with_bounded_output_timeout(
+            timeout,
+            MAX_EXPORT_OUTPUT_BYTES,
+            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+        )
+        .map_err(export_spawn_error)?
+        .ok_or(OpencodeExportError::TimedOut)?;
+    validate_bounded_export_output(&output, output.stdout.len())?;
+    validate_export_status(&output)?;
+    parse_export_stdout(&output.stdout)
 }
 
 pub fn session_list(
@@ -338,9 +374,14 @@ pub fn import_session(
         .stderr(Stdio::piped());
     let child = command.spawn().map_err(import_spawn_error)?;
     let output = ChildCustody::new(child)
-        .wait_with_output_timeout(timeout)
+        .wait_with_bounded_output_timeout(
+            timeout,
+            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+        )
         .map_err(import_spawn_error)?
         .ok_or(OpencodeImportError::TimedOut)?;
+    validate_bounded_import_output(&output)?;
     validate_import_status(&output)?;
     parse_import_stdout(&output.stdout)
 }
@@ -359,10 +400,25 @@ pub fn observe_auth_list(
         .stderr(Stdio::piped());
     let child = command.spawn()?;
     let output = ChildCustody::new(child)
-        .wait_with_output_timeout(timeout)?
+        .wait_with_bounded_output_timeout(
+            timeout,
+            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+        )?
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "opencode auth list timed out")
         })?;
+    if output.stdout.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES
+        || output.stderr.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "opencode auth list output exceeds supported {}-byte per-stream bound",
+                MAX_NATIVE_COMMAND_OUTPUT_BYTES
+            ),
+        ));
+    }
     let after = credential_snapshot(auth_path);
     Ok(OpencodeAuthObservation {
         output: ShellOutput {
@@ -431,12 +487,68 @@ fn export_spawn_error(err: std::io::Error) -> OpencodeExportError {
     OpencodeExportError::Spawn(err.to_string())
 }
 
+#[cfg(unix)]
 fn export_capture_error(err: std::io::Error) -> OpencodeExportError {
     OpencodeExportError::Spawn(format!("failed to capture opencode export: {err}"))
 }
 
 fn import_spawn_error(err: std::io::Error) -> OpencodeImportError {
     OpencodeImportError::Spawn(err.to_string())
+}
+
+fn validate_bounded_export_output(
+    output: &std::process::Output,
+    stdout_bytes: usize,
+) -> Result<(), OpencodeExportError> {
+    if stdout_bytes > MAX_EXPORT_OUTPUT_BYTES {
+        return Err(OpencodeExportError::OutputTooLarge {
+            stream: "stdout",
+            maximum_bytes: MAX_EXPORT_OUTPUT_BYTES,
+        });
+    }
+    if output.stderr.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES {
+        return Err(OpencodeExportError::OutputTooLarge {
+            stream: "stderr",
+            maximum_bytes: MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn constrain_export_file_size(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    let maximum_with_sentinel = MAX_EXPORT_OUTPUT_BYTES.saturating_add(1) as libc::rlim_t;
+    unsafe {
+        command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: maximum_with_sentinel,
+                rlim_max: maximum_with_sentinel,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn validate_bounded_import_output(
+    output: &std::process::Output,
+) -> Result<(), OpencodeImportError> {
+    for (stream, bytes) in [
+        ("stdout", output.stdout.as_slice()),
+        ("stderr", output.stderr.as_slice()),
+    ] {
+        if bytes.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES {
+            return Err(OpencodeImportError::OutputTooLarge {
+                stream,
+                maximum_bytes: MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn session_list_spawn_error(err: std::io::Error) -> OpencodeSessionListError {

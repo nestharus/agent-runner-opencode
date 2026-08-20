@@ -16,11 +16,41 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTHORIZATION_TTL: Duration = Duration::from_secs(10 * 60);
 const ROTATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_ROTATION_ARTIFACT_BYTES: usize = opencode::MAX_EXPORT_OUTPUT_BYTES;
+const MAX_ROTATION_STATE_BYTES: usize = 1024 * 1024;
 const ROTATION_STATE_DIR: &str = "provider-state/opencode/rotation";
+
+struct RotationBudget {
+    started: Instant,
+    host_deadline_unix_ms: Option<u64>,
+}
+
+impl RotationBudget {
+    fn new(host: &HostContext) -> Self {
+        Self {
+            started: Instant::now(),
+            host_deadline_unix_ms: host.deadline_unix_ms,
+        }
+    }
+
+    fn remaining(&self, request_id: &str) -> Result<Duration, ProviderFailure> {
+        let provider_remaining = ROTATION_OPERATION_TIMEOUT.saturating_sub(self.started.elapsed());
+        if provider_remaining.is_zero() {
+            return Err(rotation_deadline_exceeded(request_id));
+        }
+        operation_bounds::remaining_timeout(self.host_deadline_unix_ms, provider_remaining)
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| rotation_deadline_exceeded(request_id))
+    }
+
+    fn checkpoint(&self, request_id: &str) -> Result<(), ProviderFailure> {
+        self.remaining(request_id).map(|_| ())
+    }
+}
 
 pub fn assess_params(
     host: &HostContext,
@@ -28,6 +58,7 @@ pub fn assess_params(
     request_id: &str,
     provider_instance_id: &str,
 ) -> Result<Value, ProviderFailure> {
+    let budget = RotationBudget::new(host);
     let requirements = requirements(&params);
     let met = requirements_met(&requirements);
     let facts_allow = facts_allow_rotation(&params);
@@ -37,8 +68,10 @@ pub fn assess_params(
         && facts_allow
         && binding.source_provider_id != binding.target_provider_id
         && binding.source_account.opencode_wrapper != binding.target_account.opencode_wrapper;
-    let _lock = acquire_rotation_lock(host, request_id)?;
+    let _lock = acquire_rotation_lock(host, &budget, request_id)?;
+    budget.checkpoint(request_id)?;
     let authorization = persist_assessment_decision(host, &binding, allowed, request_id)?;
+    budget.checkpoint(request_id)?;
     Ok(assess_result(
         allowed,
         &requirements,
@@ -54,12 +87,17 @@ pub fn materialize_params(
     request_id: &str,
     provider_instance_id: &str,
 ) -> Result<Value, ProviderFailure> {
+    let budget = RotationBudget::new(host);
     let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
-    let _lock = acquire_rotation_lock(host, request_id)?;
+    let _lock = acquire_rotation_lock(host, &budget, request_id)?;
+    budget.checkpoint(request_id)?;
     if let Some(result) = read_materialization_receipt(host, &binding, request_id)? {
+        budget.checkpoint(request_id)?;
         return Ok(result);
     }
+    budget.checkpoint(request_id)?;
     if let Some(mut operation) = read_rotation_operation(host, &binding, request_id)? {
+        budget.checkpoint(request_id)?;
         if operation.phase == RotationOperationPhase::Prepared {
             let target_runtime =
                 native_runtime::resolve_for_account(host, binding.target_account, request_id)?;
@@ -69,12 +107,14 @@ pub fn materialize_params(
                 &binding,
                 &target_runtime,
                 &mut operation,
+                &budget,
                 request_id,
             )?;
         }
-        return finalize_rotation_operation(host, &binding, &operation, request_id);
+        return finalize_rotation_operation(host, &binding, &operation, &budget, request_id);
     }
     let authorization = require_fresh_authorization(host, &binding, request_id)?;
+    budget.checkpoint(request_id)?;
     let working_directory = rotation_working_directory(host, request_id)?;
     let source_runtime =
         native_runtime::resolve_for_account(host, binding.source_account, request_id)?;
@@ -83,17 +123,26 @@ pub fn materialize_params(
     let native = opencode::export_with_timeout(
         &binding.source_session_id,
         &source_runtime,
-        rotation_operation_timeout(host, request_id)?,
+        budget.remaining(request_id)?,
     )
     .map_err(|error| rotation_export_failure(request_id, &binding.source_session_id, error))?;
+    budget.checkpoint(request_id)?;
     validate_rotation_export(&native, &binding.source_session_id, request_id)?;
     let boundary = crate::session::rotation_boundary_timestamp(&native)
         .ok_or_else(|| rotation_boundary_missing(request_id, &binding.source_session_id))?;
     let artifact_bytes = serde_json::to_vec(native.native_json())
         .map_err(|error| rotation_artifact_failure(request_id, error))?;
+    if artifact_bytes.len() > MAX_ROTATION_ARTIFACT_BYTES {
+        return Err(rotation_artifact_capacity_exceeded(
+            request_id,
+            artifact_bytes.len(),
+        ));
+    }
+    budget.checkpoint(request_id)?;
     let artifact_path = rotation_artifact_path(host, &artifact_bytes, request_id)?;
     write_artifact_atomic(&artifact_path, &artifact_bytes)
         .map_err(|error| rotation_artifact_failure(request_id, error))?;
+    budget.checkpoint(request_id)?;
     let mut operation = RotationOperation {
         schema_version: 1,
         binding_sha256: binding_digest(&binding),
@@ -116,18 +165,21 @@ pub fn materialize_params(
         imported_at_unix_ms: None,
     };
     write_rotation_operation(host, &binding, &operation, request_id)?;
+    budget.checkpoint(request_id)?;
     let target_session_id = opencode::import_session(
         &artifact_path,
         &target_runtime,
         working_directory,
-        rotation_operation_timeout(host, request_id)?,
+        budget.remaining(request_id)?,
     )
     .map_err(|error| rotation_import_failure(request_id, &binding.target_provider_id, error))?;
+    budget.checkpoint(request_id)?;
     operation.phase = RotationOperationPhase::Imported;
     operation.target_session_id = Some(target_session_id);
     operation.imported_at_unix_ms = Some(now_unix_ms());
     write_rotation_operation(host, &binding, &operation, request_id)?;
-    finalize_rotation_operation(host, &binding, &operation, request_id)
+    budget.checkpoint(request_id)?;
+    finalize_rotation_operation(host, &binding, &operation, &budget, request_id)
 }
 
 pub(crate) fn activity_targets(params: &Value, result: Option<&Value>) -> ActivityTargets {
@@ -441,7 +493,7 @@ fn require_fresh_authorization(
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let path = authorization_path(host, binding, request_id)?;
-    let bytes = durable_fs::read_file(&path)
+    let bytes = durable_fs::read_file_bounded(&path, MAX_ROTATION_STATE_BYTES)
         .map_err(|error| rotation_authorization_failure(request_id, error))?;
     let record: Value = serde_json::from_slice(&bytes)
         .map_err(|error| rotation_authorization_failure(request_id, error))?;
@@ -460,6 +512,7 @@ fn require_fresh_authorization(
 
 fn acquire_rotation_lock(
     host: &HostContext,
+    budget: &RotationBudget,
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
     let root = rotation_state_root(host, request_id)?;
@@ -474,21 +527,13 @@ fn acquire_rotation_lock(
         .truncate(false)
         .open(lock_path)
         .map_err(|error| rotation_state_failure(request_id, error))?;
-    let timeout = rotation_operation_timeout(host, request_id)?;
+    let timeout = budget.remaining(request_id)?;
     if !operation_bounds::lock_exclusive_for(&lock, timeout)
         .map_err(|error| rotation_state_failure(request_id, error))?
     {
         return Err(rotation_lock_timeout(request_id));
     }
     Ok(lock)
-}
-
-fn rotation_operation_timeout(
-    host: &HostContext,
-    request_id: &str,
-) -> Result<Duration, ProviderFailure> {
-    operation_bounds::remaining_timeout(host.deadline_unix_ms, ROTATION_OPERATION_TIMEOUT)
-        .ok_or_else(|| rotation_deadline_exceeded(request_id))
 }
 
 fn authorization_path(
@@ -563,7 +608,7 @@ fn read_materialization_receipt(
     request_id: &str,
 ) -> Result<Option<Value>, ProviderFailure> {
     let path = materialization_receipt_path(host, binding, request_id)?;
-    let bytes = match durable_fs::read_file(&path) {
+    let bytes = match durable_fs::read_file_bounded(&path, MAX_ROTATION_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(rotation_state_failure(request_id, error)),
@@ -584,7 +629,7 @@ fn read_rotation_operation(
     request_id: &str,
 ) -> Result<Option<RotationOperation>, ProviderFailure> {
     let path = rotation_operation_path(host, binding, request_id)?;
-    let bytes = match durable_fs::read_file(&path) {
+    let bytes = match durable_fs::read_file_bounded(&path, MAX_ROTATION_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(rotation_state_failure(request_id, error)),
@@ -638,7 +683,7 @@ fn read_rotation_operation_artifact(
     let data_root = rotation_data_root(host, request_id)?;
     let path = path_guard::confined_target(data_root, Path::new(&operation.artifact_path))
         .map_err(|error| rotation_operation_invalid(request_id, error))?;
-    let bytes = durable_fs::read_file(&path)
+    let bytes = durable_fs::read_file_bounded(&path, MAX_ROTATION_ARTIFACT_BYTES)
         .map_err(|error| rotation_operation_invalid(request_id, error))?;
     if sha256_hex(&bytes) != operation.artifact_sha256 {
         return Err(rotation_operation_invalid(
@@ -669,6 +714,7 @@ fn reconcile_prepared_operation(
     binding: &RotationBinding,
     target_runtime: &native_runtime::NativeRuntimeContext,
     operation: &mut RotationOperation,
+    budget: &RotationBudget,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     let supplied_target = optional_string(params, "recovery_target_session_id");
@@ -676,7 +722,7 @@ fn reconcile_prepared_operation(
     let target = match opencode::export_with_timeout(
         candidate_session_id,
         target_runtime,
-        rotation_operation_timeout(host, request_id)?,
+        budget.remaining(request_id)?,
     ) {
         Ok(target) => target,
         Err(error) => {
@@ -689,6 +735,7 @@ fn reconcile_prepared_operation(
             ));
         }
     };
+    budget.checkpoint(request_id)?;
     if target.info.id != candidate_session_id
         || target
             .messages
@@ -717,10 +764,12 @@ fn reconcile_prepared_operation(
             Some("target export content does not match the prepared source artifact".to_string()),
         ));
     }
+    budget.checkpoint(request_id)?;
     operation.phase = RotationOperationPhase::Imported;
     operation.target_session_id = Some(candidate_session_id.to_string());
     operation.imported_at_unix_ms = Some(now_unix_ms());
-    write_rotation_operation(host, binding, operation, request_id)
+    write_rotation_operation(host, binding, operation, request_id)?;
+    budget.checkpoint(request_id)
 }
 
 fn normalized_rotation_session(mut native: Value) -> Value {
@@ -758,8 +807,10 @@ fn finalize_rotation_operation(
     host: &HostContext,
     binding: &RotationBinding,
     operation: &RotationOperation,
+    budget: &RotationBudget,
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
+    budget.checkpoint(request_id)?;
     if operation.phase != RotationOperationPhase::Imported {
         return Err(rotation_operation_invalid(
             request_id,
@@ -771,9 +822,11 @@ fn finalize_rotation_operation(
         .as_deref()
         .expect("validated imported operation has a target session id");
     let artifact_bytes = read_rotation_operation_artifact(host, operation, request_id)?;
+    budget.checkpoint(request_id)?;
     let artifact_path = Path::new(&operation.artifact_path);
     let artifact = rotation_artifact(artifact_path, &artifact_bytes);
     let decision_artifact = write_rotation_decision_receipt(host, binding, operation, request_id)?;
+    budget.checkpoint(request_id)?;
     let host_state_plan = host_state_plan(HostStatePlanInput {
         chain_id: &binding.chain_id,
         source_provider: &binding.source_provider_id,
@@ -797,6 +850,7 @@ fn finalize_rotation_operation(
         &operation.materialization_request_id,
         request_id,
     )?;
+    budget.checkpoint(request_id)?;
     Ok(result)
 }
 
@@ -1051,7 +1105,7 @@ fn write_artifact_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         )
     })?;
     durable_fs::create_private_directories(parent)?;
-    match fs::read(path) {
+    match durable_fs::read_file_bounded(path, bytes.len()) {
         Ok(existing) if existing == bytes => return durable_fs::sync_directory(parent),
         Ok(_) => {
             return Err(std::io::Error::new(
@@ -1073,7 +1127,10 @@ fn write_artifact_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     drop(file);
     match fs::rename(&temporary, path) {
         Ok(()) => durable_fs::sync_directory(parent),
-        Err(error) if fs::read(path).is_ok_and(|existing| existing == bytes) => {
+        Err(error)
+            if durable_fs::read_file_bounded(path, bytes.len())
+                .is_ok_and(|existing| existing == bytes) =>
+        {
             let _ = fs::remove_file(&temporary);
             durable_fs::sync_directory(parent)
         }
@@ -1151,10 +1208,33 @@ fn rotation_export_failure(
     session_id: &str,
     error: OpencodeExportError,
 ) -> ProviderFailure {
+    if let OpencodeExportError::OutputTooLarge {
+        stream,
+        maximum_bytes,
+    } = &error
+    {
+        return ProviderFailure::invalid_request(
+            request_id,
+            "rotation_export_capacity_exceeded",
+            format!(
+                "source session {session_id} export {stream} exceeds the supported {maximum_bytes}-byte bound"
+            ),
+        );
+    }
     ProviderFailure::internal(
         request_id,
         "rotation_export_failed",
         format!("failed to export source session {session_id}: {error:?}"),
+    )
+}
+
+fn rotation_artifact_capacity_exceeded(request_id: &str, observed_bytes: usize) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "rotation_artifact_capacity_exceeded",
+        format!(
+            "serialized rotation artifact is {observed_bytes} bytes; the supported maximum is {MAX_ROTATION_ARTIFACT_BYTES} bytes"
+        ),
     )
 }
 
@@ -1179,6 +1259,19 @@ fn rotation_import_failure(
     target_provider: &str,
     error: OpencodeImportError,
 ) -> ProviderFailure {
+    if let OpencodeImportError::OutputTooLarge {
+        stream,
+        maximum_bytes,
+    } = &error
+    {
+        return ProviderFailure::invalid_request(
+            request_id,
+            "rotation_import_output_capacity_exceeded",
+            format!(
+                "session import into {target_provider} produced {stream} above the supported {maximum_bytes}-byte bound"
+            ),
+        );
+    }
     ProviderFailure::internal(
         request_id,
         "rotation_import_failed",
@@ -1198,7 +1291,7 @@ fn rotation_deadline_exceeded(request_id: &str) -> ProviderFailure {
     ProviderFailure::internal(
         request_id,
         "rotation_deadline_exceeded",
-        "rotation operation deadline was reached before the next native effect",
+        "the end-to-end rotation operation deadline was reached while the shared rotation lock was held",
     )
 }
 

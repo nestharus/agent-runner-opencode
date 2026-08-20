@@ -31,6 +31,8 @@ const STORE_LOCK_FILE: &str = ".settings-store.lock";
 const CURRENT_STORE_SCHEMA_VERSION: u32 = 3;
 const MAX_SETTINGS_STORE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SETTINGS_RECORDS: usize = 256;
+const MAX_PREDECESSOR_SETTINGS_STORE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PREDECESSOR_SETTINGS_RECORDS: usize = 4_096;
 const MAX_SETTINGS_HISTORY_EVENTS: usize = 1_024;
 const MAX_SETTINGS_MUTATION_RECEIPTS: usize = 4_096;
 const SETTINGS_RECEIPT_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -753,9 +755,16 @@ fn read_store_bytes(path: &Path, request_id: &str) -> Result<(Vec<u8>, bool), Pr
     durable_fs::read_file_bounded_or(
         path,
         MAX_SETTINGS_STORE_BYTES,
+        MAX_PREDECESSOR_SETTINGS_STORE_BYTES,
         is_predecessor_capacity_store,
     )
-    .map_err(|err| store_io_failure(request_id, "settings_store_read_failed", err))
+    .map_err(|err| {
+        if err.kind() == std::io::ErrorKind::InvalidData {
+            settings_store_capacity_unsupported(request_id, err)
+        } else {
+            store_io_failure(request_id, "settings_store_read_failed", err)
+        }
+    })
 }
 
 fn is_predecessor_capacity_store(bytes: &[u8]) -> bool {
@@ -771,6 +780,16 @@ fn parse_store_bytes(
     let store: SettingsStore = serde_json::from_slice(bytes)
         .map_err(|err| settings_store_parse_failure(request_id, err))?;
     let predecessor_schema = store.schema_version == 0;
+    if predecessor_schema && store.records.len() > MAX_PREDECESSOR_SETTINGS_RECORDS {
+        return Err(settings_store_capacity_unsupported(
+            request_id,
+            format!(
+                "predecessor store has {} records; the supported transition maximum is {}",
+                store.records.len(),
+                MAX_PREDECESSOR_SETTINGS_RECORDS
+            ),
+        ));
+    }
     let mut store = upgrade_persisted_store(store, request_id)?;
     store.predecessor_capacity_recovery = predecessor_capacity_recovery || predecessor_schema;
     Ok(store)
@@ -1409,6 +1428,19 @@ fn settings_store_parse_failure(request_id: &str, err: serde_json::Error) -> Pro
 
 fn settings_store_upgrade_failure(request_id: &str, message: impl Into<String>) -> ProviderFailure {
     ProviderFailure::invalid_request(request_id, "settings_store_upgrade_required", message)
+}
+
+fn settings_store_capacity_unsupported(
+    request_id: &str,
+    detail: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "settings_store_capacity_unsupported",
+        format!(
+            "settings store is outside the supported transition envelope: {detail}; current-schema stores must be at most {MAX_SETTINGS_STORE_BYTES} bytes and predecessor/schema-zero recovery stores must be at most {MAX_PREDECESSOR_SETTINGS_STORE_BYTES} bytes and {MAX_PREDECESSOR_SETTINGS_RECORDS} records"
+        ),
+    )
 }
 
 fn settings_store_serialize_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {

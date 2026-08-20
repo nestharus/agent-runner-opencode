@@ -757,6 +757,16 @@ fn export_failure(request_id: &str, session_id: &str, err: OpencodeExportError) 
         OpencodeExportError::InvalidJson(message) => {
             invalid_opencode_export_failure(request_id, message)
         }
+        OpencodeExportError::OutputTooLarge {
+            stream,
+            maximum_bytes,
+        } => ProviderFailure::invalid_request(
+            request_id,
+            "opencode_export_capacity_exceeded",
+            format!(
+                "opencode export {stream} for {session_id} exceeds the supported {maximum_bytes}-byte bound"
+            ),
+        ),
         OpencodeExportError::TimedOut => ProviderFailure::invalid_request(
             request_id,
             "opencode_export_timeout",

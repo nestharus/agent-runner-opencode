@@ -38,11 +38,15 @@ compatibility-projected to the current OpenCode-owned account, quota, and model
 shape while preserving record IDs and versions; the next mutation writes the
 upgraded store schema. A predecessor-produced store above the current 4 MiB or
 256-record steady-state limits remains readable and routable during the
-transition. Creates and other growth are rejected, while a size-reducing update
-or record-reducing delete is committed in predecessor recovery form; each later
-process can continue that in-band reduction, and the first mutation that fits
-the current envelope atomically writes the current schema. Oversized files that
-claim the current schema are not admitted through this compatibility path. An
+transition up to a declared 16 MiB and 4,096-record predecessor envelope.
+Reads stop at that byte bound; a larger predecessor store or one with more
+records fails explicitly as `settings_store_capacity_unsupported` and must be
+reduced with the predecessor binary before this provider is installed. Creates
+and other growth are rejected, while a size-reducing update or record-reducing
+delete is committed in predecessor recovery form; each later process can
+continue that in-band reduction, and the first mutation that fits the current
+envelope atomically writes the current schema. Files that claim the current
+schema above 4 MiB are not admitted through this compatibility path. An
 otherwise valid predecessor model tuple that omitted `model.name` is projected
 from its exact `provider_model` and `variant`. A residual predecessor record
 that cannot be routed remains listable with a `repair_required` migration
@@ -211,7 +215,11 @@ lifecycle, pinned-target, bare, or live-report evidence.
 
 Generic canonical `session.replace` remains unsupported: OpenCode has no
 stable canonical-transcript replacement API. Rotation's native full-session
-export/import is a separate, representation-bounded capability. It requires a
+export/import is a separate, representation-bounded capability. Native export
+stdout and the serialized source artifact are each capped at 16 MiB; native
+import stdout and per-command diagnostics are capped at 64 KiB. Oversize
+results fail explicitly before import while preserving bounded capture and
+allocation. It requires a
 fresh provider-issued assessment authorization, emits a decision receipt,
 durably publishes the content-addressed source artifact, and then persists a
 binding-keyed prepared operation before import. A successful
@@ -245,7 +253,8 @@ only a new settings mutation as `settings_capacity_exhausted`; existing bounded
 records remain readable and usable. The predecessor recovery exception is
 non-growing and finite: only the exact schema-less predecessor serialization or
 an intermediate schema-zero recovery transaction can exceed the encoded bound,
-and each admitted recovery mutation must reduce record count or encoded size.
+no admitted predecessor/recovery store may exceed 16 MiB or 4,096 records, and
+each admitted recovery mutation must reduce record count or encoded size.
 Settings lock admission is bounded by the earlier of the host deadline and five
 seconds. Migration
 artifacts are content-addressed, atomically published, confined to
@@ -346,9 +355,14 @@ recovery while giving wrapper and observer upgrades an explicit restoration
 path.
 
 Rotation assessment and materialization likewise bound acquisition of their
-shared state lock. Native export and import performed while that lock is held
-use the earlier of the host deadline and a 20-second provider ceiling; a stalled
-import is terminated and reaped while its prepared record remains available for
+shared state lock. One monotonic budget—the earlier of the host deadline and a
+20-second provider ceiling—covers lock admission and every action while the
+lock is held: state reads, bounded native export, parsing and hashing, artifact
+publication, native import, reconciliation, and receipt finalization. Each
+phase checks the remaining absolute budget, native children are terminated and
+reaped at expiry, artifacts are read back through the same 16 MiB bound, and
+provider-owned rotation state records are capped at 1 MiB. An expired operation
+releases the lock while retaining any prepared/imported record needed for
 identity-safe reconciliation. Unrelated rotation actors can therefore regain
 the shared capability without terminating the provider manually.
 

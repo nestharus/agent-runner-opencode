@@ -44,16 +44,22 @@ pub(crate) fn is_executable_file(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn read_file_bounded(path: &Path, maximum_bytes: usize) -> std::io::Result<Vec<u8>> {
-    read_file_bounded_or(path, maximum_bytes, |_| false).map(|(bytes, _)| bytes)
+    read_file_bounded_or(path, maximum_bytes, maximum_bytes, |_| false).map(|(bytes, _)| bytes)
 }
 
 pub(crate) fn read_file_bounded_or(
     path: &Path,
     maximum_bytes: usize,
+    maximum_oversized_bytes: usize,
     allow_oversized: impl FnOnce(&[u8]) -> bool,
 ) -> std::io::Result<(Vec<u8>, bool)> {
+    if maximum_oversized_bytes < maximum_bytes {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "oversized file bound is smaller than the steady-state bound",
+        ));
+    }
     let mut file = fs::File::open(path)?;
     let mut bytes = Vec::new();
     (&mut file)
@@ -67,7 +73,20 @@ pub(crate) fn read_file_bounded_or(
         ));
     }
     if oversized {
-        file.read_to_end(&mut bytes)?;
+        let remaining_with_sentinel = maximum_oversized_bytes
+            .saturating_sub(bytes.len())
+            .saturating_add(1);
+        (&mut file)
+            .take(remaining_with_sentinel as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > maximum_oversized_bytes {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "file exceeds supported {maximum_oversized_bytes}-byte compatibility bound"
+                ),
+            ));
+        }
     }
     sync_directory(
         path.parent()
@@ -213,5 +232,21 @@ mod tests {
         fs::write(&path, vec![b'x'; 33]).expect("write oversized fixture");
         let error = read_file_bounded(&path, 32).expect_err("oversized file must fail");
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn compatibility_read_stops_at_its_distinct_upper_bound() {
+        let temporary = tempfile::tempdir().expect("create compatibility-read root");
+        let path = temporary.path().join("bounded-compatibility");
+        fs::write(&path, vec![b'x'; 65]).expect("write oversized compatibility fixture");
+        let error = read_file_bounded_or(&path, 32, 64, |_| true)
+            .expect_err("compatibility read above its upper bound must fail");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+
+        fs::write(&path, vec![b'x'; 64]).expect("write boundary compatibility fixture");
+        let (bytes, compatibility) = read_file_bounded_or(&path, 32, 64, |_| true)
+            .expect("compatibility read at the upper bound");
+        assert_eq!(bytes.len(), 64);
+        assert!(compatibility);
     }
 }
