@@ -679,6 +679,21 @@ exit 17\n",
     )
 }
 
+pub fn fake_opencode_auth_rewrite_then_unicode_fail_script(auth_path: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
+  printf 'auth argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
+fi\n\
+printf '%s' {} > {}\n\
+printf '%s' {} >&2\n\
+exit 17\n",
+        shell_single_quote(&opencode_auth_json("sentinel-refreshed", "acct")),
+        shell_single_quote(&auth_path.to_string_lossy()),
+        shell_single_quote(&"é".repeat(600)),
+    )
+}
+
 pub fn fake_opencode_auth_rewrite_then_oversize_script(auth_path: &Path) -> String {
     format!(
         "#!/bin/sh\n\

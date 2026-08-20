@@ -10,7 +10,7 @@
 use crate::account::{profile_for_wrapper_reference, AccountProfile};
 use crate::activity::ActivityTargets;
 use crate::durable_fs;
-use crate::encoding::{bounded_text, now_unix_ms, sha256_hex};
+use crate::encoding::{bounded_text_bytes, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::native_runtime::{self, NativeRuntimeContext};
 use crate::opencode::{OpencodeAuthEffect, OpencodeAuthFailure, OpencodeAuthObservation};
@@ -38,6 +38,7 @@ const QUOTA_REFRESH_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 6
 const MAX_ACTIVE_QUOTA_REFRESH_REQUEST_RECORDS: usize = 64;
 const MAX_QUOTA_REFRESH_REPLAY_RECORDS: usize = 4096;
 const MAX_QUOTA_REFRESH_STATE_BYTES: usize = 256 * 1024;
+const MAX_QUOTA_REFRESH_RECONCILIATION_DETAIL_BYTES: usize = 500;
 
 #[derive(Deserialize)]
 struct QuotaBaseParams {
@@ -788,7 +789,10 @@ fn valid_quota_refresh_reconciliation(reconciliation: &Value) -> bool {
         && reconciliation
             .get("detail")
             .and_then(Value::as_str)
-            .is_some_and(|detail| !detail.trim().is_empty() && detail.len() <= 500)
+            .is_some_and(|detail| {
+                !detail.trim().is_empty()
+                    && detail.len() <= MAX_QUOTA_REFRESH_RECONCILIATION_DETAIL_BYTES
+            })
         && reconciliation
             .get("observed_at_unix_ms")
             .and_then(Value::as_u64)
@@ -800,6 +804,7 @@ fn write_quota_refresh_operation(
     operation: &QuotaRefreshOperation,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
+    validate_quota_refresh_operation(operation, request_id)?;
     let path = quota_refresh_operation_path(host, request_id)?;
     let parent = path
         .parent()
@@ -1094,7 +1099,7 @@ fn source_id(account: &AccountProfile, auth_path: &Path) -> String {
 
 fn opencode_command_failure_detail(output: &crate::shell::ShellOutput) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = bounded_text(stderr.trim(), 500);
+    let stderr = bounded_text_bytes(stderr.trim(), MAX_QUOTA_REFRESH_RECONCILIATION_DETAIL_BYTES);
     if stderr.is_empty() {
         return format!("opencode auth list exited with status {}", output.status);
     }
@@ -1208,7 +1213,7 @@ fn require_quota_refresh_reconciliation(
     operation.reconciliation = Some(json!({
         "reason": reason,
         "credential_effect": credential_effect,
-        "detail": bounded_text(detail, 500),
+        "detail": bounded_text_bytes(detail, MAX_QUOTA_REFRESH_RECONCILIATION_DETAIL_BYTES),
         "observed_at_unix_ms": now_unix_ms(),
     }));
 }

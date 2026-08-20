@@ -35,6 +35,17 @@ pub fn bounded_text(text: &str, max_len: usize) -> String {
     text.chars().take(max_len).collect()
 }
 
+pub fn bounded_text_bytes(text: &str, maximum_bytes: usize) -> String {
+    if text.len() <= maximum_bytes {
+        return text.to_string();
+    }
+    let mut end = maximum_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 pub fn canonical_json_bytes(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).expect("canonical JSON serialization is infallible")
 }

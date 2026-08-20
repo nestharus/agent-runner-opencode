@@ -567,6 +567,15 @@ fn contract_quota_refresh_changed_credentials_with_nonzero_exit_require_reconcil
 }
 
 #[test]
+fn contract_quota_refresh_unicode_failure_replays_valid_reconciliation() {
+    assert_changed_auth_requires_reconciliation(
+        "unicode-nonzero-exit",
+        fake_opencode_auth_rewrite_then_unicode_fail_script,
+        "credential_changed_with_command_failure",
+    );
+}
+
+#[test]
 fn contract_quota_refresh_changed_credentials_with_oversized_output_require_reconciliation() {
     assert_changed_auth_requires_reconciliation(
         "oversized-output",
@@ -605,6 +614,7 @@ fn assert_changed_auth_requires_reconciliation(
     );
     support::ensure_default_runtime_settings(&request);
 
+    let mut first_reconciliation = None;
     for attempt in 0..2 {
         let output =
             support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &env);
@@ -632,6 +642,20 @@ fn assert_changed_auth_requires_reconciliation(
             response["error"]["details"]["reconciliation_evidence"]["credential_effect"],
             "credentials_changed"
         );
+        let reconciliation = response["error"]["details"]["reconciliation_evidence"].clone();
+        assert!(
+            reconciliation["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.len() <= 500),
+            "persisted reconciliation detail must honor its UTF-8 byte bound"
+        );
+        match first_reconciliation.as_ref() {
+            Some(first) => assert_eq!(
+                &reconciliation, first,
+                "exact replay must preserve identical reconciliation evidence"
+            ),
+            None => first_reconciliation = Some(reconciliation),
+        }
     }
 
     assert_ne!(
