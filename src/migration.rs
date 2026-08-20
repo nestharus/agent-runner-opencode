@@ -354,24 +354,26 @@ fn legacy_model_identities(legacy: &Value) -> Vec<Value> {
 }
 
 fn write_artifact(path: &Path, bytes: &[u8], request_id: &str) -> Result<(), ProviderFailure> {
-    if let Ok(existing) = fs::read(path) {
-        if existing == bytes {
-            return Ok(());
-        }
-        return Err(migration_artifact_write_failure(
-            request_id,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "content-addressed migration artifact contains different bytes",
-            ),
-        ));
-    }
     let parent = path.parent().ok_or_else(|| {
         migration_artifact_create_failure(
             request_id,
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no parent"),
         )
     })?;
+    match durable_fs::read_file(path) {
+        Ok(existing) if existing == bytes => return Ok(()),
+        Ok(_) => {
+            return Err(migration_artifact_write_failure(
+                request_id,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "content-addressed migration artifact contains different bytes",
+                ),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(migration_artifact_write_failure(request_id, error)),
+    }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| migration_artifact_create_failure(request_id, error))?;
     temporary

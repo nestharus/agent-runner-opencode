@@ -177,7 +177,9 @@ rules after admission: settings and activity keep their interprocess locks,
 and migration and rotation keep their content-addressed atomic publication.
 One shared filesystem boundary durably publishes every newly created settings,
 migration, activity, rotation-artifact, and rotation-state directory link before
-a dependent file write or irreversible native import may proceed.
+a dependent file write or irreversible native import may proceed. A readable
+provider file can satisfy a retry only after that boundary re-syncs its parent,
+so a prior post-rename sync failure remains an error until durability completes.
 
 Activity evidence is operational and explicitly best-effort. A directory,
 lock, write, or chain-validation failure is emitted as a stderr warning but

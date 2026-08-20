@@ -19,6 +19,15 @@ pub(crate) fn create_private_directories(path: &Path) -> std::io::Result<()> {
     create_directory_chain(path, true)
 }
 
+pub(crate) fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let bytes = fs::read(path)?;
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "file has no parent directory"))?,
+    )?;
+    Ok(bytes)
+}
+
 fn create_directory_chain(path: &Path, private: bool) -> std::io::Result<()> {
     let mut missing = Vec::<PathBuf>::new();
     let mut ancestor = path;

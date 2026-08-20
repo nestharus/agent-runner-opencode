@@ -20,7 +20,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -681,7 +681,8 @@ fn store_path_exists(path: &Path) -> bool {
 }
 
 fn read_store_bytes(path: &Path, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
-    fs::read(path).map_err(|err| store_io_failure(request_id, "settings_store_read_failed", err))
+    durable_fs::read_file(path)
+        .map_err(|err| store_io_failure(request_id, "settings_store_read_failed", err))
 }
 
 fn parse_store_bytes(bytes: &[u8], request_id: &str) -> Result<SettingsStore, ProviderFailure> {

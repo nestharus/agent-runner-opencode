@@ -410,8 +410,8 @@ fn require_fresh_authorization(
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let path = authorization_path(host, binding, request_id)?;
-    let bytes =
-        fs::read(&path).map_err(|error| rotation_authorization_failure(request_id, error))?;
+    let bytes = durable_fs::read_file(&path)
+        .map_err(|error| rotation_authorization_failure(request_id, error))?;
     let record: Value = serde_json::from_slice(&bytes)
         .map_err(|error| rotation_authorization_failure(request_id, error))?;
     let expected = binding_digest(binding);
@@ -520,7 +520,7 @@ fn read_materialization_receipt(
     request_id: &str,
 ) -> Result<Option<Value>, ProviderFailure> {
     let path = materialization_receipt_path(host, binding, request_id)?;
-    let bytes = match fs::read(path) {
+    let bytes = match durable_fs::read_file(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(rotation_state_failure(request_id, error)),
@@ -541,7 +541,7 @@ fn read_rotation_operation(
     request_id: &str,
 ) -> Result<Option<RotationOperation>, ProviderFailure> {
     let path = rotation_operation_path(host, binding, request_id)?;
-    let bytes = match fs::read(path) {
+    let bytes = match durable_fs::read_file(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(rotation_state_failure(request_id, error)),
@@ -595,7 +595,8 @@ fn read_rotation_operation_artifact(
     let data_root = rotation_data_root(host, request_id)?;
     let path = path_guard::confined_target(data_root, Path::new(&operation.artifact_path))
         .map_err(|error| rotation_operation_invalid(request_id, error))?;
-    let bytes = fs::read(path).map_err(|error| rotation_operation_invalid(request_id, error))?;
+    let bytes = durable_fs::read_file(&path)
+        .map_err(|error| rotation_operation_invalid(request_id, error))?;
     if sha256_hex(&bytes) != operation.artifact_sha256 {
         return Err(rotation_operation_invalid(
             request_id,
