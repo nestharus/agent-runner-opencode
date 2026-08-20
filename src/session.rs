@@ -92,6 +92,11 @@ struct CapturedSession {
     source: &'static str,
 }
 
+struct SessionIdentityCandidate {
+    provider_session_id: String,
+    source: &'static str,
+}
+
 pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
     let RequestEnvelope {
         host,
@@ -139,13 +144,13 @@ pub fn capture_params(
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let params = parse_capture_params(params, request_id)?;
+    let captured = captured_session_id(&params, request_id)?;
     if let Some(captured) = capture_live_report(host, &params, request_id)? {
         return Ok(capture_result(
             Some(captured),
             "live_report.provider_session_id",
         ));
     }
-    let captured = captured_session_id(&params);
     let provider_session_id = captured.provider_session_id;
     let source = captured.source;
     Ok(capture_result(provider_session_id, source))
@@ -182,14 +187,6 @@ fn capture_live_report(
             request_id,
             "live_report.invocation_uuid must match invocation_uuid",
         ));
-    }
-    if let Some(other) = captured_session_id(params).provider_session_id {
-        if other != provider_session_id {
-            return Err(invalid_session_capture_params_failure(
-                request_id,
-                "live report conflicts with other session evidence",
-            ));
-        }
     }
     let native = export_native(host, &params.settings_id, &provider_session_id, request_id)?;
     validate_live_report_working_directory(&native, host.working_directory.as_deref(), request_id)?;
@@ -840,35 +837,103 @@ fn contract_text_part(text: &str) -> Value {
     })
 }
 
-fn captured_session_id(params: &SessionCaptureParams) -> CapturedSession {
-    if let Some(provider_session_id) = launch_provider_session_id(params) {
-        return CapturedSession {
-            provider_session_id: Some(provider_session_id),
-            source: "launch.session.provider_session_id",
-        };
+fn captured_session_id(
+    params: &SessionCaptureParams,
+    request_id: &str,
+) -> Result<CapturedSession, ProviderFailure> {
+    let candidates = session_identity_candidates(params, request_id)?;
+    validate_session_identity_candidates(&candidates, request_id)?;
+    Ok(candidates
+        .into_iter()
+        .next()
+        .map(|candidate| CapturedSession {
+            provider_session_id: Some(candidate.provider_session_id),
+            source: candidate.source,
+        })
+        .unwrap_or(CapturedSession {
+            provider_session_id: None,
+            source: "none",
+        }))
+}
+
+fn session_identity_candidates(
+    params: &SessionCaptureParams,
+    request_id: &str,
+) -> Result<Vec<SessionIdentityCandidate>, ProviderFailure> {
+    let mut candidates = Vec::new();
+    if let Some(report) = params.live_report.as_ref() {
+        let provider_session_id =
+            non_empty_string(Some(&report.provider_session_id)).ok_or_else(|| {
+                invalid_session_capture_params_failure(
+                    request_id,
+                    "live_report.provider_session_id must be non-empty",
+                )
+            })?;
+        candidates.push(session_identity_candidate(
+            provider_session_id,
+            "live_report.provider_session_id",
+        ));
     }
-    if let Some(provider_session_id) = bare_provider_session_id(params) {
-        return CapturedSession {
-            provider_session_id: Some(provider_session_id),
-            source: "session_id",
-        };
+    push_session_identity_candidate(
+        &mut candidates,
+        launch_provider_session_id(params),
+        "launch.session.provider_session_id",
+    );
+    push_session_identity_candidate(
+        &mut candidates,
+        bare_provider_session_id(params),
+        "session_id",
+    );
+    push_session_identity_candidate(&mut candidates, pinned_target(params), "pinned_target");
+    push_session_identity_candidate(
+        &mut candidates,
+        start_bound_provider_session_id(params),
+        "start_bound_provider_session_id",
+    );
+    Ok(candidates)
+}
+
+fn push_session_identity_candidate(
+    candidates: &mut Vec<SessionIdentityCandidate>,
+    provider_session_id: Option<String>,
+    source: &'static str,
+) {
+    if let Some(provider_session_id) = provider_session_id {
+        candidates.push(session_identity_candidate(provider_session_id, source));
     }
-    if let Some(provider_session_id) = pinned_target(params) {
-        return CapturedSession {
-            provider_session_id: Some(provider_session_id),
-            source: "pinned_target",
-        };
+}
+
+fn session_identity_candidate(
+    provider_session_id: String,
+    source: &'static str,
+) -> SessionIdentityCandidate {
+    SessionIdentityCandidate {
+        provider_session_id,
+        source,
     }
-    if let Some(provider_session_id) = start_bound_provider_session_id(params) {
-        return CapturedSession {
-            provider_session_id: Some(provider_session_id),
-            source: "start_bound_provider_session_id",
-        };
+}
+
+fn validate_session_identity_candidates(
+    candidates: &[SessionIdentityCandidate],
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let Some(expected) = candidates.first() else {
+        return Ok(());
+    };
+    if let Some(conflict) = candidates
+        .iter()
+        .skip(1)
+        .find(|candidate| candidate.provider_session_id != expected.provider_session_id)
+    {
+        return Err(invalid_session_capture_params_failure(
+            request_id,
+            format!(
+                "conflicting session evidence: {} disagrees with {}",
+                conflict.source, expected.source
+            ),
+        ));
     }
-    CapturedSession {
-        provider_session_id: None,
-        source: "none",
-    }
+    Ok(())
 }
 
 fn non_empty_string(value: Option<&str>) -> Option<String> {

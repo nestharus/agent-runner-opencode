@@ -191,6 +191,19 @@ pub fn rotation_assess_params(allowed: bool) -> Value {
     })
 }
 
+pub fn rotation_assess_alias_params(allowed: bool) -> Value {
+    let mut params = rotation_assess_params(allowed);
+    params["source_account"] = json!("opencode");
+    params
+}
+
+pub fn rotation_same_account_alias_params() -> Value {
+    let mut params = rotation_assess_params(true);
+    params["source_account"] = json!("opencode");
+    params["target_account"] = json!("opencode1");
+    params
+}
+
 pub fn rotation_requirements(allowed: bool) -> Value {
     json!([
         { "kind": "quota_available", "met": allowed, "detail": "target account has usable quota" },

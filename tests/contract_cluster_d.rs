@@ -838,10 +838,22 @@ fn contract_rotation_assess_materialize() {
     );
     assert_rotation_denied(&denied);
 
+    let canonical_same_account = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_same_account_alias_params(),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    assert_rotation_denied(&canonical_same_account);
+
     let allowed = success_result(
         invoke_validated_with_host(
             "rotation.assess",
-            rotation_assess_params(true),
+            rotation_assess_alias_params(true),
             host.overrides(),
             "rotation.schema.json#/$defs/RotationAssessRequest",
         ),

@@ -43,7 +43,7 @@ pub fn session_enumerate_cursor_params(limit: u64, cursor: &str) -> Value {
 pub fn launch_capture_params(session_id: &str) -> Value {
     json!({
         "settings_id": "opencode1",
-        "session_id": "fallback-session-id",
+        "session_id": session_id,
         "launch": {
             "session": {
                 "provider_session_id": session_id,
@@ -51,6 +51,12 @@ pub fn launch_capture_params(session_id: &str) -> Value {
             }
         }
     })
+}
+
+pub fn conflicting_launch_capture_params(session_id: &str) -> Value {
+    let mut params = launch_capture_params(session_id);
+    params["session_id"] = json!("conflicting-fallback-session-id");
+    params
 }
 
 pub fn bare_capture_params(session_id: &str) -> Value {

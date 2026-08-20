@@ -27,7 +27,10 @@ Policy evidence publishes that record identity and its effective account.
 Rotation preserves `source_provider` and `target_provider` as opaque host
 provider-instance identities. Provider-local `source_account` and
 `target_account` parameters are resolved separately, and the decision receipt
-referenced by the durable host plan binds both identity domains. Its optional
+referenced by the durable host plan binds both identity domains. Account aliases
+are canonicalized while the binding is constructed, so eligibility,
+authorization hashes, receipts, and native export/import all use the same
+numbered account identity. Its optional
 `settings_id` must be a persisted record for the target account. Stores written
 by the prior schema are
 compatibility-projected to the current OpenCode-owned account, quota, and model
@@ -115,6 +118,12 @@ to contract markers.
 If a lingering OpenCode process is terminated after response confirmation,
 the exit event retains the real process signal while a separate marker records
 the confirmed application response.
+
+`session.capture` accepts several compatibility-era evidence carriers at its
+external boundary. It translates every non-empty carrier into one typed
+candidate set with provenance and rejects the request if any simultaneously
+supplied session identities disagree; priority never erases conflicting launch,
+lifecycle, pinned-target, bare, or live-report evidence.
 
 Generic canonical `session.replace` remains unsupported: OpenCode has no
 stable canonical-transcript replacement API. Rotation's native full-session

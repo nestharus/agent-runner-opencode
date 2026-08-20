@@ -231,13 +231,30 @@ fn contract_session_capture() {
     let pinned_result = success_result(
         invoke_validated(
             "session.capture",
-            pinned_lifecycle_capture_params(pinned_session_id, session_id),
+            pinned_lifecycle_capture_params(pinned_session_id, pinned_session_id),
             "session.schema.json#/$defs/SessionCaptureRequest",
         ),
         "session.schema.json#/$defs/SessionCaptureResponse",
         "session.schema.json#/$defs/SessionCaptureResult",
     );
     assert_pinned_capture_result(&pinned_result, pinned_session_id);
+}
+
+#[test]
+fn contract_session_capture_rejects_conflicting_identity_carriers() {
+    let session_id = fixture_session_id();
+    for params in [
+        conflicting_launch_capture_params(session_id),
+        pinned_lifecycle_capture_params("ses_pinned_conflict", session_id),
+    ] {
+        let response = assert_error_envelope(invoke_validated(
+            "session.capture",
+            params,
+            "session.schema.json#/$defs/SessionCaptureRequest",
+        ));
+        assert_eq!(response["error"]["code"], "invalid_session_capture_params");
+        assert_error_message_contains(&response, "conflicting session evidence");
+    }
 }
 
 #[test]
