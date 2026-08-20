@@ -36,6 +36,7 @@ struct PolicyLaunchInput {
     argv: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
     stdin: Option<String>,
+    tool_restrictions: Option<Value>,
 }
 
 struct PolicyInput {
@@ -190,6 +191,7 @@ pub(crate) fn evaluate_launch(
                 argv: Some(request.argv),
                 env: request.env,
                 stdin: request.stdin,
+                tool_restrictions: None,
             },
         },
         request_id,
@@ -445,10 +447,22 @@ fn diagnostics_for_policy(
     if model.is_some_and(|model| !model.supports_account(selection.account)) {
         diagnostics.push(model_account_ineligible_diagnostic(selection, model));
     }
+    if params.launch.tool_restrictions.is_some() {
+        diagnostics.push(unsupported_tool_restrictions_diagnostic());
+    }
     diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(
         params, model,
     )));
     diagnostics
+}
+
+fn unsupported_tool_restrictions_diagnostic() -> PolicyDiagnostic {
+    diagnostic(
+        "error",
+        "unsupported_tool_restrictions",
+        "OpenCode cannot faithfully enforce the configured tool_restrictions; refusing unrestricted launch"
+            .to_string(),
+    )
 }
 
 fn model_account_ineligible_diagnostic(

@@ -213,6 +213,17 @@ pub fn policy_evaluate_params_with_host_candidate_argv() -> Value {
     params
 }
 
+pub fn policy_evaluate_params_with_tool_restrictions() -> Value {
+    let mut params = policy_evaluate_params_with_host_candidate_argv();
+    params["launch"]["tool_restrictions"] = json!({
+        "kind": "codex",
+        "codex": {
+            "disabled_features": ["web_search"]
+        }
+    });
+    params
+}
+
 pub fn policy_evaluate_params_with_host_candidate_command(command: &str) -> Value {
     let mut params = policy_evaluate_params();
     params["launch"]["argv"] = json!(host_candidate_argv_for_command(command, "low"));

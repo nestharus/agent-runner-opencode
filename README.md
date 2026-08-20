@@ -77,7 +77,10 @@ the decision into the public JSON result, so supervision never reparses its own
 external DTO or silently weakens launch-plan fields. Every accepted plan also
 carries the resolved account wrapper, provider ID, model ID, and effort used by
 resume observation; launch does not recover those identities from public model
-JSON or generated argv.
+JSON or generated argv. Agent Runner's Claude- and Codex-specific
+`tool_restrictions` have no faithful OpenCode mapping, so policy retains their
+presence and rejects the launch as `unsupported_tool_restrictions` instead of
+combining an ignored owner restriction with `--dangerously-skip-permissions`.
 
 Quota probing likewise converges on a typed `QuotaObservation`. The native
 adapter translates authenticated WHAM HTTP responses directly into that type.

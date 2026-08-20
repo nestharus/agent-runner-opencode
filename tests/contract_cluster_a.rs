@@ -1363,6 +1363,29 @@ fn contract_policy_evaluate_accepts_host_candidate_argv() {
 }
 
 #[test]
+fn contract_policy_evaluate_rejects_unsupported_tool_restrictions() {
+    let output = invoke_validated(
+        "policy.evaluate",
+        policy_evaluate_params_with_tool_restrictions(),
+        "policy.schema.json#/$defs/PolicyEvaluateRequest",
+    );
+
+    assert_output_success(&output, "policy.evaluate tool restriction rejection");
+    let response = json_stdout(&output);
+    assert_policy_response_shape(&response);
+    let result = policy_result(&response);
+    assert_policy_rejected(
+        result,
+        "unsupported OpenCode tool restrictions must fail closed",
+    );
+    assert_policy_diagnostic(
+        policy_diagnostics(result),
+        "unsupported_tool_restrictions",
+        "cannot faithfully enforce",
+    );
+}
+
+#[test]
 fn contract_policy_evaluate_accepts_only_canonical_command_for_every_account_id() {
     for settings_id in account_host_settings_ids() {
         let output = invoke_with_env(
