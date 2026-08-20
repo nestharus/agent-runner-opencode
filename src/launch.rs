@@ -620,7 +620,7 @@ fn spawn_child(
     let mut command = child_command(argv, working_directory, stdin_present);
     command.env_clear();
     let child_env = child_env(env);
-    command.envs(child_env_pairs(&child_env));
+    command.envs(child_env.iter());
     configure_process_group(&mut command);
     command.spawn()
 }
@@ -644,54 +644,19 @@ fn child_stdin(stdin_present: bool) -> Stdio {
     }
 }
 
-fn child_env_pairs(env: &BTreeMap<String, String>) -> Vec<(&str, &str)> {
-    env.iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect()
-}
-
 fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut env = pass_through_env();
-    env.extend(allowed_declared_env(declared));
-    env
-}
-
-fn pass_through_env() -> BTreeMap<String, String> {
-    pass_through_env_map(pass_through_env_entries())
-}
-
-fn pass_through_env_entries() -> Vec<(String, String)> {
-    present_pass_through_env_entries(optional_pass_through_env_entries())
-}
-
-fn optional_pass_through_env_entries() -> Vec<Option<(String, String)>> {
-    BASE_LAUNCH_ENV_PASSTHROUGH_KEYS
+    let mut env = BTreeMap::new();
+    for key in BASE_LAUNCH_ENV_PASSTHROUGH_KEYS
         .iter()
         .chain(HOST_LINKAGE_ENV_KEYS.iter())
-        .map(|key| pass_through_env_entry(key))
-        .collect()
-}
-
-fn present_pass_through_env_entries(
-    entries: Vec<Option<(String, String)>>,
-) -> Vec<(String, String)> {
-    entries.into_iter().flatten().collect()
-}
-
-fn pass_through_env_map(entries: Vec<(String, String)>) -> BTreeMap<String, String> {
-    entries.into_iter().collect()
-}
-
-fn pass_through_env_entry(key: &str) -> Option<(String, String)> {
-    ambient_env_value(key).map(|value| env_pair(key, value))
-}
-
-fn ambient_env_value(key: &str) -> Option<String> {
-    std::env::var(key).ok()
-}
-
-fn env_pair(key: &str, value: String) -> (String, String) {
-    (key.to_string(), value)
+    {
+        if let Ok(value) = std::env::var(key) {
+            env.insert((*key).to_string(), value);
+        }
+    }
+    // Explicitly declared values take precedence over ambient passthrough.
+    env.extend(declared.clone());
+    env
 }
 
 fn write_child_stdin(child: &mut Child, stdin: Option<&Vec<u8>>) -> std::io::Result<()> {
@@ -761,53 +726,36 @@ fn spawn_drain<R: Read + Send + 'static>(
 }
 
 fn drain_reader<R: Read>(mut reader: R, sender: SyncSender<DrainMessage>, stdout: bool) {
-    let mut buffer = drain_buffer();
+    let mut buffer = [0_u8; 8192];
     loop {
-        match read_drain_chunk(&mut reader, &mut buffer) {
-            Ok(count) if drain_read_complete(count) => break,
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
             Ok(count) => {
-                let message = drain_chunk_message(stdout, drain_chunk(&buffer, count));
-                if drain_send_failed(send_drain_message(&sender, message)) {
+                let bytes = buffer[..count].to_vec();
+                let message = if stdout {
+                    DrainMessage::Stdout(bytes)
+                } else {
+                    DrainMessage::Stderr(bytes)
+                };
+                if sender.send(message).is_err() {
                     return;
                 }
             }
             Err(error) => {
-                let _ = send_drain_message(
-                    &sender,
-                    DrainMessage::ReadError {
-                        stdout,
-                        message: error.to_string(),
-                    },
-                );
+                let _ = sender.send(DrainMessage::ReadError {
+                    stdout,
+                    message: error.to_string(),
+                });
                 return;
             }
         }
     }
-    send_drain_done(&sender, stdout);
-}
-
-fn drain_buffer() -> [u8; 8192] {
-    [0_u8; 8192]
-}
-
-fn read_drain_chunk<R: Read>(reader: &mut R, buffer: &mut [u8]) -> std::io::Result<usize> {
-    reader.read(buffer)
-}
-
-fn drain_read_complete(count: usize) -> bool {
-    count == 0
-}
-
-fn drain_chunk(buffer: &[u8], count: usize) -> &[u8] {
-    &buffer[..count]
-}
-
-fn drain_chunk_message(stdout: bool, chunk: &[u8]) -> DrainMessage {
-    drain_bytes_message(stdout, drain_chunk_bytes(chunk))
-}
-
-fn drain_chunk_bytes(chunk: &[u8]) -> Vec<u8> {
-    chunk.to_vec()
+    let done = if stdout {
+        DrainMessage::StdoutDone
+    } else {
+        DrainMessage::StderrDone
+    };
+    let _ = sender.send(done);
 }
 
 fn retain_terminal_tail(target: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
@@ -826,21 +774,6 @@ fn retain_terminal_tail(target: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool
         *truncated = true;
     }
     target.extend_from_slice(bytes);
-}
-
-fn send_drain_message(
-    sender: &SyncSender<DrainMessage>,
-    message: DrainMessage,
-) -> Result<(), mpsc::SendError<DrainMessage>> {
-    sender.send(message)
-}
-
-fn drain_send_failed(result: Result<(), mpsc::SendError<DrainMessage>>) -> bool {
-    result.is_err()
-}
-
-fn send_drain_done(sender: &SyncSender<DrainMessage>, stdout: bool) {
-    let _ = send_drain_message(sender, drain_done_message(stdout));
 }
 
 fn run_supervision_loop<W: Write>(
@@ -1437,10 +1370,6 @@ fn invalid_stdin_encoding_failure(request_id: &str, encoding: &str) -> ProviderF
     )
 }
 
-fn allowed_declared_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    declared.clone()
-}
-
 fn session_marker_name(session_id: &str) -> String {
     format!("opencode.sessionID.{session_id}")
 }
@@ -1477,22 +1406,6 @@ fn flush_event_writer<W: Write>(request_id: &str, writer: &mut W) -> Result<(), 
     writer
         .flush()
         .map_err(|error| write_failure(request_id, error))
-}
-
-fn drain_bytes_message(stdout: bool, bytes: Vec<u8>) -> DrainMessage {
-    if stdout {
-        DrainMessage::Stdout(bytes)
-    } else {
-        DrainMessage::Stderr(bytes)
-    }
-}
-
-fn drain_done_message(stdout: bool) -> DrainMessage {
-    if stdout {
-        DrainMessage::StdoutDone
-    } else {
-        DrainMessage::StderrDone
-    }
 }
 
 fn deadline_status() -> ProcessStatus {
