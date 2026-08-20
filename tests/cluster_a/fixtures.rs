@@ -278,6 +278,16 @@ impl FakeOpencodeWrapper {
         Self::from_parts(dir, log_path, log_path_string)
     }
 
+    pub fn with_counted_resume() -> Self {
+        let dir = unique_temp_dir("agent-runner-opencode-counted-resume");
+        create_fake_wrapper_dir(&dir);
+        let wrapper_path = fake_wrapper_path(&dir);
+        let log_path = fake_wrapper_log_path(&dir);
+        write_fake_wrapper(&wrapper_path, fake_counted_resume_script(&log_path));
+        let log_path_string = path_string(&log_path);
+        Self::from_parts(dir, log_path, log_path_string)
+    }
+
     fn from_parts(dir: PathBuf, log_path: PathBuf, log_path_string: String) -> Self {
         Self {
             dir,
@@ -441,6 +451,10 @@ pub fn fake_wrapper_log_script() -> &'static str {
 
 pub fn fake_wrapper_log_stdin_script() -> &'static str {
     "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '{\"info\":{\"id\":\"%s\",\"title\":\"empty resume fixture\"},\"messages\":[]}\\n' \"$2\"\n\
+  exit 0\n\
+fi\n\
 {\n\
   printf 'argv0=%s\\n' \"$0\"\n\
   for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
@@ -486,6 +500,53 @@ printf '%s\\n' \"$count\" > {count_path}\n\
 printf '%s\\n' {event}\n\
 exit 0\n",
         count_path = shell_single_quote(&path_string(count_path)),
+        event = shell_single_quote(&event),
+    )
+}
+
+pub fn fake_counted_resume_script(count_path: &Path) -> String {
+    let export = json!({
+        "info": {"id": resume_session_id(), "title": "durable resume contract"},
+        "messages": [{
+            "info": {
+                "id": "msg-durable-resume-user",
+                "role": "user",
+                "sessionID": resume_session_id(),
+                "model": {
+                    "providerID": "openai",
+                    "modelID": "gpt-5.6-sol",
+                    "variant": "low"
+                },
+                "time": {"created": 4_102_444_800_000_u64}
+            },
+            "parts": [{"type": "text", "text": resume_payload()}]
+        }]
+    })
+    .to_string();
+    let event = json!({
+        "type": "step_start",
+        "timestamp": OBSERVED_AT_UNIX_MS,
+        "sessionID": resume_session_id(),
+        "part": {
+            "type": "step-start",
+            "sessionID": resume_session_id()
+        }
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '%s\\n' {export}\n\
+  exit 0\n\
+fi\n\
+count=0\n\
+if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
+count=$((count + 1))\n\
+printf '%s\\n' \"$count\" > {count_path}\n\
+printf '%s\\n' {event}\n\
+exit 0\n",
+        count_path = shell_single_quote(&path_string(count_path)),
+        export = shell_single_quote(&export),
         event = shell_single_quote(&event),
     )
 }
@@ -542,7 +603,7 @@ exit 0\n",
 pub fn fake_wrapper_resume_confirming_export_script() -> &'static str {
     "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
-	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]}]}'\n\
+	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]}]}'\n\
   exit 0\n\
 fi\n\
 {\n\
@@ -556,7 +617,7 @@ exit 0\n"
 pub fn fake_wrapper_resume_unconfirmed_export_script() -> &'static str {
     "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
-	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"different prompt\"}]}]}'\n\
+	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"different prompt\"}]}]}'\n\
   exit 0\n\
 fi\n\
 {\n\

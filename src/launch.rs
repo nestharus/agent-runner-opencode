@@ -17,7 +17,9 @@ use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
 use crate::path_guard;
 use crate::policy;
-use crate::resume_observation::{self, ResumeObservationRequest};
+use crate::resume_observation::{
+    self, DurableResumeObservationRequest, ResumeObservation, ResumeObservationRequest,
+};
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -96,6 +98,7 @@ enum DrainMessage {
 #[derive(Serialize, Deserialize)]
 struct LaunchRequestState {
     schema_version: u32,
+    operation_kind: LaunchOperationKind,
     request_id: String,
     binding_sha256: String,
     prompt_sha256: Option<String>,
@@ -105,6 +108,18 @@ struct LaunchRequestState {
     terminal_status: Option<Value>,
     prepared_at_unix_ms: u64,
     observed_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LaunchOperationKind {
+    NewSession,
+    Resume,
+}
+
+#[derive(Deserialize)]
+struct LaunchOperationDiscriminator {
+    operation_kind: LaunchOperationKind,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -134,6 +149,37 @@ enum LaunchRequestPhase {
 struct LaunchRequestGuard {
     state_path: PathBuf,
     state: LaunchRequestState,
+    _lock: fs::File,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ResumeLaunchRequestState {
+    schema_version: u32,
+    operation_kind: LaunchOperationKind,
+    request_id: String,
+    binding_sha256: String,
+    observation: DurableResumeObservationRequest,
+    recovery: LaunchRecoveryIdentity,
+    phase: ResumeLaunchRequestPhase,
+    terminal_status: Option<Value>,
+    prepared_at_unix_ms: u64,
+    observed_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResumeLaunchRequestPhase {
+    Prepared,
+    SubmissionObserved,
+    CompletionObserved,
+    Unresolved,
+    TerminalWithoutSubmission,
+}
+
+struct ResumeLaunchRequestGuard {
+    state_path: PathBuf,
+    state: ResumeLaunchRequestState,
+    declared_env: BTreeMap<String, String>,
     _lock: fs::File,
 }
 
@@ -180,6 +226,10 @@ pub(crate) fn stream<W: Write>(
         &effective.env,
         &effective.route,
     );
+    let resume_durable_identity = effective
+        .resume_observation_request
+        .as_ref()
+        .map(ResumeObservationRequest::durable_identity);
     let mut state = LaunchState::new(
         request_id,
         host.deadline_unix_ms,
@@ -199,25 +249,49 @@ pub(crate) fn stream<W: Write>(
             });
         }
     };
-    let launch_request = if new_session {
-        Some(LaunchRequestGuard::prepare(
-            host,
-            request_id,
-            binding_sha256,
-            prompt_sha256,
-            recovery,
-        )?)
+    let (launch_request, resume_launch_request) = if new_session {
+        (
+            Some(LaunchRequestGuard::prepare(
+                host,
+                request_id,
+                binding_sha256,
+                prompt_sha256,
+                recovery,
+            )?),
+            None,
+        )
     } else {
-        None
+        let observation = resume_durable_identity.ok_or_else(|| {
+            launch_state_invalid(
+                request_id,
+                "resumed-session launch has no durable observation identity",
+            )
+        })?;
+        (
+            None,
+            Some(ResumeLaunchRequestGuard::prepare(
+                host,
+                request_id,
+                binding_sha256,
+                observation,
+                recovery,
+            )?),
+        )
     };
     if let Err(failure) = state.emit_route_evidence(writer) {
         if let Some(launch_request) = launch_request {
             launch_request.abandon_before_spawn()?;
         }
+        if let Some(resume_launch_request) = resume_launch_request {
+            resume_launch_request.abandon_before_spawn()?;
+        }
         return Err(failure);
     }
     if let Some(launch_request) = launch_request {
         state.attach_launch_request(launch_request);
+    }
+    if let Some(resume_launch_request) = resume_launch_request {
+        state.attach_resume_launch_request(resume_launch_request);
     }
     let child = match spawn_child(
         &effective.argv,
@@ -229,6 +303,9 @@ pub(crate) fn stream<W: Write>(
         Err(err) => {
             if let Some(launch_request) = state.launch_request.take() {
                 launch_request.abandon_before_spawn()?;
+            }
+            if let Some(resume_launch_request) = state.resume_launch_request.take() {
+                resume_launch_request.abandon_before_spawn()?;
             }
             state.final_status = Some(spawn_error_status(err));
             state.mark_drains_done();
@@ -877,6 +954,12 @@ impl LaunchRequestGuard {
             .map_err(|error| launch_state_failure(request_id, error))?;
         match durable_fs::read_file(&state_path) {
             Ok(bytes) => {
+                validate_launch_operation_kind(
+                    &bytes,
+                    LaunchOperationKind::NewSession,
+                    request_id,
+                    &binding_sha256,
+                )?;
                 let mut state: LaunchRequestState = serde_json::from_slice(&bytes)
                     .map_err(|error| launch_state_invalid(request_id, error))?;
                 validate_launch_request_state(&state, request_id)?;
@@ -889,7 +972,7 @@ impl LaunchRequestGuard {
                 }
                 match state.phase {
                     LaunchRequestPhase::Prepared => {
-                        validate_launch_recovery_context(&state, &recovery, request_id)?;
+                        validate_launch_recovery_context(&state.recovery, &recovery, request_id)?;
                         match recover_prepared_launch(&state, &recovery.declared_env, request_id)? {
                             PreparedLaunchRecovery::NoEffectObserved => {
                                 remove_launch_request_state(&state_path, request_id)?;
@@ -923,7 +1006,8 @@ impl LaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = LaunchRequestState {
-            schema_version: 3,
+            schema_version: 4,
+            operation_kind: LaunchOperationKind::NewSession,
             request_id: request_id.to_string(),
             binding_sha256,
             prompt_sha256,
@@ -976,6 +1060,144 @@ impl LaunchRequestGuard {
         self.state.terminal_status = Some(terminal_status);
         self.state.observed_at_unix_ms = Some(now_unix_ms());
         write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
+    }
+
+    fn abandon_before_spawn(self) -> Result<(), ProviderFailure> {
+        remove_launch_request_state(&self.state_path, &self.state.request_id)
+    }
+}
+
+impl ResumeLaunchRequestGuard {
+    fn prepare(
+        host: &HostContext,
+        request_id: &str,
+        binding_sha256: String,
+        observation: DurableResumeObservationRequest,
+        recovery: LaunchRecoveryContext,
+    ) -> Result<Self, ProviderFailure> {
+        let root = launch_state_root(host, request_id)?;
+        durable_fs::create_private_directories(&root)
+            .map_err(|error| launch_state_failure(request_id, error))?;
+        let key = sha256_hex(request_id.as_bytes());
+        let state_path =
+            confined_launch_state_target(host, &root.join(format!("{key}.json")), request_id)?;
+        let lock_path =
+            confined_launch_state_target(host, &root.join(format!("{key}.lock")), request_id)?;
+        let lock = open_launch_state_lock(&lock_path)
+            .map_err(|error| launch_state_failure(request_id, error))?;
+        lock.lock_exclusive()
+            .map_err(|error| launch_state_failure(request_id, error))?;
+        match durable_fs::read_file(&state_path) {
+            Ok(bytes) => {
+                validate_launch_operation_kind(
+                    &bytes,
+                    LaunchOperationKind::Resume,
+                    request_id,
+                    &binding_sha256,
+                )?;
+                let mut state: ResumeLaunchRequestState = serde_json::from_slice(&bytes)
+                    .map_err(|error| launch_state_invalid(request_id, error))?;
+                validate_resume_launch_request_state(&state, request_id)?;
+                if state.binding_sha256 != binding_sha256 {
+                    return Err(resume_launch_request_reuse_conflict(
+                        request_id,
+                        &binding_sha256,
+                        &state,
+                    ));
+                }
+                validate_launch_recovery_context(&state.recovery, &recovery, request_id)?;
+                match state.phase {
+                    ResumeLaunchRequestPhase::SubmissionObserved
+                    | ResumeLaunchRequestPhase::CompletionObserved => {
+                        return Err(resume_launch_reconciliation_required(request_id, &state));
+                    }
+                    ResumeLaunchRequestPhase::Prepared
+                    | ResumeLaunchRequestPhase::Unresolved
+                    | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
+                        let recovered = observe_durable_resume(
+                            &state.observation,
+                            &state.recovery,
+                            &recovery.declared_env,
+                        );
+                        if !recovered.available {
+                            state.phase = ResumeLaunchRequestPhase::Unresolved;
+                            state.observed_at_unix_ms = Some(now_unix_ms());
+                            write_launch_request_state(&state_path, &state, request_id)?;
+                            return Err(resume_launch_recovery_unavailable(request_id, &state));
+                        }
+                        if recovered.submitted_user_turn.is_some() {
+                            state.phase = if recovered.completion_observed() {
+                                ResumeLaunchRequestPhase::CompletionObserved
+                            } else {
+                                ResumeLaunchRequestPhase::SubmissionObserved
+                            };
+                            state.observed_at_unix_ms = Some(now_unix_ms());
+                            write_launch_request_state(&state_path, &state, request_id)?;
+                            return Err(resume_launch_reconciliation_required(request_id, &state));
+                        }
+                        remove_launch_request_state(&state_path, request_id)?;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(launch_state_failure(request_id, error)),
+        }
+        let state = ResumeLaunchRequestState {
+            schema_version: 4,
+            operation_kind: LaunchOperationKind::Resume,
+            request_id: request_id.to_string(),
+            binding_sha256,
+            observation,
+            recovery: recovery.identity,
+            phase: ResumeLaunchRequestPhase::Prepared,
+            terminal_status: None,
+            prepared_at_unix_ms: now_unix_ms(),
+            observed_at_unix_ms: None,
+        };
+        write_launch_request_state(&state_path, &state, request_id)?;
+        Ok(Self {
+            state_path,
+            state,
+            declared_env: recovery.declared_env,
+            _lock: lock,
+        })
+    }
+
+    fn observe(&self) -> ResumeObservation {
+        observe_durable_resume(
+            &self.state.observation,
+            &self.state.recovery,
+            &self.declared_env,
+        )
+    }
+
+    fn settle(
+        &mut self,
+        observation: &ResumeObservation,
+        completion_observed: bool,
+        terminal_status: Value,
+    ) -> Result<(), ProviderFailure> {
+        self.state.phase = if completion_observed {
+            ResumeLaunchRequestPhase::CompletionObserved
+        } else if !observation.available {
+            ResumeLaunchRequestPhase::Unresolved
+        } else if observation.submitted_user_turn.is_some() {
+            ResumeLaunchRequestPhase::SubmissionObserved
+        } else {
+            ResumeLaunchRequestPhase::TerminalWithoutSubmission
+        };
+        self.state.terminal_status = Some(terminal_status);
+        self.state.observed_at_unix_ms = Some(now_unix_ms());
+        write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
+    }
+
+    fn unresolved_marker(&self) -> Value {
+        json!({
+            "state": "resume_observation_unavailable",
+            "provider_session_id": self.state.observation.session_id,
+            "prompt_sha256": self.state.observation.payload_sha256,
+            "required_action": "reconcile the provider session before retrying the submitted turn",
+        })
     }
 
     fn abandon_before_spawn(self) -> Result<(), ProviderFailure> {
@@ -1043,17 +1265,32 @@ fn launch_environment_sha256(env: &BTreeMap<String, String>) -> String {
 }
 
 fn validate_launch_recovery_context(
-    state: &LaunchRequestState,
+    identity: &LaunchRecoveryIdentity,
     recovery: &LaunchRecoveryContext,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    if state.recovery.declared_env_sha256 == launch_environment_sha256(&recovery.declared_env) {
+    if identity.declared_env_sha256 == launch_environment_sha256(&recovery.declared_env) {
         return Ok(());
     }
     Err(launch_recovery_unavailable(
         request_id,
         "the exact retry did not reproduce the declared child environment",
     ))
+}
+
+fn observe_durable_resume(
+    observation: &DurableResumeObservationRequest,
+    recovery: &LaunchRecoveryIdentity,
+    declared_env: &BTreeMap<String, String>,
+) -> ResumeObservation {
+    let mut env = recovery.passthrough_env.clone();
+    env.extend(declared_env.clone());
+    resume_observation::observe_durable(
+        observation,
+        &recovery.program,
+        &recovery.working_directory,
+        &env,
+    )
 }
 
 fn resolve_launch_program(
@@ -1242,7 +1479,7 @@ fn launch_data_root<'a>(
             ProviderFailure::invalid_request(
                 request_id,
                 "launch_data_root_missing",
-                "new-session launch requires host.data_root for durable request-to-session binding",
+                "launch requires host.data_root for durable request-to-operation binding",
             )
         })
 }
@@ -1267,9 +1504,9 @@ fn open_launch_state_lock(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
-fn write_launch_request_state(
+fn write_launch_request_state<T: Serialize>(
     path: &Path,
-    state: &LaunchRequestState,
+    state: &T,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     let parent = path
@@ -1292,6 +1529,29 @@ fn write_launch_request_state(
         .persist(path)
         .map_err(|error| launch_state_failure(request_id, error.error))?;
     durable_fs::sync_directory(parent).map_err(|error| launch_state_failure(request_id, error))
+}
+
+fn validate_launch_operation_kind(
+    bytes: &[u8],
+    expected: LaunchOperationKind,
+    request_id: &str,
+    attempted_binding_sha256: &str,
+) -> Result<(), ProviderFailure> {
+    let discriminator: LaunchOperationDiscriminator =
+        serde_json::from_slice(bytes).map_err(|error| launch_state_invalid(request_id, error))?;
+    if discriminator.operation_kind == expected {
+        return Ok(());
+    }
+    Err(ProviderFailure::conflict(
+        request_id,
+        "launch_request_conflict",
+        "launch request_id already names a different durable launch operation",
+        json!({
+            "attempted_operation_kind": expected,
+            "committed_operation_kind": discriminator.operation_kind,
+            "attempted_binding_sha256": attempted_binding_sha256,
+        }),
+    ))
 }
 
 fn validate_launch_request_state(
@@ -1318,7 +1578,8 @@ fn validate_launch_request_state(
                 && state.observed_at_unix_ms.is_some()
         }
     };
-    if state.schema_version == 3
+    if state.schema_version == 4
+        && state.operation_kind == LaunchOperationKind::NewSession
         && state.request_id == request_id
         && !state.binding_sha256.trim().is_empty()
         && !state.recovery.program.trim().is_empty()
@@ -1334,6 +1595,49 @@ fn validate_launch_request_state(
     Err(launch_state_invalid(
         request_id,
         "launch request state identity or phase is inconsistent",
+    ))
+}
+
+fn validate_resume_launch_request_state(
+    state: &ResumeLaunchRequestState,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let phase_valid = match state.phase {
+        ResumeLaunchRequestPhase::Prepared => {
+            state.terminal_status.is_none() && state.observed_at_unix_ms.is_none()
+        }
+        ResumeLaunchRequestPhase::SubmissionObserved
+        | ResumeLaunchRequestPhase::CompletionObserved
+        | ResumeLaunchRequestPhase::Unresolved
+        | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
+            state.observed_at_unix_ms.is_some()
+                && state.terminal_status.as_ref().is_none_or(Value::is_object)
+        }
+    };
+    let observation = &state.observation;
+    if state.schema_version == 4
+        && state.operation_kind == LaunchOperationKind::Resume
+        && state.request_id == request_id
+        && !state.binding_sha256.trim().is_empty()
+        && !observation.account_wrapper.trim().is_empty()
+        && !observation.session_id.trim().is_empty()
+        && !observation.payload_sha256.trim().is_empty()
+        && !observation.provider_id.trim().is_empty()
+        && !observation.model_id.trim().is_empty()
+        && !observation.variant.trim().is_empty()
+        && !state.recovery.program.trim().is_empty()
+        && !state.recovery.declared_env_sha256.trim().is_empty()
+        && !state.recovery.working_directory.trim().is_empty()
+        && state.recovery.provider_id == observation.provider_id
+        && state.recovery.model_id == observation.model_id
+        && state.recovery.effort == observation.variant
+        && phase_valid
+    {
+        return Ok(());
+    }
+    Err(launch_state_invalid(
+        request_id,
+        "durable resume launch state identity or phase is inconsistent",
     ))
 }
 
@@ -1434,6 +1738,56 @@ fn launch_terminal_reconciliation_required(
     )
 }
 
+fn resume_launch_request_reuse_conflict(
+    request_id: &str,
+    attempted_binding_sha256: &str,
+    state: &ResumeLaunchRequestState,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "launch_request_conflict",
+        "launch request_id already names a different durable resumed-session operation",
+        json!({
+            "attempted_binding_sha256": attempted_binding_sha256,
+            "committed_binding_sha256": state.binding_sha256,
+            "provider_session_id": state.observation.session_id,
+        }),
+    )
+}
+
+fn resume_launch_reconciliation_required(
+    request_id: &str,
+    state: &ResumeLaunchRequestState,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "launch_resume_reconciliation_required",
+        "resumed-session launch request has durable delivery evidence and will not resubmit the turn",
+        json!({
+            "phase": state.phase,
+            "binding_sha256": state.binding_sha256,
+            "prompt_sha256": state.observation.payload_sha256,
+            "provider_session_id": state.observation.session_id,
+            "terminal_status": state.terminal_status,
+            "required_action": "reconcile the bound provider session before deciding whether to submit another turn",
+        }),
+    )
+}
+
+fn resume_launch_recovery_unavailable(
+    request_id: &str,
+    state: &ResumeLaunchRequestState,
+) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "launch_resume_recovery_unavailable",
+        format!(
+            "could not authoritatively reconcile prepared resumed-session launch for provider session {}",
+            state.observation.session_id
+        ),
+    )
+}
+
 struct LaunchState {
     request_id: String,
     seq: u64,
@@ -1459,6 +1813,7 @@ struct LaunchState {
     next_heartbeat: Instant,
     route_evidence: Value,
     launch_request: Option<LaunchRequestGuard>,
+    resume_launch_request: Option<ResumeLaunchRequestGuard>,
     projection_admitted: bool,
     deferred_events: Vec<Value>,
     deferred_event_bytes: usize,
@@ -1501,6 +1856,7 @@ impl LaunchState {
             route_evidence,
             projection_admitted: launch_request.is_none(),
             launch_request,
+            resume_launch_request: None,
             deferred_events: Vec::new(),
             deferred_event_bytes: 0,
         }
@@ -1508,6 +1864,11 @@ impl LaunchState {
 
     fn attach_launch_request(&mut self, launch_request: LaunchRequestGuard) {
         self.launch_request = Some(launch_request);
+        self.projection_admitted = false;
+    }
+
+    fn attach_resume_launch_request(&mut self, launch_request: ResumeLaunchRequestGuard) {
+        self.resume_launch_request = Some(launch_request);
         self.projection_admitted = false;
     }
 
@@ -1749,7 +2110,12 @@ impl LaunchState {
         let Some(request) = self.resume_observation_request.as_ref() else {
             return;
         };
-        if resume_observation::observe(request).completion_observed() {
+        let observation = self
+            .resume_launch_request
+            .as_ref()
+            .map(ResumeLaunchRequestGuard::observe)
+            .unwrap_or_else(|| resume_observation::observe(request));
+        if observation.completion_observed() {
             self.completed_resume_at = Some(Instant::now());
         }
     }
@@ -1782,19 +2148,30 @@ impl LaunchState {
         self.capture_session_from_parser_tail(writer)?;
         self.admit_terminal_without_session(writer)?;
         let final_resume_observation = self
-            .resume_observation_request
+            .resume_launch_request
             .as_ref()
-            .map(resume_observation::observe);
+            .map(ResumeLaunchRequestGuard::observe)
+            .or_else(|| {
+                self.resume_observation_request
+                    .as_ref()
+                    .map(resume_observation::observe)
+            });
         let completion_observed = self.completed_resume_at.is_some()
             || final_resume_observation
                 .as_ref()
                 .is_some_and(|observation| observation.completion_observed());
-        let submitted_user_turn =
-            final_resume_observation.and_then(|observation| observation.submitted_user_turn);
-        self.confirm_submitted_user_turn(submitted_user_turn.as_ref(), writer)?;
+        let submitted_user_turn = final_resume_observation
+            .as_ref()
+            .and_then(|observation| observation.submitted_user_turn.as_ref());
+        self.confirm_submitted_user_turn(submitted_user_turn, writer)?;
         self.confirm_produced_assistant_response(completion_observed, writer)?;
         self.retain_unresolved_resume_completion(
-            submitted_user_turn.as_ref(),
+            final_resume_observation.as_ref(),
+            completion_observed,
+            writer,
+        )?;
+        self.settle_resume_launch_request(
+            final_resume_observation.as_ref(),
             completion_observed,
             writer,
         )?;
@@ -1811,6 +2188,9 @@ impl LaunchState {
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
         if self.projection_admitted {
+            return Ok(());
+        }
+        if self.resume_launch_request.is_some() {
             return Ok(());
         }
         let status = self.finished_status();
@@ -1848,11 +2228,28 @@ impl LaunchState {
 
     fn retain_unresolved_resume_completion<W: Write>(
         &mut self,
-        submitted_user_turn: Option<&Value>,
+        observation: Option<&ResumeObservation>,
         completion_observed: bool,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
-        let Some(submitted_user_turn) = submitted_user_turn.filter(|_| !completion_observed) else {
+        if !completion_observed && observation.is_some_and(|observation| !observation.available) {
+            if let Some(unresolved) = self
+                .resume_launch_request
+                .as_ref()
+                .map(ResumeLaunchRequestGuard::unresolved_marker)
+            {
+                self.unresolved_resume_completion = Some(unresolved.clone());
+                return self.marker_with_value(
+                    RESUME_COMPLETION_UNRESOLVED_MARKER.to_string(),
+                    unresolved,
+                    writer,
+                );
+            }
+        }
+        let submitted_user_turn = observation
+            .and_then(|observation| observation.submitted_user_turn.as_ref())
+            .filter(|_| !completion_observed);
+        let Some(submitted_user_turn) = submitted_user_turn else {
             return Ok(());
         };
         let unresolved = json!({
@@ -1869,6 +2266,29 @@ impl LaunchState {
         )
     }
 
+    fn settle_resume_launch_request<W: Write>(
+        &mut self,
+        observation: Option<&ResumeObservation>,
+        completion_observed: bool,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        let Some(observation) = observation else {
+            if self.resume_launch_request.is_some() {
+                return Err(launch_state_invalid(
+                    &self.request_id,
+                    "durable resumed-session launch has no final observation identity",
+                ));
+            }
+            return Ok(());
+        };
+        let status = process_status_json(&self.finished_status());
+        let Some(launch_request) = self.resume_launch_request.as_mut() else {
+            return Ok(());
+        };
+        launch_request.settle(observation, completion_observed, status)?;
+        self.admit_projection(writer)
+    }
+
     fn finished_status(&self) -> ProcessStatus {
         let status = self.final_status.clone().unwrap_or(ProcessStatus::Unknown);
         if is_clean_exit_status(&status)
@@ -1881,9 +2301,18 @@ impl LaunchState {
 
     fn terminal_signal_for(&self, status: &ProcessStatus) -> Value {
         if matches!(status, ProcessStatus::Unknown) && self.unresolved_resume_completion.is_some() {
+            let evidence = if self
+                .unresolved_resume_completion
+                .as_ref()
+                .is_some_and(|value| value["state"] == "resume_observation_unavailable")
+            {
+                "resume delivery observation is unavailable; submission outcome remains unconfirmed"
+            } else {
+                "resume submission confirmed; assistant response completion remains unconfirmed"
+            };
             return json!({
                 "kind": "unknown",
-                "evidence": "resume submission confirmed; assistant response completion remains unconfirmed",
+                "evidence": evidence,
                 "observed_at_unix_ms": now_unix_ms(),
             });
         }

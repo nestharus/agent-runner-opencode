@@ -132,6 +132,57 @@ fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss
 }
 
 #[test]
+fn contract_launch_resume_replay_does_not_resubmit_after_output_loss() {
+    let fake_wrapper = FakeOpencodeWrapper::with_counted_resume();
+    let path = prepend_path(fake_wrapper.dir());
+    let params =
+        resume_launch_params_with_arg_payload_env(path.as_str(), fake_wrapper.log_path_str());
+    let mut request = support::validated_request_envelope(
+        "launch",
+        params,
+        serde_json::json!({}),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    request["request_id"] = serde_json::json!("req-launch-resume-submission-response-loss");
+    support::assert_valid_request_envelope(&request, "launch.schema.json#/$defs/LaunchRequest");
+    support::ensure_default_runtime_settings(&request);
+
+    let args = vec!["agent-runner-opencode".to_string(), "launch".to_string()];
+    let mut writer = FailAfterFirstLaunchEvent {
+        completed_events: 0,
+    };
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&request).expect("serialize resumed launch request"),
+            &mut writer,
+        ),
+        1,
+        "losing a deferred post-spawn event should fail the first invocation"
+    );
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read resumed launch count"),
+        "1\n",
+        "the first invocation should submit exactly one resumed turn"
+    );
+
+    let replay = json_stdout(&support::invoke_with_request("launch", request));
+    assert_eq!(
+        replay["error"]["code"],
+        "launch_resume_reconciliation_required"
+    );
+    assert_eq!(
+        replay["error"]["details"]["provider_session_id"],
+        resume_session_id()
+    );
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read replay resume count"),
+        "1\n",
+        "an exact replay must not submit the resumed turn twice"
+    );
+}
+
+#[test]
 fn contract_launch_route_handoff_failure_releases_request_before_spawn() {
     let provider_session_id = "ses_route_handoff_retry";
     let fake_wrapper = FakeOpencodeWrapper::with_counted_new_session(provider_session_id);
@@ -254,7 +305,8 @@ fn contract_launch_prepared_recovery_proves_no_effect_before_readmission() {
     fs::write(
         state_path,
         serde_json::to_vec(&serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 4,
+            "operation_kind": "new_session",
             "request_id": request_id,
             "binding_sha256": binding_sha256,
             "prompt_sha256": prompt_sha256,

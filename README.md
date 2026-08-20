@@ -126,6 +126,15 @@ For resumed sessions, model switching is allowed per turn. Delivery and
 completion are credited only when bounded native export observes the submitted
 payload and a completed assistant message for the requested session, provider
 model, and variant. A bare native `step_finish` is not completion authority.
+Before spawning a resumed turn, launch durably binds the request ID to its
+session, route, payload digest, delivery nonce, observation timestamp, and
+original export-command context. Post-spawn events remain withheld until a
+terminal export result is durable. If event delivery then fails, an exact retry
+uses that same context to inspect the bound session and refuses to resubmit a
+turn whose user message is already present; readmission requires authoritative
+evidence that the prior invocation had no effect. New-session and resumed-turn
+records carry distinct operation kinds, so a request ID cannot cross those
+lifecycle domains.
 The named resume-observation boundary owns this transcript traversal and
 returns either evidence-backed completion or explicit uncertainty; launch only
 orchestrates its probes alongside process supervision and projects the result

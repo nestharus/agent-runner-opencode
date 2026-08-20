@@ -15,10 +15,11 @@ use crate::shell;
 use crate::shell::ShellOutput;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
@@ -251,12 +252,35 @@ pub fn export_with_timeout(
     account: &AccountProfile,
     timeout: Duration,
 ) -> Result<OpencodeExport, OpencodeExportError> {
-    let mut stdout = tempfile::tempfile().map_err(export_capture_error)?;
-    let stdout_writer = stdout.try_clone().map_err(export_capture_error)?;
     let mut command = shell::command(account.opencode_wrapper);
+    command.arg("export").arg(session_id);
+    run_export_command(command, timeout)
+}
+
+pub fn export_with_launch_context(
+    session_id: &str,
+    program: &str,
+    working_directory: &str,
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<OpencodeExport, OpencodeExportError> {
+    let mut command = Command::new(program);
     command
         .arg("export")
         .arg(session_id)
+        .current_dir(working_directory)
+        .env_clear()
+        .envs(env);
+    run_export_command(command, timeout)
+}
+
+fn run_export_command(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<OpencodeExport, OpencodeExportError> {
+    let mut stdout = tempfile::tempfile().map_err(export_capture_error)?;
+    let stdout_writer = stdout.try_clone().map_err(export_capture_error)?;
+    command
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::piped());
     let child = command.spawn().map_err(export_spawn_error)?;
