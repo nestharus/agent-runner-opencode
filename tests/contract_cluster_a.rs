@@ -11,6 +11,21 @@ struct FailAfterFirstLaunchEvent {
     completed_events: usize,
 }
 
+struct RejectLaunchWrites;
+
+impl std::io::Write for RejectLaunchWrites {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "simulated route handoff failure",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl std::io::Write for FailAfterFirstLaunchEvent {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         if self.completed_events >= 1 {
@@ -112,6 +127,155 @@ fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss
         fs::read_to_string(fake_wrapper.log_path()).expect("read replay launch count"),
         "1\n",
         "an exact replay must not create a second provider session"
+    );
+}
+
+#[test]
+fn contract_launch_route_handoff_failure_releases_request_before_spawn() {
+    let provider_session_id = "ses_route_handoff_retry";
+    let fake_wrapper = FakeOpencodeWrapper::with_counted_new_session(provider_session_id);
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_env(
+        "low",
+        &[
+            ("PATH", path.as_str()),
+            (
+                "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                fake_wrapper.log_path_str(),
+            ),
+        ],
+    );
+    let mut request = support::validated_request_envelope(
+        "launch",
+        params,
+        serde_json::json!({}),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    request["request_id"] = serde_json::json!("req-launch-route-response-loss");
+    support::assert_valid_request_envelope(&request, "launch.schema.json#/$defs/LaunchRequest");
+    support::ensure_default_runtime_settings(&request);
+    let args = vec!["agent-runner-opencode".to_string(), "launch".to_string()];
+
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&request).expect("serialize launch request"),
+            &mut RejectLaunchWrites,
+        ),
+        1
+    );
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "route handoff must complete before the child can spawn"
+    );
+
+    let replay = support::invoke_with_request("launch", request);
+    assert_output_success(&replay, "launch after pre-spawn route handoff failure");
+    let events = launch_events_from_output(&replay, "route handoff retry stdout");
+    assert!(events.iter().any(|event| {
+        event["kind"] == "marker"
+            && event["name"] == "oulipoly.provider_session"
+            && event["value"]["provider_session_id"] == provider_session_id
+    }));
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read route retry launch count"),
+        "1\n"
+    );
+}
+
+#[test]
+fn contract_launch_prepared_recovery_proves_no_effect_before_readmission() {
+    let provider_session_id = "ses_prepared_recovery_readmission";
+    let fake_wrapper = FakeOpencodeWrapper::with_counted_new_session(provider_session_id);
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_env(
+        "low",
+        &[
+            ("PATH", path.as_str()),
+            (
+                "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                fake_wrapper.log_path_str(),
+            ),
+        ],
+    );
+    let mut request = support::validated_request_envelope(
+        "launch",
+        params,
+        serde_json::json!({}),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    let request_id = "req-launch-prepared-recovery-readmission";
+    request["request_id"] = serde_json::json!(request_id);
+    support::assert_valid_request_envelope(&request, "launch.schema.json#/$defs/LaunchRequest");
+    support::ensure_default_runtime_settings(&request);
+
+    let policy = json_stdout(&support::invoke(
+        "policy.evaluate",
+        policy_evaluate_params(),
+    ));
+    let route = policy["result"]["markers"].clone();
+    let binding_sha256 = agent_runner_opencode::encoding::sha256_hex(
+        serde_json::json!({
+            "host_app": request["host"]["app"],
+            "params": request["params"],
+            "route": route,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let prompt_sha256 = agent_runner_opencode::encoding::sha256_hex(
+        request["params"]["model"]["inputs"]["prompt"]
+            .as_str()
+            .expect("launch prompt")
+            .as_bytes(),
+    );
+    let data_root = std::path::PathBuf::from(
+        request["host"]["data_root"]
+            .as_str()
+            .expect("launch data root"),
+    );
+    let state_root = data_root.join("provider-state/opencode/launch/requests");
+    fs::create_dir_all(&state_root).expect("create prepared launch state root");
+    let state_path = state_root.join(format!(
+        "{}.json",
+        agent_runner_opencode::encoding::sha256_hex(request_id.as_bytes())
+    ));
+    let prepared_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("current time")
+        .as_millis() as u64;
+    fs::write(
+        state_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "request_id": request_id,
+            "binding_sha256": binding_sha256,
+            "prompt_sha256": prompt_sha256,
+            "recovery": {
+                "program": fake_wrapper.dir().join("opencode1").to_string_lossy(),
+                "home": null,
+                "path": path,
+                "working_directory": env!("CARGO_MANIFEST_DIR"),
+                "provider_id": "openai",
+                "model_id": "gpt-5.6-sol",
+                "effort": "low"
+            },
+            "phase": "prepared",
+            "provider_session_id": null,
+            "terminal_status": null,
+            "prepared_at_unix_ms": prepared_at_unix_ms,
+            "observed_at_unix_ms": null
+        }))
+        .expect("serialize prepared launch state"),
+    )
+    .expect("write prepared launch state");
+
+    let replay = support::invoke_with_request("launch", request);
+    assert_output_success(&replay, "recovered prepared launch");
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read recovered launch count"),
+        "1\n",
+        "an exhaustive empty session list should readmit exactly one launch"
     );
 }
 

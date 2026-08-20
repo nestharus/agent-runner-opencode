@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -39,6 +39,7 @@ const MAX_RESUME_COMPLETION_PROBES: usize = 3;
 const DRAIN_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 const DRAIN_CHANNEL_CAPACITY: usize = 32;
 const TERMINAL_CAPTURE_LIMIT: usize = 1024 * 1024;
+const DEFERRED_EVENT_LIMIT: usize = 1024 * 1024;
 const BASE_LAUNCH_ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME"];
 // Step-6a host-linkage contract: these runner bindings must survive env_clear.
 const HOST_LINKAGE_ENV_KEYS: &[&str] = &[
@@ -98,10 +99,23 @@ struct LaunchRequestState {
     request_id: String,
     binding_sha256: String,
     prompt_sha256: Option<String>,
+    recovery: LaunchRecoveryIdentity,
     phase: LaunchRequestPhase,
     provider_session_id: Option<String>,
+    terminal_status: Option<Value>,
     prepared_at_unix_ms: u64,
     observed_at_unix_ms: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LaunchRecoveryIdentity {
+    program: String,
+    home: Option<String>,
+    path: Option<String>,
+    working_directory: String,
+    provider_id: String,
+    model_id: String,
+    effort: String,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -109,12 +123,19 @@ struct LaunchRequestState {
 enum LaunchRequestPhase {
     Prepared,
     SessionObserved,
+    TerminalWithoutSession,
 }
 
 struct LaunchRequestGuard {
     state_path: PathBuf,
     state: LaunchRequestState,
     _lock: fs::File,
+}
+
+enum PreparedLaunchRecovery {
+    NoEffectObserved,
+    SessionObserved(String),
+    Ambiguous(Vec<String>),
 }
 
 pub(crate) struct LaunchOutcome {
@@ -141,31 +162,72 @@ pub(crate) fn stream<W: Write>(
             })
         }
     };
-    let mut launch_request = if known_provider_session_id(&params).is_none() {
+    let new_session = known_provider_session_id(&params).is_none();
+    let binding_sha256 =
+        launch_request_binding_sha256(host, &raw_params, &effective.route_evidence);
+    let prompt_sha256 = effective
+        .prompt
+        .as_deref()
+        .map(|prompt| sha256_hex(prompt.as_bytes()));
+    let recovery = launch_recovery_identity(
+        &effective.argv,
+        &params.working_directory,
+        &effective.env,
+        &effective.route,
+    );
+    let mut state = LaunchState::new(
+        request_id,
+        host.deadline_unix_ms,
+        effective.resume_observation_request,
+        effective.route_evidence.clone(),
+        None,
+    );
+    let child_stdin = match prepared_child_stdin(effective.stdin.as_deref()) {
+        Ok(stdin) => stdin,
+        Err(error) => {
+            state.emit_route_evidence(writer)?;
+            state.final_status = Some(spawn_error_status(error));
+            state.mark_drains_done();
+            return state.finish(writer).map(|exit_code| LaunchOutcome {
+                exit_code,
+                activity_targets: effective.activity_targets,
+            });
+        }
+    };
+    let launch_request = if new_session {
         Some(LaunchRequestGuard::prepare(
             host,
             request_id,
-            launch_request_binding_sha256(host, &raw_params, &effective.route_evidence),
-            effective
-                .prompt
-                .as_deref()
-                .map(|prompt| sha256_hex(prompt.as_bytes())),
+            binding_sha256,
+            prompt_sha256,
+            recovery,
         )?)
     } else {
         None
     };
+    if let Err(failure) = state.emit_route_evidence(writer) {
+        if let Some(launch_request) = launch_request {
+            launch_request.abandon_before_spawn()?;
+        }
+        return Err(failure);
+    }
+    if let Some(launch_request) = launch_request {
+        state.attach_launch_request(launch_request);
+    }
     let child = match spawn_child(
         &effective.argv,
         &params.working_directory,
         &effective.env,
-        effective.stdin.is_some(),
+        child_stdin,
     ) {
         Ok(child) => child,
         Err(err) => {
-            if let Some(launch_request) = launch_request.take() {
+            if let Some(launch_request) = state.launch_request.take() {
                 launch_request.abandon_before_spawn()?;
             }
-            return stream_spawn_error(request_id, writer, err).map(|exit_code| LaunchOutcome {
+            state.final_status = Some(spawn_error_status(err));
+            state.mark_drains_done();
+            return state.finish(writer).map(|exit_code| LaunchOutcome {
                 exit_code,
                 activity_targets: effective.activity_targets,
             });
@@ -174,22 +236,7 @@ pub(crate) fn stream<W: Write>(
     let mut custody = ChildCustody::with_cleanup(child, |child| {
         let _ = terminate_child(child);
     });
-    if let Err(err) = write_child_stdin(custody.child_mut(), effective.stdin.as_ref()) {
-        return stream_spawn_error(request_id, writer, err).map(|exit_code| LaunchOutcome {
-            exit_code,
-            activity_targets: effective.activity_targets,
-        });
-    }
-    stream_child(
-        request_id,
-        host,
-        custody.child_mut(),
-        effective.resume_observation_request,
-        effective.route_evidence,
-        launch_request,
-        writer,
-    )
-    .map(|exit_code| LaunchOutcome {
+    stream_child(custody.child_mut(), &mut state, writer).map(|exit_code| LaunchOutcome {
         exit_code,
         activity_targets: effective.activity_targets,
     })
@@ -238,6 +285,7 @@ struct EffectiveLaunch {
     stdin: Option<Vec<u8>>,
     prompt: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
+    route: policy::PolicyRouteIdentity,
     route_evidence: Value,
     activity_targets: ActivityTargets,
 }
@@ -317,6 +365,7 @@ fn effective_launch(
         stdin,
         prompt,
         resume_observation_request,
+        route,
         route_evidence: json!(markers),
         activity_targets,
     })
@@ -599,9 +648,9 @@ fn spawn_child(
     argv: &[String],
     working_directory: &str,
     env: &BTreeMap<String, String>,
-    stdin_present: bool,
+    stdin: Stdio,
 ) -> std::io::Result<Child> {
-    let mut command = child_command(argv, working_directory, stdin_present);
+    let mut command = child_command(argv, working_directory, stdin);
     command.env_clear();
     let child_env = child_env(env);
     command.envs(child_env.iter());
@@ -609,23 +658,26 @@ fn spawn_child(
     command.spawn()
 }
 
-fn child_command(argv: &[String], working_directory: &str, stdin_present: bool) -> Command {
+fn child_command(argv: &[String], working_directory: &str, stdin: Stdio) -> Command {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
         .current_dir(working_directory)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(child_stdin(stdin_present));
+        .stdin(stdin);
     command
 }
 
-fn child_stdin(stdin_present: bool) -> Stdio {
-    if stdin_present {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    }
+fn prepared_child_stdin(stdin: Option<&[u8]>) -> std::io::Result<Stdio> {
+    let Some(stdin) = stdin else {
+        return Ok(Stdio::null());
+    };
+    let mut staged = tempfile::tempfile()?;
+    staged.write_all(stdin)?;
+    staged.sync_all()?;
+    staged.seek(SeekFrom::Start(0))?;
+    Ok(Stdio::from(staged))
 }
 
 fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -643,32 +695,13 @@ fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     env
 }
 
-fn write_child_stdin(child: &mut Child, stdin: Option<&Vec<u8>>) -> std::io::Result<()> {
-    if let (Some(input), Some(mut child_stdin)) = (stdin, child.stdin.take()) {
-        child_stdin.write_all(input)?;
-    }
-    Ok(())
-}
-
 fn stream_child<W: Write>(
-    request_id: &str,
-    host: &HostContext,
     child: &mut Child,
-    resume_observation_request: Option<ResumeObservationRequest>,
-    route_evidence: Value,
-    launch_request: Option<LaunchRequestGuard>,
+    state: &mut LaunchState,
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(
-        request_id,
-        host.deadline_unix_ms,
-        resume_observation_request,
-        route_evidence,
-        launch_request,
-    );
     let receiver = start_drains(child);
-    state.emit_route_evidence(writer)?;
-    run_supervision_loop(child, &receiver, &mut state, writer)?;
+    run_supervision_loop(child, &receiver, state, writer)?;
     state.finish(writer)
 }
 
@@ -801,17 +834,6 @@ fn capture_child_exit(child: &mut Child, state: &mut LaunchState) -> Result<(), 
     Ok(())
 }
 
-fn stream_spawn_error<W: Write>(
-    request_id: &str,
-    writer: &mut W,
-    err: std::io::Error,
-) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, None, None, json!([]), None);
-    state.final_status = Some(spawn_error_status(err));
-    state.mark_drains_done();
-    state.finish(writer)
-}
-
 fn stream_policy_rejection<W: Write>(
     request_id: &str,
     writer: &mut W,
@@ -829,6 +851,7 @@ impl LaunchRequestGuard {
         request_id: &str,
         binding_sha256: String,
         prompt_sha256: Option<String>,
+        recovery: LaunchRecoveryIdentity,
     ) -> Result<Self, ProviderFailure> {
         let root = launch_state_root(host, request_id)?;
         durable_fs::create_private_directories(&root)
@@ -844,7 +867,7 @@ impl LaunchRequestGuard {
             .map_err(|error| launch_state_failure(request_id, error))?;
         match durable_fs::read_file(&state_path) {
             Ok(bytes) => {
-                let state: LaunchRequestState = serde_json::from_slice(&bytes)
+                let mut state: LaunchRequestState = serde_json::from_slice(&bytes)
                     .map_err(|error| launch_state_invalid(request_id, error))?;
                 validate_launch_request_state(&state, request_id)?;
                 if state.binding_sha256 != binding_sha256 {
@@ -854,18 +877,49 @@ impl LaunchRequestGuard {
                         &state,
                     ));
                 }
-                return Err(launch_session_reconciliation_required(request_id, &state));
+                match state.phase {
+                    LaunchRequestPhase::Prepared => {
+                        match recover_prepared_launch(&state, request_id)? {
+                            PreparedLaunchRecovery::NoEffectObserved => {
+                                remove_launch_request_state(&state_path, request_id)?;
+                            }
+                            PreparedLaunchRecovery::SessionObserved(provider_session_id) => {
+                                state.phase = LaunchRequestPhase::SessionObserved;
+                                state.provider_session_id = Some(provider_session_id);
+                                state.terminal_status = None;
+                                state.observed_at_unix_ms = Some(now_unix_ms());
+                                write_launch_request_state(&state_path, &state, request_id)?;
+                                return Err(launch_session_reconciliation_required(
+                                    request_id, &state,
+                                ));
+                            }
+                            PreparedLaunchRecovery::Ambiguous(candidates) => {
+                                return Err(launch_session_recovery_required(
+                                    request_id, &state, candidates,
+                                ));
+                            }
+                        }
+                    }
+                    LaunchRequestPhase::SessionObserved => {
+                        return Err(launch_session_reconciliation_required(request_id, &state));
+                    }
+                    LaunchRequestPhase::TerminalWithoutSession => {
+                        return Err(launch_terminal_reconciliation_required(request_id, &state));
+                    }
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = LaunchRequestState {
-            schema_version: 1,
+            schema_version: 2,
             request_id: request_id.to_string(),
             binding_sha256,
             prompt_sha256,
+            recovery,
             phase: LaunchRequestPhase::Prepared,
             provider_session_id: None,
+            terminal_status: None,
             prepared_at_unix_ms: now_unix_ms(),
             observed_at_unix_ms: None,
         };
@@ -894,21 +948,39 @@ impl LaunchRequestGuard {
         }
         self.state.phase = LaunchRequestPhase::SessionObserved;
         self.state.provider_session_id = Some(provider_session_id.to_string());
+        self.state.terminal_status = None;
+        self.state.observed_at_unix_ms = Some(now_unix_ms());
+        write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
+    }
+
+    fn observe_terminal_without_session(
+        &mut self,
+        terminal_status: Value,
+    ) -> Result<(), ProviderFailure> {
+        if self.state.phase == LaunchRequestPhase::SessionObserved {
+            return Ok(());
+        }
+        self.state.phase = LaunchRequestPhase::TerminalWithoutSession;
+        self.state.provider_session_id = None;
+        self.state.terminal_status = Some(terminal_status);
         self.state.observed_at_unix_ms = Some(now_unix_ms());
         write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
     }
 
     fn abandon_before_spawn(self) -> Result<(), ProviderFailure> {
-        match fs::remove_file(&self.state_path) {
-            Ok(()) => durable_fs::sync_directory(
-                self.state_path
-                    .parent()
-                    .expect("launch state path always has a parent"),
-            )
-            .map_err(|error| launch_state_failure(&self.state.request_id, error)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(launch_state_failure(&self.state.request_id, error)),
-        }
+        remove_launch_request_state(&self.state_path, &self.state.request_id)
+    }
+}
+
+fn remove_launch_request_state(path: &Path, request_id: &str) -> Result<(), ProviderFailure> {
+    match fs::remove_file(path) {
+        Ok(()) => durable_fs::sync_directory(
+            path.parent()
+                .expect("launch state path always has a parent"),
+        )
+        .map_err(|error| launch_state_failure(request_id, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(launch_state_failure(request_id, error)),
     }
 }
 
@@ -926,6 +998,185 @@ fn launch_request_binding_sha256(
         .to_string()
         .as_bytes(),
     )
+}
+
+fn launch_recovery_identity(
+    argv: &[String],
+    working_directory: &str,
+    declared_env: &BTreeMap<String, String>,
+    route: &policy::PolicyRouteIdentity,
+) -> LaunchRecoveryIdentity {
+    let env = child_env(declared_env);
+    LaunchRecoveryIdentity {
+        program: resolve_launch_program(&argv[0], working_directory, &env),
+        home: env.get("HOME").cloned(),
+        path: env.get("PATH").cloned(),
+        working_directory: working_directory.to_string(),
+        provider_id: route.provider_id.clone(),
+        model_id: route.model_id.clone(),
+        effort: route.effort.clone(),
+    }
+}
+
+fn resolve_launch_program(
+    program: &str,
+    working_directory: &str,
+    env: &BTreeMap<String, String>,
+) -> String {
+    let path = Path::new(program);
+    if path.is_absolute() {
+        return program.to_string();
+    }
+    if path.components().count() > 1 {
+        return Path::new(working_directory)
+            .join(path)
+            .to_string_lossy()
+            .into_owned();
+    }
+    env.get("PATH")
+        .and_then(|path| {
+            std::env::split_paths(path)
+                .map(|directory| directory.join(program))
+                .find(|candidate| candidate.is_file())
+        })
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string())
+}
+
+fn recover_prepared_launch(
+    state: &LaunchRequestState,
+    request_id: &str,
+) -> Result<PreparedLaunchRecovery, ProviderFailure> {
+    let output = launch_recovery_command(state, &["session", "list", "--format", "json"])
+        .output()
+        .map_err(|error| launch_recovery_unavailable(request_id, error))?;
+    if !output.status.success() {
+        return Err(launch_recovery_unavailable(
+            request_id,
+            format!(
+                "session list exited {:?}: {}",
+                output.status.code(),
+                bounded_text(&String::from_utf8_lossy(&output.stderr), 500)
+            ),
+        ));
+    }
+    let sessions = opencode::parse_session_list_stdout(&output.stdout)
+        .map_err(|error| launch_recovery_unavailable(request_id, format!("{error:?}")))?;
+    let mut candidates = sessions
+        .iter()
+        .filter(|entry| launch_recovery_session_is_plausible(entry, state))
+        .filter_map(launch_recovery_session_id)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    if candidates.is_empty() {
+        return Ok(PreparedLaunchRecovery::NoEffectObserved);
+    }
+    let Some(prompt_sha256) = state.prompt_sha256.as_deref() else {
+        return Ok(PreparedLaunchRecovery::Ambiguous(candidates));
+    };
+    let mut matched = candidates
+        .iter()
+        .filter(|session_id| {
+            recovered_session_matches_request(state, session_id, prompt_sha256).unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    matched.sort();
+    matched.dedup();
+    match matched.as_slice() {
+        [session_id] => Ok(PreparedLaunchRecovery::SessionObserved(session_id.clone())),
+        [] => Ok(PreparedLaunchRecovery::Ambiguous(candidates)),
+        _ => Ok(PreparedLaunchRecovery::Ambiguous(matched)),
+    }
+}
+
+fn launch_recovery_command(state: &LaunchRequestState, args: &[&str]) -> Command {
+    let mut command = Command::new(&state.recovery.program);
+    command
+        .args(args)
+        .current_dir(&state.recovery.working_directory)
+        .env_clear();
+    if let Some(home) = state.recovery.home.as_deref() {
+        command.env("HOME", home);
+    }
+    if let Some(path) = state.recovery.path.as_deref() {
+        command.env("PATH", path);
+    }
+    command
+}
+
+fn launch_recovery_session_is_plausible(entry: &Value, state: &LaunchRequestState) -> bool {
+    let directory_matches =
+        launch_recovery_string(entry, &["directory", "cwd", "working_directory"])
+            .is_none_or(|directory| directory == state.recovery.working_directory);
+    let timestamp =
+        launch_recovery_integer(entry, &["updated", "updated_unix_ms", "updatedUnixMs"])
+            .or_else(|| {
+                launch_recovery_integer(entry, &["created", "created_unix_ms", "createdUnixMs"])
+            })
+            .or_else(|| {
+                entry.get("time").and_then(|time| {
+                    launch_recovery_integer(time, &["updated", "updated_unix_ms"])
+                        .or_else(|| launch_recovery_integer(time, &["created", "created_unix_ms"]))
+                })
+            });
+    directory_matches
+        && timestamp
+            .is_none_or(|timestamp| timestamp >= state.prepared_at_unix_ms.saturating_sub(5_000))
+}
+
+fn launch_recovery_session_id(entry: &Value) -> Option<String> {
+    launch_recovery_string(entry, &["id", "sessionID", "sessionId", "session_id"])
+        .map(str::to_string)
+}
+
+fn launch_recovery_string<'a>(entry: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| entry.get(*key).and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn launch_recovery_integer(entry: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| entry.get(*key).and_then(Value::as_u64))
+}
+
+fn recovered_session_matches_request(
+    state: &LaunchRequestState,
+    session_id: &str,
+    prompt_sha256: &str,
+) -> Result<bool, ProviderFailure> {
+    let output = launch_recovery_command(state, &["export", session_id])
+        .output()
+        .map_err(|error| launch_recovery_unavailable(&state.request_id, error))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let export = opencode::parse_export_stdout(&output.stdout)
+        .map_err(|error| launch_recovery_unavailable(&state.request_id, format!("{error:?}")))?;
+    if export.info.id != session_id {
+        return Ok(false);
+    }
+    Ok(export.messages.iter().any(|message| {
+        let (provider_id, model_id, effort) = message.info.model_identity();
+        message.info.role == "user"
+            && message.info.session_id.as_deref() == Some(session_id)
+            && provider_id == Some(state.recovery.provider_id.as_str())
+            && model_id == Some(state.recovery.model_id.as_str())
+            && effort == Some(state.recovery.effort.as_str())
+            && message
+                .info
+                .time
+                .as_ref()
+                .and_then(|time| time.created)
+                .is_some_and(|created| created >= state.prepared_at_unix_ms.saturating_sub(5_000))
+            && message.parts.iter().any(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| sha256_hex(text.as_bytes()) == prompt_sha256)
+            })
+    }))
 }
 
 fn launch_state_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
@@ -1003,19 +1254,32 @@ fn validate_launch_request_state(
 ) -> Result<(), ProviderFailure> {
     let phase_valid = match state.phase {
         LaunchRequestPhase::Prepared => {
-            state.provider_session_id.is_none() && state.observed_at_unix_ms.is_none()
+            state.provider_session_id.is_none()
+                && state.terminal_status.is_none()
+                && state.observed_at_unix_ms.is_none()
         }
         LaunchRequestPhase::SessionObserved => {
             state
                 .provider_session_id
                 .as_deref()
                 .is_some_and(|session_id| !session_id.trim().is_empty())
+                && state.terminal_status.is_none()
+                && state.observed_at_unix_ms.is_some()
+        }
+        LaunchRequestPhase::TerminalWithoutSession => {
+            state.provider_session_id.is_none()
+                && state.terminal_status.as_ref().is_some_and(Value::is_object)
                 && state.observed_at_unix_ms.is_some()
         }
     };
-    if state.schema_version == 1
+    if state.schema_version == 2
         && state.request_id == request_id
         && !state.binding_sha256.trim().is_empty()
+        && !state.recovery.program.trim().is_empty()
+        && !state.recovery.working_directory.trim().is_empty()
+        && !state.recovery.provider_id.trim().is_empty()
+        && !state.recovery.model_id.trim().is_empty()
+        && !state.recovery.effort.trim().is_empty()
         && phase_valid
     {
         return Ok(());
@@ -1039,6 +1303,14 @@ fn launch_state_invalid(request_id: &str, error: impl std::fmt::Display) -> Prov
         request_id,
         "launch_state_invalid",
         format!("durable launch request state is invalid: {error}"),
+    )
+}
+
+fn launch_recovery_unavailable(request_id: &str, error: impl std::fmt::Display) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "launch_session_recovery_unavailable",
+        format!("could not reconcile a prepared new-session launch: {error}"),
     )
 }
 
@@ -1072,7 +1344,45 @@ fn launch_session_reconciliation_required(
             "binding_sha256": state.binding_sha256,
             "prompt_sha256": state.prompt_sha256,
             "provider_session_id": state.provider_session_id,
+            "terminal_status": state.terminal_status,
             "required_action": "reconcile the bound provider session before deciding whether to resume",
+        }),
+    )
+}
+
+fn launch_session_recovery_required(
+    request_id: &str,
+    state: &LaunchRequestState,
+    candidate_session_ids: Vec<String>,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "launch_session_recovery_required",
+        "prepared launch recovery found sessions that require authoritative reconciliation",
+        json!({
+            "phase": state.phase,
+            "binding_sha256": state.binding_sha256,
+            "prompt_sha256": state.prompt_sha256,
+            "candidate_provider_session_ids": candidate_session_ids,
+            "required_action": "inspect the candidate native sessions and resume only the one that owns this request",
+        }),
+    )
+}
+
+fn launch_terminal_reconciliation_required(
+    request_id: &str,
+    state: &LaunchRequestState,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "launch_terminal_reconciliation_required",
+        "new-session launch request already reached a durable terminal without observing a provider session",
+        json!({
+            "phase": state.phase,
+            "binding_sha256": state.binding_sha256,
+            "prompt_sha256": state.prompt_sha256,
+            "terminal_status": state.terminal_status,
+            "required_action": "reconcile the durable terminal before deciding whether a distinct request should retry",
         }),
     )
 }
@@ -1102,6 +1412,9 @@ struct LaunchState {
     next_heartbeat: Instant,
     route_evidence: Value,
     launch_request: Option<LaunchRequestGuard>,
+    projection_admitted: bool,
+    deferred_events: Vec<Value>,
+    deferred_event_bytes: usize,
 }
 
 impl LaunchState {
@@ -1139,8 +1452,16 @@ impl LaunchState {
             deadline_unix_ms,
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
             route_evidence,
+            projection_admitted: launch_request.is_none(),
             launch_request,
+            deferred_events: Vec::new(),
+            deferred_event_bytes: 0,
         }
+    }
+
+    fn attach_launch_request(&mut self, launch_request: LaunchRequestGuard) {
+        self.launch_request = Some(launch_request);
+        self.projection_admitted = false;
     }
 
     fn handle_drain_message<W: Write>(
@@ -1181,9 +1502,9 @@ impl LaunchState {
     ) -> Result<(), ProviderFailure> {
         self.record_stdout(bytes);
         let session = self.session_from_stdout(bytes);
-        self.persist_generated_session(session.as_deref())?;
+        self.admit_generated_session(session.as_deref(), writer)?;
         self.project_stdout_bytes(bytes, writer)?;
-        self.capture_session(session, writer)
+        self.capture_session_marker(session, writer)
     }
 
     fn stderr_bytes<W: Write>(
@@ -1236,13 +1557,33 @@ impl LaunchState {
         session: Option<String>,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
-        self.persist_generated_session(session.as_deref())?;
+        self.admit_generated_session(session.as_deref(), writer)?;
+        self.capture_session_marker(session, writer)
+    }
+
+    fn capture_session_marker<W: Write>(
+        &mut self,
+        session: Option<String>,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
         if self.has_session_marker() {
             return Ok(());
         }
         if let Some(session_id) = session {
             self.record_session_id(&session_id);
             self.write_session_marker(&session_id, writer)?;
+        }
+        Ok(())
+    }
+
+    fn admit_generated_session<W: Write>(
+        &mut self,
+        provider_session_id: Option<&str>,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        self.persist_generated_session(provider_session_id)?;
+        if provider_session_id.is_some() && self.launch_request.is_some() {
+            self.admit_projection(writer)?;
         }
         Ok(())
     }
@@ -1257,6 +1598,18 @@ impl LaunchState {
             return Ok(());
         };
         launch_request.observe_session(provider_session_id)
+    }
+
+    fn admit_projection<W: Write>(&mut self, writer: &mut W) -> Result<(), ProviderFailure> {
+        if self.projection_admitted {
+            return Ok(());
+        }
+        self.projection_admitted = true;
+        self.deferred_event_bytes = 0;
+        for event in std::mem::take(&mut self.deferred_events) {
+            self.write_event(event, writer)?;
+        }
+        Ok(())
     }
 
     fn has_session_marker(&self) -> bool {
@@ -1380,6 +1733,7 @@ impl LaunchState {
 
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
         self.capture_session_from_parser_tail(writer)?;
+        self.admit_terminal_without_session(writer)?;
         let final_resume_observation = self
             .resume_observation_request
             .as_ref()
@@ -1403,6 +1757,20 @@ impl LaunchState {
         let event = self.exit_event(&status, signal);
         self.write_event(event, writer)?;
         Ok(provider_exit_code(&status))
+    }
+
+    fn admit_terminal_without_session<W: Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        if self.projection_admitted {
+            return Ok(());
+        }
+        let status = self.finished_status();
+        if let Some(launch_request) = self.launch_request.as_mut() {
+            launch_request.observe_terminal_without_session(process_status_json(&status))?;
+        }
+        self.admit_projection(writer)
     }
 
     fn confirm_submitted_user_turn<W: Write>(
@@ -1500,6 +1868,21 @@ impl LaunchState {
         mut event: Value,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
+        if !self.projection_admitted {
+            let event_bytes = event.to_string().len();
+            if self.deferred_event_bytes.saturating_add(event_bytes) <= DEFERRED_EVENT_LIMIT {
+                self.deferred_event_bytes += event_bytes;
+                self.deferred_events.push(event);
+            } else if !self
+                .integrity_failures
+                .iter()
+                .any(|failure| failure == "pre-session event projection buffer exhausted")
+            {
+                self.integrity_failures
+                    .push("pre-session event projection buffer exhausted".to_string());
+            }
+            return Ok(());
+        }
         assign_event_seq(&mut event, self.seq);
         write_ndjson_event(&self.request_id, writer, &event)?;
         self.advance_seq();
@@ -1855,7 +2238,30 @@ fn json_write_failure(request_id: &str, err: serde_json::Error) -> ProviderFailu
     )
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let parent_pid = unsafe { getpid() };
+    unsafe {
+        command.pre_exec(move || set_current_process_group_with_parent_death(parent_pid));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_current_process_group_with_parent_death(parent_pid: i32) -> std::io::Result<()> {
+    set_current_process_group()?;
+    if unsafe { prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { getppid() } != parent_pid {
+        return Err(std::io::Error::other(
+            "provider parent exited before child custody was established",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     unsafe {
@@ -1912,8 +2318,18 @@ const SIGTERM: i32 = 15;
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
 
+#[cfg(target_os = "linux")]
+const PR_SET_PDEATHSIG: i32 = 1;
+
 #[cfg(unix)]
 extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn getpid() -> i32;
+    fn getppid() -> i32;
+    fn prctl(option: i32, arg2: i32, arg3: usize, arg4: usize, arg5: usize) -> i32;
 }

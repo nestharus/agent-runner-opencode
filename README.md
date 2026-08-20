@@ -109,13 +109,17 @@ truncation are emitted as explicit evidence markers. Independent stdout and
 stderr pipes are sequenced in provider receipt order; the provider makes no
 claim about an unknowable pre-receipt cross-pipe emission order.
 
-Before a new-session child is spawned, launch durably binds the request ID to
-the accepted route and prompt digest. The first generated provider session ID
-is added to that binding before its native stdout bytes are handed off. An
-exact retry therefore never spawns independent work: it returns the durable
-session identity, when observed, and requires the caller to reconcile that
-session. Reusing the request ID with different launch inputs is rejected as a
-conflict.
+Before a new-session child is spawned, launch stages its complete stdin and
+durably binds the request ID to the accepted route and prompt digest. The route
+event must also be handed off before spawn; a failed pre-spawn handoff durably
+releases the binding. After spawn, projection is held until either the first
+generated provider session ID or a no-session terminal is durable, so an event
+write cannot discard the responsible successor. An exact retry returns an
+observed session or terminal for reconciliation. A request left merely
+prepared by an interrupted provider invocation runs native session discovery,
+binding a matching session when present and readmitting the request only after
+an exhaustive list proves no effect. Reusing the request ID with different
+launch inputs is rejected as a conflict.
 
 For resumed sessions, model switching is allowed per turn. Delivery and
 completion are credited only when bounded native export observes the submitted

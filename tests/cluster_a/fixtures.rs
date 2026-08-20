@@ -471,6 +471,10 @@ pub fn fake_counted_new_session_script(count_path: &Path, session_id: &str) -> S
     .to_string();
     format!(
         "#!/bin/sh\n\
+if [ \"$1\" = \"session\" ] && [ \"${{2:-}}\" = \"list\" ]; then\n\
+  printf '%s\\n' '[]'\n\
+  exit 0\n\
+fi\n\
 count=0\n\
 if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
 count=$((count + 1))\n\
