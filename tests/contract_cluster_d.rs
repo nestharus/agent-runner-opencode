@@ -272,7 +272,7 @@ fn contract_account_reference_is_not_an_implicit_settings_record() {
 #[test]
 fn contract_activity_evidence_is_redacted_private_and_hash_chained() {
     let host = HostRoots::new("agent-runner-opencode-activity-ledger");
-    let _ = success_result(
+    let created = success_result(
         invoke_validated_with_host(
             "settings.create",
             settings_create_params(Some(SECRET_TOKEN)),
@@ -282,6 +282,7 @@ fn contract_activity_evidence_is_redacted_private_and_hash_chained() {
         "settings.schema.json#/$defs/SettingsCreateResponse",
         "settings.schema.json#/$defs/SettingsCreateResult",
     );
+    let created_id = settings_create_id(&created);
     let ledger_path = host
         .data_root()
         .join("provider-state/opencode/activity/operations.jsonl");
@@ -293,6 +294,12 @@ fn contract_activity_evidence_is_redacted_private_and_hash_chained() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("activity JSON"))
         .collect::<Vec<_>>();
     assert_eq!(events.len(), 2);
+    assert!(activity_identities(&events[1]).iter().any(|identity| {
+        identity["kind"] == "settings_record"
+            && identity["value"] == created_id
+            && identity["status"] == "generated"
+            && identity["provenance"] == "result.record.id"
+    }));
     let mut previous = String::new();
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event["sequence"], index + 1);
@@ -323,6 +330,81 @@ fn contract_activity_evidence_is_redacted_private_and_hash_chained() {
             0o600
         );
     }
+}
+
+#[test]
+fn contract_activity_preserves_all_conflicting_session_identity_carriers() {
+    let host = HostRoots::new("agent-runner-opencode-activity-session-conflict");
+    let response = error_response(invoke_validated_with_host(
+        "session.capture",
+        json!({
+            "settings_id": "opencode1",
+            "session_id": "ses_bare_conflict",
+            "launch": {
+                "session": {
+                    "provider_session_id": "ses_launch_conflict",
+                    "source": "opencode.run.format_json"
+                }
+            },
+            "pinned_target": "ses_pinned_conflict",
+            "start_bound_provider_session_id": "ses_start_bound_conflict"
+        }),
+        host.overrides(),
+        "session.schema.json#/$defs/SessionCaptureRequest",
+    ));
+    assert_eq!(response["error"]["code"], "invalid_session_capture_params");
+    let events = read_activity_events(&host);
+    assert_eq!(events.len(), 2);
+    let identities = activity_identities(&events[1]);
+    for (value, provenance) in [
+        (
+            "ses_launch_conflict",
+            "params.launch.session.provider_session_id",
+        ),
+        ("ses_bare_conflict", "params.session_id"),
+        ("ses_pinned_conflict", "params.pinned_target"),
+        (
+            "ses_start_bound_conflict",
+            "params.start_bound_provider_session_id",
+        ),
+    ] {
+        assert!(identities.iter().any(|identity| {
+            identity["kind"] == "provider_session"
+                && identity["value"] == value
+                && identity["status"] == "attempted"
+                && identity["provenance"] == provenance
+        }));
+    }
+}
+
+#[test]
+fn contract_activity_keeps_rotation_alias_and_canonical_account_identity() {
+    let host = HostRoots::new("agent-runner-opencode-activity-rotation-alias");
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(false),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let events = read_activity_events(&host);
+    assert_eq!(events.len(), 2);
+    let identities = activity_identities(&events[1]);
+    assert!(identities.iter().any(|identity| {
+        identity["kind"] == "account"
+            && identity["value"] == "opencode"
+            && identity["status"] == "attempted"
+            && identity["provenance"] == "params.source_account"
+    }));
+    assert!(identities.iter().any(|identity| {
+        identity["kind"] == "account"
+            && identity["value"] == "opencode1"
+            && identity["status"] == "resolved"
+            && identity["provenance"] == "params.source_account.catalog"
+    }));
 }
 
 #[test]
@@ -376,6 +458,23 @@ fn assert_settings_history(host: &HostRoots, expected_events: usize) {
     let serialized = String::from_utf8(bytes).expect("settings store UTF-8");
     assert!(!serialized.contains(SECRET_TOKEN));
     assert!(!serialized.contains(UPDATE_SECRET_TOKEN));
+}
+
+fn read_activity_events(host: &HostRoots) -> Vec<serde_json::Value> {
+    fs::read_to_string(
+        host.data_root()
+            .join("provider-state/opencode/activity/operations.jsonl"),
+    )
+    .expect("activity ledger")
+    .lines()
+    .map(|line| serde_json::from_str(line).expect("activity JSON"))
+    .collect()
+}
+
+fn activity_identities(event: &serde_json::Value) -> &[serde_json::Value] {
+    event["targets"]["identities"]
+        .as_array()
+        .expect("typed activity identities")
 }
 
 #[test]

@@ -1,9 +1,12 @@
 //! Declared roles: validator, mapper, formatter, parser, filter, predicate
 
 use crate::account::profile_for_wrapper_reference;
+use crate::activity::ActivityTargets;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::models::{model_alias, provider_args_match, ModelAlias};
-use crate::runtime_selection::{resolve_runtime_selection, RuntimeSelection};
+use crate::runtime_selection::{
+    append_resolved_activity_targets, resolve_runtime_selection, RuntimeSelection,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -132,6 +135,77 @@ pub fn evaluate_params(
     let wire = parse_policy_params(params, request_id)?;
     let decision = evaluate(host, wire.into(), request_id)?;
     Ok(project_policy_result(decision))
+}
+
+pub(crate) fn activity_targets(
+    host: &HostContext,
+    params: &Value,
+    result: Option<&Value>,
+    request_id: &str,
+) -> ActivityTargets {
+    let mut targets = ActivityTargets::default();
+    let settings_id = params
+        .get("settings_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    if let Some(settings_id) = settings_id {
+        targets.attempted("settings_record", settings_id, "params.settings_id");
+    }
+    if let Some(name) = params
+        .pointer("/model/name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        targets.attempted("model_alias", name, "params.model.name");
+    }
+    if let Some(provider_args) = params.pointer("/model/provider_args") {
+        targets.provider_args(provider_args);
+    }
+    let Some(result) = result else {
+        return targets;
+    };
+    if let Some(settings_id) = settings_id {
+        append_resolved_activity_targets(
+            &mut targets,
+            host,
+            settings_id,
+            request_id,
+            "runtime_selection.settings_record",
+        );
+    }
+    if result.get("accepted").and_then(Value::as_bool) == Some(true) {
+        append_resolved_policy_model(&mut targets, params);
+    }
+    targets
+}
+
+fn append_resolved_policy_model(targets: &mut ActivityTargets, params: &Value) {
+    let Some(name) = params.pointer("/model/name").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(provider_args) = params
+        .pointer("/model/provider_args")
+        .and_then(Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+    else {
+        return;
+    };
+    let Some(model) = model_alias(name).filter(|model| provider_args_match(model, &provider_args))
+    else {
+        return;
+    };
+    targets.resolved("model_alias", model.name, "model_catalog.name");
+    targets.resolved(
+        "provider_model",
+        model.provider_model,
+        "model_catalog.provider_model",
+    );
+    targets.resolved("effort", model.effort, "model_catalog.effort");
 }
 
 pub(crate) fn evaluate_launch(

@@ -8,11 +8,12 @@
 //!       - opencode CLI-owned auth refresh boundary to QuotaRefreshAuthResult
 
 use crate::account::AccountProfile;
+use crate::activity::ActivityTargets;
 use crate::encoding::{bounded_text, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::opencode::{OpencodeAuthEffect, OpencodeAuthObservation};
 use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
-use crate::runtime_selection::resolve_runtime_selection;
+use crate::runtime_selection::{append_resolved_activity_targets, resolve_runtime_selection};
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -42,6 +43,32 @@ pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, Provi
         "quota.refresh_auth" => refresh_auth_params(&host, params, &request_id),
         unknown => Err(unknown_quota_subcommand_failure(request_id, unknown)),
     }
+}
+
+pub(crate) fn activity_targets(
+    host: &HostContext,
+    params: &Value,
+    result: Option<&Value>,
+    request_id: &str,
+) -> ActivityTargets {
+    let mut targets = ActivityTargets::default();
+    let settings_id = params
+        .get("settings_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    if let Some(settings_id) = settings_id {
+        targets.attempted("settings_record", settings_id, "params.settings_id");
+        if result.is_some() {
+            append_resolved_activity_targets(
+                &mut targets,
+                host,
+                settings_id,
+                request_id,
+                "runtime_selection.settings_record",
+            );
+        }
+    }
+    targets
 }
 
 pub fn source_params(

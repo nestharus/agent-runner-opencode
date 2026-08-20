@@ -8,7 +8,7 @@
 //!       - per-capability handler invocation
 //!       - request/response envelope decode-encode
 
-use crate::activity::ActivityContext;
+use crate::activity::{ActivityContext, ActivityTargets};
 use crate::discovery;
 use crate::encoding::canonical_json_bytes;
 use crate::envelope::{
@@ -133,34 +133,45 @@ fn write_invocation_result<W: Write>(
     let request = decode_request(stdin)?;
     let subcommand = subcommand_from_args(args, &request.request_id)?;
     let activity = ActivityContext::from_request(&request, subcommand);
-    if let Err(error) = activity.started() {
+    let attempted_targets = activity_targets(subcommand, &request, None);
+    if let Err(error) = activity.started(&attempted_targets) {
         eprintln!("provider activity start evidence warning: {error:?}");
     }
     if subcommand == "launch" {
+        let params_snapshot = request.params.clone();
         let result = launch::stream(&request.request_id, &request.host, request.params, writer);
+        let completed_targets = launch::activity_targets(
+            &request.host,
+            &params_snapshot,
+            result.is_ok(),
+            &request.request_id,
+        );
         match &result {
             Ok(exit_code) => {
-                if let Err(error) = activity.succeeded(*exit_code) {
+                if let Err(error) = activity.succeeded(*exit_code, &completed_targets) {
                     eprintln!("provider activity completion evidence warning: {error:?}");
                 }
             }
             Err(failure) => {
-                if let Err(error) = activity.failed(failure) {
+                if let Err(error) = activity.failed(failure, &completed_targets) {
                     eprintln!("provider activity completion evidence warning: {error:?}");
                 }
             }
         }
         return result;
     }
+    let request_snapshot = request.clone();
     let response = match handle_decoded_invocation(request, subcommand) {
         Ok(response) => {
-            if let Err(error) = activity.succeeded(0) {
+            let completed_targets =
+                activity_targets(subcommand, &request_snapshot, response.get("result"));
+            if let Err(error) = activity.succeeded(0, &completed_targets) {
                 eprintln!("provider activity completion evidence warning: {error:?}");
             }
             response
         }
         Err(failure) => {
-            if let Err(error) = activity.failed(&failure) {
+            if let Err(error) = activity.failed(&failure, &attempted_targets) {
                 eprintln!("provider activity completion evidence warning: {error:?}");
             }
             return Err(failure);
@@ -170,6 +181,50 @@ fn write_invocation_result<W: Write>(
         .write_all(&canonical_json_bytes(&response))
         .map_err(stdout_write_failure)?;
     Ok(0)
+}
+
+fn activity_targets(
+    subcommand: &str,
+    request: &RequestEnvelope,
+    result: Option<&Value>,
+) -> ActivityTargets {
+    match subcommand {
+        "settings.list" | "settings.get" | "settings.create" | "settings.update"
+        | "settings.delete" | "settings.validate" | "settings.migrate" => {
+            settings::activity_targets(subcommand, &request.params, result)
+        }
+        "session.locate_transcript"
+        | "session.read_turns"
+        | "session.capture"
+        | "session.enumerate"
+        | "session.export"
+        | "session.replace" => session::activity_targets(
+            subcommand,
+            &request.host,
+            &request.params,
+            result,
+            &request.request_id,
+        ),
+        "quota.source" | "quota.probe" | "quota.refresh_auth" => {
+            quota::activity_targets(&request.host, &request.params, result, &request.request_id)
+        }
+        "policy.evaluate" => {
+            policy::activity_targets(&request.host, &request.params, result, &request.request_id)
+        }
+        "launch" => launch::activity_targets(
+            &request.host,
+            &request.params,
+            result.is_some(),
+            &request.request_id,
+        ),
+        "rotation.assess" | "rotation.materialize" => {
+            rotation::activity_targets(&request.params, result)
+        }
+        "migration.plan" | "migration.apply" => {
+            migration::activity_targets(&request.params, result)
+        }
+        _ => ActivityTargets::default(),
+    }
 }
 
 fn parse_raw_request(stdin: &[u8]) -> Result<Value, serde_json::Error> {

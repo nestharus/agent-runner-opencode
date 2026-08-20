@@ -9,6 +9,7 @@
 //!       - truthful settings-record evidence labels
 
 use crate::account::AccountProfile;
+use crate::activity::ActivityTargets;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::models::ModelAlias;
 use crate::settings;
@@ -58,6 +59,37 @@ pub fn resolve_runtime_selection(
             .map(RuntimeModelBinding::Exact)
             .unwrap_or(RuntimeModelBinding::AnyAdvertised),
     })
+}
+
+pub fn append_resolved_activity_targets(
+    targets: &mut ActivityTargets,
+    host: &HostContext,
+    settings_id: &str,
+    request_id: &str,
+    provenance: &'static str,
+) {
+    let Ok(selection) = resolve_runtime_selection(host, settings_id, request_id) else {
+        return;
+    };
+    targets.resolved("settings_record", selection.settings_id.clone(), provenance);
+    targets.resolved(
+        "account",
+        selection.account.opencode_wrapper,
+        "settings_record.values.wrapper",
+    );
+    if let Some(model) = selection.exact_model() {
+        targets.resolved(
+            "model_alias",
+            model.name,
+            "settings_record.values.model.name",
+        );
+        targets.resolved(
+            "provider_model",
+            model.provider_model,
+            "model_catalog.provider_model",
+        );
+        targets.resolved("effort", model.effort, "model_catalog.effort");
+    }
 }
 
 fn map_missing_record(

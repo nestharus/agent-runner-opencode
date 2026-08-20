@@ -1,5 +1,6 @@
 //! Declared roles: mapper, validator, orchestration, accessor, formatter, predicate
 
+use crate::activity::ActivityTargets;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::path_guard;
@@ -49,6 +50,33 @@ pub fn apply_params(
         migration_warnings(&params),
         &artifact_root,
     ))
+}
+
+pub(crate) fn activity_targets(params: &Value, result: Option<&Value>) -> ActivityTargets {
+    let mut targets = ActivityTargets::default();
+    if let Some(provider) = string_param(params, "target_provider") {
+        targets.attempted("provider", provider, "params.target_provider");
+    }
+    targets.attempted(
+        "migration_input_digest",
+        sha256_hex(params.to_string().as_bytes()),
+        "params.content_sha256",
+    );
+    if let Some(artifacts) = result
+        .and_then(|result| result.get("artifacts"))
+        .and_then(Value::as_array)
+    {
+        for artifact in artifacts {
+            if let Some(digest) = artifact
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                targets.generated("migration_artifact", digest, "result.artifacts[].sha256");
+            }
+        }
+    }
+    targets
 }
 
 fn migration_apply_result(

@@ -1,6 +1,7 @@
 //! Declared roles: mapper, validator, predicate, filter, formatter
 
 use crate::account::{profile_for_account_reference, AccountProfile};
+use crate::activity::ActivityTargets;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
@@ -97,6 +98,107 @@ pub fn materialize_params(
     });
     write_materialization_receipt(host, &binding, &result, request_id)?;
     Ok(result)
+}
+
+pub(crate) fn activity_targets(params: &Value, result: Option<&Value>) -> ActivityTargets {
+    let mut targets = ActivityTargets::default();
+    append_attempted_string(
+        &mut targets,
+        params,
+        "chain_id",
+        "rotation_chain",
+        "params.chain_id",
+    );
+    append_attempted_string(
+        &mut targets,
+        params,
+        "source_provider",
+        "provider",
+        "params.source_provider",
+    );
+    append_attempted_string(
+        &mut targets,
+        params,
+        "target_provider",
+        "provider",
+        "params.target_provider",
+    );
+    append_rotation_account_targets(
+        &mut targets,
+        params,
+        "source_account",
+        "params.source_account",
+    );
+    append_rotation_account_targets(
+        &mut targets,
+        params,
+        "target_account",
+        "params.target_account",
+    );
+    append_attempted_string(
+        &mut targets,
+        params,
+        "source_session_id",
+        "provider_session",
+        "params.source_session_id",
+    );
+    append_attempted_string(
+        &mut targets,
+        params,
+        "settings_id",
+        "settings_record",
+        "params.settings_id",
+    );
+    append_attempted_string(
+        &mut targets,
+        params,
+        "model_name",
+        "model_alias",
+        "params.model_name",
+    );
+    if let Some(target_session_id) = result
+        .and_then(|result| result.get("target_provider_session_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        targets.generated(
+            "provider_session",
+            target_session_id,
+            "result.target_provider_session_id",
+        );
+    }
+    targets
+}
+
+fn append_attempted_string(
+    targets: &mut ActivityTargets,
+    params: &Value,
+    field: &str,
+    kind: &'static str,
+    provenance: &'static str,
+) {
+    if let Some(value) = optional_string(params, field) {
+        targets.attempted(kind, value, provenance);
+    }
+}
+
+fn append_rotation_account_targets(
+    targets: &mut ActivityTargets,
+    params: &Value,
+    field: &str,
+    provenance: &'static str,
+) {
+    let Some(reference) = optional_string(params, field) else {
+        return;
+    };
+    targets.attempted("account", reference, provenance);
+    if let Some(profile) = profile_for_account_reference(reference) {
+        targets.resolved(
+            "account",
+            profile.opencode_wrapper,
+            format!("{provenance}.catalog"),
+        );
+    }
 }
 
 fn requirements(params: &Value) -> Vec<Value> {

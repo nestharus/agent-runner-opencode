@@ -9,6 +9,7 @@
 //!       - record normalization, sanitization, and legacy-store mapping
 
 use crate::account::{profile_for_wrapper_reference, AccountProfile};
+use crate::activity::ActivityTargets;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
 use crate::models::{default_model, model_alias, DEFAULT_MODEL_ALIAS};
@@ -88,6 +89,110 @@ pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, Provi
         }
         unknown => Err(unknown_settings_subcommand_failure(request_id, unknown)),
     }
+}
+
+pub(crate) fn activity_targets(
+    subcommand: &str,
+    params: &Value,
+    result: Option<&Value>,
+) -> ActivityTargets {
+    let mut targets = ActivityTargets::default();
+    if matches!(
+        subcommand,
+        "settings.get" | "settings.update" | "settings.delete"
+    ) {
+        if let Some(id) = non_empty_value(params.get("id")) {
+            targets.attempted("settings_record", id, "params.id");
+        }
+    }
+    if let Some(values) = params.get("values") {
+        append_settings_value_activity_targets(&mut targets, values, "params.values", false);
+    }
+    let Some(result) = result else {
+        return targets;
+    };
+    if let Some(record) = result.get("record") {
+        append_settings_record_activity_targets(
+            &mut targets,
+            record,
+            subcommand == "settings.create",
+        );
+    }
+    if let Some(records) = result.get("records").and_then(Value::as_array) {
+        for record in records {
+            append_settings_record_activity_targets(&mut targets, record, false);
+        }
+    }
+    if subcommand == "settings.delete" {
+        if let Some(id) = non_empty_value(result.get("id")) {
+            targets.resolved("settings_record", id, "result.id");
+        }
+    }
+    targets
+}
+
+fn append_settings_record_activity_targets(
+    targets: &mut ActivityTargets,
+    record: &Value,
+    generated: bool,
+) {
+    if let Some(id) = non_empty_value(record.get("id")) {
+        if generated {
+            targets.generated("settings_record", id, "result.record.id");
+        } else {
+            targets.resolved("settings_record", id, "result.record.id");
+        }
+    }
+    if let Some(values) = record.get("values") {
+        append_settings_value_activity_targets(targets, values, "result.record.values", true);
+    }
+}
+
+fn append_settings_value_activity_targets(
+    targets: &mut ActivityTargets,
+    values: &Value,
+    provenance: &'static str,
+    resolved: bool,
+) {
+    let wrapper = wrapper_value(values);
+    if !wrapper.trim().is_empty() {
+        let canonical = profile_for_wrapper_reference(wrapper)
+            .map(|profile| profile.opencode_wrapper)
+            .unwrap_or(wrapper);
+        if resolved {
+            targets.resolved("account", canonical, format!("{provenance}.wrapper"));
+        } else {
+            targets.attempted("account", wrapper, format!("{provenance}.wrapper"));
+            if canonical != wrapper {
+                targets.resolved(
+                    "account",
+                    canonical,
+                    format!("{provenance}.wrapper.catalog"),
+                );
+            }
+        }
+    }
+    if let Some(model_name) = model_name_value(values) {
+        if resolved {
+            targets.resolved(
+                "model_alias",
+                model_name,
+                format!("{provenance}.model.name"),
+            );
+        } else {
+            targets.attempted(
+                "model_alias",
+                model_name,
+                format!("{provenance}.model.name"),
+            );
+        }
+    }
+}
+
+fn non_empty_value(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 #[derive(Serialize, Deserialize)]

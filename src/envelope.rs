@@ -12,7 +12,7 @@ pub const CATEGORY_INVALID_SETTINGS: &str = "invalid_settings";
 pub const CATEGORY_CONFLICT: &str = "conflict";
 pub const CATEGORY_FAILED: &str = "failed";
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestEnvelope {
     pub contract: String,
@@ -22,7 +22,7 @@ pub struct RequestEnvelope {
     pub params: Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostContext {
     pub app: String,

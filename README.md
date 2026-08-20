@@ -147,9 +147,14 @@ retain hashes for the complete legacy input plus its provider/model records.
 When `host.data_root` is present, a redacted hash-chained activity ledger is
 written under `provider-state/opencode/activity`. It joins requests across
 policy, launch, session, quota, settings, migration, and rotation without
-recording prompts, tokens, or environment values. Rotation authorizations,
-idempotency records, and decision receipts live under the adjacent
-`provider-state/opencode/rotation` tree.
+recording prompts, tokens, or environment values. Each capability translates
+its own domain identities into typed targets: start evidence preserves every
+attempted identity and its source, while completion evidence adds canonical,
+resolved, or generated settings, account, model, provider, session, and
+artifact identities. This prevents generic JSON-path fallback from collapsing
+distinct source and target roles. Rotation authorizations, idempotency records,
+and decision receipts live under the adjacent `provider-state/opencode/rotation`
+tree.
 
 Settings, migration, activity, and rotation all pass every provider-owned
 filesystem target through the same lexical and canonical confinement guard

@@ -9,11 +9,14 @@
 //!       - declared params.env entries and host-linkage env to env-cleared child env
 //!       - process terminal status to LaunchExitEvent
 
+use crate::activity::ActivityTargets;
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
+use crate::models::{model_alias, provider_args_match};
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
 use crate::policy;
 use crate::resume_observation::{self, ResumeObservationRequest};
+use crate::runtime_selection::append_resolved_activity_targets;
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -117,6 +120,86 @@ pub fn stream<W: Write>(
         effective.route_evidence,
         writer,
     )
+}
+
+pub(crate) fn activity_targets(
+    host: &HostContext,
+    params: &Value,
+    completed: bool,
+    request_id: &str,
+) -> ActivityTargets {
+    let mut targets = ActivityTargets::default();
+    let settings_id = params
+        .get("settings_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    if let Some(settings_id) = settings_id {
+        targets.attempted("settings_record", settings_id, "params.settings_id");
+    }
+    if let Some(model_name) = params
+        .pointer("/model/name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        targets.attempted("model_alias", model_name, "params.model.name");
+    }
+    if let Some(provider_args) = params.pointer("/model/provider_args") {
+        targets.provider_args(provider_args);
+    }
+    if let Some(provider_session_id) = params
+        .pointer("/session/known_provider_session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        targets.attempted(
+            "provider_session",
+            provider_session_id,
+            "params.session.known_provider_session_id",
+        );
+    }
+    if !completed {
+        return targets;
+    }
+    if let Some(settings_id) = settings_id {
+        append_resolved_activity_targets(
+            &mut targets,
+            host,
+            settings_id,
+            request_id,
+            "runtime_selection.settings_record",
+        );
+    }
+    append_resolved_launch_model(&mut targets, params);
+    targets
+}
+
+fn append_resolved_launch_model(targets: &mut ActivityTargets, params: &Value) {
+    let Some(name) = params.pointer("/model/name").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(provider_args) = params
+        .pointer("/model/provider_args")
+        .and_then(Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+    else {
+        return;
+    };
+    let Some(model) = model_alias(name).filter(|model| provider_args_match(model, &provider_args))
+    else {
+        return;
+    };
+    targets.resolved("model_alias", model.name, "model_catalog.name");
+    targets.resolved(
+        "provider_model",
+        model.provider_model,
+        "model_catalog.provider_model",
+    );
+    targets.resolved("effort", model.effort, "model_catalog.effort");
 }
 
 fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, ProviderFailure> {

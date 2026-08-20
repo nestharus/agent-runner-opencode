@@ -8,6 +8,7 @@ use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
 use crate::path_guard;
 use fs2::FileExt;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -16,19 +17,42 @@ use std::path::{Path, PathBuf};
 const ACTIVITY_DIR: &str = "provider-state/opencode/activity";
 const ACTIVITY_FILE: &str = "operations.jsonl";
 const ACTIVITY_LOCK: &str = ".operations.lock";
+const ACTIVITY_SCHEMA_VERSION: u32 = 2;
 
 pub struct ActivityContext {
     host: HostContextSnapshot,
     request_id: String,
     provider_instance_id: Option<String>,
     subcommand: String,
-    targets: Value,
 }
 
 struct HostContextSnapshot {
     app: String,
     app_version: Option<String>,
     data_root: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize)]
+pub struct ActivityTargets {
+    identities: Vec<ActivityIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempted_provider_args_sha256: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct ActivityIdentity {
+    kind: &'static str,
+    value: String,
+    status: ActivityIdentityStatus,
+    provenance: String,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityIdentityStatus {
+    Attempted,
+    Resolved,
+    Generated,
 }
 
 impl ActivityContext {
@@ -42,21 +66,33 @@ impl ActivityContext {
             request_id: request.request_id.clone(),
             provider_instance_id: request.provider_instance_id.clone(),
             subcommand: subcommand.to_string(),
-            targets: redacted_targets(&request.params),
         }
     }
 
-    pub fn started(&self) -> Result<(), ProviderFailure> {
-        self.record("started", json!({}))
+    pub fn started(&self, targets: &ActivityTargets) -> Result<(), ProviderFailure> {
+        self.record("started", targets, json!({}))
     }
 
-    pub fn succeeded(&self, exit_code: i32) -> Result<(), ProviderFailure> {
-        self.record("completed", json!({ "ok": true, "exit_code": exit_code }))
-    }
-
-    pub fn failed(&self, failure: &ProviderFailure) -> Result<(), ProviderFailure> {
+    pub fn succeeded(
+        &self,
+        exit_code: i32,
+        targets: &ActivityTargets,
+    ) -> Result<(), ProviderFailure> {
         self.record(
             "completed",
+            targets,
+            json!({ "ok": true, "exit_code": exit_code }),
+        )
+    }
+
+    pub fn failed(
+        &self,
+        failure: &ProviderFailure,
+        targets: &ActivityTargets,
+    ) -> Result<(), ProviderFailure> {
+        self.record(
+            "completed",
+            targets,
             json!({
                 "ok": false,
                 "category": failure.category,
@@ -67,11 +103,16 @@ impl ActivityContext {
         )
     }
 
-    fn record(&self, phase: &str, outcome: Value) -> Result<(), ProviderFailure> {
+    fn record(
+        &self,
+        phase: &str,
+        targets: &ActivityTargets,
+        outcome: Value,
+    ) -> Result<(), ProviderFailure> {
         let Some(root) = self.root() else {
             return Ok(());
         };
-        write_activity(&root, self, phase, outcome).map_err(|error| {
+        write_activity(&root, self, phase, targets, outcome).map_err(|error| {
             ProviderFailure::internal(
                 &self.request_id,
                 "activity_evidence_write_failed",
@@ -89,33 +130,85 @@ impl ActivityContext {
     }
 }
 
-fn redacted_targets(params: &Value) -> Value {
-    let provider_args_sha256 = params
-        .pointer("/model/provider_args")
-        .map(|args| sha256_hex(args.to_string().as_bytes()));
-    json!({
-        "settings_id": string_at(params, "/settings_id"),
-        "model_name": string_at(params, "/model/name").or_else(|| string_at(params, "/model_name")),
-        "provider_session_id": string_at(params, "/session_id")
-            .or_else(|| string_at(params, "/source_session_id"))
-            .or_else(|| string_at(params, "/session/known_provider_session_id")),
-        "chain_id": string_at(params, "/chain_id"),
-        "source_provider": string_at(params, "/source_provider"),
-        "target_provider": string_at(params, "/target_provider"),
-        "source_account": string_at(params, "/source_account"),
-        "target_account": string_at(params, "/target_account"),
-        "attempted_provider_args_sha256": provider_args_sha256,
-    })
-}
+impl ActivityTargets {
+    pub fn push(
+        &mut self,
+        kind: &'static str,
+        value: impl Into<String>,
+        status: ActivityIdentityStatus,
+        provenance: impl Into<String>,
+    ) {
+        let value = value.into();
+        let provenance = provenance.into();
+        if value.trim().is_empty()
+            || self.identities.iter().any(|identity| {
+                identity.kind == kind
+                    && identity.value == value
+                    && identity.status == status
+                    && identity.provenance == provenance
+            })
+        {
+            return;
+        }
+        self.identities.push(ActivityIdentity {
+            kind,
+            value,
+            status,
+            provenance,
+        });
+    }
 
-fn string_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
-    value.pointer(pointer).and_then(Value::as_str)
+    pub fn attempted(
+        &mut self,
+        kind: &'static str,
+        value: impl Into<String>,
+        provenance: impl Into<String>,
+    ) {
+        self.push(kind, value, ActivityIdentityStatus::Attempted, provenance);
+    }
+
+    pub fn resolved(
+        &mut self,
+        kind: &'static str,
+        value: impl Into<String>,
+        provenance: impl Into<String>,
+    ) {
+        self.push(kind, value, ActivityIdentityStatus::Resolved, provenance);
+    }
+
+    pub fn generated(
+        &mut self,
+        kind: &'static str,
+        value: impl Into<String>,
+        provenance: impl Into<String>,
+    ) {
+        self.push(kind, value, ActivityIdentityStatus::Generated, provenance);
+    }
+
+    pub fn provider_args(&mut self, args: &Value) {
+        self.attempted_provider_args_sha256 = Some(sha256_hex(args.to_string().as_bytes()));
+    }
+
+    pub fn extend(&mut self, other: ActivityTargets) {
+        for identity in other.identities {
+            self.push(
+                identity.kind,
+                identity.value,
+                identity.status,
+                identity.provenance,
+            );
+        }
+        if other.attempted_provider_args_sha256.is_some() {
+            self.attempted_provider_args_sha256 = other.attempted_provider_args_sha256;
+        }
+    }
 }
 
 fn write_activity(
     root: &Path,
     context: &ActivityContext,
     phase: &str,
+    targets: &ActivityTargets,
     outcome: Value,
 ) -> std::io::Result<()> {
     let data_root = context
@@ -143,7 +236,7 @@ fn write_activity(
     };
     let (sequence, previous_event_sha256) = validate_ledger(&existing)?;
     let mut event = json!({
-        "schema_version": 1,
+        "schema_version": ACTIVITY_SCHEMA_VERSION,
         "sequence": sequence + 1,
         "phase": phase,
         "subcommand": context.subcommand,
@@ -156,7 +249,7 @@ fn write_activity(
         "authenticated_principal": null,
         "delegation": null,
         "principal_binding": "not_supplied_by_oulipoly.provider/v1",
-        "targets": context.targets,
+        "targets": targets,
         "outcome": outcome,
         "recorded_at_unix_ms": now_unix_ms(),
         "previous_event_sha256": previous_event_sha256,

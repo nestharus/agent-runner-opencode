@@ -18,12 +18,13 @@
 //!       - opencode absent transcript path to SessionLocateTranscriptResult
 //!       - opencode unsupported transcript import to SessionReplaceResult boundary
 
+use crate::activity::ActivityTargets;
 use crate::encoding::{encode_base64, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
 use crate::opencode::{
     self, OpencodeExport, OpencodeExportError, OpencodeMessage, OpencodeSessionListError,
 };
-use crate::runtime_selection::resolve_runtime_selection;
+use crate::runtime_selection::{append_resolved_activity_targets, resolve_runtime_selection};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -112,6 +113,128 @@ pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, Provi
         "session.export" => export_params(&host, params, &request_id),
         "session.replace" => replace_params(params, &request_id),
         unknown => Err(unknown_session_subcommand_failure(request_id, unknown)),
+    }
+}
+
+pub(crate) fn activity_targets(
+    subcommand: &str,
+    host: &crate::envelope::HostContext,
+    params: &Value,
+    result: Option<&Value>,
+    request_id: &str,
+) -> ActivityTargets {
+    let mut targets = ActivityTargets::default();
+    let settings_id = params
+        .get("settings_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    if let Some(settings_id) = settings_id {
+        targets.attempted("settings_record", settings_id, "params.settings_id");
+    }
+    if subcommand == "session.capture" {
+        append_capture_activity_candidates(&mut targets, params, request_id);
+    } else if let Some(session_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        targets.attempted("provider_session", session_id, "params.session_id");
+    }
+    let Some(result) = result else {
+        return targets;
+    };
+    if let Some(settings_id) = settings_id.filter(|_| session_resolves_runtime(subcommand, params))
+    {
+        append_resolved_activity_targets(
+            &mut targets,
+            host,
+            settings_id,
+            request_id,
+            "runtime_selection.settings_record",
+        );
+    }
+    append_completed_session_activity_targets(&mut targets, subcommand, params, result);
+    targets
+}
+
+fn append_capture_activity_candidates(
+    targets: &mut ActivityTargets,
+    params: &Value,
+    request_id: &str,
+) {
+    let Ok(params) = parse_capture_params(params.clone(), request_id) else {
+        return;
+    };
+    let Ok(candidates) = session_identity_candidates(&params, request_id) else {
+        return;
+    };
+    for candidate in candidates {
+        targets.attempted(
+            "provider_session",
+            candidate.provider_session_id,
+            format!("params.{}", candidate.source),
+        );
+    }
+}
+
+fn session_resolves_runtime(subcommand: &str, params: &Value) -> bool {
+    matches!(
+        subcommand,
+        "session.read_turns" | "session.enumerate" | "session.export"
+    ) || (subcommand == "session.capture" && params.get("live_report").is_some())
+}
+
+fn append_completed_session_activity_targets(
+    targets: &mut ActivityTargets,
+    subcommand: &str,
+    params: &Value,
+    result: &Value,
+) {
+    if subcommand == "session.capture" {
+        if let Some(provider_session_id) = result
+            .get("provider_session_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            let source = result
+                .pointer("/state/source")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("provider_session_id");
+            targets.resolved(
+                "provider_session",
+                provider_session_id,
+                format!("result.{source}"),
+            );
+        }
+        return;
+    }
+    if subcommand == "session.enumerate" {
+        if let Some(sessions) = result.get("sessions").and_then(Value::as_array) {
+            for session in sessions {
+                if let Some(provider_session_id) = session
+                    .get("provider_session_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    targets.resolved(
+                        "provider_session",
+                        provider_session_id,
+                        "result.sessions[].provider_session_id",
+                    );
+                }
+            }
+        }
+        return;
+    }
+    if matches!(subcommand, "session.read_turns" | "session.export") {
+        if let Some(session_id) = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            targets.resolved("provider_session", session_id, "params.session_id");
+        }
     }
 }
 
