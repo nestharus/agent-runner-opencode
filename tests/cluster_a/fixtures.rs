@@ -479,6 +479,19 @@ exit 0\n"
         .to_string()
 }
 
+pub fn fake_wrapper_runtime_identity_script() -> String {
+    "#!/bin/sh\n\
+if [ \"${CONTEXT_SELECTOR-}\" != \"runtime-a\" ]; then\n\
+  printf '%s\\n' 'native runtime selector mismatch' >&2\n\
+  exit 66\n\
+fi\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '{\"info\":{\"id\":\"%s\",\"title\":\"runtime identity fixture\"},\"messages\":[]}\\n' \"$2\"\n\
+fi\n\
+exit 0\n"
+        .to_string()
+}
+
 pub fn fake_counted_new_session_script(count_path: &Path, session_id: &str) -> String {
     let event = json!({
         "type": "step_start",

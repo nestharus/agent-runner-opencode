@@ -5,6 +5,7 @@ use crate::activity::ActivityTargets;
 use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
+use crate::native_runtime;
 use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
 use crate::path_guard;
 use crate::runtime_selection::resolve_runtime_selection;
@@ -59,13 +60,26 @@ pub fn materialize_params(
     }
     if let Some(mut operation) = read_rotation_operation(host, &binding, request_id)? {
         if operation.phase == RotationOperationPhase::Prepared {
-            reconcile_prepared_operation(host, &params, &binding, &mut operation, request_id)?;
+            let target_runtime =
+                native_runtime::resolve_for_account(host, binding.target_account, request_id)?;
+            reconcile_prepared_operation(
+                host,
+                &params,
+                &binding,
+                &target_runtime,
+                &mut operation,
+                request_id,
+            )?;
         }
         return finalize_rotation_operation(host, &binding, &operation, request_id);
     }
     let authorization = require_fresh_authorization(host, &binding, request_id)?;
     let working_directory = rotation_working_directory(host, request_id)?;
-    let native = opencode::export(&binding.source_session_id, binding.source_account)
+    let source_runtime =
+        native_runtime::resolve_for_account(host, binding.source_account, request_id)?;
+    let target_runtime =
+        native_runtime::resolve_for_account(host, binding.target_account, request_id)?;
+    let native = opencode::export(&binding.source_session_id, &source_runtime)
         .map_err(|error| rotation_export_failure(request_id, &binding.source_session_id, error))?;
     validate_rotation_export(&native, &binding.source_session_id, request_id)?;
     let boundary = crate::session::rotation_boundary_timestamp(&native)
@@ -98,10 +112,9 @@ pub fn materialize_params(
     };
     write_rotation_operation(host, &binding, &operation, request_id)?;
     let target_session_id =
-        opencode::import_session(&artifact_path, binding.target_account, working_directory)
-            .map_err(|error| {
-                rotation_import_failure(request_id, &binding.target_provider_id, error)
-            })?;
+        opencode::import_session(&artifact_path, &target_runtime, working_directory).map_err(
+            |error| rotation_import_failure(request_id, &binding.target_provider_id, error),
+        )?;
     operation.phase = RotationOperationPhase::Imported;
     operation.target_session_id = Some(target_session_id);
     operation.imported_at_unix_ms = Some(now_unix_ms());
@@ -293,12 +306,14 @@ fn rotation_binding(
 ) -> Result<RotationBinding, ProviderFailure> {
     let source_account_reference = required_string(params, "source_account", request_id)?;
     let target_account_reference = required_string(params, "target_account", request_id)?;
+    let source_account = rotation_account(source_account_reference, request_id, "source")?;
+    let target_account = rotation_account(target_account_reference, request_id, "target")?;
     Ok(RotationBinding {
         chain_id: required_string(params, "chain_id", request_id)?.to_string(),
         source_provider_id: required_string(params, "source_provider", request_id)?.to_string(),
         target_provider_id: required_string(params, "target_provider", request_id)?.to_string(),
-        source_account: rotation_account(source_account_reference, request_id, "source")?,
-        target_account: rotation_account(target_account_reference, request_id, "target")?,
+        source_account,
+        target_account,
         source_session_id: required_string(params, "source_session_id", request_id)?.to_string(),
         model_name: optional_string(params, "model_name")
             .unwrap_or("")
@@ -632,12 +647,13 @@ fn reconcile_prepared_operation(
     host: &HostContext,
     params: &Value,
     binding: &RotationBinding,
+    target_runtime: &native_runtime::NativeRuntimeContext,
     operation: &mut RotationOperation,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     let supplied_target = optional_string(params, "recovery_target_session_id");
     let candidate_session_id = supplied_target.unwrap_or(&binding.source_session_id);
-    let target = match opencode::export(candidate_session_id, binding.target_account) {
+    let target = match opencode::export(candidate_session_id, target_runtime) {
         Ok(target) => target,
         Err(error) => {
             return Err(rotation_recovery_required(

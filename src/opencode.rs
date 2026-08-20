@@ -9,9 +9,8 @@
 //!       - opencode export native session JSON
 //!       - opencode auth list status plus observed credential-file effect
 
-use crate::account::AccountProfile;
 use crate::child_custody::ChildCustody;
-use crate::shell;
+use crate::native_runtime::NativeRuntimeContext;
 use crate::shell::ShellOutput;
 use serde::Deserialize;
 use serde_json::Value;
@@ -242,17 +241,17 @@ pub fn is_successful_terminal_event(event: &OpencodeEventMetadata) -> bool {
 
 pub fn export(
     session_id: &str,
-    account: &AccountProfile,
+    runtime: &NativeRuntimeContext,
 ) -> Result<OpencodeExport, OpencodeExportError> {
-    export_with_timeout(session_id, account, Duration::from_secs(20))
+    export_with_timeout(session_id, runtime, Duration::from_secs(20))
 }
 
 pub fn export_with_timeout(
     session_id: &str,
-    account: &AccountProfile,
+    runtime: &NativeRuntimeContext,
     timeout: Duration,
 ) -> Result<OpencodeExport, OpencodeExportError> {
-    let mut command = shell::command(account.opencode_wrapper);
+    let mut command = runtime.command();
     command.arg("export").arg(session_id);
     run_export_command(command, timeout)
 }
@@ -307,9 +306,9 @@ fn run_export_command(
 
 pub fn session_list(
     limit: Option<usize>,
-    account: &AccountProfile,
+    runtime: &NativeRuntimeContext,
 ) -> Result<Vec<Value>, OpencodeSessionListError> {
-    let mut command = shell::command(account.opencode_wrapper);
+    let mut command = runtime.command();
     command
         .arg("session")
         .arg("list")
@@ -325,10 +324,11 @@ pub fn session_list(
 
 pub fn import_session(
     path: &Path,
-    account: &AccountProfile,
+    runtime: &NativeRuntimeContext,
     working_directory: &Path,
 ) -> Result<String, OpencodeImportError> {
-    let output = shell::command(account.opencode_wrapper)
+    let output = runtime
+        .command()
         .current_dir(working_directory)
         .arg("import")
         .arg(path)
@@ -339,24 +339,20 @@ pub fn import_session(
 }
 
 pub fn observe_auth_list(
-    account: &AccountProfile,
+    runtime: &NativeRuntimeContext,
     auth_path: &Path,
 ) -> std::io::Result<OpencodeAuthObservation> {
     let before = credential_snapshot(auth_path);
-    let output = crate::shell::run(&auth_list_argv(account))?;
+    let output = runtime.command().arg("auth").arg("list").output()?;
     let after = credential_snapshot(auth_path);
     Ok(OpencodeAuthObservation {
-        output,
+        output: ShellOutput {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            status: output.status.code().unwrap_or(1),
+        },
         effect: observed_auth_effect(before, after),
     })
-}
-
-fn auth_list_argv(account: &AccountProfile) -> Vec<String> {
-    vec![
-        account.opencode_wrapper.to_string(),
-        "auth".to_string(),
-        "list".to_string(),
-    ]
 }
 
 fn credential_snapshot(path: &Path) -> Option<Vec<u8>> {

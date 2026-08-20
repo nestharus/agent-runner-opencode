@@ -390,6 +390,7 @@ fn contract_launch_resume_replay_preserves_multi_part_positional_identity() {
 
 #[test]
 fn contract_launch_route_handoff_failure_releases_request_before_spawn() {
+    let runtime = IsolatedLaunchSettings::new();
     let provider_session_id = "ses_route_handoff_retry";
     let fake_wrapper = FakeOpencodeWrapper::with_counted_new_session(provider_session_id);
     let path = prepend_path(fake_wrapper.dir());
@@ -406,7 +407,7 @@ fn contract_launch_route_handoff_failure_releases_request_before_spawn() {
     let mut request = support::validated_request_envelope(
         "launch",
         params,
-        serde_json::json!({}),
+        runtime.host_overrides(),
         "launch.schema.json#/$defs/LaunchRequest",
     );
     request["request_id"] = serde_json::json!("req-launch-route-response-loss");
@@ -427,7 +428,8 @@ fn contract_launch_route_handoff_failure_releases_request_before_spawn() {
         "route handoff must complete before the child can spawn"
     );
 
-    let replay = support::invoke_with_request("launch", request);
+    let home = std::env::var("HOME").expect("test HOME");
+    let replay = support::invoke_with_request_and_env("launch", request, &[("HOME", &home)]);
     assert_output_success(&replay, "launch after pre-spawn route handoff failure");
     let events = launch_events_from_output(&replay, "route handoff retry stdout");
     assert!(events.iter().any(|event| {
@@ -444,6 +446,7 @@ fn contract_launch_route_handoff_failure_releases_request_before_spawn() {
 #[test]
 #[cfg(unix)]
 fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() {
+    let runtime = IsolatedLaunchSettings::new();
     let provider_session_id = "ses_prepared_recovery_readmission";
     let fake_wrapper = FakeOpencodeWrapper::with_counted_new_session(provider_session_id);
     let path = prepend_path(fake_wrapper.dir());
@@ -461,7 +464,7 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
     let mut request = support::validated_request_envelope(
         "launch",
         params,
-        serde_json::json!({}),
+        runtime.host_overrides(),
         "launch.schema.json#/$defs/LaunchRequest",
     );
     let request_id = "req-launch-prepared-recovery-readmission";
@@ -729,6 +732,104 @@ fn contract_launch_luna_low_reaches_exact_native_route() {
     assert_output_success(&output, "launch Luna low");
     let argv = wrapper_nul_log_args(fake_wrapper.log_path());
     assert_contains_subsequence(&argv, &["-m", "openai/gpt-5.6-luna", "--variant", "low"]);
+}
+
+#[test]
+fn contract_native_runtime_identity_is_shared_across_capabilities() {
+    let runtime = IsolatedLaunchSettings::new();
+    let admitted_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_runtime_identity_script());
+    let conflicting_wrapper = FakeOpencodeWrapper::with_script("#!/bin/sh\nexit 17\n".to_string());
+    let admitted_path = prepend_path(admitted_wrapper.dir());
+    let conflicting_path = prepend_path(conflicting_wrapper.dir());
+    let admitted_home = tempfile::tempdir().expect("create admitted native HOME");
+    let conflicting_home = tempfile::tempdir().expect("create conflicting native HOME");
+    let admitted_home_path = admitted_home.path().to_string_lossy().into_owned();
+    let conflicting_home_path = conflicting_home.path().to_string_lossy().into_owned();
+    let admitted_auth_path = admitted_home.path().join(".local/share/opencode/auth.json");
+    fs::create_dir_all(admitted_auth_path.parent().expect("auth parent"))
+        .expect("create admitted auth parent");
+    fs::write(&admitted_auth_path, "{}\n").expect("write admitted auth source");
+    let launch = invoke_with_host_and_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", admitted_path.as_str()),
+                ("HOME", admitted_home_path.as_str()),
+                ("CONTEXT_SELECTOR", "runtime-a"),
+            ],
+        ),
+        runtime.host_overrides(),
+        &[
+            ("PATH", admitted_path.as_str()),
+            ("HOME", admitted_home_path.as_str()),
+        ],
+    );
+    assert_output_success(&launch, "launch that admits native runtime identity");
+
+    let session_id = "ses_native_runtime_identity";
+    let exported = support::invoke_validated_with_host_and_env(
+        "session.export",
+        serde_json::json!({
+            "settings_id": "opencode1",
+            "session_id": session_id,
+        }),
+        runtime.host_overrides(),
+        "session.schema.json#/$defs/SessionExportRequest",
+        &[
+            ("PATH", conflicting_path.as_str()),
+            ("HOME", conflicting_home_path.as_str()),
+        ],
+    );
+    let export_response = json_stdout(&exported);
+    support::assert_valid(
+        &export_response,
+        "session.schema.json#/$defs/SessionExportResponse",
+    );
+    assert_eq!(export_response["ok"], true, "response={export_response}");
+    assert_eq!(export_response["result"]["turn_count"], 0);
+
+    let quota_source = support::invoke_validated_with_host_and_env(
+        "quota.source",
+        serde_json::json!({ "settings_id": "opencode1" }),
+        runtime.host_overrides(),
+        "quota.schema.json#/$defs/QuotaSourceRequest",
+        &[
+            ("PATH", conflicting_path.as_str()),
+            ("HOME", conflicting_home_path.as_str()),
+        ],
+    );
+    let quota_response = json_stdout(&quota_source);
+    support::assert_valid(
+        &quota_response,
+        "quota.schema.json#/$defs/QuotaSourceResponse",
+    );
+    assert_eq!(quota_response["ok"], true, "response={quota_response}");
+    assert_eq!(quota_response["result"]["has_source"], true);
+    assert!(quota_response["result"]["source_id"]
+        .as_str()
+        .is_some_and(|source| source.contains(admitted_home_path.as_str())));
+
+    let conflicting_launch = invoke_with_host_and_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", conflicting_path.as_str()),
+                ("HOME", conflicting_home_path.as_str()),
+            ],
+        ),
+        runtime.host_overrides(),
+        &[
+            ("PATH", conflicting_path.as_str()),
+            ("HOME", conflicting_home_path.as_str()),
+        ],
+    );
+    let conflict_response = json_stdout(&conflicting_launch);
+    assert_eq!(
+        conflict_response["error"]["code"],
+        "native_runtime_context_conflict"
+    );
 }
 
 #[test]
@@ -1262,25 +1363,37 @@ fn contract_policy_evaluate_accepts_host_candidate_argv() {
 }
 
 #[test]
-fn contract_policy_evaluate_accepts_host_candidate_argv_for_every_account_id() {
-    for (settings_id, command) in account_host_command_cases() {
+fn contract_policy_evaluate_accepts_only_canonical_command_for_every_account_id() {
+    for settings_id in account_host_settings_ids() {
         let output = invoke_with_env(
             "policy.evaluate",
-            policy_evaluate_params_for_alias_host_candidate(settings_id, command.as_str()),
+            policy_evaluate_params_for_alias_host_candidate(settings_id, settings_id),
             &[],
         );
 
         assert_output_success(
             &output,
-            &format!("policy.evaluate host candidate argv for {settings_id}"),
+            &format!("policy.evaluate canonical host candidate argv for {settings_id}"),
         );
         let response = json_stdout(&output);
-        assert_policy_accepts_for_wrapper(&response, command.as_str());
+        assert_policy_accepts_for_wrapper(&response, settings_id);
+
+        let path_command = host_bin_command(settings_id);
+        let path_output = invoke_with_env(
+            "policy.evaluate",
+            policy_evaluate_params_for_alias_host_candidate(settings_id, &path_command),
+            &[],
+        );
+        assert_output_success(
+            &path_output,
+            &format!("policy.evaluate path-shaped host candidate argv for {settings_id}"),
+        );
+        assert_policy_rejected_with_code(&json_stdout(&path_output), "invalid_command");
     }
 }
 
 #[test]
-fn contract_policy_evaluate_accepts_account_one_wrapper_command_aliases() {
+fn contract_policy_evaluate_rejects_account_one_wrapper_command_aliases() {
     for (settings_id, command) in [
         ("opencode1", "opencode"),
         ("opencode1", "/tmp/host-bin/opencode"),
@@ -1296,7 +1409,7 @@ fn contract_policy_evaluate_accepts_account_one_wrapper_command_aliases() {
             &format!("policy.evaluate wrapper command alias for {settings_id}"),
         );
         let response = json_stdout(&output);
-        assert_policy_accepts_for_wrapper(&response, command);
+        assert_policy_rejected_with_code(&response, "invalid_command");
     }
 }
 
@@ -1314,13 +1427,6 @@ fn contract_policy_evaluate_rejects_user_injected_managed_flag_after_host_prefix
     assert_policy_rejects_forbidden_arg(&response, forbidden_flag);
 }
 
-fn account_host_command_cases() -> Vec<(&'static str, String)> {
-    account_host_settings_ids()
-        .into_iter()
-        .flat_map(account_host_command_cases_for)
-        .collect()
-}
-
 fn account_host_settings_ids() -> [&'static str; 5] {
     [
         "opencode1",
@@ -1329,21 +1435,6 @@ fn account_host_settings_ids() -> [&'static str; 5] {
         "opencode4",
         "opencode5",
     ]
-}
-
-fn account_host_command_cases_for(settings_id: &'static str) -> Vec<(&'static str, String)> {
-    account_host_commands(settings_id)
-        .into_iter()
-        .map(move |command| account_host_command_case(settings_id, command))
-        .collect()
-}
-
-fn account_host_commands(settings_id: &str) -> [String; 2] {
-    [settings_id.to_string(), host_bin_command(settings_id)]
-}
-
-fn account_host_command_case(settings_id: &'static str, command: String) -> (&'static str, String) {
-    (settings_id, command)
 }
 
 fn host_bin_command(settings_id: &str) -> String {
@@ -1377,7 +1468,7 @@ fn contract_policy_evaluate_accepts_account_one_persisted_settings_id() {
 }
 
 #[test]
-fn contract_policy_evaluate_accepts_account_one_plain_host_command() {
+fn contract_policy_evaluate_rejects_account_one_plain_host_command() {
     let output = invoke_with_env(
         "policy.evaluate",
         policy_evaluate_account_one_plain_host_command_params(),
@@ -1386,7 +1477,7 @@ fn contract_policy_evaluate_accepts_account_one_plain_host_command() {
 
     assert_output_success(&output, "policy.evaluate account-one plain host command");
     let response = json_stdout(&output);
-    assert_policy_accepts_for_wrapper(&response, "opencode");
+    assert_policy_rejected_with_code(&response, "invalid_command");
 }
 
 #[test]

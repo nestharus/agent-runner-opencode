@@ -13,13 +13,15 @@ configuration and credentials are neither read nor modified. The optional
 The provider recognizes five account-pinned wrappers, `opencode1` through
 `opencode5`. The selected settings record, wrapper command, session commands,
 auth path, quota probe, refresh command, and rotation target must resolve to
-the same profile. One account-catalog resolver owns wrapper-shaped references
-from command paths, settings values, and native routing. The bare `opencode`
-name is a compatibility alias for account one; numbered wrappers are canonical
-persisted identities. Setup plans and legacy-provider migration both resolve
-their inputs through this same catalog and emit canonical numbered identities;
-unknown OpenCode-shaped references are diagnostic errors and are never mapped
-to account one. A contract field named `settings_id` identifies only an opaque,
+the same profile. Numbered wrappers are the canonical persisted and executable
+identities, and launch accepts only the exact canonical wrapper name selected
+by the settings record. Path-shaped or basename-equivalent commands are not
+account aliases. The bare `opencode` name remains an account-one compatibility
+reference only at catalog-mediated setup and legacy inputs; it is not an
+accepted launch command. Setup plans and legacy-provider migration emit
+canonical numbered identities, while unknown or path-shaped OpenCode
+references are diagnostic errors and are never inferred from a basename. A
+contract field named `settings_id` identifies only an opaque,
 persisted settings record; account or wrapper aliases are not accepted as a
 second hidden token kind. A record carries its ID, version, account, and either
 an exact stored route or the explicit `model.selection=requested` policy.
@@ -99,8 +101,9 @@ availability is reported independently.
 `quota.refresh_auth` also takes durable custody of each request before admitting
 the native auth command. The request binding includes the complete parameter
 digest, provider/host identity, resolved settings-record ID and version,
-account, and credential-source path. A completed observation is committed before
-the response is written, so an exact retry after response loss replays the same
+account, credential-source path, and native runtime identity. A completed
+observation is committed before the response is written, so an exact retry
+after response loss replays the same
 `refreshed`, availability, timestamp, and detail without invoking OpenCode
 again. If provider loss occurs after the native-effect boundary but before that
 observation is committed, the request is durably marked for reconciliation;
@@ -247,6 +250,20 @@ retry re-synchronizes the complete directory lineage, including links already
 visible after an earlier parent-sync failure. A readable provider file can
 satisfy a retry only after that boundary re-syncs its parent, so a prior
 post-rename sync failure remains an error until durability completes.
+
+Every native effect also passes through one durable runtime context per
+numbered account under `host.data_root/provider-state/opencode/native-runtimes`.
+The context privately records the canonical absolute wrapper, its content hash,
+and the stable execution environment that can select OpenCode state or alter
+wrapper behavior. Launch establishes or validates that binding before spawn;
+session export/enumeration, resume observation, rotation export/import, auth
+refresh, and quota-source observation after a binding exists reuse it instead
+of resolving a fresh ambient command or auth path. Explicitly
+transient runner-linkage and contract-test logging variables are forwarded for
+the current invocation but do not change the state identity. A different
+wrapper, stable environment, or changed wrapper implementation is rejected
+before another native effect rather than silently addressing a second state
+namespace with the same account/session labels.
 
 Activity evidence is operational and explicitly best-effort. A directory,
 lock, write, or chain-validation failure is emitted as a stderr warning but

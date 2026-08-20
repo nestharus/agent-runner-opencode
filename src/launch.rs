@@ -9,11 +9,13 @@
 //!       - declared params.env entries and host-linkage env to env-cleared child env
 //!       - process terminal status to LaunchExitEvent
 
+use crate::account::profile_for_wrapper_reference;
 use crate::activity::ActivityTargets;
 use crate::child_custody::ChildCustody;
 use crate::durable_fs;
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
+use crate::native_runtime;
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
 use crate::path_guard;
 use crate::policy;
@@ -45,13 +47,6 @@ const DRAIN_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 const DRAIN_CHANNEL_CAPACITY: usize = 32;
 const TERMINAL_CAPTURE_LIMIT: usize = 1024 * 1024;
 const DEFERRED_EVENT_LIMIT: usize = 1024 * 1024;
-const BASE_LAUNCH_ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME"];
-// Step-6a host-linkage contract: these runner bindings must survive env_clear.
-const HOST_LINKAGE_ENV_KEYS: &[&str] = &[
-    "OULIPOLY_DATA_DIR",
-    "OULIPOLY_PARENT_INVOCATION",
-    "AGENT_BASH_AGENT_RUNNER_BIN",
-];
 const OPENCODE_SESSION_FLAG: &str = "--session";
 const OPENCODE_RUN_ARG: &str = "run";
 const POLICY_MANAGED_FLAGS_WITH_VALUE: &[&str] = &["--format", "-m", "--variant"];
@@ -323,7 +318,7 @@ pub(crate) fn stream<W: Write>(
     let (child, launch_exec_gate) = match spawn_child(
         &effective.argv,
         &params.working_directory,
-        &effective.env,
+        &effective.execution_env,
         child_stdin,
     ) {
         Ok(child) => child,
@@ -403,6 +398,7 @@ fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, 
 struct EffectiveLaunch {
     argv: Vec<String>,
     env: BTreeMap<String, String>,
+    execution_env: BTreeMap<String, String>,
     stdin: Option<Vec<u8>>,
     prompt: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
@@ -437,7 +433,7 @@ fn launch_argv(
     )?;
     match decision {
         policy::PolicyDecision::Accepted(plan) => Ok(PolicyLaunch::Accepted(Box::new(
-            effective_launch(params, plan, host.deadline_unix_ms, request_id)?,
+            effective_launch(params, plan, host, request_id)?,
         ))),
         policy::PolicyDecision::Rejected(plan) => {
             Ok(PolicyLaunch::Rejected(policy_rejection_reason(&plan)))
@@ -448,11 +444,11 @@ fn launch_argv(
 fn effective_launch(
     params: &LaunchParams,
     plan: policy::PolicyLaunchPlan,
-    deadline_unix_ms: Option<u64>,
+    host: &HostContext,
     request_id: &str,
 ) -> Result<EffectiveLaunch, ProviderFailure> {
     let policy::PolicyLaunchPlan {
-        argv,
+        mut argv,
         env,
         stdin,
         prompt,
@@ -461,16 +457,38 @@ fn effective_launch(
         route,
     } = plan;
     validate_policy_argv(&argv, request_id)?;
+    let account = profile_for_wrapper_reference(&route.account_wrapper).ok_or_else(|| {
+        ProviderFailure::internal(
+            request_id,
+            "native_runtime_account_invalid",
+            "accepted launch route does not name a declared canonical account",
+        )
+    })?;
+    let configured_program = argv.first().map(String::as_str).unwrap_or_default();
+    let native_runtime =
+        native_runtime::resolve_for_launch(host, account, configured_program, &env, request_id)?;
+    let execution_env = native_runtime.execution_environment(&env);
+    if let Some(program) = argv.first_mut() {
+        *program = native_runtime.program().to_string();
+    }
     let stdin = stdin.map(String::into_bytes);
     let argv = resume_argv(params, argv, stdin.as_deref(), request_id)?;
-    let resume_observation_request =
-        resume_observation_request(params, stdin.as_deref(), &argv, deadline_unix_ms, &route);
+    let resume_observation_request = resume_observation_request(
+        params,
+        stdin.as_deref(),
+        &argv,
+        host.deadline_unix_ms,
+        &route,
+        &native_runtime,
+        &env,
+    );
     let mut activity_targets = ActivityTargets::default();
     policy::append_route_activity_targets(&mut activity_targets, &route);
     let argv = split_oversized_prompt_argv(argv, request_id)?;
     Ok(EffectiveLaunch {
         argv,
         env,
+        execution_env,
         stdin,
         prompt,
         resume_observation_request,
@@ -546,6 +564,8 @@ fn resume_observation_request(
     argv: &[String],
     deadline_unix_ms: Option<u64>,
     route: &policy::PolicyRouteIdentity,
+    native_runtime: &native_runtime::NativeRuntimeContext,
+    declared_env: &BTreeMap<String, String>,
 ) -> Option<ResumeObservationRequest> {
     let session_id = known_provider_session_id(params)?;
     let prompt = submitted_resume_payload(argv, stdin)?;
@@ -558,6 +578,9 @@ fn resume_observation_request(
         route.provider_id.clone(),
         route.model_id.clone(),
         route.effort.to_string(),
+        native_runtime.program().to_string(),
+        params.working_directory.clone(),
+        native_runtime.execution_environment(declared_env),
     ))
 }
 
@@ -774,9 +797,7 @@ fn spawn_child(
     stdin: Stdio,
 ) -> std::io::Result<(Child, Option<LaunchExecGate>)> {
     let (mut command, launch_exec_gate) = child_command(argv, working_directory, stdin)?;
-    command.env_clear();
-    let child_env = child_env(env);
-    command.envs(child_env.iter());
+    command.env_clear().envs(env);
     configure_process_group(&mut command);
     command
         .env(
@@ -890,27 +911,6 @@ fn prepared_child_stdin(stdin: Option<&[u8]>) -> std::io::Result<Stdio> {
     staged.sync_all()?;
     staged.seek(SeekFrom::Start(0))?;
     Ok(Stdio::from(staged))
-}
-
-#[cfg(unix)]
-fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut env = launch_passthrough_env();
-    // Explicitly declared values take precedence over ambient passthrough.
-    env.extend(declared.clone());
-    env
-}
-
-fn launch_passthrough_env() -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    for key in BASE_LAUNCH_ENV_PASSTHROUGH_KEYS
-        .iter()
-        .chain(HOST_LINKAGE_ENV_KEYS.iter())
-    {
-        if let Ok(value) = std::env::var(key) {
-            env.insert((*key).to_string(), value);
-        }
-    }
-    env
 }
 
 fn stream_child<W: Write>(
@@ -1557,7 +1557,7 @@ fn launch_recovery_context(
     declared_env: &BTreeMap<String, String>,
     route: &policy::PolicyRouteIdentity,
 ) -> LaunchRecoveryContext {
-    let passthrough_env = launch_passthrough_env();
+    let passthrough_env = native_runtime::ambient_launch_environment();
     let mut effective_env = passthrough_env.clone();
     effective_env.extend(declared_env.clone());
     LaunchRecoveryContext {

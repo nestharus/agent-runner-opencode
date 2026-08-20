@@ -3,11 +3,12 @@
 use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Map, Value};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
+use std::sync::Mutex;
 
 pub const CONTRACT: &str = "oulipoly.provider/v1";
 
@@ -76,9 +77,10 @@ pub fn invoke_with_request(subcommand: &str, request_json: Value) -> Output {
 #[allow(dead_code)]
 pub fn invoke_with_request_and_env(
     subcommand: &str,
-    request_json: Value,
+    mut request_json: Value,
     env: &[(&str, &str)],
 ) -> Output {
+    scope_default_host_to_native_env(&mut request_json, env);
     ensure_default_runtime_settings(&request_json);
     let stdin = request_stdin_bytes(&request_json);
     invoke_raw_stdin_with_env(subcommand, &stdin, env)
@@ -154,24 +156,54 @@ fn default_test_root() -> PathBuf {
 }
 
 pub fn ensure_default_runtime_settings(request: &Value) {
-    static INITIALIZE: Once = Once::new();
+    static INITIALIZE_LOCK: Mutex<()> = Mutex::new(());
+    let Some(config_root) = request
+        .pointer("/host/config_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    if !config_root.starts_with(default_test_root()) {
+        return;
+    }
+    let _guard = INITIALIZE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_root = config_root.join("agent-runner-opencode");
+    let store_path = store_root.join("settings-store.json");
+    fs::create_dir_all(&store_root).expect("create default provider settings fixture");
+    if let Some(data_root) = request.pointer("/host/data_root").and_then(Value::as_str) {
+        fs::create_dir_all(data_root).expect("create default provider data fixture");
+    }
+    if !store_path.exists() {
+        fs::write(
+            store_path,
+            serde_json::to_vec_pretty(&default_runtime_settings_store())
+                .expect("serialize default provider settings fixture"),
+        )
+        .expect("write default provider settings fixture");
+    }
+}
+
+fn scope_default_host_to_native_env(request: &mut Value, env: &[(&str, &str)]) {
     let default_config_root = default_test_root().join("config");
     if request.pointer("/host/config_root").and_then(Value::as_str) != default_config_root.to_str()
     {
         return;
     }
-    INITIALIZE.call_once(|| {
-        let store_root = default_config_root.join("agent-runner-opencode");
-        fs::create_dir_all(&store_root).expect("create default provider settings fixture");
-        fs::create_dir_all(default_test_root().join("data"))
-            .expect("create default provider data fixture");
-        fs::write(
-            store_root.join("settings-store.json"),
-            serde_json::to_vec_pretty(&default_runtime_settings_store())
-                .expect("serialize default provider settings fixture"),
-        )
-        .expect("write default provider settings fixture");
-    });
+    let state_context = env
+        .iter()
+        .filter(|(key, _)| matches!(*key, "PATH" | "HOME"))
+        .collect::<Vec<_>>();
+    if state_context.is_empty() {
+        return;
+    }
+    let mut hasher = DefaultHasher::new();
+    state_context.hash(&mut hasher);
+    let root = default_test_root().join(format!("native-env-{:016x}", hasher.finish()));
+    request["host"]["config_root"] = json!(root.join("config").to_string_lossy());
+    request["host"]["data_root"] = json!(root.join("data").to_string_lossy());
 }
 
 fn default_runtime_settings_store() -> Value {

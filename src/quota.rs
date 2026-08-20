@@ -12,6 +12,7 @@ use crate::activity::ActivityTargets;
 use crate::durable_fs;
 use crate::encoding::{bounded_text, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
+use crate::native_runtime::{self, NativeRuntimeContext};
 use crate::opencode::{OpencodeAuthEffect, OpencodeAuthObservation};
 use crate::path_guard;
 use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
@@ -122,7 +123,7 @@ pub fn source_params(
 ) -> Result<Value, ProviderFailure> {
     let params = parse_base_params(params, request_id)?;
     let account = account_from_settings_record(host, &params.settings_id, request_id)?;
-    let auth_path = resolved_auth_path(account);
+    let auth_path = observed_auth_path(host, account, request_id)?;
     Ok(source_result(account, &auth_path))
 }
 
@@ -133,7 +134,8 @@ pub fn probe_params(
 ) -> Result<Value, ProviderFailure> {
     let params = parse_base_params(params, request_id)?;
     let account = account_from_settings_record(host, &params.settings_id, request_id)?;
-    Ok(probe_account(account))
+    let auth_path = observed_auth_path(host, account, request_id)?;
+    Ok(probe_auth_path(&auth_path))
 }
 
 pub fn refresh_auth_params(
@@ -151,86 +153,91 @@ pub fn refresh_auth_params(
         &host.app,
     );
     let _request_lock = acquire_quota_refresh_request_lock(host, request_id)?;
-    let (mut operation, account, auth_path) = match read_quota_refresh_operation(host, request_id)?
-    {
-        Some(operation) => {
-            validate_quota_refresh_operation(&operation, request_id)?;
-            if !quota_refresh_attempt_matches(
-                &operation,
-                &params_sha256,
-                &parsed.settings_id,
-                provider_instance_id,
-                &host.app,
-            ) {
-                return Err(quota_refresh_request_conflict(
-                    request_id,
-                    &attempted_identity_sha256,
+    let (mut operation, account, runtime, auth_path) =
+        match read_quota_refresh_operation(host, request_id)? {
+            Some(operation) => {
+                validate_quota_refresh_operation(&operation, request_id)?;
+                if !quota_refresh_attempt_matches(
                     &operation,
-                ));
-            }
-            match operation.phase {
-                QuotaRefreshOperationPhase::Committed => {
-                    return Ok(operation
-                        .result
-                        .expect("validated committed quota refresh has a result"));
-                }
-                QuotaRefreshOperationPhase::NativeEffectAdmitted => {
-                    let mut unresolved = operation;
-                    unresolved.phase = QuotaRefreshOperationPhase::ReconciliationRequired;
-                    write_quota_refresh_operation(host, &unresolved, request_id)?;
-                    return Err(quota_refresh_reconciliation_required(
+                    &params_sha256,
+                    &parsed.settings_id,
+                    provider_instance_id,
+                    &host.app,
+                ) {
+                    return Err(quota_refresh_request_conflict(
                         request_id,
-                        &unresolved,
+                        &attempted_identity_sha256,
+                        &operation,
                     ));
                 }
-                QuotaRefreshOperationPhase::ReconciliationRequired => {
-                    return Err(quota_refresh_reconciliation_required(
-                        request_id, &operation,
-                    ));
+                match operation.phase {
+                    QuotaRefreshOperationPhase::Committed => {
+                        return Ok(operation
+                            .result
+                            .expect("validated committed quota refresh has a result"));
+                    }
+                    QuotaRefreshOperationPhase::NativeEffectAdmitted => {
+                        let mut unresolved = operation;
+                        unresolved.phase = QuotaRefreshOperationPhase::ReconciliationRequired;
+                        write_quota_refresh_operation(host, &unresolved, request_id)?;
+                        return Err(quota_refresh_reconciliation_required(
+                            request_id,
+                            &unresolved,
+                        ));
+                    }
+                    QuotaRefreshOperationPhase::ReconciliationRequired => {
+                        return Err(quota_refresh_reconciliation_required(
+                            request_id, &operation,
+                        ));
+                    }
+                    QuotaRefreshOperationPhase::Prepared => {}
                 }
-                QuotaRefreshOperationPhase::Prepared => {}
+                let operation =
+                    upgrade_prepared_quota_refresh_runtime_binding(host, operation, request_id)?;
+                let (account, runtime, auth_path) =
+                    quota_refresh_operation_route(host, &operation, request_id)?;
+                (operation, account, runtime, auth_path)
             }
-            let (account, auth_path) = quota_refresh_operation_route(&operation, request_id)?;
-            (operation, account, auth_path)
-        }
-        None => {
-            let selection = resolve_runtime_selection(host, &parsed.settings_id, request_id)?;
-            let account = selection.account;
-            let auth_path = resolved_auth_path(account);
-            let binding = quota_refresh_binding(
-                &params_sha256,
-                &selection,
-                &auth_path,
-                provider_instance_id,
-                &host.app,
-            );
-            let operation = QuotaRefreshOperation {
-                schema_version: QUOTA_REFRESH_SCHEMA_VERSION,
-                operation: "quota.refresh_auth".to_string(),
-                request_id: request_id.to_string(),
-                binding_sha256: quota_refresh_binding_sha256(&binding),
-                binding,
-                phase: QuotaRefreshOperationPhase::Prepared,
-                prepared_at_unix_ms: now_unix_ms(),
-                native_effect_admitted_at_unix_ms: None,
-                committed_at_unix_ms: None,
-                result: None,
-            };
-            write_quota_refresh_operation(host, &operation, request_id)?;
-            (operation, account, auth_path)
-        }
-    };
+            None => {
+                let selection = resolve_runtime_selection(host, &parsed.settings_id, request_id)?;
+                let account = selection.account;
+                let runtime = native_runtime::resolve_for_account(host, account, request_id)?;
+                let auth_path = resolved_auth_path(account, &runtime);
+                let binding = quota_refresh_binding(
+                    &params_sha256,
+                    &selection,
+                    &runtime,
+                    &auth_path,
+                    provider_instance_id,
+                    &host.app,
+                );
+                let operation = QuotaRefreshOperation {
+                    schema_version: QUOTA_REFRESH_SCHEMA_VERSION,
+                    operation: "quota.refresh_auth".to_string(),
+                    request_id: request_id.to_string(),
+                    binding_sha256: quota_refresh_binding_sha256(&binding),
+                    binding,
+                    phase: QuotaRefreshOperationPhase::Prepared,
+                    prepared_at_unix_ms: now_unix_ms(),
+                    native_effect_admitted_at_unix_ms: None,
+                    committed_at_unix_ms: None,
+                    result: None,
+                };
+                write_quota_refresh_operation(host, &operation, request_id)?;
+                (operation, account, runtime, auth_path)
+            }
+        };
     let _account_lock = acquire_quota_refresh_account_lock(host, account, &auth_path, request_id)?;
     operation.phase = QuotaRefreshOperationPhase::NativeEffectAdmitted;
     operation.native_effect_admitted_at_unix_ms = Some(now_unix_ms());
     write_quota_refresh_operation(host, &operation, request_id)?;
     let checked_at_unix_ms = now_unix_ms();
-    let refresh = run_account_auth_refresh(account, &auth_path);
+    let refresh = run_account_auth_refresh(&runtime, &auth_path);
     let refreshed = refresh_succeeded(&refresh);
     let available = refresh
         .as_ref()
         .is_ok_and(OpencodeAuthObservation::command_succeeded)
-        && refresh_available(account);
+        && refresh_available(account, &runtime);
     let result = refresh_auth_result(
         refreshed,
         available,
@@ -244,9 +251,49 @@ pub fn refresh_auth_params(
     Ok(result)
 }
 
+fn upgrade_prepared_quota_refresh_runtime_binding(
+    host: &HostContext,
+    mut operation: QuotaRefreshOperation,
+    request_id: &str,
+) -> Result<QuotaRefreshOperation, ProviderFailure> {
+    if operation.binding["native_runtime_identity_sha256"]
+        .as_str()
+        .is_some()
+    {
+        return Ok(operation);
+    }
+    let account_name = operation.binding["account"]
+        .as_str()
+        .ok_or_else(|| quota_refresh_operation_invalid(request_id, "binding account is missing"))?;
+    let account = profile_for_wrapper_reference(account_name).ok_or_else(|| {
+        quota_refresh_operation_invalid(request_id, "binding account is not declared")
+    })?;
+    if account.opencode_wrapper != account_name {
+        return Err(quota_refresh_operation_invalid(
+            request_id,
+            "binding account identity is inconsistent",
+        ));
+    }
+    let runtime = native_runtime::resolve_for_account(host, account, request_id)?;
+    let expected_auth_path = resolved_auth_path(account, &runtime);
+    if operation.binding["auth_source_path"].as_str()
+        != Some(expected_auth_path.to_string_lossy().as_ref())
+    {
+        return Err(quota_refresh_operation_invalid(
+            request_id,
+            "legacy prepared binding auth source does not match the native runtime context",
+        ));
+    }
+    operation.binding["native_runtime_identity_sha256"] = json!(runtime.identity_sha256());
+    operation.binding_sha256 = quota_refresh_binding_sha256(&operation.binding);
+    write_quota_refresh_operation(host, &operation, request_id)?;
+    Ok(operation)
+}
+
 fn quota_refresh_binding(
     params_sha256: &str,
     selection: &RuntimeSelection,
+    runtime: &NativeRuntimeContext,
     auth_path: &Path,
     provider_instance_id: Option<&str>,
     host_app: &str,
@@ -258,6 +305,7 @@ fn quota_refresh_binding(
         "settings_version": selection.settings_version,
         "account": selection.account.opencode_wrapper,
         "account_index": selection.account.opencode_index,
+        "native_runtime_identity_sha256": runtime.identity_sha256(),
         "auth_source_path": auth_path.display().to_string(),
         "provider_instance_id": provider_instance_id,
         "host_app": host_app,
@@ -297,9 +345,10 @@ fn quota_refresh_attempt_matches(
 }
 
 fn quota_refresh_operation_route(
+    host: &HostContext,
     operation: &QuotaRefreshOperation,
     request_id: &str,
-) -> Result<(&'static AccountProfile, PathBuf), ProviderFailure> {
+) -> Result<(&'static AccountProfile, NativeRuntimeContext, PathBuf), ProviderFailure> {
     let account_name = operation.binding["account"]
         .as_str()
         .ok_or_else(|| quota_refresh_operation_invalid(request_id, "binding account is missing"))?;
@@ -321,7 +370,16 @@ fn quota_refresh_operation_route(
         .ok_or_else(|| {
             quota_refresh_operation_invalid(request_id, "binding auth source path is missing")
         })?;
-    Ok((account, auth_path))
+    let runtime = native_runtime::resolve_for_account(host, account, request_id)?;
+    if operation.binding["native_runtime_identity_sha256"].as_str()
+        != Some(runtime.identity_sha256())
+    {
+        return Err(quota_refresh_operation_invalid(
+            request_id,
+            "binding native runtime identity is inconsistent",
+        ));
+    }
+    Ok((account, runtime, auth_path))
 }
 
 fn quota_refresh_binding_sha256(binding: &Value) -> String {
@@ -595,12 +653,11 @@ fn readable_source_id(
     has_source.then(|| source_id(account, auth_path))
 }
 
-fn probe_account(account: &AccountProfile) -> Value {
-    let auth_path = resolved_auth_path(account);
-    if !auth_has_source(&auth_path) {
+fn probe_auth_path(auth_path: &Path) -> Value {
+    if !auth_has_source(auth_path) {
         return unreadable_auth_probe_result();
     }
-    probe_observation_result(run_probe(&auth_path))
+    probe_observation_result(run_probe(auth_path))
 }
 
 fn unreadable_auth_probe_result() -> Value {
@@ -679,17 +736,31 @@ fn account_from_settings_record(
     resolve_runtime_selection(host, settings_id, request_id).map(|selection| selection.account)
 }
 
-fn resolved_auth_path(account: &AccountProfile) -> PathBuf {
-    expand_tilde(account.quota_auth_path())
+fn resolved_auth_path(account: &AccountProfile, runtime: &NativeRuntimeContext) -> PathBuf {
+    runtime.expand_path(account.quota_auth_path())
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(relative) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(relative);
-        }
+fn ambient_auth_path(account: &AccountProfile) -> PathBuf {
+    match (
+        account.quota_auth_path().strip_prefix("~/"),
+        std::env::var_os("HOME"),
+    ) {
+        (Some(relative), Some(home)) => PathBuf::from(home).join(relative),
+        _ => PathBuf::from(account.quota_auth_path()),
     }
-    PathBuf::from(path)
+}
+
+fn observed_auth_path(
+    host: &HostContext,
+    account: &AccountProfile,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    native_runtime::resolve_existing_for_account(host, account, request_id).map(|runtime| {
+        runtime
+            .as_ref()
+            .map(|runtime| resolved_auth_path(account, runtime))
+            .unwrap_or_else(|| ambient_auth_path(account))
+    })
 }
 
 fn auth_is_readable(path: &Path) -> bool {
@@ -740,21 +811,22 @@ fn opencode_command_failure_detail(output: &crate::shell::ShellOutput) -> String
     )
 }
 
-fn refresh_available(account: &AccountProfile) -> bool {
-    quota_observation_without_refresh(account).is_ok()
+fn refresh_available(account: &AccountProfile, runtime: &NativeRuntimeContext) -> bool {
+    quota_observation_without_refresh(account, runtime).is_ok()
 }
 
 fn quota_observation_without_refresh(
     account: &AccountProfile,
+    runtime: &NativeRuntimeContext,
 ) -> Result<QuotaObservation, QuotaObservationFailure> {
-    run_probe(&resolved_auth_path(account))
+    run_probe(&resolved_auth_path(account, runtime))
 }
 
 fn run_account_auth_refresh(
-    account: &AccountProfile,
+    runtime: &NativeRuntimeContext,
     auth_path: &Path,
 ) -> std::io::Result<OpencodeAuthObservation> {
-    crate::opencode::observe_auth_list(account, auth_path)
+    crate::opencode::observe_auth_list(runtime, auth_path)
 }
 
 fn refresh_succeeded(refresh: &std::io::Result<OpencodeAuthObservation>) -> bool {

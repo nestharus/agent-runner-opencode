@@ -487,12 +487,13 @@ fn launch_command_diagnostics(
         return vec![diagnostic(
             "error",
             "invalid_command",
-            "launch argv must begin with a configured OpenCode command".to_string(),
+            format!(
+                "launch argv for account {} must begin with its exact canonical OpenCode wrapper",
+                selection.account.opencode_wrapper
+            ),
         )];
     };
-    if profile_for_wrapper_reference(command)
-        .is_some_and(|account| account.opencode_wrapper == selection.account.opencode_wrapper)
-    {
+    if command == selection.account.opencode_wrapper {
         return Vec::new();
     }
     vec![diagnostic(
@@ -582,7 +583,8 @@ fn is_forbidden_launch_arg(arg: &str) -> bool {
 }
 
 fn intrinsic_host_launch_command(command: &str) -> bool {
-    profile_for_wrapper_reference(command).is_some()
+    profile_for_wrapper_reference(command)
+        .is_some_and(|account| command == account.opencode_wrapper)
 }
 
 fn diagnostic(severity: &'static str, code: &'static str, message: String) -> PolicyDiagnostic {

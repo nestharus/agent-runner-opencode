@@ -8,7 +8,6 @@
 //!       - native transcript traversal and submitted-turn matching
 //!       - explicit observed-versus-unconfirmed completion results
 
-use crate::account::profile_for_wrapper_reference;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::opencode::{self, OpencodeExport, OpencodeMessage};
 use serde::{Deserialize, Serialize};
@@ -31,6 +30,9 @@ pub struct ResumeObservationRequest {
     started_at_unix_ms: u64,
     deadline_unix_ms: Option<u64>,
     route: RouteIdentity,
+    program: String,
+    working_directory: String,
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -91,6 +93,9 @@ impl ResumeObservationRequest {
         provider_id: String,
         model_id: String,
         variant: String,
+        program: String,
+        working_directory: String,
+        env: BTreeMap<String, String>,
     ) -> Self {
         let delivery_nonce = delivery_nonce_from_payload(&payload);
         Self {
@@ -105,6 +110,9 @@ impl ResumeObservationRequest {
                 model_id,
                 variant,
             },
+            program,
+            working_directory,
+            env,
         }
     }
 
@@ -297,9 +305,15 @@ fn text_sha256_matches(text: &str, expected: &str) -> bool {
 }
 
 fn export_for_observation(request: &ResumeObservationRequest) -> Option<OpencodeExport> {
-    let account = profile_for_wrapper_reference(&request.account_wrapper)?;
     let timeout = remaining_export_timeout(request)?;
-    opencode::export_with_timeout(&request.session_id, account, timeout).ok()
+    opencode::export_with_launch_context(
+        &request.session_id,
+        &request.program,
+        &request.working_directory,
+        &request.env,
+        timeout,
+    )
+    .ok()
 }
 
 fn remaining_export_timeout(request: &ResumeObservationRequest) -> Option<Duration> {

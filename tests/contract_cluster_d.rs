@@ -775,22 +775,23 @@ fn contract_prior_settings_store_is_upgraded_without_losing_identity() {
 }
 
 #[test]
-fn contract_settings_create_normalizes_all_account_records() {
-    let host = HostRoots::new("agent-runner-opencode-settings-normalize-accounts");
-    for (wrapper, auth_path) in normalized_account_cases() {
+fn contract_settings_create_rejects_path_shaped_account_references() {
+    let host = HostRoots::new("agent-runner-opencode-settings-reject-path-accounts");
+    for (wrapper, _) in normalized_account_cases() {
         let mut request = support::validated_request_envelope(
             "settings.create",
             settings_create_params_for_values(path_wrapped_opencode_settings_values(wrapper)),
             host.overrides(),
             "settings.schema.json#/$defs/SettingsCreateRequest",
         );
-        request["request_id"] = json!(format!("req-settings-create-normalize-{wrapper}"));
-        let create = success_result(
-            support::invoke_with_request("settings.create", request),
-            "settings.schema.json#/$defs/SettingsCreateResponse",
-            "settings.schema.json#/$defs/SettingsCreateResult",
-        );
-        assert_normalized_account_settings_record(&create["record"], wrapper, auth_path);
+        request["request_id"] = json!(format!("req-settings-create-reject-path-{wrapper}"));
+        let response = error_response(support::invoke_with_request("settings.create", request));
+        assert_eq!(response["error"]["code"], "settings_validation_failed");
+        assert!(response["error"]["details"]["diagnostics"]
+            .as_array()
+            .expect("settings diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "invalid_wrapper"));
     }
 }
 
@@ -878,7 +879,7 @@ fn contract_settings_migrate() {
 }
 
 #[test]
-fn contract_settings_migrate_canonicalizes_and_rejects_unknown_legacy_accounts() {
+fn contract_settings_migrate_rejects_path_shaped_legacy_accounts() {
     let host = HostRoots::new("agent-runner-opencode-settings-migrate-account-admission");
     let providers_toml = r#"
 [legacy_alias]
@@ -910,13 +911,17 @@ command = "/tmp/bin/opencode9"
         .iter()
         .filter_map(|action| action["provider"].as_str())
         .collect::<Vec<_>>();
-    assert_eq!(action_providers, vec!["opencode1", "opencode2"]);
+    assert!(action_providers.is_empty());
     assert_eq!(dry_run["requires_user_input"], true);
-    assert!(dry_run["diagnostics"]
-        .as_array()
-        .expect("migration diagnostics")
-        .iter()
-        .any(|diagnostic| diagnostic["code"] == "legacy_provider_unknown"));
+    assert_eq!(
+        dry_run["diagnostics"]
+            .as_array()
+            .expect("migration diagnostics")
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == "legacy_provider_unknown")
+            .count(),
+        3
+    );
 
     let apply = invoke_validated_with_host(
         "settings.migrate",
@@ -998,7 +1003,7 @@ fn contract_setup_detect_install_sync() {
 }
 
 #[test]
-fn contract_setup_sync_canonicalizes_and_rejects_unknown_account_references() {
+fn contract_setup_sync_accepts_only_declared_account_references() {
     let host = HostRoots::new("agent-runner-opencode-setup-account-admission");
     let result = success_result(
         invoke_validated_with_host(
@@ -1019,12 +1024,16 @@ fn contract_setup_sync_canonicalizes_and_rejects_unknown_account_references() {
         .iter()
         .map(|operation| operation["profile"].as_str().expect("canonical profile"))
         .collect::<Vec<_>>();
-    assert_eq!(profiles, vec!["opencode1", "opencode2"]);
-    assert!(result["diagnostics"]
-        .as_array()
-        .expect("setup diagnostics")
-        .iter()
-        .any(|diagnostic| diagnostic["code"] == "unknown_opencode_profile"));
+    assert_eq!(profiles, vec!["opencode1"]);
+    assert_eq!(
+        result["diagnostics"]
+            .as_array()
+            .expect("setup diagnostics")
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == "unknown_opencode_profile")
+            .count(),
+        2
+    );
 }
 
 #[test]

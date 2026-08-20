@@ -21,6 +21,7 @@
 use crate::activity::ActivityTargets;
 use crate::encoding::{encode_base64, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
+use crate::native_runtime::{self, NativeRuntimeContext};
 use crate::opencode::{
     self, OpencodeExport, OpencodeExportError, OpencodeMessage, OpencodeSessionListError,
 };
@@ -461,8 +462,8 @@ fn export_native(
     session_id: &str,
     request_id: &str,
 ) -> Result<OpencodeExport, ProviderFailure> {
-    let account = session_account(host, settings_id, request_id)?;
-    let native = opencode::export(session_id, account)
+    let runtime = session_runtime(host, settings_id, request_id)?;
+    let native = opencode::export(session_id, &runtime)
         .map_err(|err| export_failure(request_id, session_id, err))?;
     validate_export_session_id(&native, session_id, request_id)?;
     validate_export_message_sessions(&native, session_id, request_id)?;
@@ -474,8 +475,8 @@ fn enumerate_native(
     settings_id: &str,
     request_id: &str,
 ) -> Result<Vec<Value>, ProviderFailure> {
-    let account = session_account(host, settings_id, request_id)?;
-    opencode::session_list(None, account).map_err(|err| session_list_failure(request_id, err))
+    let runtime = session_runtime(host, settings_id, request_id)?;
+    opencode::session_list(None, &runtime).map_err(|err| session_list_failure(request_id, err))
 }
 
 struct EnumeratePage {
@@ -1184,14 +1185,15 @@ fn missing_session_id_failure(request_id: &str) -> ProviderFailure {
     )
 }
 
-fn session_account(
+fn session_runtime(
     host: &crate::envelope::HostContext,
     settings_id: &str,
     request_id: &str,
-) -> Result<&'static crate::account::AccountProfile, ProviderFailure> {
+) -> Result<NativeRuntimeContext, ProviderFailure> {
     // Session storage is account-scoped; the settings record's model binding
     // deliberately does not constrain read/enumerate/export operations.
-    resolve_runtime_selection(host, settings_id, request_id).map(|selection| selection.account)
+    let selection = resolve_runtime_selection(host, settings_id, request_id)?;
+    native_runtime::resolve_for_account(host, selection.account, request_id)
 }
 
 fn session_export_id_mismatch_failure(
