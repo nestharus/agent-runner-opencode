@@ -170,9 +170,10 @@ fn ensure_default_runtime_settings(request: &Value) {
 
 fn default_runtime_settings_store() -> Value {
     json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "records": (1..=5).map(default_runtime_settings_record).collect::<Vec<_>>(),
-        "history": []
+        "history": [],
+        "mutation_receipts": {}
     })
 }
 

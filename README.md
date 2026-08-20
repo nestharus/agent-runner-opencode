@@ -147,9 +147,13 @@ prepared artifact path for a one-time manual import when no effect occurred.
 Settings are stored under `host.config_root/agent-runner-opencode` using an
 interprocess lock and atomic file transactions. The same transaction records a
 hash-chained mutation history with request/provider identity, predecessor and
-result versions, value hashes, and tombstones. Migration artifacts are
-content-addressed, atomically published, confined to provider-owned roots, and
-retain hashes for the complete legacy input plus its provider/model records.
+result versions, value hashes, and tombstones. It also retains a request-bound
+mutation receipt, so an exact retry after response loss returns the committed
+create, update, delete, or migration result without repeating the mutation;
+reuse of that request identity with a different binding is rejected. Migration
+artifacts are content-addressed, atomically published, confined to
+provider-owned roots, and retain hashes for the complete legacy input plus its
+provider/model records.
 `src/settings_definition.rs` is the sole owner of both the published
 `opencode.settings/v1` JSON schema and its executable domain validation;
 `schema` projects that definition and `settings` owns record lifecycle.

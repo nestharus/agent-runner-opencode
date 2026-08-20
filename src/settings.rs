@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 const STORE_DIR: &str = "agent-runner-opencode";
 const STORE_FILE: &str = "settings-store.json";
 const STORE_LOCK_FILE: &str = ".settings-store.lock";
-const CURRENT_STORE_SCHEMA_VERSION: u32 = 2;
+const CURRENT_STORE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Deserialize)]
 struct SettingsCreateParams {
@@ -205,6 +205,8 @@ struct SettingsStore {
     records: Vec<SettingsRecord>,
     #[serde(default)]
     history: Vec<Value>,
+    #[serde(default)]
+    mutation_receipts: BTreeMap<String, SettingsMutationReceipt>,
 }
 
 impl Default for SettingsStore {
@@ -213,8 +215,17 @@ impl Default for SettingsStore {
             schema_version: CURRENT_STORE_SCHEMA_VERSION,
             records: Vec::new(),
             history: Vec::new(),
+            mutation_receipts: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SettingsMutationReceipt {
+    operation: String,
+    binding_sha256: String,
+    result: Value,
+    recorded_at_unix_ms: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -276,23 +287,29 @@ pub fn create_params(
     request_id: &str,
     provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
-    let params: SettingsCreateParams =
-        parse_params(params, request_id, "invalid_settings_create_params")?;
-    let values = normalize_settings_value(sanitize_value(&params.values));
-    let diagnostics = validate_values(&values);
-    ensure_valid_settings(request_id, &diagnostics)?;
-    let record = mutate_store(
+    let binding_sha256 = settings_mutation_binding_sha256(
+        "settings.create",
+        &params,
+        provider_instance_id,
+        &host.app,
+    );
+    mutate_store(
         host,
         request_id,
         provider_instance_id,
         "settings.create",
+        &binding_sha256,
         |store| {
+            let params: SettingsCreateParams =
+                parse_params(params, request_id, "invalid_settings_create_params")?;
+            let values = normalize_settings_value(sanitize_value(&params.values));
+            let diagnostics = validate_values(&values);
+            ensure_valid_settings(request_id, &diagnostics)?;
             let record = new_record(store, params.display_name, values, request_id);
             store.records.push(record.clone());
-            Ok(record)
+            Ok(settings_record_result(&record, diagnostics))
         },
-    )?;
-    Ok(settings_record_result(&record, diagnostics))
+    )
 }
 
 pub fn update_params(
@@ -301,23 +318,30 @@ pub fn update_params(
     request_id: &str,
     provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
-    let params: SettingsUpdateParams =
-        parse_params(params, request_id, "invalid_settings_update_params")?;
-    let values = normalize_settings_value(sanitize_value(&params.values));
-    let diagnostics = validate_values(&values);
-    ensure_valid_settings(request_id, &diagnostics)?;
-    let record = mutate_store(
+    let binding_sha256 = settings_mutation_binding_sha256(
+        "settings.update",
+        &params,
+        provider_instance_id,
+        &host.app,
+    );
+    mutate_store(
         host,
         request_id,
         provider_instance_id,
         "settings.update",
+        &binding_sha256,
         |store| {
+            let params: SettingsUpdateParams =
+                parse_params(params, request_id, "invalid_settings_update_params")?;
+            let values = normalize_settings_value(sanitize_value(&params.values));
+            let diagnostics = validate_values(&values);
+            ensure_valid_settings(request_id, &diagnostics)?;
             let index = record_index(store, &params.id, request_id)?;
             ensure_version(&store.records[index], &params.version, request_id)?;
-            Ok(update_record(store, index, &params.id, values, request_id))
+            let record = update_record(store, index, &params.id, values, request_id);
+            Ok(settings_record_result(&record, diagnostics))
         },
-    )?;
-    Ok(settings_record_result(&record, diagnostics))
+    )
 }
 
 pub fn delete_params(
@@ -326,21 +350,27 @@ pub fn delete_params(
     request_id: &str,
     provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
-    let params: SettingsDeleteParams =
-        parse_params(params, request_id, "invalid_settings_delete_params")?;
+    let binding_sha256 = settings_mutation_binding_sha256(
+        "settings.delete",
+        &params,
+        provider_instance_id,
+        &host.app,
+    );
     mutate_store(
         host,
         request_id,
         provider_instance_id,
         "settings.delete",
+        &binding_sha256,
         |store| {
+            let params: SettingsDeleteParams =
+                parse_params(params, request_id, "invalid_settings_delete_params")?;
             let index = record_index(store, &params.id, request_id)?;
             ensure_version(&store.records[index], &params.version, request_id)?;
             store.records.remove(index);
-            Ok(())
+            Ok(settings_delete_result(params.id))
         },
-    )?;
-    Ok(settings_delete_result(params.id))
+    )
 }
 
 pub fn validate_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
@@ -358,22 +388,54 @@ pub fn migrate_params(
     request_id: &str,
     provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
-    let params: SettingsMigrateParams =
-        parse_params(params, request_id, "invalid_settings_migrate_params")?;
-    let actions = legacy_actions(&params.legacy);
-    let warnings = legacy_warnings(&params.legacy);
-    let diagnostics = legacy_diagnostics(&params.legacy);
-    if !params.dry_run {
-        ensure_valid_settings(request_id, &diagnostics)?;
-        write_migrated_settings(host, &params.legacy, request_id, provider_instance_id)?;
+    let parsed: SettingsMigrateParams = parse_params(
+        params.clone(),
+        request_id,
+        "invalid_settings_migrate_params",
+    )?;
+    if parsed.dry_run {
+        let actions = legacy_actions(&parsed.legacy);
+        let warnings = legacy_warnings(&parsed.legacy);
+        let diagnostics = legacy_diagnostics(&parsed.legacy);
+        let requires_user_input = settings_requires_user_input(&diagnostics);
+        return Ok(settings_migrate_result(
+            actions,
+            warnings,
+            requires_user_input,
+            diagnostics,
+        ));
     }
-    let requires_user_input = settings_requires_user_input(&diagnostics);
-    Ok(settings_migrate_result(
-        actions,
-        warnings,
-        requires_user_input,
-        diagnostics,
-    ))
+    let binding_sha256 = settings_mutation_binding_sha256(
+        "settings.migrate",
+        &params,
+        provider_instance_id,
+        &host.app,
+    );
+    mutate_store(
+        host,
+        request_id,
+        provider_instance_id,
+        "settings.migrate",
+        &binding_sha256,
+        |store| {
+            let params: SettingsMigrateParams =
+                parse_params(params, request_id, "invalid_settings_migrate_params")?;
+            let actions = legacy_actions(&params.legacy);
+            let warnings = legacy_warnings(&params.legacy);
+            let diagnostics = legacy_diagnostics(&params.legacy);
+            ensure_valid_settings(request_id, &diagnostics)?;
+            for provider in legacy_provider_names(&params.legacy) {
+                upsert_migrated_record(store, &provider, request_id)?;
+            }
+            let requires_user_input = settings_requires_user_input(&diagnostics);
+            Ok(settings_migrate_result(
+                actions,
+                warnings,
+                requires_user_input,
+                diagnostics,
+            ))
+        },
+    )
 }
 
 fn settings_list_result(records: &[SettingsRecord]) -> Value {
@@ -454,13 +516,14 @@ fn read_store_path(path: &Path, request_id: &str) -> Result<SettingsStore, Provi
     parse_store_bytes(&bytes, request_id)
 }
 
-fn mutate_store<T>(
+fn mutate_store(
     host: &HostContext,
     request_id: &str,
     provider_instance_id: Option<&str>,
     operation: &str,
-    mutation: impl FnOnce(&mut SettingsStore) -> Result<T, ProviderFailure>,
-) -> Result<T, ProviderFailure> {
+    binding_sha256: &str,
+    mutation: impl FnOnce(&mut SettingsStore) -> Result<Value, ProviderFailure>,
+) -> Result<Value, ProviderFailure> {
     let config_root = config_root(host, request_id)?;
     let path = store_path_from_root(&config_root);
     let parent = path.parent().expect("settings store always has parent");
@@ -480,6 +543,17 @@ fn mutate_store<T>(
     lock.lock_exclusive()
         .map_err(|err| store_io_failure(request_id, "settings_store_lock_failed", err))?;
     let mut store = read_store_path(&path, request_id)?;
+    if let Some(receipt) = store.mutation_receipts.get(request_id) {
+        if receipt.operation == operation && receipt.binding_sha256 == binding_sha256 {
+            return Ok(receipt.result.clone());
+        }
+        return Err(settings_mutation_request_conflict(
+            request_id,
+            operation,
+            binding_sha256,
+            receipt,
+        ));
+    }
     let before = store.records.clone();
     let result = mutation(&mut store)?;
     append_settings_history(
@@ -490,8 +564,35 @@ fn mutate_store<T>(
         provider_instance_id,
         &host.app,
     );
+    store.mutation_receipts.insert(
+        request_id.to_string(),
+        SettingsMutationReceipt {
+            operation: operation.to_string(),
+            binding_sha256: binding_sha256.to_string(),
+            result: result.clone(),
+            recorded_at_unix_ms: now_unix_ms(),
+        },
+    );
     write_store_path(&path, &config_root, &store, request_id)?;
     Ok(result)
+}
+
+fn settings_mutation_binding_sha256(
+    operation: &str,
+    params: &Value,
+    provider_instance_id: Option<&str>,
+    host_app: &str,
+) -> String {
+    sha256_hex(
+        json!({
+            "operation": operation,
+            "params": params,
+            "provider_instance_id": provider_instance_id,
+            "host_app": host_app,
+        })
+        .to_string()
+        .as_bytes(),
+    )
 }
 
 fn append_settings_history(
@@ -604,16 +705,18 @@ fn upgrade_persisted_store(
     if store.schema_version == CURRENT_STORE_SCHEMA_VERSION {
         return Ok(store);
     }
-    for record in &mut store.records {
-        record.values = upgrade_persisted_values(&record.values).ok_or_else(|| {
-            settings_store_upgrade_failure(
-                request_id,
-                format!(
-                    "settings record {} cannot be upgraded automatically; back up and recreate that record",
-                    record.id
-                ),
-            )
-        })?;
+    if store.schema_version < 2 {
+        for record in &mut store.records {
+            record.values = upgrade_persisted_values(&record.values).ok_or_else(|| {
+                settings_store_upgrade_failure(
+                    request_id,
+                    format!(
+                        "settings record {} cannot be upgraded automatically; back up and recreate that record",
+                        record.id
+                    ),
+                )
+            })?;
+        }
     }
     store.schema_version = CURRENT_STORE_SCHEMA_VERSION;
     Ok(store)
@@ -1108,27 +1211,6 @@ fn legacy_models(legacy: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn write_migrated_settings(
-    host: &HostContext,
-    legacy: &Value,
-    request_id: &str,
-    provider_instance_id: Option<&str>,
-) -> Result<(), ProviderFailure> {
-    let providers = legacy_provider_names(legacy);
-    mutate_store(
-        host,
-        request_id,
-        provider_instance_id,
-        "settings.migrate",
-        |store| {
-            for provider in providers {
-                upsert_migrated_record(store, &provider, request_id)?;
-            }
-            Ok(())
-        },
-    )
-}
-
 fn upsert_migrated_record(
     store: &mut SettingsStore,
     provider: &str,
@@ -1251,6 +1333,25 @@ fn stale_settings_version_failure(request_id: &str) -> ProviderFailure {
         retryable: false,
         exit_code: 4,
     }
+}
+
+fn settings_mutation_request_conflict(
+    request_id: &str,
+    attempted_operation: &str,
+    attempted_binding_sha256: &str,
+    receipt: &SettingsMutationReceipt,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "settings_mutation_request_conflict",
+        "settings mutation request_id was already committed with a different binding",
+        json!({
+            "attempted_operation": attempted_operation,
+            "attempted_binding_sha256": attempted_binding_sha256,
+            "committed_operation": receipt.operation,
+            "committed_binding_sha256": receipt.binding_sha256,
+        }),
+    )
 }
 
 fn legacy_providers_toml(legacy: &Value) -> Option<toml::Value> {

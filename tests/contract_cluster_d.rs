@@ -90,19 +90,182 @@ fn contract_settings_crud() {
 }
 
 #[test]
+fn contract_settings_mutations_replay_committed_results_after_response_loss() {
+    struct RejectWrites;
+
+    impl std::io::Write for RejectWrites {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "contract output handoff failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let host = HostRoots::new("agent-runner-opencode-settings-mutation-replay");
+    let mut create_request = support::validated_request_envelope(
+        "settings.create",
+        settings_create_params(None),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsCreateRequest",
+    );
+    create_request["request_id"] = json!("req-settings-create-response-loss");
+    support::assert_valid_request_envelope(
+        &create_request,
+        "settings.schema.json#/$defs/SettingsCreateRequest",
+    );
+    let args = vec![
+        "agent-runner-opencode".to_string(),
+        "settings.create".to_string(),
+    ];
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&create_request).expect("serialize create request"),
+            &mut RejectWrites,
+        ),
+        1,
+        "the first response handoff should fail after the mutation commits"
+    );
+
+    let created = success_result(
+        support::invoke_with_request("settings.create", create_request.clone()),
+        "settings.schema.json#/$defs/SettingsCreateResponse",
+        "settings.schema.json#/$defs/SettingsCreateResult",
+    );
+    let created_again = success_result(
+        support::invoke_with_request("settings.create", create_request.clone()),
+        "settings.schema.json#/$defs/SettingsCreateResponse",
+        "settings.schema.json#/$defs/SettingsCreateResult",
+    );
+    assert_eq!(created_again, created);
+    let id = settings_create_id(&created);
+    let created_version = settings_create_version(&created);
+
+    let mut conflicting_create = create_request;
+    conflicting_create["params"]["display_name"] = json!("different request binding");
+    let conflict = error_response(support::invoke_with_request(
+        "settings.create",
+        conflicting_create,
+    ));
+    assert_eq!(
+        conflict["error"]["code"],
+        "settings_mutation_request_conflict"
+    );
+
+    let mut update_request = support::validated_request_envelope(
+        "settings.update",
+        settings_update_params(&id, &created_version, Some(UPDATE_SECRET_TOKEN)),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsUpdateRequest",
+    );
+    update_request["request_id"] = json!("req-settings-update-response-loss");
+    let updated = success_result(
+        support::invoke_with_request("settings.update", update_request.clone()),
+        "settings.schema.json#/$defs/SettingsUpdateResponse",
+        "settings.schema.json#/$defs/SettingsUpdateResult",
+    );
+    let updated_again = success_result(
+        support::invoke_with_request("settings.update", update_request),
+        "settings.schema.json#/$defs/SettingsUpdateResponse",
+        "settings.schema.json#/$defs/SettingsUpdateResult",
+    );
+    assert_eq!(updated_again, updated);
+
+    let mut delete_request = support::validated_request_envelope(
+        "settings.delete",
+        settings_delete_params(
+            &id,
+            updated["record"]["version"]
+                .as_str()
+                .expect("updated version"),
+        ),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsDeleteRequest",
+    );
+    delete_request["request_id"] = json!("req-settings-delete-response-loss");
+    let deleted = success_result(
+        support::invoke_with_request("settings.delete", delete_request.clone()),
+        "settings.schema.json#/$defs/SettingsDeleteResponse",
+        "settings.schema.json#/$defs/SettingsDeleteResult",
+    );
+    let deleted_again = success_result(
+        support::invoke_with_request("settings.delete", delete_request),
+        "settings.schema.json#/$defs/SettingsDeleteResponse",
+        "settings.schema.json#/$defs/SettingsDeleteResult",
+    );
+    assert_eq!(deleted_again, deleted);
+
+    let mut migrate_request = support::validated_request_envelope(
+        "settings.migrate",
+        json!({ "dry_run": false, "legacy": legacy_fixture() }),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsMigrateRequest",
+    );
+    migrate_request["request_id"] = json!("req-settings-migrate-response-loss");
+    let migrated = success_result(
+        support::invoke_with_request("settings.migrate", migrate_request.clone()),
+        "settings.schema.json#/$defs/SettingsMigrateResponse",
+        "settings.schema.json#/$defs/SettingsMigrateResult",
+    );
+    let migrated_again = success_result(
+        support::invoke_with_request("settings.migrate", migrate_request),
+        "settings.schema.json#/$defs/SettingsMigrateResponse",
+        "settings.schema.json#/$defs/SettingsMigrateResult",
+    );
+    assert_eq!(migrated_again, migrated);
+
+    let store: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            host.config_root()
+                .join("agent-runner-opencode/settings-store.json"),
+        )
+        .expect("settings store"),
+    )
+    .expect("settings store JSON");
+    assert_eq!(
+        store["records"].as_array().expect("settings records").len(),
+        2,
+        "migration replay must not repeat its two record upserts"
+    );
+    assert_eq!(
+        store["history"].as_array().expect("settings history").len(),
+        4
+    );
+    assert_eq!(
+        store["mutation_receipts"]
+            .as_object()
+            .expect("settings mutation receipts")
+            .len(),
+        4
+    );
+}
+
+#[test]
 fn contract_settings_parallel_creates_do_not_lose_records() {
     let host = HostRoots::new("agent-runner-opencode-settings-parallel-create");
     let host_overrides = host.overrides();
     let workers = (0..8)
-        .map(|_| {
+        .map(|worker_index| {
             let host_overrides = host_overrides.clone();
             thread::spawn(move || {
-                invoke_validated_with_host(
+                let mut request = support::validated_request_envelope(
                     "settings.create",
                     settings_create_params(None),
                     host_overrides,
                     "settings.schema.json#/$defs/SettingsCreateRequest",
-                )
+                );
+                request["request_id"] =
+                    json!(format!("req-settings-create-parallel-{worker_index}"));
+                support::assert_valid_request_envelope(
+                    &request,
+                    "settings.schema.json#/$defs/SettingsCreateRequest",
+                );
+                support::invoke_with_request("settings.create", request)
             })
         })
         .collect::<Vec<_>>();
@@ -146,17 +309,24 @@ fn contract_settings_parallel_updates_preserve_optimistic_concurrency() {
     let id = settings_create_id(&created);
     let version = settings_create_version(&created);
     let workers = (0..2)
-        .map(|_| {
+        .map(|worker_index| {
             let host_overrides = host.overrides();
             let id = id.clone();
             let version = version.clone();
             thread::spawn(move || {
-                invoke_validated_with_host(
+                let mut request = support::validated_request_envelope(
                     "settings.update",
                     settings_update_params(&id, &version, None),
                     host_overrides,
                     "settings.schema.json#/$defs/SettingsUpdateRequest",
-                )
+                );
+                request["request_id"] =
+                    json!(format!("req-settings-update-parallel-{worker_index}"));
+                support::assert_valid_request_envelope(
+                    &request,
+                    "settings.schema.json#/$defs/SettingsUpdateRequest",
+                );
+                support::invoke_with_request("settings.update", request)
             })
         })
         .collect::<Vec<_>>();
@@ -593,7 +763,7 @@ fn contract_prior_settings_store_is_upgraded_without_losing_identity() {
     let persisted: serde_json::Value =
         serde_json::from_slice(&fs::read(&store_path).expect("read upgraded settings store"))
             .expect("parse upgraded settings store");
-    assert_eq!(persisted["schema_version"], 2);
+    assert_eq!(persisted["schema_version"], 3);
     assert_eq!(persisted["records"][0]["id"], "prior-settings-id");
     assert_eq!(
         persisted["records"][0]["values"]["quota"]["source"],
@@ -608,13 +778,15 @@ fn contract_prior_settings_store_is_upgraded_without_losing_identity() {
 fn contract_settings_create_normalizes_all_account_records() {
     let host = HostRoots::new("agent-runner-opencode-settings-normalize-accounts");
     for (wrapper, auth_path) in normalized_account_cases() {
+        let mut request = support::validated_request_envelope(
+            "settings.create",
+            settings_create_params_for_values(path_wrapped_opencode_settings_values(wrapper)),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsCreateRequest",
+        );
+        request["request_id"] = json!(format!("req-settings-create-normalize-{wrapper}"));
         let create = success_result(
-            invoke_validated_with_host(
-                "settings.create",
-                settings_create_params_for_values(path_wrapped_opencode_settings_values(wrapper)),
-                host.overrides(),
-                "settings.schema.json#/$defs/SettingsCreateRequest",
-            ),
+            support::invoke_with_request("settings.create", request),
             "settings.schema.json#/$defs/SettingsCreateResponse",
             "settings.schema.json#/$defs/SettingsCreateResult",
         );
