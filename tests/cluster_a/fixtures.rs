@@ -295,6 +295,27 @@ impl FakeOpencodeWrapper {
         Self::from_parts(dir, log_path, log_path_string)
     }
 
+    pub fn with_counted_resume_late_completion() -> (Self, PathBuf) {
+        let dir = unique_temp_dir("agent-runner-opencode-counted-resume-reconciliation");
+        create_fake_wrapper_dir(&dir);
+        let wrapper_path = fake_wrapper_path(&dir);
+        let log_path = fake_wrapper_log_path(&dir);
+        let completion_marker = dir.join("completion-ready");
+        write_fake_wrapper(
+            &wrapper_path,
+            fake_counted_resume_late_completion_script(
+                &log_path,
+                &completion_marker,
+                resume_payload(),
+            ),
+        );
+        let log_path_string = path_string(&log_path);
+        (
+            Self::from_parts(dir, log_path, log_path_string),
+            completion_marker,
+        )
+    }
+
     fn from_parts(dir: PathBuf, log_path: PathBuf, log_path_string: String) -> Self {
         Self {
             dir,
@@ -567,6 +588,80 @@ printf '%s\\n' {event}\n\
 exit 0\n",
         count_path = shell_single_quote(&path_string(count_path)),
         export = shell_single_quote(&export),
+        event = shell_single_quote(&event),
+    )
+}
+
+pub fn fake_counted_resume_late_completion_script(
+    count_path: &Path,
+    completion_marker: &Path,
+    payload: &str,
+) -> String {
+    let user = json!({
+        "info": {
+            "id": "msg-durable-resume-user",
+            "role": "user",
+            "sessionID": resume_session_id(),
+            "model": {
+                "providerID": "openai",
+                "modelID": "gpt-5.6-sol",
+                "variant": "low"
+            },
+            "time": {"created": 4_102_444_800_000_u64}
+        },
+        "parts": [{"type": "text", "text": payload}]
+    });
+    let pending_export = json!({
+        "info": {"id": resume_session_id(), "title": "durable resume contract"},
+        "messages": [user.clone()]
+    })
+    .to_string();
+    let completed_export = json!({
+        "info": {"id": resume_session_id(), "title": "durable resume contract"},
+        "messages": [user, {
+            "info": {
+                "id": "msg-durable-resume-assistant",
+                "role": "assistant",
+                "sessionID": resume_session_id(),
+                "providerID": "openai",
+                "modelID": "gpt-5.6-sol",
+                "variant": "low",
+                "time": {
+                    "created": 4_102_444_800_001_u64,
+                    "completed": 4_102_444_800_002_u64
+                }
+            },
+            "parts": [{"type": "text", "text": "done"}]
+        }]
+    })
+    .to_string();
+    let event = json!({
+        "type": "step_start",
+        "timestamp": OBSERVED_AT_UNIX_MS,
+        "sessionID": resume_session_id(),
+        "part": {"type": "step-start", "sessionID": resume_session_id()}
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  if [ -e {completion_marker} ]; then\n\
+    printf '%s\\n' {completed_export}\n\
+  else\n\
+    printf '%s\\n' {pending_export}\n\
+  fi\n\
+  exit 0\n\
+fi\n\
+count=0\n\
+if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
+count=$((count + 1))\n\
+printf '%s\\n' \"$count\" > {count_path}\n\
+printf '%s\\n' {event}\n\
+exit 0\n",
+        completion_marker = shell_single_quote(&path_string(completion_marker)),
+        count_path = shell_single_quote(&path_string(count_path)),
+        completed_export = shell_single_quote(&completed_export),
+        pending_export = shell_single_quote(&pending_export),
         event = shell_single_quote(&event),
     )
 }

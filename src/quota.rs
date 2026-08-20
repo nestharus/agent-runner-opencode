@@ -48,6 +48,13 @@ struct QuotaBaseParams {
 #[derive(Deserialize)]
 struct QuotaRefreshAuthParams {
     settings_id: String,
+    reconciliation: Option<QuotaRefreshAuthReconciliation>,
+}
+
+#[derive(Deserialize)]
+struct QuotaRefreshAuthReconciliation {
+    disposition: String,
+    credential_source_sha256: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -158,7 +165,7 @@ pub fn refresh_auth_params(
     provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
     let parsed = parse_refresh_params(params.clone(), request_id)?;
-    let params_sha256 = sha256_hex(params.to_string().as_bytes());
+    let params_sha256 = quota_refresh_binding_params_sha256(&params);
     let attempted_identity_sha256 = quota_refresh_attempt_identity_sha256(
         &params_sha256,
         &parsed.settings_id,
@@ -204,11 +211,23 @@ pub fn refresh_auth_params(
                         ));
                     }
                     QuotaRefreshOperationPhase::ReconciliationRequired => {
+                        if let Some(reconciliation) = parsed.reconciliation.as_ref() {
+                            return reconcile_quota_refresh_operation(
+                                host,
+                                operation,
+                                reconciliation,
+                                request_id,
+                            );
+                        }
                         return Err(quota_refresh_reconciliation_required(
                             request_id, &operation,
                         ));
                     }
-                    QuotaRefreshOperationPhase::Prepared => {}
+                    QuotaRefreshOperationPhase::Prepared => {
+                        if parsed.reconciliation.is_some() {
+                            return Err(quota_refresh_reconciliation_not_required(request_id));
+                        }
+                    }
                 }
                 let operation =
                     upgrade_prepared_quota_refresh_runtime_binding(host, operation, request_id)?;
@@ -217,6 +236,9 @@ pub fn refresh_auth_params(
                 (operation, account, runtime, observer, auth_path)
             }
             None => {
+                if parsed.reconciliation.is_some() {
+                    return Err(quota_refresh_reconciliation_not_required(request_id));
+                }
                 let selection = resolve_runtime_selection(host, &parsed.settings_id, request_id)?;
                 let account = selection.account;
                 let runtime = native_runtime::resolve_for_account(host, account, request_id)?;
@@ -282,6 +304,73 @@ pub fn refresh_auth_params(
     operation.committed_at_unix_ms = Some(now_unix_ms());
     operation.result = Some(result.clone());
     operation.reconciliation = None;
+    write_quota_refresh_operation(host, &operation, request_id)?;
+    Ok(result)
+}
+
+fn quota_refresh_binding_params_sha256(params: &Value) -> String {
+    let mut binding_params = params.clone();
+    if let Some(object) = binding_params.as_object_mut() {
+        object.remove("reconciliation");
+    }
+    sha256_hex(binding_params.to_string().as_bytes())
+}
+
+fn reconcile_quota_refresh_operation(
+    host: &HostContext,
+    mut operation: QuotaRefreshOperation,
+    reconciliation: &QuotaRefreshAuthReconciliation,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
+    if reconciliation.disposition != "accept_current_credentials"
+        || !is_sha256_hex(&reconciliation.credential_source_sha256)
+    {
+        return Err(invalid_quota_refresh_reconciliation_failure(request_id));
+    }
+    let (account, runtime, observer, auth_path) =
+        quota_refresh_operation_route(host, &operation, request_id)?;
+    let _account_lock = acquire_quota_refresh_account_lock(host, account, &auth_path, request_id)?;
+    let credential_bytes =
+        durable_fs::read_file_bounded(&auth_path, durable_fs::MAX_AUTH_FILE_BYTES)
+            .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    let observed_sha256 = sha256_hex(&credential_bytes);
+    if observed_sha256 != reconciliation.credential_source_sha256 {
+        return Err(quota_refresh_reconciliation_mismatch(
+            request_id,
+            &reconciliation.credential_source_sha256,
+            &observed_sha256,
+        ));
+    }
+    let checked_at_unix_ms = now_unix_ms();
+    let refreshed = operation
+        .reconciliation
+        .as_ref()
+        .and_then(|evidence| evidence.get("credential_effect"))
+        .and_then(Value::as_str)
+        == Some("credentials_changed");
+    let available = refresh_available(account, &runtime, &observer);
+    let result = refresh_auth_result(
+        refreshed,
+        available,
+        checked_at_unix_ms,
+        "the caller reconciled and accepted the current bound credential source".to_string(),
+    );
+    let evidence = operation.reconciliation.get_or_insert_with(|| {
+        json!({
+            "reason": "manual_reconciliation",
+            "credential_effect": "unobserved",
+            "detail": "the caller supplied authoritative reconciliation for an admitted auth effect",
+            "observed_at_unix_ms": checked_at_unix_ms,
+        })
+    });
+    evidence["resolution"] = json!({
+        "disposition": reconciliation.disposition,
+        "credential_source_sha256": observed_sha256,
+        "accepted_at_unix_ms": checked_at_unix_ms,
+    });
+    operation.phase = QuotaRefreshOperationPhase::Committed;
+    operation.committed_at_unix_ms = Some(checked_at_unix_ms);
+    operation.result = Some(result.clone());
     write_quota_refresh_operation(host, &operation, request_id)?;
     Ok(result)
 }
@@ -751,12 +840,20 @@ fn validate_quota_refresh_operation(
             operation.native_effect_admitted_at_unix_ms.is_some()
                 && operation.committed_at_unix_ms.is_none()
                 && operation.result.is_none()
+                && operation
+                    .reconciliation
+                    .as_ref()
+                    .is_none_or(|evidence| evidence.get("resolution").is_none())
         }
         QuotaRefreshOperationPhase::Committed => {
             operation.native_effect_admitted_at_unix_ms.is_some()
                 && operation.committed_at_unix_ms.is_some()
                 && operation.result.is_some()
-                && operation.reconciliation.is_none()
+                && operation.reconciliation.as_ref().is_none_or(|evidence| {
+                    evidence
+                        .get("resolution")
+                        .is_some_and(valid_quota_refresh_resolution)
+                })
         }
     };
     if operation.schema_version != QUOTA_REFRESH_SCHEMA_VERSION
@@ -795,6 +892,21 @@ fn valid_quota_refresh_reconciliation(reconciliation: &Value) -> bool {
             })
         && reconciliation
             .get("observed_at_unix_ms")
+            .and_then(Value::as_u64)
+            .is_some()
+        && reconciliation
+            .get("resolution")
+            .is_none_or(valid_quota_refresh_resolution)
+}
+
+fn valid_quota_refresh_resolution(resolution: &Value) -> bool {
+    resolution.get("disposition").and_then(Value::as_str) == Some("accept_current_credentials")
+        && resolution
+            .get("credential_source_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(is_sha256_hex)
+        && resolution
+            .get("accepted_at_unix_ms")
             .and_then(Value::as_u64)
             .is_some()
 }
@@ -865,7 +977,40 @@ fn quota_refresh_reconciliation_required(
             "account": operation.binding["account"],
             "auth_source_path": operation.binding["auth_source_path"],
             "reconciliation_evidence": operation.reconciliation,
-            "recovery": "inspect the bound credential source and submit a new request_id only after reconciling the prior native auth attempt",
+            "recovery": "inspect the bound credential source, then retry this original request with params.reconciliation.disposition=accept_current_credentials and params.reconciliation.credential_source_sha256 set to the lowercase SHA-256 of the credential file you accepted",
+        }),
+    )
+}
+
+fn quota_refresh_reconciliation_not_required(request_id: &str) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "quota_refresh_reconciliation_not_required",
+        "quota.refresh_auth reconciliation is accepted only for the original reconciliation-required request",
+        json!({}),
+    )
+}
+
+fn invalid_quota_refresh_reconciliation_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_quota_refresh_reconciliation",
+        "reconciliation requires disposition=accept_current_credentials and the lowercase SHA-256 of the current bound credential source",
+    )
+}
+
+fn quota_refresh_reconciliation_mismatch(
+    request_id: &str,
+    supplied_sha256: &str,
+    observed_sha256: &str,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "quota_refresh_reconciliation_mismatch",
+        "the bound credential source changed after the caller's reconciliation observation",
+        json!({
+            "supplied_credential_source_sha256": supplied_sha256,
+            "observed_credential_source_sha256": observed_sha256,
         }),
     )
 }
@@ -1279,6 +1424,13 @@ fn invalid_quota_refresh_params_failure(
         "invalid_quota_refresh_auth_params",
         format!("quota.refresh_auth params are invalid: {err}"),
     )
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn epoch_ms(rfc3339: &str) -> i64 {

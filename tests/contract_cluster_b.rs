@@ -9,6 +9,21 @@ use serde_json::{json, Value};
 use std::fs;
 use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env};
 
+struct RejectWrites;
+
+impl std::io::Write for RejectWrites {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "simulated terminal enumeration response loss",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn characterization_opencode_session_export_json() {
     let export = native_export_fixture();
@@ -184,6 +199,75 @@ fn contract_session_enumerate_retires_consumed_snapshot() {
     assert_eq!(
         consumed["error"]["code"], "invalid_session_enumerate_cursor",
         "a consumed cursor must be retired immediately"
+    );
+    fs::remove_dir_all(&data_root).expect("remove isolated session snapshot data root");
+}
+
+#[test]
+fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_handoff() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-response-loss-session-snapshot");
+    fs::create_dir_all(&data_root).expect("create isolated session snapshot data root");
+    let host = json!({"data_root": data_root.to_string_lossy()});
+    let first = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_limit_params(2),
+            host.clone(),
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("truncated page cursor");
+    let request = support::validated_request_envelope(
+        "session.enumerate",
+        session_enumerate_cursor_params(2, cursor),
+        host,
+        "session.schema.json#/$defs/SessionEnumerateRequest",
+    );
+    support::ensure_default_runtime_settings(&request);
+    let prior_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", &path);
+    let args = vec![
+        "agent-runner-opencode".to_string(),
+        "session.enumerate".to_string(),
+    ];
+    let lost_exit = agent_runner_opencode::write_invocation(
+        &args,
+        &serde_json::to_vec(&request).expect("serialize enumeration request"),
+        &mut RejectWrites,
+    );
+    match prior_path {
+        Some(value) => std::env::set_var("PATH", value),
+        None => std::env::remove_var("PATH"),
+    }
+    assert_eq!(
+        lost_exit, 1,
+        "closed response handoff must fail the invocation"
+    );
+
+    let retry = success_result(
+        support::invoke_with_request_and_env(
+            "session.enumerate",
+            request.clone(),
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_second_enumerate_page(&retry);
+    let consumed = assert_error_envelope(support::invoke_with_request_and_env(
+        "session.enumerate",
+        request,
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        consumed["error"]["code"],
+        "invalid_session_enumerate_cursor"
     );
     fs::remove_dir_all(&data_root).expect("remove isolated session snapshot data root");
 }

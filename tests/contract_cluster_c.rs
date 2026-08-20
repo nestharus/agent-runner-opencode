@@ -563,6 +563,7 @@ fn contract_quota_refresh_changed_credentials_with_nonzero_exit_require_reconcil
         "nonzero-exit",
         fake_opencode_auth_rewrite_then_fail_script,
         "credential_changed_with_command_failure",
+        true,
     );
 }
 
@@ -572,6 +573,7 @@ fn contract_quota_refresh_unicode_failure_replays_valid_reconciliation() {
         "unicode-nonzero-exit",
         fake_opencode_auth_rewrite_then_unicode_fail_script,
         "credential_changed_with_command_failure",
+        false,
     );
 }
 
@@ -581,6 +583,7 @@ fn contract_quota_refresh_changed_credentials_with_oversized_output_require_reco
         "oversized-output",
         fake_opencode_auth_rewrite_then_oversize_script,
         "credential_changed_with_oversized_output",
+        false,
     );
 }
 
@@ -588,6 +591,7 @@ fn assert_changed_auth_requires_reconciliation(
     case: &str,
     script: fn(&std::path::Path) -> String,
     expected_reason: &str,
+    reconcile: bool,
 ) {
     let runtime = IsolatedQuotaSettings::new();
     let home = HomeFixture::new(&format!("agent-runner-opencode-quota-refresh-{case}-home"));
@@ -663,6 +667,50 @@ fn assert_changed_auth_requires_reconciliation(
         before,
         "the native participant must expose the changed credential effect"
     );
+    if reconcile {
+        let mut stale_reconciliation_request = request.clone();
+        stale_reconciliation_request["params"]["reconciliation"] = json!({
+            "disposition": "accept_current_credentials",
+            "credential_source_sha256": "0".repeat(64),
+        });
+        let stale = support::invoke_with_request_and_env(
+            "quota.refresh_auth",
+            stale_reconciliation_request,
+            &env,
+        );
+        assert_eq!(stale.status.code(), Some(2));
+        let stale_response = json_stdout(&stale);
+        support::assert_valid(
+            &stale_response,
+            "quota.schema.json#/$defs/QuotaRefreshAuthErrorResponse",
+        );
+        assert_eq!(
+            stale_response["error"]["code"],
+            "quota_refresh_reconciliation_mismatch"
+        );
+
+        let mut reconciliation_request = request.clone();
+        reconciliation_request["params"]["reconciliation"] = json!({
+            "disposition": "accept_current_credentials",
+            "credential_source_sha256": file_sha256(&auth_path),
+        });
+        let resolved = success_result(
+            support::invoke_with_request_and_env(
+                "quota.refresh_auth",
+                reconciliation_request,
+                &env,
+            ),
+            "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+            "quota.schema.json#/$defs/QuotaRefreshAuthResult",
+        );
+        assert_eq!(resolved["refreshed"], true);
+        let replay = success_result(
+            support::invoke_with_request_and_env("quota.refresh_auth", request, &env),
+            "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+            "quota.schema.json#/$defs/QuotaRefreshAuthResult",
+        );
+        assert_eq!(replay, resolved, "terminal reconciliation must replay");
+    }
     assert_eq!(
         optional_usage_log(&usage_log)
             .matches("auth argv=auth list")

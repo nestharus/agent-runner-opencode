@@ -143,6 +143,12 @@ earlier of `host.deadline_unix_ms` and a 20-second provider ceiling. A timed-out
 child is terminated and reaped, the admitted operation becomes
 `reconciliation_required`, and the account lane is released for an authorized
 follow-up instead of remaining monopolized by the stalled process.
+That authorized follow-up reuses the original request and adds
+`params.reconciliation` with the `accept_current_credentials` disposition and
+the lowercase SHA-256 of the current bound credential file. The provider
+verifies that exact source under the account lock, records the resolution on
+the original operation, and commits a terminal result without invoking native
+auth again. A stale source digest fails closed and leaves the obligation open.
 Exact refresh retries inspect this immutable request record before resolving
 live settings. Deleting or updating the former settings record therefore cannot
 hide either a committed result or an admitted-effect reconciliation handoff;
@@ -232,14 +238,19 @@ status is not completion authority.
 Before spawning a resumed turn, launch durably binds the request ID to its
 session, route, payload digest, delivery nonce, observation timestamp, and
 original recovery-command context. Post-spawn run events remain withheld until
-the corresponding observation is durable. Recovery of a prepared or legacy
-terminal record may perform one bounded 750 ms export in that original context.
+the corresponding observation is durable. Recovery of a prepared, legacy
+terminal, submission-observed, or unresolved record may perform one bounded
+750 ms export in that original context.
 If it cannot prove safe readmission, the record becomes durable `unresolved`;
-exact retries return the same reconciliation handoff without polling the
-transcript again. New-session and resumed-turn records carry distinct operation
-kinds, so a request ID cannot cross those lifecycle domains. If run evidence
-proves submission but cannot prove a completed assistant response, launch emits
-an unresolved
+exact retries re-run that same bounded observer without resubmitting the turn.
+A still-live prior process group blocks reconciliation and readmission.
+A later completion moves the original record into terminal replay custody; an
+authoritative no-effect observation can safely retire an `unresolved` record
+for exact readmission. Submission evidence without completion remains owned and
+is observed again on a later exact retry. New-session and resumed-turn records
+carry distinct operation kinds, so a request ID cannot cross those lifecycle
+domains. If run evidence proves submission but cannot prove a completed
+assistant response, launch emits an unresolved
 completion marker and returns a non-clean unknown terminal result so the caller
 must reconcile the named provider session before retrying the turn.
 If a lingering OpenCode process is terminated after response confirmation,
@@ -280,7 +291,9 @@ the first page instead of relisting the complete native population for every
 cursor. Page size and admitted population are each capped at 256, list capture
 at 2 MiB, each row at 64 KiB, and each snapshot at 4 MiB. At most 32 abandoned
 snapshots are retained for 15 minutes; continuation cursors read only the
-requested rows and consuming the terminal page immediately retires its snapshot.
+requested rows. A terminal snapshot is retired only after the complete response
+is successfully written; a failed response handoff preserves the cursor for an
+exact retry, and a cleanup failure falls back to the existing 15-minute expiry.
 An above-bound native population fails explicitly.
 
 ## State, evidence, and authority

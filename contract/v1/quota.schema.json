@@ -80,9 +80,22 @@
       "properties": {
         "settings_id": { "type": "string", "minLength": 1 },
         "force": { "type": "boolean" },
-        "context": { "$ref": "#/$defs/QuotaContext" }
+        "context": { "$ref": "#/$defs/QuotaContext" },
+        "reconciliation": { "$ref": "#/$defs/QuotaRefreshAuthReconciliation" }
       },
       "required": ["settings_id"],
+      "additionalProperties": false
+    },
+    "QuotaRefreshAuthReconciliation": {
+      "type": "object",
+      "properties": {
+        "disposition": { "const": "accept_current_credentials" },
+        "credential_source_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": ["disposition", "credential_source_sha256"],
       "additionalProperties": false
     },
     "QuotaRefreshAuthRequest": {

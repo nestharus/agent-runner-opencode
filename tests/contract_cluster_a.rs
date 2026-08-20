@@ -4,6 +4,7 @@ mod cluster_a;
 mod support;
 
 use cluster_a::*;
+use serde_json::Value;
 use std::fs;
 #[cfg(unix)]
 use std::{
@@ -323,6 +324,66 @@ fn contract_launch_resume_replay_does_not_resubmit_after_output_loss() {
         "1\n",
         "an exact replay must not submit the resumed turn twice"
     );
+}
+
+#[test]
+fn contract_launch_resume_reconciliation_observes_late_completion_without_resubmission() {
+    let runtime = IsolatedLaunchSettings::new();
+    let (fake_wrapper, completion_marker) =
+        FakeOpencodeWrapper::with_counted_resume_late_completion();
+    let path = prepend_path(fake_wrapper.dir());
+    let params =
+        resume_launch_params_with_arg_payload_env(path.as_str(), fake_wrapper.log_path_str());
+    let mut request = support::validated_request_envelope(
+        "launch",
+        params,
+        runtime.host_overrides(),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    request["request_id"] = serde_json::json!("req-launch-resume-late-completion-reconciliation");
+    support::assert_valid_request_envelope(&request, "launch.schema.json#/$defs/LaunchRequest");
+    support::ensure_default_runtime_settings(&request);
+
+    let args = vec!["agent-runner-opencode".to_string(), "launch".to_string()];
+    let mut writer = FailAfterFirstLaunchEvent {
+        completed_events: 0,
+    };
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&request).expect("serialize resumed launch request"),
+            &mut writer,
+        ),
+        1
+    );
+    fs::write(&completion_marker, b"ready").expect("publish later assistant completion");
+
+    let replay = json_stdout(&support::invoke_with_request("launch", request.clone()));
+    assert_eq!(
+        replay["error"]["code"],
+        "launch_resume_reconciliation_required"
+    );
+    assert_eq!(replay["error"]["details"]["phase"], "completion_observed");
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read resumed launch count"),
+        "1\n",
+        "late completion reconciliation must not submit another turn"
+    );
+    let data_root = request["host"]["data_root"]
+        .as_str()
+        .expect("launch data root");
+    let request_id = request["request_id"].as_str().expect("launch request id");
+    let state_path = std::path::Path::new(data_root)
+        .join("provider-state/opencode/launch/requests")
+        .join(format!(
+            "{}.json",
+            agent_runner_opencode::encoding::sha256_hex(request_id.as_bytes())
+        ));
+    let state: Value = serde_json::from_slice(
+        &fs::read(state_path).expect("read reconciled resumed launch state"),
+    )
+    .expect("parse reconciled resumed launch state");
+    assert_eq!(state["phase"], "completion_observed");
 }
 
 #[test]

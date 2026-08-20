@@ -1159,11 +1159,39 @@ fn reconcile_existing_launch_request(
         ));
     }
     match state.phase {
-        ResumeLaunchRequestPhase::SubmissionObserved
-        | ResumeLaunchRequestPhase::CompletionObserved => {
+        ResumeLaunchRequestPhase::CompletionObserved => {
             Err(resume_launch_reconciliation_required(request_id, &state))
         }
-        ResumeLaunchRequestPhase::Unresolved => {
+        ResumeLaunchRequestPhase::SubmissionObserved | ResumeLaunchRequestPhase::Unresolved => {
+            let prior_phase = state.phase;
+            validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
+            require_prior_actor_terminal(
+                state.actor_process_group_id,
+                request_id,
+                &state.binding_sha256,
+            )?;
+            let recovered =
+                observe_durable_resume(&state.observation, &state.recovery, declared_env);
+            if recovered.completion_observed() {
+                state.phase = ResumeLaunchRequestPhase::CompletionObserved;
+                state.observed_at_unix_ms = Some(now_unix_ms());
+                write_launch_request_state(&state_path, &state, request_id)?;
+                return Err(resume_launch_reconciliation_required(request_id, &state));
+            }
+            if recovered.submitted_user_turn.is_some() {
+                state.phase = ResumeLaunchRequestPhase::SubmissionObserved;
+                state.observed_at_unix_ms = Some(now_unix_ms());
+                write_launch_request_state(&state_path, &state, request_id)?;
+                return Err(resume_launch_reconciliation_required(request_id, &state));
+            }
+            if prior_phase == ResumeLaunchRequestPhase::Unresolved && recovered.available {
+                remove_launch_request_state(&state_path, request_id)?;
+                drop(lock);
+                return retire_orphan_launch_request_lock(&state_path, request_id);
+            }
+            if prior_phase == ResumeLaunchRequestPhase::SubmissionObserved {
+                return Err(resume_launch_reconciliation_required(request_id, &state));
+            }
             Err(resume_launch_recovery_unavailable(request_id, &state))
         }
         ResumeLaunchRequestPhase::Prepared
@@ -1394,12 +1422,43 @@ impl ResumeLaunchRequestGuard {
                 }
                 validate_launch_recovery_context(&state.recovery, &recovery, request_id)?;
                 match state.phase {
-                    ResumeLaunchRequestPhase::SubmissionObserved
-                    | ResumeLaunchRequestPhase::CompletionObserved => {
+                    ResumeLaunchRequestPhase::CompletionObserved => {
                         return Err(resume_launch_reconciliation_required(request_id, &state));
                     }
-                    ResumeLaunchRequestPhase::Unresolved => {
-                        return Err(resume_launch_recovery_unavailable(request_id, &state));
+                    ResumeLaunchRequestPhase::SubmissionObserved
+                    | ResumeLaunchRequestPhase::Unresolved => {
+                        let prior_phase = state.phase;
+                        require_prior_actor_terminal(
+                            state.actor_process_group_id,
+                            request_id,
+                            &state.binding_sha256,
+                        )?;
+                        let recovered = observe_durable_resume(
+                            &state.observation,
+                            &state.recovery,
+                            &recovery.declared_env,
+                        );
+                        if recovered.completion_observed() {
+                            state.phase = ResumeLaunchRequestPhase::CompletionObserved;
+                            state.observed_at_unix_ms = Some(now_unix_ms());
+                            write_launch_request_state(&state_path, &state, request_id)?;
+                            return Err(resume_launch_reconciliation_required(request_id, &state));
+                        }
+                        if recovered.submitted_user_turn.is_some() {
+                            state.phase = ResumeLaunchRequestPhase::SubmissionObserved;
+                            state.observed_at_unix_ms = Some(now_unix_ms());
+                            write_launch_request_state(&state_path, &state, request_id)?;
+                            return Err(resume_launch_reconciliation_required(request_id, &state));
+                        }
+                        if prior_phase == ResumeLaunchRequestPhase::Unresolved
+                            && recovered.available
+                        {
+                            remove_launch_request_state(&state_path, request_id)?;
+                        } else if prior_phase == ResumeLaunchRequestPhase::SubmissionObserved {
+                            return Err(resume_launch_reconciliation_required(request_id, &state));
+                        } else {
+                            return Err(resume_launch_recovery_unavailable(request_id, &state));
+                        }
                     }
                     ResumeLaunchRequestPhase::Prepared
                     | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {

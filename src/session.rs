@@ -137,7 +137,39 @@ pub(crate) enum Command {
     Replace,
 }
 
-pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+pub(crate) struct SessionOutcome {
+    pub result: Value,
+    pub post_write: Option<SessionPostWrite>,
+}
+
+pub(crate) struct SessionPostWrite {
+    root: PathBuf,
+    snapshot_root: PathBuf,
+}
+
+impl SessionPostWrite {
+    pub fn complete(self) -> Result<(), std::io::Error> {
+        match fs::remove_dir_all(&self.snapshot_root) {
+            Ok(()) => durable_fs::sync_directory(&self.root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl SessionOutcome {
+    fn new(result: Value) -> Self {
+        Self {
+            result,
+            post_write: None,
+        }
+    }
+}
+
+pub(crate) fn handle(
+    command: Command,
+    request: RequestEnvelope,
+) -> Result<SessionOutcome, ProviderFailure> {
     let RequestEnvelope {
         host,
         params,
@@ -145,12 +177,16 @@ pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value
         ..
     } = request;
     match command {
-        Command::LocateTranscript => locate_transcript_params(params, &request_id),
-        Command::ReadTurns => read_turns_params(&host, params, &request_id),
-        Command::Capture => capture_params(&host, params, &request_id),
+        Command::LocateTranscript => {
+            locate_transcript_params(params, &request_id).map(SessionOutcome::new)
+        }
+        Command::ReadTurns => {
+            read_turns_params(&host, params, &request_id).map(SessionOutcome::new)
+        }
+        Command::Capture => capture_params(&host, params, &request_id).map(SessionOutcome::new),
         Command::Enumerate => enumerate_params(&host, params, &request_id),
-        Command::Export => export_params(&host, params, &request_id),
-        Command::Replace => replace_params(params, &request_id),
+        Command::Export => export_params(&host, params, &request_id).map(SessionOutcome::new),
+        Command::Replace => replace_params(params, &request_id).map(SessionOutcome::new),
     }
 }
 
@@ -381,11 +417,11 @@ fn validate_live_report_working_directory(
     Ok(())
 }
 
-pub fn enumerate_params(
+pub(crate) fn enumerate_params(
     host: &crate::envelope::HostContext,
     params: Value,
     request_id: &str,
-) -> Result<Value, ProviderFailure> {
+) -> Result<SessionOutcome, ProviderFailure> {
     let params = parse_enumerate_params(params, request_id)?;
     validate_enumerate_params(&params, request_id)?;
     if let Some(cursor) = params.cursor.as_deref() {
@@ -528,6 +564,7 @@ struct EnumeratePage {
     warnings: Vec<String>,
     complete: bool,
     next_cursor: Option<String>,
+    post_write: Option<SessionPostWrite>,
 }
 
 fn enumerate_sessions(
@@ -619,6 +656,7 @@ fn paginate_sessions(
         warnings,
         complete,
         next_cursor,
+        post_write: None,
     })
 }
 
@@ -764,18 +802,16 @@ fn load_enumeration_snapshot_page(
         );
     }
     let complete = end == total;
-    if complete {
-        fs::remove_dir_all(&snapshot_root)
-            .map_err(|error| session_snapshot_failure(request_id, error))?;
-        durable_fs::sync_directory(&root)
-            .map_err(|error| session_snapshot_failure(request_id, error))?;
-    }
     Ok(EnumeratePage {
         sessions,
         warnings: Vec::new(),
         complete,
         next_cursor: (!complete)
             .then(|| enumeration_cursor(&snapshot_id, end, total, &expected_identity)),
+        post_write: complete.then_some(SessionPostWrite {
+            root,
+            snapshot_root,
+        }),
     })
 }
 
@@ -1476,13 +1512,16 @@ fn capture_result(provider_session_id: Option<String>, source: &'static str) -> 
     })
 }
 
-fn enumerate_result(page: EnumeratePage) -> Value {
-    json!({
-        "sessions": page.sessions,
-        "complete": page.complete,
-        "next_cursor": page.next_cursor,
-        "warnings": page.warnings,
-    })
+fn enumerate_result(page: EnumeratePage) -> SessionOutcome {
+    SessionOutcome {
+        result: json!({
+            "sessions": page.sessions,
+            "complete": page.complete,
+            "next_cursor": page.next_cursor,
+            "warnings": page.warnings,
+        }),
+        post_write: page.post_write,
+    }
 }
 
 fn export_result(bytes: &[u8], turn_count: usize) -> Value {
