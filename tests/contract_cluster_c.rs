@@ -10,6 +10,85 @@ use support::{invoke_with_env, invoke_with_host_and_env, json_stdout};
 
 struct RejectWrites;
 
+struct IsolatedQuotaSettings {
+    _root: tempfile::TempDir,
+    host_overrides: serde_json::Value,
+}
+
+impl IsolatedQuotaSettings {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("create isolated quota host root");
+        let config_root = root.path().join("config");
+        let data_root = root.path().join("data");
+        let store_root = config_root.join("agent-runner-opencode");
+        std::fs::create_dir_all(&store_root).expect("create isolated quota settings root");
+        std::fs::create_dir_all(&data_root).expect("create isolated quota data root");
+        let store = json!({
+            "schema_version": 3,
+            "records": [{
+                "id": "opencode3",
+                "display_name": "isolated quota account",
+                "version": "fixture-v1",
+                "values": {
+                    "provider": "opencode",
+                    "profile": "opencode3",
+                    "wrapper": "opencode3",
+                    "model": { "selection": "requested" },
+                    "quota": {
+                        "source": "opencode_auth",
+                        "auth_path": "~/.opencode3/opencode/auth.json",
+                        "probe": "native_chatgpt_usage"
+                    },
+                    "launch": {
+                        "dangerously_skip_permissions": true,
+                        "format": "json",
+                        "preserve_pure_wrapper": true
+                    },
+                    "extra_env": {},
+                    "mode": "non_interactive"
+                }
+            }],
+            "history": [],
+            "mutation_receipts": {}
+        });
+        std::fs::write(
+            store_root.join("settings-store.json"),
+            serde_json::to_vec_pretty(&store).expect("serialize isolated quota settings store"),
+        )
+        .expect("write isolated quota settings store");
+        let host_overrides = json!({
+            "config_root": config_root.to_string_lossy(),
+            "data_root": data_root.to_string_lossy(),
+        });
+        Self {
+            _root: root,
+            host_overrides,
+        }
+    }
+
+    fn host_overrides(&self) -> serde_json::Value {
+        self.host_overrides.clone()
+    }
+
+    fn delete_settings_record(&self) {
+        let output = support::invoke_validated_with_host(
+            "settings.delete",
+            json!({ "id": "opencode3", "version": "fixture-v1" }),
+            self.host_overrides(),
+            "settings.schema.json#/$defs/SettingsDeleteRequest",
+        );
+        let response = json_stdout(&output);
+        support::assert_valid(
+            &response,
+            "settings.schema.json#/$defs/SettingsDeleteResponse",
+        );
+        assert_eq!(
+            response["ok"], true,
+            "settings deletion response={response}"
+        );
+    }
+}
+
 impl std::io::Write for RejectWrites {
     fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
         Err(std::io::Error::new(
@@ -378,11 +457,12 @@ fn contract_quota_refresh_auth() {
 
 #[test]
 fn contract_quota_refresh_auth_replays_committed_observation_after_response_loss() {
+    let runtime = IsolatedQuotaSettings::new();
     let fixture = RefreshAuthFixture::new();
     let mut request = support::validated_request_envelope(
         "quota.refresh_auth",
         quota_refresh_auth_params(),
-        json!({}),
+        runtime.host_overrides(),
         "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
     );
     request["request_id"] = json!(format!(
@@ -426,6 +506,7 @@ fn contract_quota_refresh_auth_replays_committed_observation_after_response_loss
         1,
         "the response-lost invocation must execute exactly one native auth refresh"
     );
+    runtime.delete_settings_record();
 
     let replay = success_result(
         support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &fixture.env()),
@@ -475,11 +556,12 @@ fn contract_quota_refresh_auth_replays_committed_observation_after_response_loss
 
 #[test]
 fn contract_quota_refresh_auth_does_not_repeat_an_unsettled_native_effect() {
+    let runtime = IsolatedQuotaSettings::new();
     let fixture = RefreshAuthFixture::new();
     let request = support::validated_request_envelope(
         "quota.refresh_auth",
         quota_refresh_auth_params(),
-        json!({}),
+        runtime.host_overrides(),
         "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
     );
     let first = success_result(
@@ -517,6 +599,7 @@ fn contract_quota_refresh_auth_does_not_repeat_an_unsettled_native_effect() {
         serde_json::to_vec_pretty(&operation).expect("serialize unsettled quota operation"),
     )
     .expect("simulate provider loss after native effect admission");
+    runtime.delete_settings_record();
 
     let retry = support::invoke_with_request_and_env("quota.refresh_auth", request, &fixture.env());
     assert_eq!(retry.status.code(), Some(2));

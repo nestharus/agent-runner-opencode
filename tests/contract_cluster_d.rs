@@ -1178,6 +1178,8 @@ fn contract_rotation_assess_materialize() {
         "rotation.schema.json#/$defs/RotationMaterializeResult",
     );
     assert_rotation_materialized(&materialized);
+    fs::remove_dir_all(host.working_directory())
+        .expect("remove former working directory after committed materialization");
     let retried = success_result(
         invoke_validated_with_host_and_env(
             "rotation.materialize",

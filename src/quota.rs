@@ -7,7 +7,7 @@
 //!       - provider-owned QuotaObservation to QuotaProbeWindow
 //!       - opencode CLI-owned auth refresh boundary to QuotaRefreshAuthResult
 
-use crate::account::AccountProfile;
+use crate::account::{profile_for_wrapper_reference, AccountProfile};
 use crate::activity::ActivityTargets;
 use crate::durable_fs;
 use crate::encoding::{bounded_text, now_unix_ms, sha256_hex};
@@ -143,25 +143,28 @@ pub fn refresh_auth_params(
     provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
     let parsed = parse_refresh_params(params.clone(), request_id)?;
-    let selection = resolve_runtime_selection(host, &parsed.settings_id, request_id)?;
-    let account = selection.account;
-    let auth_path = resolved_auth_path(account);
-    let binding = quota_refresh_binding(
-        &params,
-        &selection,
-        &auth_path,
+    let params_sha256 = sha256_hex(params.to_string().as_bytes());
+    let attempted_identity_sha256 = quota_refresh_attempt_identity_sha256(
+        &params_sha256,
+        &parsed.settings_id,
         provider_instance_id,
         &host.app,
     );
-    let binding_sha256 = quota_refresh_binding_sha256(&binding);
     let _request_lock = acquire_quota_refresh_request_lock(host, request_id)?;
-    let mut operation = match read_quota_refresh_operation(host, request_id)? {
+    let (mut operation, account, auth_path) = match read_quota_refresh_operation(host, request_id)?
+    {
         Some(operation) => {
             validate_quota_refresh_operation(&operation, request_id)?;
-            if operation.binding_sha256 != binding_sha256 || operation.binding != binding {
+            if !quota_refresh_attempt_matches(
+                &operation,
+                &params_sha256,
+                &parsed.settings_id,
+                provider_instance_id,
+                &host.app,
+            ) {
                 return Err(quota_refresh_request_conflict(
                     request_id,
-                    &binding_sha256,
+                    &attempted_identity_sha256,
                     &operation,
                 ));
             }
@@ -185,15 +188,27 @@ pub fn refresh_auth_params(
                         request_id, &operation,
                     ));
                 }
-                QuotaRefreshOperationPhase::Prepared => operation,
+                QuotaRefreshOperationPhase::Prepared => {}
             }
+            let (account, auth_path) = quota_refresh_operation_route(&operation, request_id)?;
+            (operation, account, auth_path)
         }
         None => {
+            let selection = resolve_runtime_selection(host, &parsed.settings_id, request_id)?;
+            let account = selection.account;
+            let auth_path = resolved_auth_path(account);
+            let binding = quota_refresh_binding(
+                &params_sha256,
+                &selection,
+                &auth_path,
+                provider_instance_id,
+                &host.app,
+            );
             let operation = QuotaRefreshOperation {
                 schema_version: QUOTA_REFRESH_SCHEMA_VERSION,
                 operation: "quota.refresh_auth".to_string(),
                 request_id: request_id.to_string(),
-                binding_sha256,
+                binding_sha256: quota_refresh_binding_sha256(&binding),
                 binding,
                 phase: QuotaRefreshOperationPhase::Prepared,
                 prepared_at_unix_ms: now_unix_ms(),
@@ -202,7 +217,7 @@ pub fn refresh_auth_params(
                 result: None,
             };
             write_quota_refresh_operation(host, &operation, request_id)?;
-            operation
+            (operation, account, auth_path)
         }
     };
     let _account_lock = acquire_quota_refresh_account_lock(host, account, &auth_path, request_id)?;
@@ -230,7 +245,7 @@ pub fn refresh_auth_params(
 }
 
 fn quota_refresh_binding(
-    params: &Value,
+    params_sha256: &str,
     selection: &RuntimeSelection,
     auth_path: &Path,
     provider_instance_id: Option<&str>,
@@ -238,7 +253,7 @@ fn quota_refresh_binding(
 ) -> Value {
     json!({
         "operation": "quota.refresh_auth",
-        "params_sha256": sha256_hex(params.to_string().as_bytes()),
+        "params_sha256": params_sha256,
         "settings_id": selection.settings_id,
         "settings_version": selection.settings_version,
         "account": selection.account.opencode_wrapper,
@@ -247,6 +262,66 @@ fn quota_refresh_binding(
         "provider_instance_id": provider_instance_id,
         "host_app": host_app,
     })
+}
+
+fn quota_refresh_attempt_identity_sha256(
+    params_sha256: &str,
+    settings_id: &str,
+    provider_instance_id: Option<&str>,
+    host_app: &str,
+) -> String {
+    sha256_hex(
+        json!({
+            "operation": "quota.refresh_auth",
+            "params_sha256": params_sha256,
+            "settings_id": settings_id,
+            "provider_instance_id": provider_instance_id,
+            "host_app": host_app,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+fn quota_refresh_attempt_matches(
+    operation: &QuotaRefreshOperation,
+    params_sha256: &str,
+    settings_id: &str,
+    provider_instance_id: Option<&str>,
+    host_app: &str,
+) -> bool {
+    operation.binding["params_sha256"].as_str() == Some(params_sha256)
+        && operation.binding["settings_id"].as_str() == Some(settings_id)
+        && operation.binding["provider_instance_id"] == json!(provider_instance_id)
+        && operation.binding["host_app"].as_str() == Some(host_app)
+}
+
+fn quota_refresh_operation_route(
+    operation: &QuotaRefreshOperation,
+    request_id: &str,
+) -> Result<(&'static AccountProfile, PathBuf), ProviderFailure> {
+    let account_name = operation.binding["account"]
+        .as_str()
+        .ok_or_else(|| quota_refresh_operation_invalid(request_id, "binding account is missing"))?;
+    let account = profile_for_wrapper_reference(account_name).ok_or_else(|| {
+        quota_refresh_operation_invalid(request_id, "binding account is not declared")
+    })?;
+    if account.opencode_wrapper != account_name
+        || operation.binding["account_index"].as_u64() != Some(u64::from(account.opencode_index))
+    {
+        return Err(quota_refresh_operation_invalid(
+            request_id,
+            "binding account identity is inconsistent",
+        ));
+    }
+    let auth_path = operation.binding["auth_source_path"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            quota_refresh_operation_invalid(request_id, "binding auth source path is missing")
+        })?;
+    Ok((account, auth_path))
 }
 
 fn quota_refresh_binding_sha256(binding: &Value) -> String {
@@ -433,7 +508,7 @@ fn write_quota_refresh_operation(
 
 fn quota_refresh_request_conflict(
     request_id: &str,
-    attempted_binding_sha256: &str,
+    attempted_identity_sha256: &str,
     operation: &QuotaRefreshOperation,
 ) -> ProviderFailure {
     ProviderFailure::conflict(
@@ -441,7 +516,7 @@ fn quota_refresh_request_conflict(
         "quota_refresh_request_conflict",
         "quota.refresh_auth request_id is already bound to a different operation identity",
         json!({
-            "attempted_binding_sha256": attempted_binding_sha256,
+            "attempted_request_identity_sha256": attempted_identity_sha256,
             "committed_binding_sha256": operation.binding_sha256,
             "committed_phase": quota_refresh_phase_name(operation.phase),
         }),

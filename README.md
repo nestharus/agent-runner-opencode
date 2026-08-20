@@ -107,6 +107,10 @@ observation is committed, the request is durably marked for reconciliation;
 retries return an actionable conflict instead of guessing whether it is safe to
 repeat the credential operation. Account-scoped locks serialize observable auth
 refreshes while their provider invocation remains alive.
+Exact refresh retries inspect this immutable request record before resolving
+live settings. Deleting or updating the former settings record therefore cannot
+hide either a committed result or an admitted-effect reconciliation handoff;
+prepared work continues from its stored canonical account and auth-source path.
 
 ## Invocation and lifecycle
 
@@ -147,6 +151,12 @@ exhaustive same-context list proves no effect.
 Non-Unix builds do not admit native launch because they cannot provide this
 process-group custody contract.
 Reusing the request ID with different launch inputs is rejected as a conflict.
+Launch records also retain a settings-independent digest of the original host
+app and complete request parameters. Exact retries inspect that immutable
+identity and any durable session, terminal, or resume observation before
+consulting mutable live settings. Current settings admission occurs only when
+there is no prior operation or authoritative recovery proved that it had no
+native effect.
 
 For resumed sessions, model switching is allowed per turn. Delivery and
 completion are credited only when bounded native export observes the submitted
@@ -192,6 +202,10 @@ blocked: the provider first probes the expected target session, or the caller
 supplies `recovery_target_session_id`; the exported target must match the
 prepared source artifact before finalization. The recovery error retains the
 prepared artifact path for a one-time manual import when no effect occurred.
+Receipt replay and imported-operation finalization run before validating the
+host working directory because neither path uses it. The directory is required
+only before a new native import, so removing or renaming it cannot strand a
+completed materialization.
 
 ## State, evidence, and authority
 

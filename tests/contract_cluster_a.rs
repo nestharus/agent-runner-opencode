@@ -23,6 +23,88 @@ struct FailAfterFirstLaunchEvent {
 
 struct RejectLaunchWrites;
 
+struct IsolatedLaunchSettings {
+    _root: tempfile::TempDir,
+    host_overrides: serde_json::Value,
+}
+
+impl IsolatedLaunchSettings {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("create isolated launch host root");
+        let config_root = root.path().join("config");
+        let data_root = root.path().join("data");
+        let working_directory = root.path().join("workspace");
+        let store_root = config_root.join("agent-runner-opencode");
+        fs::create_dir_all(&store_root).expect("create isolated settings root");
+        fs::create_dir_all(&data_root).expect("create isolated launch data root");
+        fs::create_dir_all(&working_directory).expect("create isolated host workspace");
+        let store = serde_json::json!({
+            "schema_version": 3,
+            "records": [{
+                "id": "opencode1",
+                "display_name": "isolated launch account",
+                "version": "fixture-v1",
+                "values": {
+                    "provider": "opencode",
+                    "profile": "opencode1",
+                    "wrapper": "opencode1",
+                    "model": { "selection": "requested" },
+                    "quota": {
+                        "source": "opencode_auth",
+                        "auth_path": "~/.local/share/opencode/auth.json",
+                        "probe": "native_chatgpt_usage"
+                    },
+                    "launch": {
+                        "dangerously_skip_permissions": true,
+                        "format": "json",
+                        "preserve_pure_wrapper": true
+                    },
+                    "extra_env": {},
+                    "mode": "non_interactive"
+                }
+            }],
+            "history": [],
+            "mutation_receipts": {}
+        });
+        fs::write(
+            store_root.join("settings-store.json"),
+            serde_json::to_vec_pretty(&store).expect("serialize isolated settings store"),
+        )
+        .expect("write isolated settings store");
+        let host_overrides = serde_json::json!({
+            "config_root": config_root.to_string_lossy(),
+            "data_root": data_root.to_string_lossy(),
+            "working_directory": working_directory.to_string_lossy(),
+        });
+        Self {
+            _root: root,
+            host_overrides,
+        }
+    }
+
+    fn host_overrides(&self) -> serde_json::Value {
+        self.host_overrides.clone()
+    }
+
+    fn delete_settings_record(&self) {
+        let output = support::invoke_validated_with_host(
+            "settings.delete",
+            serde_json::json!({ "id": "opencode1", "version": "fixture-v1" }),
+            self.host_overrides(),
+            "settings.schema.json#/$defs/SettingsDeleteRequest",
+        );
+        let response = json_stdout(&output);
+        support::assert_valid(
+            &response,
+            "settings.schema.json#/$defs/SettingsDeleteResponse",
+        );
+        assert_eq!(
+            response["ok"], true,
+            "settings deletion response={response}"
+        );
+    }
+}
+
 impl std::io::Write for RejectLaunchWrites {
     fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
         Err(std::io::Error::new(
@@ -129,6 +211,7 @@ fn contract_launch_stream() {
 
 #[test]
 fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss() {
+    let runtime = IsolatedLaunchSettings::new();
     let provider_session_id = "ses_durable_launch_response_loss";
     let fake_wrapper = FakeOpencodeWrapper::with_counted_new_session(provider_session_id);
     let path = prepend_path(fake_wrapper.dir());
@@ -146,7 +229,7 @@ fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss
     let mut request = support::validated_request_envelope(
         "launch",
         params,
-        serde_json::json!({}),
+        runtime.host_overrides(),
         "launch.schema.json#/$defs/LaunchRequest",
     );
     request["request_id"] = serde_json::json!("req-launch-generated-session-response-loss");
@@ -171,6 +254,7 @@ fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss
         "1\n",
         "the first invocation should create exactly one provider session"
     );
+    runtime.delete_settings_record();
 
     let replay = json_stdout(&support::invoke_with_request("launch", request));
     assert_eq!(
@@ -190,6 +274,7 @@ fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss
 
 #[test]
 fn contract_launch_resume_replay_does_not_resubmit_after_output_loss() {
+    let runtime = IsolatedLaunchSettings::new();
     let fake_wrapper = FakeOpencodeWrapper::with_counted_resume();
     let path = prepend_path(fake_wrapper.dir());
     let params =
@@ -197,7 +282,7 @@ fn contract_launch_resume_replay_does_not_resubmit_after_output_loss() {
     let mut request = support::validated_request_envelope(
         "launch",
         params,
-        serde_json::json!({}),
+        runtime.host_overrides(),
         "launch.schema.json#/$defs/LaunchRequest",
     );
     request["request_id"] = serde_json::json!("req-launch-resume-submission-response-loss");
@@ -222,6 +307,7 @@ fn contract_launch_resume_replay_does_not_resubmit_after_output_loss() {
         "1\n",
         "the first invocation should submit exactly one resumed turn"
     );
+    runtime.delete_settings_record();
 
     let replay = json_stdout(&support::invoke_with_request("launch", request));
     assert_eq!(
@@ -334,6 +420,14 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
         .to_string()
         .as_bytes(),
     );
+    let request_identity_sha256 = agent_runner_opencode::encoding::sha256_hex(
+        serde_json::json!({
+            "host_app": request["host"]["app"],
+            "params": request["params"],
+        })
+        .to_string()
+        .as_bytes(),
+    );
     let prompt_sha256 = agent_runner_opencode::encoding::sha256_hex(
         request["params"]["model"]["inputs"]["prompt"]
             .as_str()
@@ -361,9 +455,10 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
         .expect("current time")
         .as_millis() as u64;
     let mut prepared_state = serde_json::json!({
-        "schema_version": 4,
+        "schema_version": 5,
         "operation_kind": "new_session",
         "request_id": request_id,
+        "request_identity_sha256": request_identity_sha256,
         "binding_sha256": binding_sha256,
         "prompt_sha256": prompt_sha256,
         "recovery": {

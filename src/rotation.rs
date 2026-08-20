@@ -53,7 +53,6 @@ pub fn materialize_params(
     provider_instance_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
-    let working_directory = rotation_working_directory(host, request_id)?;
     let _lock = acquire_rotation_lock(host, request_id)?;
     if let Some(result) = read_materialization_receipt(host, &binding, request_id)? {
         return Ok(result);
@@ -65,6 +64,7 @@ pub fn materialize_params(
         return finalize_rotation_operation(host, &binding, &operation, request_id);
     }
     let authorization = require_fresh_authorization(host, &binding, request_id)?;
+    let working_directory = rotation_working_directory(host, request_id)?;
     let native = opencode::export(&binding.source_session_id, binding.source_account)
         .map_err(|error| rotation_export_failure(request_id, &binding.source_session_id, error))?;
     validate_rotation_export(&native, &binding.source_session_id, request_id)?;

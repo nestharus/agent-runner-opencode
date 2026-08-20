@@ -112,6 +112,7 @@ struct LaunchRequestState {
     schema_version: u32,
     operation_kind: LaunchOperationKind,
     request_id: String,
+    request_identity_sha256: String,
     binding_sha256: String,
     prompt_sha256: Option<String>,
     recovery: LaunchRecoveryIdentity,
@@ -170,6 +171,7 @@ struct ResumeLaunchRequestState {
     schema_version: u32,
     operation_kind: LaunchOperationKind,
     request_id: String,
+    request_identity_sha256: String,
     binding_sha256: String,
     observation: DurableResumeObservationRequest,
     recovery: LaunchRecoveryIdentity,
@@ -216,6 +218,16 @@ pub(crate) fn stream<W: Write>(
 ) -> Result<LaunchOutcome, ProviderFailure> {
     let raw_params = params.clone();
     let params = parse_launch_params(params, request_id)?;
+    let new_session = known_provider_session_id(&params).is_none();
+    let request_identity_sha256 = launch_request_identity_sha256(host, &raw_params);
+    let declared_env = params.env.clone().unwrap_or_default();
+    reconcile_existing_launch_request(
+        host,
+        request_id,
+        &request_identity_sha256,
+        new_session,
+        &declared_env,
+    )?;
     let effective = match launch_argv(&params, host, request_id)? {
         PolicyLaunch::Accepted(effective) => *effective,
         PolicyLaunch::Rejected(reason) => {
@@ -227,7 +239,6 @@ pub(crate) fn stream<W: Write>(
             })
         }
     };
-    let new_session = known_provider_session_id(&params).is_none();
     let binding_sha256 =
         launch_request_binding_sha256(host, &raw_params, &effective.route_evidence);
     let prompt_sha256 = effective
@@ -268,6 +279,7 @@ pub(crate) fn stream<W: Write>(
             Some(LaunchRequestGuard::prepare(
                 host,
                 request_id,
+                request_identity_sha256,
                 binding_sha256,
                 prompt_sha256,
                 recovery,
@@ -286,6 +298,7 @@ pub(crate) fn stream<W: Write>(
             Some(ResumeLaunchRequestGuard::prepare(
                 host,
                 request_id,
+                request_identity_sha256,
                 binding_sha256,
                 observation,
                 recovery,
@@ -1049,10 +1062,149 @@ fn stream_policy_rejection<W: Write>(
     state.finish(writer)
 }
 
+fn reconcile_existing_launch_request(
+    host: &HostContext,
+    request_id: &str,
+    request_identity_sha256: &str,
+    new_session: bool,
+    declared_env: &BTreeMap<String, String>,
+) -> Result<(), ProviderFailure> {
+    let root = launch_state_root(host, request_id)?;
+    match fs::metadata(&root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(launch_state_failure(
+                request_id,
+                "launch request state root is not a directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(launch_state_failure(request_id, error)),
+    }
+    durable_fs::create_private_directories(&root)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    let key = sha256_hex(request_id.as_bytes());
+    let state_path =
+        confined_launch_state_target(host, &root.join(format!("{key}.json")), request_id)?;
+    let lock_path =
+        confined_launch_state_target(host, &root.join(format!("{key}.lock")), request_id)?;
+    let lock = open_launch_state_lock(&lock_path)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    lock.lock_exclusive()
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    let bytes = match durable_fs::read_file(&state_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(launch_state_failure(request_id, error)),
+    };
+    let expected_kind = if new_session {
+        LaunchOperationKind::NewSession
+    } else {
+        LaunchOperationKind::Resume
+    };
+    validate_launch_operation_kind(&bytes, expected_kind, request_id, request_identity_sha256)?;
+    if new_session {
+        let mut state: LaunchRequestState = serde_json::from_slice(&bytes)
+            .map_err(|error| launch_state_invalid(request_id, error))?;
+        validate_launch_request_state(&state, request_id)?;
+        if state.request_identity_sha256 != request_identity_sha256 {
+            return Err(launch_request_reuse_conflict(
+                request_id,
+                request_identity_sha256,
+                &state,
+            ));
+        }
+        match state.phase {
+            LaunchRequestPhase::SessionObserved => {
+                return Err(launch_session_reconciliation_required(request_id, &state));
+            }
+            LaunchRequestPhase::TerminalWithoutSession => {
+                return Err(launch_terminal_reconciliation_required(request_id, &state));
+            }
+            LaunchRequestPhase::Prepared => {
+                validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
+                require_prior_actor_terminal(
+                    state.actor_process_group_id,
+                    request_id,
+                    &state.binding_sha256,
+                )?;
+                match recover_prepared_launch(&state, declared_env, request_id)? {
+                    PreparedLaunchRecovery::NoEffectObserved => {
+                        remove_launch_request_state(&state_path, request_id)?;
+                    }
+                    PreparedLaunchRecovery::SessionObserved(provider_session_id) => {
+                        state.phase = LaunchRequestPhase::SessionObserved;
+                        state.provider_session_id = Some(provider_session_id);
+                        state.terminal_status = None;
+                        state.observed_at_unix_ms = Some(now_unix_ms());
+                        write_launch_request_state(&state_path, &state, request_id)?;
+                        return Err(launch_session_reconciliation_required(request_id, &state));
+                    }
+                    PreparedLaunchRecovery::Ambiguous(candidates) => {
+                        return Err(launch_session_recovery_required(
+                            request_id, &state, candidates,
+                        ));
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let mut state: ResumeLaunchRequestState =
+        serde_json::from_slice(&bytes).map_err(|error| launch_state_invalid(request_id, error))?;
+    validate_resume_launch_request_state(&state, request_id)?;
+    if state.request_identity_sha256 != request_identity_sha256 {
+        return Err(resume_launch_request_reuse_conflict(
+            request_id,
+            request_identity_sha256,
+            &state,
+        ));
+    }
+    match state.phase {
+        ResumeLaunchRequestPhase::SubmissionObserved
+        | ResumeLaunchRequestPhase::CompletionObserved => {
+            Err(resume_launch_reconciliation_required(request_id, &state))
+        }
+        ResumeLaunchRequestPhase::Prepared
+        | ResumeLaunchRequestPhase::Unresolved
+        | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
+            validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
+            if state.phase == ResumeLaunchRequestPhase::Prepared {
+                require_prior_actor_terminal(
+                    state.actor_process_group_id,
+                    request_id,
+                    &state.binding_sha256,
+                )?;
+            }
+            let recovered =
+                observe_durable_resume(&state.observation, &state.recovery, declared_env);
+            if !recovered.available {
+                state.phase = ResumeLaunchRequestPhase::Unresolved;
+                state.observed_at_unix_ms = Some(now_unix_ms());
+                write_launch_request_state(&state_path, &state, request_id)?;
+                return Err(resume_launch_recovery_unavailable(request_id, &state));
+            }
+            if recovered.submitted_user_turn.is_some() {
+                state.phase = if recovered.completion_observed() {
+                    ResumeLaunchRequestPhase::CompletionObserved
+                } else {
+                    ResumeLaunchRequestPhase::SubmissionObserved
+                };
+                state.observed_at_unix_ms = Some(now_unix_ms());
+                write_launch_request_state(&state_path, &state, request_id)?;
+                return Err(resume_launch_reconciliation_required(request_id, &state));
+            }
+            remove_launch_request_state(&state_path, request_id)
+        }
+    }
+}
+
 impl LaunchRequestGuard {
     fn prepare(
         host: &HostContext,
         request_id: &str,
+        request_identity_sha256: String,
         binding_sha256: String,
         prompt_sha256: Option<String>,
         recovery: LaunchRecoveryContext,
@@ -1080,10 +1232,10 @@ impl LaunchRequestGuard {
                 let mut state: LaunchRequestState = serde_json::from_slice(&bytes)
                     .map_err(|error| launch_state_invalid(request_id, error))?;
                 validate_launch_request_state(&state, request_id)?;
-                if state.binding_sha256 != binding_sha256 {
+                if state.request_identity_sha256 != request_identity_sha256 {
                     return Err(launch_request_reuse_conflict(
                         request_id,
-                        &binding_sha256,
+                        &request_identity_sha256,
                         &state,
                     ));
                 }
@@ -1128,9 +1280,10 @@ impl LaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = LaunchRequestState {
-            schema_version: 4,
+            schema_version: 5,
             operation_kind: LaunchOperationKind::NewSession,
             request_id: request_id.to_string(),
+            request_identity_sha256,
             binding_sha256,
             prompt_sha256,
             recovery: recovery.identity,
@@ -1204,6 +1357,7 @@ impl ResumeLaunchRequestGuard {
     fn prepare(
         host: &HostContext,
         request_id: &str,
+        request_identity_sha256: String,
         binding_sha256: String,
         observation: DurableResumeObservationRequest,
         recovery: LaunchRecoveryContext,
@@ -1231,10 +1385,10 @@ impl ResumeLaunchRequestGuard {
                 let mut state: ResumeLaunchRequestState = serde_json::from_slice(&bytes)
                     .map_err(|error| launch_state_invalid(request_id, error))?;
                 validate_resume_launch_request_state(&state, request_id)?;
-                if state.binding_sha256 != binding_sha256 {
+                if state.request_identity_sha256 != request_identity_sha256 {
                     return Err(resume_launch_request_reuse_conflict(
                         request_id,
-                        &binding_sha256,
+                        &request_identity_sha256,
                         &state,
                     ));
                 }
@@ -1283,9 +1437,10 @@ impl ResumeLaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = ResumeLaunchRequestState {
-            schema_version: 4,
+            schema_version: 5,
             operation_kind: LaunchOperationKind::Resume,
             request_id: request_id.to_string(),
+            request_identity_sha256,
             binding_sha256,
             observation,
             recovery: recovery.identity,
@@ -1384,6 +1539,17 @@ fn launch_request_binding_sha256(
     )
 }
 
+fn launch_request_identity_sha256(host: &HostContext, params: &Value) -> String {
+    sha256_hex(
+        json!({
+            "host_app": host.app,
+            "params": params,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
 fn launch_recovery_context(
     argv: &[String],
     working_directory: &str,
@@ -1420,7 +1586,15 @@ fn validate_launch_recovery_context(
     recovery: &LaunchRecoveryContext,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    if identity.declared_env_sha256 == launch_environment_sha256(&recovery.declared_env) {
+    validate_launch_recovery_environment(identity, &recovery.declared_env, request_id)
+}
+
+fn validate_launch_recovery_environment(
+    identity: &LaunchRecoveryIdentity,
+    declared_env: &BTreeMap<String, String>,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if identity.declared_env_sha256 == launch_environment_sha256(declared_env) {
         return Ok(());
     }
     Err(launch_recovery_unavailable(
@@ -1779,9 +1953,10 @@ fn validate_launch_request_state(
                 && state.observed_at_unix_ms.is_some()
         }
     };
-    if state.schema_version == 4
+    if state.schema_version == 5
         && state.operation_kind == LaunchOperationKind::NewSession
         && state.request_id == request_id
+        && !state.request_identity_sha256.trim().is_empty()
         && !state.binding_sha256.trim().is_empty()
         && !state.recovery.program.trim().is_empty()
         && !state.recovery.declared_env_sha256.trim().is_empty()
@@ -1818,9 +1993,10 @@ fn validate_resume_launch_request_state(
         }
     };
     let observation = &state.observation;
-    if state.schema_version == 4
+    if state.schema_version == 5
         && state.operation_kind == LaunchOperationKind::Resume
         && state.request_id == request_id
+        && !state.request_identity_sha256.trim().is_empty()
         && !state.binding_sha256.trim().is_empty()
         && !observation.account_wrapper.trim().is_empty()
         && !observation.session_id.trim().is_empty()
@@ -1871,7 +2047,7 @@ fn launch_recovery_unavailable(request_id: &str, error: impl std::fmt::Display) 
 
 fn launch_request_reuse_conflict(
     request_id: &str,
-    attempted_binding_sha256: &str,
+    attempted_request_identity_sha256: &str,
     state: &LaunchRequestState,
 ) -> ProviderFailure {
     ProviderFailure::conflict(
@@ -1879,7 +2055,8 @@ fn launch_request_reuse_conflict(
         "launch_request_conflict",
         "launch request_id already names a different durable new-session operation",
         json!({
-            "attempted_binding_sha256": attempted_binding_sha256,
+            "attempted_request_identity_sha256": attempted_request_identity_sha256,
+            "committed_request_identity_sha256": state.request_identity_sha256,
             "committed_binding_sha256": state.binding_sha256,
             "provider_session_id": state.provider_session_id,
         }),
@@ -1963,7 +2140,7 @@ fn launch_actor_reconciliation_required(
 
 fn resume_launch_request_reuse_conflict(
     request_id: &str,
-    attempted_binding_sha256: &str,
+    attempted_request_identity_sha256: &str,
     state: &ResumeLaunchRequestState,
 ) -> ProviderFailure {
     ProviderFailure::conflict(
@@ -1971,7 +2148,8 @@ fn resume_launch_request_reuse_conflict(
         "launch_request_conflict",
         "launch request_id already names a different durable resumed-session operation",
         json!({
-            "attempted_binding_sha256": attempted_binding_sha256,
+            "attempted_request_identity_sha256": attempted_request_identity_sha256,
+            "committed_request_identity_sha256": state.request_identity_sha256,
             "committed_binding_sha256": state.binding_sha256,
             "provider_session_id": state.observation.session_id,
         }),
