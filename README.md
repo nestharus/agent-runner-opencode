@@ -90,6 +90,18 @@ an observed before/after change in the selected credential source. Automatic
 retry and the public `refreshed` flag require that credential change;
 post-operation quota availability is reported independently.
 
+`quota.refresh_auth` also takes durable custody of each request before admitting
+the native auth command. The request binding includes the complete parameter
+digest, provider/host identity, resolved settings-record ID and version,
+account, and credential-source path. A completed observation is committed before
+the response is written, so an exact retry after response loss replays the same
+`refreshed`, availability, timestamp, and detail without invoking OpenCode
+again. If provider loss occurs after the native-effect boundary but before that
+observation is committed, the request is durably marked for reconciliation;
+retries return an actionable conflict instead of guessing whether it is safe to
+repeat the credential operation. Account-scoped locks serialize observable auth
+refreshes while their provider invocation remains alive.
+
 ## Invocation and lifecycle
 
 The one-shot invocation form is:

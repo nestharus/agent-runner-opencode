@@ -9,16 +9,25 @@
 
 use crate::account::AccountProfile;
 use crate::activity::ActivityTargets;
-use crate::encoding::{bounded_text, now_unix_ms};
+use crate::durable_fs;
+use crate::encoding::{bounded_text, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::opencode::{OpencodeAuthEffect, OpencodeAuthObservation};
+use crate::path_guard;
 use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
-use crate::runtime_selection::{append_resolved_activity_targets, resolve_runtime_selection};
+use crate::runtime_selection::{
+    append_resolved_activity_targets, resolve_runtime_selection, RuntimeSelection,
+};
 use chrono::DateTime;
-use serde::Deserialize;
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+const QUOTA_REFRESH_STATE_DIR: &str = "provider-state/opencode/quota/auth-refresh";
+const QUOTA_REFRESH_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Deserialize)]
 struct QuotaBaseParams {
@@ -28,6 +37,32 @@ struct QuotaBaseParams {
 #[derive(Deserialize)]
 struct QuotaRefreshAuthParams {
     settings_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct QuotaRefreshOperation {
+    schema_version: u32,
+    operation: String,
+    request_id: String,
+    binding_sha256: String,
+    binding: Value,
+    phase: QuotaRefreshOperationPhase,
+    prepared_at_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_effect_admitted_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    committed_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QuotaRefreshOperationPhase {
+    Prepared,
+    NativeEffectAdmitted,
+    ReconciliationRequired,
+    Committed,
 }
 
 #[derive(Clone, Copy)]
@@ -42,12 +77,15 @@ pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value
         host,
         params,
         request_id,
+        provider_instance_id,
         ..
     } = request;
     match command {
         Command::Source => source_params(&host, params, &request_id),
         Command::Probe => probe_params(&host, params, &request_id),
-        Command::RefreshAuth => refresh_auth_params(&host, params, &request_id),
+        Command::RefreshAuth => {
+            refresh_auth_params(&host, params, &request_id, provider_instance_id.as_deref())
+        }
     }
 }
 
@@ -102,10 +140,75 @@ pub fn refresh_auth_params(
     host: &HostContext,
     params: Value,
     request_id: &str,
+    provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
-    let params = parse_refresh_params(params, request_id)?;
-    let account = account_from_settings_record(host, &params.settings_id, request_id)?;
+    let parsed = parse_refresh_params(params.clone(), request_id)?;
+    let selection = resolve_runtime_selection(host, &parsed.settings_id, request_id)?;
+    let account = selection.account;
     let auth_path = resolved_auth_path(account);
+    let binding = quota_refresh_binding(
+        &params,
+        &selection,
+        &auth_path,
+        provider_instance_id,
+        &host.app,
+    );
+    let binding_sha256 = quota_refresh_binding_sha256(&binding);
+    let _request_lock = acquire_quota_refresh_request_lock(host, request_id)?;
+    let mut operation = match read_quota_refresh_operation(host, request_id)? {
+        Some(operation) => {
+            validate_quota_refresh_operation(&operation, request_id)?;
+            if operation.binding_sha256 != binding_sha256 || operation.binding != binding {
+                return Err(quota_refresh_request_conflict(
+                    request_id,
+                    &binding_sha256,
+                    &operation,
+                ));
+            }
+            match operation.phase {
+                QuotaRefreshOperationPhase::Committed => {
+                    return Ok(operation
+                        .result
+                        .expect("validated committed quota refresh has a result"));
+                }
+                QuotaRefreshOperationPhase::NativeEffectAdmitted => {
+                    let mut unresolved = operation;
+                    unresolved.phase = QuotaRefreshOperationPhase::ReconciliationRequired;
+                    write_quota_refresh_operation(host, &unresolved, request_id)?;
+                    return Err(quota_refresh_reconciliation_required(
+                        request_id,
+                        &unresolved,
+                    ));
+                }
+                QuotaRefreshOperationPhase::ReconciliationRequired => {
+                    return Err(quota_refresh_reconciliation_required(
+                        request_id, &operation,
+                    ));
+                }
+                QuotaRefreshOperationPhase::Prepared => operation,
+            }
+        }
+        None => {
+            let operation = QuotaRefreshOperation {
+                schema_version: QUOTA_REFRESH_SCHEMA_VERSION,
+                operation: "quota.refresh_auth".to_string(),
+                request_id: request_id.to_string(),
+                binding_sha256,
+                binding,
+                phase: QuotaRefreshOperationPhase::Prepared,
+                prepared_at_unix_ms: now_unix_ms(),
+                native_effect_admitted_at_unix_ms: None,
+                committed_at_unix_ms: None,
+                result: None,
+            };
+            write_quota_refresh_operation(host, &operation, request_id)?;
+            operation
+        }
+    };
+    let _account_lock = acquire_quota_refresh_account_lock(host, account, &auth_path, request_id)?;
+    operation.phase = QuotaRefreshOperationPhase::NativeEffectAdmitted;
+    operation.native_effect_admitted_at_unix_ms = Some(now_unix_ms());
+    write_quota_refresh_operation(host, &operation, request_id)?;
     let checked_at_unix_ms = now_unix_ms();
     let refresh = run_account_auth_refresh(account, &auth_path);
     let refreshed = refresh_succeeded(&refresh);
@@ -113,12 +216,284 @@ pub fn refresh_auth_params(
         .as_ref()
         .is_ok_and(OpencodeAuthObservation::command_succeeded)
         && refresh_available(account);
-    Ok(refresh_auth_result(
+    let result = refresh_auth_result(
         refreshed,
         available,
         checked_at_unix_ms,
         refresh_detail(refresh.as_ref()),
-    ))
+    );
+    operation.phase = QuotaRefreshOperationPhase::Committed;
+    operation.committed_at_unix_ms = Some(now_unix_ms());
+    operation.result = Some(result.clone());
+    write_quota_refresh_operation(host, &operation, request_id)?;
+    Ok(result)
+}
+
+fn quota_refresh_binding(
+    params: &Value,
+    selection: &RuntimeSelection,
+    auth_path: &Path,
+    provider_instance_id: Option<&str>,
+    host_app: &str,
+) -> Value {
+    json!({
+        "operation": "quota.refresh_auth",
+        "params_sha256": sha256_hex(params.to_string().as_bytes()),
+        "settings_id": selection.settings_id,
+        "settings_version": selection.settings_version,
+        "account": selection.account.opencode_wrapper,
+        "account_index": selection.account.opencode_index,
+        "auth_source_path": auth_path.display().to_string(),
+        "provider_instance_id": provider_instance_id,
+        "host_app": host_app,
+    })
+}
+
+fn quota_refresh_binding_sha256(binding: &Value) -> String {
+    sha256_hex(binding.to_string().as_bytes())
+}
+
+fn acquire_quota_refresh_request_lock(
+    host: &HostContext,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    let name = sha256_hex(request_id.as_bytes());
+    acquire_quota_refresh_lock(host, &format!("locks/requests/{name}.lock"), request_id)
+}
+
+fn acquire_quota_refresh_account_lock(
+    host: &HostContext,
+    account: &AccountProfile,
+    auth_path: &Path,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    let name = sha256_hex(
+        format!(
+            "{}\0{}\0{}",
+            account.opencode_wrapper,
+            account.opencode_index,
+            auth_path.display()
+        )
+        .as_bytes(),
+    );
+    acquire_quota_refresh_lock(host, &format!("locks/accounts/{name}.lock"), request_id)
+}
+
+fn acquire_quota_refresh_lock(
+    host: &HostContext,
+    relative: &str,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    let root = quota_refresh_state_root(host, request_id)?;
+    let path = confined_quota_refresh_target(host, &root.join(relative), request_id)?;
+    let parent = path
+        .parent()
+        .expect("quota refresh lock always has a parent");
+    durable_fs::create_private_directories(parent)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    lock.lock_exclusive()
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    Ok(lock)
+}
+
+fn quota_refresh_operation_path(
+    host: &HostContext,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let name = sha256_hex(request_id.as_bytes());
+    let root = quota_refresh_state_root(host, request_id)?;
+    confined_quota_refresh_target(
+        host,
+        &root.join(format!("requests/{name}.json")),
+        request_id,
+    )
+}
+
+fn quota_refresh_state_root(
+    host: &HostContext,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let data_root = quota_refresh_data_root(host, request_id)?;
+    confined_quota_refresh_target(host, &data_root.join(QUOTA_REFRESH_STATE_DIR), request_id)
+}
+
+fn quota_refresh_data_root<'a>(
+    host: &'a HostContext,
+    request_id: &str,
+) -> Result<&'a Path, ProviderFailure> {
+    host.data_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(Path::new)
+        .ok_or_else(|| {
+            ProviderFailure::invalid_request(
+                request_id,
+                "quota_refresh_data_root_missing",
+                "quota.refresh_auth requires host.data_root for durable request custody",
+            )
+        })
+}
+
+fn confined_quota_refresh_target(
+    host: &HostContext,
+    target: &Path,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    path_guard::confined_target(quota_refresh_data_root(host, request_id)?, target)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))
+}
+
+fn read_quota_refresh_operation(
+    host: &HostContext,
+    request_id: &str,
+) -> Result<Option<QuotaRefreshOperation>, ProviderFailure> {
+    let path = quota_refresh_operation_path(host, request_id)?;
+    let bytes = match durable_fs::read_file(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(quota_refresh_state_failure(request_id, error)),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| quota_refresh_operation_invalid(request_id, error))
+}
+
+fn validate_quota_refresh_operation(
+    operation: &QuotaRefreshOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let phase_valid = match operation.phase {
+        QuotaRefreshOperationPhase::Prepared => {
+            operation.native_effect_admitted_at_unix_ms.is_none()
+                && operation.committed_at_unix_ms.is_none()
+                && operation.result.is_none()
+        }
+        QuotaRefreshOperationPhase::NativeEffectAdmitted
+        | QuotaRefreshOperationPhase::ReconciliationRequired => {
+            operation.native_effect_admitted_at_unix_ms.is_some()
+                && operation.committed_at_unix_ms.is_none()
+                && operation.result.is_none()
+        }
+        QuotaRefreshOperationPhase::Committed => {
+            operation.native_effect_admitted_at_unix_ms.is_some()
+                && operation.committed_at_unix_ms.is_some()
+                && operation.result.is_some()
+        }
+    };
+    if operation.schema_version != QUOTA_REFRESH_SCHEMA_VERSION
+        || operation.operation != "quota.refresh_auth"
+        || operation.request_id != request_id
+        || operation.binding_sha256 != quota_refresh_binding_sha256(&operation.binding)
+        || operation.binding_sha256.trim().is_empty()
+        || !phase_valid
+    {
+        return Err(quota_refresh_operation_invalid(
+            request_id,
+            "operation identity, binding, or phase is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn write_quota_refresh_operation(
+    host: &HostContext,
+    operation: &QuotaRefreshOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let path = quota_refresh_operation_path(host, request_id)?;
+    let parent = path
+        .parent()
+        .expect("quota refresh operation always has a parent");
+    durable_fs::create_private_directories(parent)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    let bytes = serde_json::to_vec_pretty(operation)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| quota_refresh_state_failure(request_id, error.error))?;
+    durable_fs::sync_directory(parent)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))
+}
+
+fn quota_refresh_request_conflict(
+    request_id: &str,
+    attempted_binding_sha256: &str,
+    operation: &QuotaRefreshOperation,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "quota_refresh_request_conflict",
+        "quota.refresh_auth request_id is already bound to a different operation identity",
+        json!({
+            "attempted_binding_sha256": attempted_binding_sha256,
+            "committed_binding_sha256": operation.binding_sha256,
+            "committed_phase": quota_refresh_phase_name(operation.phase),
+        }),
+    )
+}
+
+fn quota_refresh_reconciliation_required(
+    request_id: &str,
+    operation: &QuotaRefreshOperation,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "quota_refresh_reconciliation_required",
+        "a prior quota.refresh_auth invocation admitted the native auth effect but did not commit an observation; automatic replay is unsafe",
+        json!({
+            "binding_sha256": operation.binding_sha256,
+            "phase": quota_refresh_phase_name(operation.phase),
+            "settings_id": operation.binding["settings_id"],
+            "settings_version": operation.binding["settings_version"],
+            "account": operation.binding["account"],
+            "auth_source_path": operation.binding["auth_source_path"],
+            "recovery": "inspect the bound credential source and submit a new request_id only after reconciling the prior native auth attempt",
+        }),
+    )
+}
+
+fn quota_refresh_phase_name(phase: QuotaRefreshOperationPhase) -> &'static str {
+    match phase {
+        QuotaRefreshOperationPhase::Prepared => "prepared",
+        QuotaRefreshOperationPhase::NativeEffectAdmitted => "native_effect_admitted",
+        QuotaRefreshOperationPhase::ReconciliationRequired => "reconciliation_required",
+        QuotaRefreshOperationPhase::Committed => "committed",
+    }
+}
+
+fn quota_refresh_state_failure(request_id: &str, error: impl std::fmt::Display) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "quota_refresh_state_failed",
+        format!("failed to preserve quota.refresh_auth request state: {error}"),
+    )
+}
+
+fn quota_refresh_operation_invalid(
+    request_id: &str,
+    error: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "quota_refresh_operation_invalid",
+        format!("durable quota.refresh_auth request state is invalid: {error}"),
+    )
 }
 
 fn source_result(account: &AccountProfile, auth_path: &Path) -> Value {

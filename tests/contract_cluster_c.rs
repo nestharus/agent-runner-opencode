@@ -8,6 +8,21 @@ use cluster_c::*;
 use serde_json::json;
 use support::{invoke_with_env, invoke_with_host_and_env, json_stdout};
 
+struct RejectWrites;
+
+impl std::io::Write for RejectWrites {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "simulated quota response handoff failure",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn characterization_chatgpt_usage_windows() {
     let windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
@@ -347,6 +362,173 @@ fn contract_quota_refresh_auth() {
     assert_refresh_auth_result(&result);
     fixture.assert_auth_changed();
     fixture.assert_auth_command_invoked();
+}
+
+#[test]
+fn contract_quota_refresh_auth_replays_committed_observation_after_response_loss() {
+    let fixture = RefreshAuthFixture::new();
+    let mut request = support::validated_request_envelope(
+        "quota.refresh_auth",
+        quota_refresh_auth_params(),
+        json!({}),
+        "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
+    );
+    request["request_id"] = json!(format!(
+        "req-quota-refresh-response-loss-{}",
+        std::process::id()
+    ));
+    support::ensure_default_runtime_settings(&request);
+
+    let env = fixture.env();
+    let prior_env = env
+        .iter()
+        .map(|(key, _)| (*key, std::env::var_os(key)))
+        .collect::<Vec<_>>();
+    for (key, value) in env {
+        std::env::set_var(key, value);
+    }
+    let args = vec![
+        "agent-runner-opencode".to_string(),
+        "quota.refresh_auth".to_string(),
+    ];
+    let lost_response_exit = agent_runner_opencode::write_invocation(
+        &args,
+        &serde_json::to_vec(&request).expect("serialize quota request"),
+        &mut RejectWrites,
+    );
+    for (key, value) in prior_env {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    assert_eq!(
+        lost_response_exit, 1,
+        "the first invocation must commit before its closed response route fails"
+    );
+    fixture.assert_auth_changed();
+    assert_eq!(
+        optional_usage_log(fixture.fake_usage.log_path())
+            .matches("auth argv=auth list")
+            .count(),
+        1,
+        "the response-lost invocation must execute exactly one native auth refresh"
+    );
+
+    let replay = success_result(
+        support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &fixture.env()),
+        "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+        "quota.schema.json#/$defs/QuotaRefreshAuthResult",
+    );
+    assert_refresh_auth_result(&replay);
+    let replay_again = success_result(
+        support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &fixture.env()),
+        "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+        "quota.schema.json#/$defs/QuotaRefreshAuthResult",
+    );
+    assert_eq!(
+        replay_again, replay,
+        "exact retries must replay one receipt"
+    );
+    assert_eq!(
+        optional_usage_log(fixture.fake_usage.log_path())
+            .matches("auth argv=auth list")
+            .count(),
+        1,
+        "receipt replay must not invoke native auth again"
+    );
+
+    let mut changed_binding = request;
+    changed_binding["params"]["context"]["reason"] = json!("different-binding");
+    let conflict =
+        support::invoke_with_request_and_env("quota.refresh_auth", changed_binding, &fixture.env());
+    assert_eq!(conflict.status.code(), Some(2));
+    let conflict_response = json_stdout(&conflict);
+    support::assert_valid(
+        &conflict_response,
+        "quota.schema.json#/$defs/QuotaRefreshAuthErrorResponse",
+    );
+    assert_eq!(
+        conflict_response["error"]["code"],
+        "quota_refresh_request_conflict"
+    );
+    assert_eq!(
+        optional_usage_log(fixture.fake_usage.log_path())
+            .matches("auth argv=auth list")
+            .count(),
+        1,
+        "a changed binding on the same request_id must not invoke native auth"
+    );
+}
+
+#[test]
+fn contract_quota_refresh_auth_does_not_repeat_an_unsettled_native_effect() {
+    let fixture = RefreshAuthFixture::new();
+    let request = support::validated_request_envelope(
+        "quota.refresh_auth",
+        quota_refresh_auth_params(),
+        json!({}),
+        "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
+    );
+    let first = success_result(
+        support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &fixture.env()),
+        "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+        "quota.schema.json#/$defs/QuotaRefreshAuthResult",
+    );
+    assert_refresh_auth_result(&first);
+
+    let request_id = request["request_id"].as_str().expect("quota request id");
+    let data_root = request["host"]["data_root"]
+        .as_str()
+        .expect("quota data root");
+    let operation_path = std::path::Path::new(data_root)
+        .join("provider-state/opencode/quota/auth-refresh/requests")
+        .join(format!(
+            "{}.json",
+            agent_runner_opencode::encoding::sha256_hex(request_id.as_bytes())
+        ));
+    let mut operation: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&operation_path).expect("read committed quota refresh operation"),
+    )
+    .expect("parse committed quota refresh operation");
+    operation["phase"] = json!("native_effect_admitted");
+    operation
+        .as_object_mut()
+        .expect("quota operation object")
+        .remove("committed_at_unix_ms");
+    operation
+        .as_object_mut()
+        .expect("quota operation object")
+        .remove("result");
+    std::fs::write(
+        &operation_path,
+        serde_json::to_vec_pretty(&operation).expect("serialize unsettled quota operation"),
+    )
+    .expect("simulate provider loss after native effect admission");
+
+    let retry = support::invoke_with_request_and_env("quota.refresh_auth", request, &fixture.env());
+    assert_eq!(retry.status.code(), Some(2));
+    let response = json_stdout(&retry);
+    support::assert_valid(
+        &response,
+        "quota.schema.json#/$defs/QuotaRefreshAuthErrorResponse",
+    );
+    assert_eq!(
+        response["error"]["code"],
+        "quota_refresh_reconciliation_required"
+    );
+    assert_eq!(
+        optional_usage_log(fixture.fake_usage.log_path())
+            .matches("auth argv=auth list")
+            .count(),
+        1,
+        "an admitted but unsettled native effect must never be invoked again"
+    );
+    let unresolved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(operation_path).expect("read unresolved quota refresh operation"),
+    )
+    .expect("parse unresolved quota refresh operation");
+    assert_eq!(unresolved["phase"], "reconciliation_required");
 }
 
 #[test]
