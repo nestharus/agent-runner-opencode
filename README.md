@@ -131,7 +131,8 @@ Generic canonical `session.replace` remains unsupported: OpenCode has no
 stable canonical-transcript replacement API. Rotation's native full-session
 export/import is a separate, representation-bounded capability. It requires a
 fresh provider-issued assessment authorization, emits a decision receipt,
-and persists a binding-keyed prepared operation before import. A successful
+durably publishes the content-addressed source artifact, and then persists a
+binding-keyed prepared operation before import. A successful
 import durably advances that operation with the observed target session before
 decision and materialization receipts are finalized. A retry resumes an
 imported operation without repeating the effect. If execution stopped in the

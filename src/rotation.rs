@@ -1002,10 +1002,9 @@ fn write_artifact_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             "artifact path has no parent",
         )
     })?;
-    fs::create_dir_all(parent)?;
-    set_private_directory_permissions(parent)?;
+    create_private_directories_durable(parent)?;
     match fs::read(path) {
-        Ok(existing) if existing == bytes => return Ok(()),
+        Ok(existing) if existing == bytes => return sync_directory(parent),
         Ok(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1025,16 +1024,57 @@ fn write_artifact_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     drop(file);
     match fs::rename(&temporary, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_directory(parent),
         Err(error) if fs::read(path).is_ok_and(|existing| existing == bytes) => {
             let _ = fs::remove_file(&temporary);
-            Ok(())
+            sync_directory(parent)
         }
         Err(error) => {
             let _ = fs::remove_file(&temporary);
             Err(error)
         }
     }
+}
+
+fn create_private_directories_durable(path: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut ancestor = path;
+    while !ancestor.exists() {
+        missing.push(ancestor.to_path_buf());
+        ancestor = ancestor.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact directory has no existing ancestor",
+            )
+        })?;
+    }
+    if !ancestor.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "artifact directory ancestor is not a directory",
+        ));
+    }
+    for directory in missing.into_iter().rev() {
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+        set_private_directory_permissions(&directory)?;
+        let parent = directory.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact directory has no parent",
+            )
+        })?;
+        sync_directory(parent)?;
+    }
+    set_private_directory_permissions(path)
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
 }
 
 fn private_artifact_file(path: &Path) -> std::io::Result<fs::File> {
