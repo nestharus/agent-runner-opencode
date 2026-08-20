@@ -102,6 +102,8 @@ fn redacted_targets(params: &Value) -> Value {
         "chain_id": string_at(params, "/chain_id"),
         "source_provider": string_at(params, "/source_provider"),
         "target_provider": string_at(params, "/target_provider"),
+        "source_account": string_at(params, "/source_account"),
+        "target_account": string_at(params, "/target_account"),
         "attempted_provider_args_sha256": provider_args_sha256,
     })
 }

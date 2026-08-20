@@ -360,6 +360,12 @@ pub fn assert_rotation_materialized(materialized: &Value) {
     );
     let decision_bytes = fs::read(decision_path).expect("rotation decision receipt");
     assert_eq!(artifacts[1]["sha256"], sha256_hex(&decision_bytes));
+    let decision: Value =
+        serde_json::from_slice(&decision_bytes).expect("rotation decision receipt JSON");
+    assert_eq!(decision["binding"]["source_provider"], "opencode-secondary");
+    assert_eq!(decision["binding"]["target_provider"], "opencode-primary");
+    assert_eq!(decision["binding"]["source_account"], "opencode1");
+    assert_eq!(decision["binding"]["target_account"], "opencode2");
     assert_private_rotation_artifact(decision_path);
     assert_valid(
         &materialized["host_state_plan"],
@@ -373,9 +379,23 @@ pub fn assert_rotation_materialized(materialized: &Value) {
         materialized["host_state_plan"]["chain_id"],
         "chain-contract-d"
     );
+    assert_eq!(
+        materialized["host_state_plan"]["source_provider"],
+        "opencode-secondary"
+    );
+    assert_eq!(
+        materialized["host_state_plan"]["target_provider"],
+        "opencode-primary"
+    );
+    assert_eq!(
+        materialized["host_state_plan"]["artifacts"],
+        materialized["artifacts"]
+    );
     let segments = materialized["host_state_plan"]["segments"]
         .as_array()
         .expect("rotation segments");
+    assert_eq!(segments[0]["provider"], "opencode-secondary");
+    assert_eq!(segments[1]["provider"], "opencode-primary");
     assert_eq!(segments[0]["ended_at"], "2026-07-01T00:00:00.000Z");
     assert_eq!(segments[1]["started_at"], segments[0]["ended_at"]);
 }

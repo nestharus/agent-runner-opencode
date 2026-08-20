@@ -24,9 +24,12 @@ persisted settings record; account or wrapper aliases are not accepted as a
 second hidden token kind. A record carries its ID, version, account, and either
 an exact stored route or the explicit `model.selection=requested` policy.
 Policy evidence publishes that record identity and its effective account.
-Rotation's `source_provider` and `target_provider` fields resolve only declared
-account/provider references, while its optional `settings_id` must be a
-persisted record for the target account. Stores written by the prior schema are
+Rotation preserves `source_provider` and `target_provider` as opaque host
+provider-instance identities. Provider-local `source_account` and
+`target_account` parameters are resolved separately, and the decision receipt
+referenced by the durable host plan binds both identity domains. Its optional
+`settings_id` must be a persisted record for the target account. Stores written
+by the prior schema are
 compatibility-projected to the current OpenCode-owned account, quota, and model
 shape while preserving record IDs and versions; the next mutation writes the
 upgraded store schema. An unrecognizable record fails the entire store with
