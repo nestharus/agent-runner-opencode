@@ -62,6 +62,20 @@ settings profile, and reconstructs the managed launch prefix. Launch emits a
 redacted route marker containing the account, alias, provider model, and
 variant actually selected.
 
+Policy evaluation has a provider-owned typed boundary. The policy core returns
+an accepted or rejected `PolicyDecision` carrying a typed launch plan; launch
+consumes that decision directly. Only the `policy.evaluate` command projects
+the decision into the public JSON result, so supervision never reparses its own
+external DTO or silently weakens launch-plan fields.
+
+Quota probing likewise converges on a typed `QuotaObservation`. The native
+adapter translates authenticated WHAM HTTP responses directly into that type,
+while the optional `chatgpt-usage` test override parses its stdout only within
+the override branch. Source-aware failures retain whether auth-file parsing,
+WHAM transport/HTTP/protocol handling, or the explicit test override failed;
+the quota command projects the observation or failure once into the public
+result.
+
 ## Invocation and lifecycle
 
 The one-shot invocation form is:

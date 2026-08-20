@@ -4,25 +4,32 @@ use crate::account::profile_for_wrapper_reference;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::models::{model_alias, provider_args_match, ModelAlias};
 use crate::runtime_selection::{resolve_runtime_selection, RuntimeSelection};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-#[derive(Deserialize)]
-pub struct PolicyEvaluateParams {
-    settings_id: String,
-    mode: String,
-    model: ProviderModelRequest,
-    launch: PolicyLaunchParams,
-}
 
 #[derive(Deserialize)]
-struct ProviderModelRequest {
+struct PolicyEvaluateWireParams {
+    settings_id: String,
+    mode: String,
+    model: PolicyModelRequest,
+    launch: PolicyLaunchInput,
+}
+
+#[derive(Clone, Deserialize)]
+pub(crate) struct PolicyModelRequest {
     name: String,
     provider_args: Vec<String>,
     inputs: ModelInputs,
 }
 
-#[derive(Deserialize)]
+impl PolicyModelRequest {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[derive(Clone, Deserialize)]
 struct ModelInputs {
     prompt: Option<String>,
     #[serde(rename = "named")]
@@ -30,10 +37,60 @@ struct ModelInputs {
 }
 
 #[derive(Deserialize)]
-struct PolicyLaunchParams {
+struct PolicyLaunchInput {
     argv: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
     stdin: Option<String>,
+}
+
+struct PolicyInput {
+    settings_id: String,
+    mode: String,
+    model: PolicyModelRequest,
+    launch: PolicyLaunchInput,
+}
+
+pub(crate) struct PolicyLaunchRequest {
+    pub settings_id: String,
+    pub mode: String,
+    pub model: PolicyModelRequest,
+    pub argv: Vec<String>,
+    pub env: Option<BTreeMap<String, String>>,
+    pub stdin: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PolicyDiagnostic {
+    severity: &'static str,
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PolicyMarker {
+    name: &'static str,
+    value: PolicyMarkerValue,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum PolicyMarkerValue {
+    Text(String),
+    Strings(Vec<String>),
+}
+
+pub(crate) struct PolicyLaunchPlan {
+    pub argv: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub stdin: Option<String>,
+    pub prompt: Option<String>,
+    pub diagnostics: Vec<PolicyDiagnostic>,
+    pub markers: Vec<PolicyMarker>,
+}
+
+pub(crate) enum PolicyDecision {
+    Accepted(PolicyLaunchPlan),
+    Rejected(PolicyLaunchPlan),
 }
 
 pub fn evaluate_params(
@@ -41,51 +98,109 @@ pub fn evaluate_params(
     params: Value,
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
-    let params = parse_policy_params(params, request_id)?;
-    evaluate(host, params, request_id)
+    let wire = parse_policy_params(params, request_id)?;
+    let decision = evaluate(host, wire.into(), request_id)?;
+    Ok(project_policy_result(decision))
 }
 
-pub fn evaluate(
+pub(crate) fn evaluate_launch(
     host: &HostContext,
-    params: PolicyEvaluateParams,
+    request: PolicyLaunchRequest,
     request_id: &str,
-) -> Result<Value, ProviderFailure> {
+) -> Result<PolicyDecision, ProviderFailure> {
+    evaluate(
+        host,
+        PolicyInput {
+            settings_id: request.settings_id,
+            mode: request.mode,
+            model: request.model,
+            launch: PolicyLaunchInput {
+                argv: Some(request.argv),
+                env: request.env,
+                stdin: request.stdin,
+            },
+        },
+        request_id,
+    )
+}
+
+fn evaluate(
+    host: &HostContext,
+    params: PolicyInput,
+    request_id: &str,
+) -> Result<PolicyDecision, ProviderFailure> {
     let selection = resolve_runtime_selection(host, &params.settings_id, request_id)?;
     let model = resolved_model(&params);
     let diagnostics = diagnostics_for_policy(&params, &selection, model);
-    Ok(policy_result(&params, &selection, model, diagnostics))
+    let plan = policy_plan(&params, &selection, model, diagnostics);
+    if policy_accepted(&plan.diagnostics) {
+        Ok(PolicyDecision::Accepted(plan))
+    } else {
+        Ok(PolicyDecision::Rejected(plan))
+    }
 }
 
-fn policy_result(
-    params: &PolicyEvaluateParams,
+fn policy_plan(
+    params: &PolicyInput,
     selection: &RuntimeSelection,
     model: Option<&ModelAlias>,
-    diagnostics: Vec<Value>,
-) -> Value {
-    let argv = effective_argv(params, model);
+    diagnostics: Vec<PolicyDiagnostic>,
+) -> PolicyLaunchPlan {
+    PolicyLaunchPlan {
+        argv: effective_argv(params, model),
+        env: effective_env(params.launch.env.as_ref()),
+        stdin: params.launch.stdin.clone(),
+        prompt: params.model.inputs.prompt.clone(),
+        diagnostics,
+        markers: policy_markers(configured_launch_command(params), params, selection, model),
+    }
+}
+
+fn project_policy_result(decision: PolicyDecision) -> Value {
+    let (accepted, plan) = match decision {
+        PolicyDecision::Accepted(plan) => (true, plan),
+        PolicyDecision::Rejected(plan) => (false, plan),
+    };
     json!({
-        "accepted": policy_accepted(&diagnostics),
-        "argv": argv,
-        "env": effective_env(params.launch.env.as_ref()),
-        "stdin": params.launch.stdin.clone(),
-        "prompt": params.model.inputs.prompt.clone(),
-        "diagnostics": diagnostics,
-        "markers": policy_markers(configured_launch_command(params), params, selection, model),
+        "accepted": accepted,
+        "argv": plan.argv,
+        "env": plan.env,
+        "stdin": plan.stdin,
+        "prompt": plan.prompt,
+        "diagnostics": plan.diagnostics,
+        "markers": plan.markers,
     })
 }
 
-fn policy_accepted(diagnostics: &[Value]) -> bool {
-    !diagnostics.iter().any(is_error_diagnostic)
+fn policy_accepted(diagnostics: &[PolicyDiagnostic]) -> bool {
+    !diagnostics.iter().any(PolicyDiagnostic::is_error)
 }
 
 fn parse_policy_params(
     params: Value,
     request_id: &str,
-) -> Result<PolicyEvaluateParams, ProviderFailure> {
+) -> Result<PolicyEvaluateWireParams, ProviderFailure> {
     serde_json::from_value(params).map_err(|err| invalid_policy_params_failure(request_id, err))
 }
 
-fn effective_argv(params: &PolicyEvaluateParams, model: Option<&ModelAlias>) -> Vec<String> {
+impl From<PolicyEvaluateWireParams> for PolicyInput {
+    fn from(wire: PolicyEvaluateWireParams) -> Self {
+        Self {
+            settings_id: wire.settings_id,
+            mode: wire.mode,
+            model: wire.model,
+            launch: wire.launch,
+        }
+    }
+}
+
+impl PolicyDiagnostic {
+    fn is_error(&self) -> bool {
+        self.severity == "error"
+    }
+}
+
+fn effective_argv(params: &PolicyInput, model: Option<&ModelAlias>) -> Vec<String> {
     let Some(prefix) = configured_launch_prefix(params) else {
         return params.launch.argv.clone().unwrap_or_default();
     };
@@ -98,13 +213,13 @@ fn effective_argv(params: &PolicyEvaluateParams, model: Option<&ModelAlias>) -> 
     argv
 }
 
-fn configured_launch_command(params: &PolicyEvaluateParams) -> Option<&str> {
+fn configured_launch_command(params: &PolicyInput) -> Option<&str> {
     configured_launch_prefix(params)
         .and_then(|prefix| prefix.first())
         .map(String::as_str)
 }
 
-fn configured_launch_prefix(params: &PolicyEvaluateParams) -> Option<&[String]> {
+fn configured_launch_prefix(params: &PolicyInput) -> Option<&[String]> {
     let argv = params.launch.argv.as_deref()?;
     let run_index = argv.iter().position(|arg| arg == "run")?;
     let prefix = &argv[..run_index];
@@ -118,7 +233,7 @@ fn valid_launch_command_prefix(prefix: &[String]) -> bool {
     intrinsic_host_launch_command(command) && options.iter().all(|arg| arg == "--pure")
 }
 
-fn resolved_model(params: &PolicyEvaluateParams) -> Option<&'static ModelAlias> {
+fn resolved_model(params: &PolicyInput) -> Option<&'static ModelAlias> {
     model_alias(&params.model.name)
         .filter(|model| provider_args_match(model, &params.model.provider_args))
 }
@@ -128,10 +243,10 @@ fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, S
 }
 
 fn diagnostics_for_policy(
-    params: &PolicyEvaluateParams,
+    params: &PolicyInput,
     selection: &RuntimeSelection,
     model: Option<&ModelAlias>,
-) -> Vec<Value> {
+) -> Vec<PolicyDiagnostic> {
     let mut diagnostics = launch_command_diagnostics(params, selection);
     if model.is_none() {
         diagnostics.push(invalid_model_diagnostic(params));
@@ -150,7 +265,7 @@ fn diagnostics_for_policy(
 fn model_account_ineligible_diagnostic(
     selection: &RuntimeSelection,
     requested: Option<&ModelAlias>,
-) -> Value {
+) -> PolicyDiagnostic {
     diagnostic(
         "error",
         "model_account_ineligible",
@@ -164,7 +279,7 @@ fn model_account_ineligible_diagnostic(
     )
 }
 
-fn invalid_model_diagnostic(params: &PolicyEvaluateParams) -> Value {
+fn invalid_model_diagnostic(params: &PolicyInput) -> PolicyDiagnostic {
     diagnostic(
         "error",
         "invalid_model",
@@ -176,9 +291,9 @@ fn invalid_model_diagnostic(params: &PolicyEvaluateParams) -> Value {
 }
 
 fn launch_command_diagnostics(
-    params: &PolicyEvaluateParams,
+    params: &PolicyInput,
     selection: &RuntimeSelection,
-) -> Vec<Value> {
+) -> Vec<PolicyDiagnostic> {
     let Some(command) = configured_launch_command(params) else {
         return vec![diagnostic(
             "error",
@@ -206,7 +321,7 @@ fn launch_command_diagnostics(
 fn settings_model_mismatch_diagnostic(
     selection: &RuntimeSelection,
     requested: Option<&ModelAlias>,
-) -> Value {
+) -> PolicyDiagnostic {
     diagnostic(
         "error",
         "settings_model_mismatch",
@@ -219,14 +334,14 @@ fn settings_model_mismatch_diagnostic(
     )
 }
 
-fn forbidden_argv_diagnostics(input: &[String]) -> Vec<Value> {
+fn forbidden_argv_diagnostics(input: &[String]) -> Vec<PolicyDiagnostic> {
     forbidden_launch_args(input)
         .into_iter()
         .map(forbidden_arg_diagnostic)
         .collect()
 }
 
-fn policy_launch_args(params: &PolicyEvaluateParams, model: Option<&ModelAlias>) -> Vec<String> {
+fn policy_launch_args(params: &PolicyInput, model: Option<&ModelAlias>) -> Vec<String> {
     let argv = params.launch.argv.as_deref().unwrap_or_default();
     stripped_policy_launch_args(argv, model)
         .unwrap_or(argv)
@@ -281,36 +396,61 @@ fn intrinsic_host_launch_command(command: &str) -> bool {
     profile_for_wrapper_reference(command).is_some()
 }
 
-fn diagnostic(severity: &str, code: &str, message: String) -> Value {
-    json!({
-        "severity": severity,
-        "code": code,
-        "message": message,
-    })
-}
-
-fn is_error_diagnostic(diagnostic: &Value) -> bool {
-    diagnostic.get("severity").and_then(Value::as_str) == Some("error")
+fn diagnostic(severity: &'static str, code: &'static str, message: String) -> PolicyDiagnostic {
+    PolicyDiagnostic {
+        severity,
+        code,
+        message,
+    }
 }
 
 fn policy_markers(
     command: Option<&str>,
-    params: &PolicyEvaluateParams,
+    params: &PolicyInput,
     selection: &RuntimeSelection,
     model: Option<&ModelAlias>,
-) -> Vec<Value> {
+) -> Vec<PolicyMarker> {
     vec![
-        json!({ "name": "opencode.command", "value": command.unwrap_or("") }),
-        json!({ "name": "opencode.mode", "value": params.mode }),
-        json!({ "name": "opencode.settings_record_id", "value": selection.settings_id }),
-        json!({ "name": "opencode.settings_record_identity", "value": selection.evidence_label() }),
-        json!({ "name": "opencode.account", "value": selection.account.opencode_wrapper }),
-        json!({ "name": "opencode.account_hash", "value": selection.account.account_hash }),
-        json!({ "name": "opencode.model_alias", "value": model.map(|model| model.name).unwrap_or("") }),
-        json!({ "name": "opencode.provider_model", "value": model.map(|model| model.provider_model).unwrap_or("") }),
-        json!({ "name": "opencode.effort", "value": model.map(|model| model.effort).unwrap_or("") }),
-        json!({ "name": "opencode.attempted_provider_args", "value": params.model.provider_args }),
+        marker("opencode.command", command.unwrap_or("")),
+        marker("opencode.mode", &params.mode),
+        marker("opencode.settings_record_id", &selection.settings_id),
+        marker(
+            "opencode.settings_record_identity",
+            &selection.evidence_label(),
+        ),
+        marker("opencode.account", selection.account.opencode_wrapper),
+        marker("opencode.account_hash", selection.account.account_hash),
+        marker(
+            "opencode.model_alias",
+            model.map(|model| model.name).unwrap_or(""),
+        ),
+        marker(
+            "opencode.provider_model",
+            model.map(|model| model.provider_model).unwrap_or(""),
+        ),
+        marker(
+            "opencode.effort",
+            model.map(|model| model.effort).unwrap_or(""),
+        ),
+        string_list_marker(
+            "opencode.attempted_provider_args",
+            params.model.provider_args.clone(),
+        ),
     ]
+}
+
+fn marker(name: &'static str, value: &str) -> PolicyMarker {
+    PolicyMarker {
+        name,
+        value: PolicyMarkerValue::Text(value.to_string()),
+    }
+}
+
+fn string_list_marker(name: &'static str, value: Vec<String>) -> PolicyMarker {
+    PolicyMarker {
+        name,
+        value: PolicyMarkerValue::Strings(value),
+    }
 }
 
 fn invalid_policy_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
@@ -328,7 +468,7 @@ fn forbidden_launch_args(input: &[String]) -> Vec<&String> {
         .collect()
 }
 
-fn forbidden_arg_diagnostic(arg: &String) -> Value {
+fn forbidden_arg_diagnostic(arg: &String) -> PolicyDiagnostic {
     diagnostic(
         "error",
         "forbidden_flag",

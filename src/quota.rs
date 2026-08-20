@@ -4,13 +4,13 @@
 //!     role: adapter
 //!     Translates:
 //!       - opencode auth source profile to QuotaSourceResult
-//!       - chatgpt-usage rolling windows to QuotaProbeWindow
+//!       - provider-owned QuotaObservation to QuotaProbeWindow
 //!       - opencode CLI-owned auth refresh boundary to QuotaRefreshAuthResult
 
 use crate::account::AccountProfile;
 use crate::encoding::{bounded_text, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
-use crate::quota_adapter::{self, ChatgptUsageWindow};
+use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
 use crate::runtime_selection::resolve_runtime_selection;
 use chrono::DateTime;
 use serde::Deserialize;
@@ -64,7 +64,7 @@ pub fn probe_params(
 ) -> Result<Value, ProviderFailure> {
     let params = parse_base_params(params, request_id)?;
     let account = account_from_settings_record(host, &params.settings_id, request_id)?;
-    probe_account(account, request_id)
+    Ok(probe_account(account))
 }
 
 pub fn refresh_auth_params(
@@ -77,7 +77,7 @@ pub fn refresh_auth_params(
     let checked_at_unix_ms = now_unix_ms();
     let refresh = run_account_auth_refresh(account);
     let refreshed = refresh_succeeded(&refresh);
-    let available = refreshed && refresh_available(account, request_id);
+    let available = refreshed && refresh_available(account);
     Ok(refresh_auth_result(
         refreshed,
         available,
@@ -110,109 +110,80 @@ fn readable_source_id(
     has_source.then(|| source_id(account, auth_path))
 }
 
-fn probe_account(account: &AccountProfile, request_id: &str) -> Result<Value, ProviderFailure> {
+fn probe_account(account: &AccountProfile) -> Value {
     let auth_path = resolved_auth_path(account);
     if !auth_has_source(&auth_path) {
-        return Ok(unreadable_auth_probe_result());
+        return unreadable_auth_probe_result();
     }
-    let output = run_probe_command(&auth_path, request_id)?;
-    if probe_output_needs_auth_refresh(&output) {
-        return probe_after_auth_refresh(account, &auth_path, &output, request_id);
+    let observation = run_probe(&auth_path);
+    if observation
+        .as_ref()
+        .is_err_and(QuotaObservationFailure::needs_auth_refresh)
+    {
+        return probe_after_auth_refresh(
+            account,
+            &auth_path,
+            observation.expect_err("refresh path requires an observation failure"),
+        );
     }
-    Ok(probe_output_result(&output))
+    probe_observation_result(observation)
 }
 
-fn probe_account_without_refresh(
-    account: &AccountProfile,
-    request_id: &str,
-) -> Result<Value, ProviderFailure> {
+fn probe_account_without_refresh(account: &AccountProfile) -> Value {
     let auth_path = resolved_auth_path(account);
     if !auth_has_source(&auth_path) {
-        return Ok(unreadable_auth_probe_result());
+        return unreadable_auth_probe_result();
     }
-    let output = run_probe_command(&auth_path, request_id)?;
-    Ok(probe_output_result(&output))
+    probe_observation_result(run_probe(&auth_path))
 }
 
 fn probe_after_auth_refresh(
     account: &AccountProfile,
     auth_path: &Path,
-    first: &crate::shell::ShellOutput,
-    request_id: &str,
-) -> Result<Value, ProviderFailure> {
+    first: QuotaObservationFailure,
+) -> Value {
     match run_account_auth_refresh(account) {
-        Ok(refresh) if refresh.status == 0 => {
-            let retry = run_probe_command(auth_path, request_id)?;
-            Ok(probe_output_result(&retry))
-        }
-        Ok(refresh) => Ok(unavailable_result(auth_refresh_failed_detail(
-            first, &refresh,
-        ))),
-        Err(err) => Ok(unavailable_result(auth_refresh_spawn_failed_detail(
-            first, err,
-        ))),
+        Ok(refresh) if refresh.status == 0 => probe_observation_result(run_probe(auth_path)),
+        Ok(refresh) => unavailable_result(auth_refresh_failed_detail(&first, &refresh)),
+        Err(err) => unavailable_result(auth_refresh_spawn_failed_detail(&first, err)),
     }
 }
 
 fn auth_refresh_failed_detail(
-    first: &crate::shell::ShellOutput,
+    first: &QuotaObservationFailure,
     refresh: &crate::shell::ShellOutput,
 ) -> String {
     format!(
         "{} (opencode auth refresh failed: {})",
-        command_failure_detail(first),
-        command_failure_detail(refresh)
+        first.detail,
+        opencode_command_failure_detail(refresh)
     )
 }
 
 fn auth_refresh_spawn_failed_detail(
-    first: &crate::shell::ShellOutput,
+    first: &QuotaObservationFailure,
     err: std::io::Error,
 ) -> String {
     format!(
         "{} (failed to run opencode auth refresh: {err})",
-        command_failure_detail(first)
+        first.detail
     )
-}
-
-fn probe_output_needs_auth_refresh(output: &crate::shell::ShellOutput) -> bool {
-    probe_command_failed(output) && output_detail_mentions_expired_auth(output)
-}
-
-fn output_detail_mentions_expired_auth(output: &crate::shell::ShellOutput) -> bool {
-    let detail = command_failure_detail(output).to_ascii_lowercase();
-    detail.contains("http 401")
-        || detail.contains("token is expired")
-        || detail.contains("authentication token is expired")
 }
 
 fn unreadable_auth_probe_result() -> Value {
     unavailable_result("native opencode auth source is missing or unreadable".to_string())
 }
 
-fn run_probe_command(
-    auth_path: &Path,
-    request_id: &str,
-) -> Result<crate::shell::ShellOutput, ProviderFailure> {
-    quota_adapter::run_chatgpt_usage(auth_path)
-        .map_err(|err| quota_probe_spawn_failure(request_id, err))
+fn run_probe(auth_path: &Path) -> Result<QuotaObservation, QuotaObservationFailure> {
+    quota_adapter::observe_quota(auth_path)
 }
 
-fn probe_output_result(output: &crate::shell::ShellOutput) -> Value {
-    if probe_command_failed(output) {
-        return unavailable_result(command_failure_detail(output));
-    }
-    parsed_probe_output_result(&output.stdout)
-}
-
-fn probe_command_failed(output: &crate::shell::ShellOutput) -> bool {
-    output.status != 0
-}
-
-fn parsed_probe_output_result(stdout: &[u8]) -> Value {
-    match parse_probe_windows(stdout) {
-        Ok(windows) => available_probe_result(&windows),
-        Err(err) => unavailable_result(invalid_probe_detail(err)),
+fn probe_observation_result(
+    observation: Result<QuotaObservation, QuotaObservationFailure>,
+) -> Value {
+    match observation {
+        Ok(observation) => available_probe_result(&observation.windows),
+        Err(failure) => unavailable_result(failure.detail),
     }
 }
 
@@ -225,11 +196,11 @@ fn unavailable_result(detail: String) -> Value {
     })
 }
 
-fn quota_windows(windows: &[ChatgptUsageWindow]) -> Vec<Value> {
+fn quota_windows(windows: &[QuotaWindow]) -> Vec<Value> {
     windows.iter().map(quota_window).collect()
 }
 
-fn quota_window(window: &ChatgptUsageWindow) -> Value {
+fn quota_window(window: &QuotaWindow) -> Value {
     let mut result = serde_json::Map::new();
     if let Some(name) = &window.name {
         result.insert("name".to_string(), json!(name));
@@ -314,22 +285,22 @@ fn source_id(account: &AccountProfile, auth_path: &Path) -> String {
     )
 }
 
-fn command_failure_detail(output: &crate::shell::ShellOutput) -> String {
+fn opencode_command_failure_detail(output: &crate::shell::ShellOutput) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = bounded_text(stderr.trim(), 500);
     if stderr.is_empty() {
-        return format!("chatgpt-usage exited with status {}", output.status);
+        return format!("opencode auth list exited with status {}", output.status);
     }
     format!(
-        "chatgpt-usage exited with status {}: {stderr}",
+        "opencode auth list exited with status {}: {stderr}",
         output.status
     )
 }
 
-fn refresh_available(account: &AccountProfile, request_id: &str) -> bool {
-    probe_account_without_refresh(account, request_id)
-        .ok()
-        .and_then(|result| result.get("available").and_then(Value::as_bool))
+fn refresh_available(account: &AccountProfile) -> bool {
+    probe_account_without_refresh(account)
+        .get("available")
+        .and_then(Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -348,7 +319,7 @@ fn refresh_detail(refresh: Result<&crate::shell::ShellOutput, &std::io::Error>) 
         Ok(output) if output.status == 0 => REFRESH_DETAIL.to_string(),
         Ok(output) => format!(
             "opencode auth list failed: {}",
-            command_failure_detail(output)
+            opencode_command_failure_detail(output)
         ),
         Err(err) => format!("failed to run opencode auth list: {err}"),
     }
@@ -376,28 +347,12 @@ fn source_freshness(has_source: bool) -> &'static str {
     }
 }
 
-fn quota_probe_spawn_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
-    ProviderFailure::internal(
-        request_id,
-        "quota_probe_spawn_failed",
-        format!("failed to run chatgpt-usage: {err}"),
-    )
-}
-
-fn parse_probe_windows(stdout: &[u8]) -> Result<Vec<ChatgptUsageWindow>, String> {
-    quota_adapter::parse_chatgpt_usage_windows(stdout)
-}
-
-fn available_probe_result(windows: &[ChatgptUsageWindow]) -> Value {
+fn available_probe_result(windows: &[QuotaWindow]) -> Value {
     json!({
         "available": true,
         "checked_at_unix_ms": now_unix_ms(),
         "windows": quota_windows(windows),
     })
-}
-
-fn invalid_probe_detail(err: String) -> String {
-    format!("chatgpt-usage output is invalid: {err}")
 }
 
 fn unknown_quota_subcommand_failure(request_id: String, unknown: &str) -> ProviderFailure {
@@ -429,6 +384,6 @@ fn invalid_quota_refresh_params_failure(
 
 fn epoch_ms(rfc3339: &str) -> i64 {
     DateTime::parse_from_rfc3339(rfc3339)
-        .expect("chatgpt-usage resets_at was validated before projection")
+        .expect("quota observation resets_at was validated before projection")
         .timestamp_millis()
 }

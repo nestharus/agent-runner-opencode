@@ -576,6 +576,17 @@ pub struct FakeNativeCurl {
 
 impl FakeNativeCurl {
     pub fn new() -> Self {
+        Self::with_response(
+            200,
+            r#"{"rate_limit":{"secondary_window":{"used_percent":4,"reset_at":1781159045},"primary_window":{"used_percent":25,"reset_at":1780572245}}}"#,
+        )
+    }
+
+    pub fn http_failure(status: u16, body: &str) -> Self {
+        Self::with_response(status, body)
+    }
+
+    fn with_response(status: u16, body: &str) -> Self {
         let dir = unique_temp_dir("agent-runner-opencode-fake-native-curl");
         fs::create_dir_all(&dir).expect("create fake native curl dir");
         let invocation_path = dir.join("curl-invocation.log");
@@ -587,9 +598,11 @@ case \"$config\" in\n\
   *) printf '%s\\n' 'missing expected auth stdin' >&2; exit 64 ;;\n\
 esac\n\
 printf '%s\\n' \"$*\" > {}\n\
-printf '%s\\n' '{{\"rate_limit\":{{\"secondary_window\":{{\"used_percent\":4,\"reset_at\":1781159045}},\"primary_window\":{{\"used_percent\":25,\"reset_at\":1780572245}}}}}}'\n\
-printf '%s' '__oulipoly_http_status__:200'\n",
-            shell_single_quote(&invocation_path.to_string_lossy())
+printf '%s\\n' {}\n\
+printf '%s' '__oulipoly_http_status__:{}'\n",
+            shell_single_quote(&invocation_path.to_string_lossy()),
+            shell_single_quote(body),
+            status,
         );
         let curl_path = dir.join("curl");
         fs::write(&curl_path, script).expect("write fake curl");
@@ -615,6 +628,13 @@ printf '%s' '__oulipoly_http_status__:200'\n",
         assert!(!argv.contains("sentinel"));
         assert!(!argv.contains("acct"));
     }
+}
+
+pub fn native_wham_expected_windows() -> Vec<RawUsageWindow> {
+    vec![
+        raw_usage_window(4.0, "2026-06-11T06:24:05Z"),
+        raw_usage_window(25.0, "2026-06-04T11:24:05Z"),
+    ]
 }
 
 impl Drop for FakeNativeCurl {

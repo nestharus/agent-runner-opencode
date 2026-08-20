@@ -54,7 +54,7 @@ pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
 struct LaunchParams {
     settings_id: String,
     mode: String,
-    model: Value,
+    model: policy::PolicyModelRequest,
     argv: Vec<String>,
     working_directory: String,
     env: Option<BTreeMap<String, String>>,
@@ -144,47 +144,41 @@ fn launch_argv(
     request_id: &str,
 ) -> Result<PolicyLaunch, ProviderFailure> {
     validate_launch_session(params, request_id)?;
-    let policy_params = policy_params_for_launch(params, request_id)?;
-    let result = policy::evaluate(host, policy_params, request_id)?;
-    if !policy_result_accepted(&result) {
-        return Ok(PolicyLaunch::Rejected(policy_rejection_reason(&result)));
-    }
-    Ok(PolicyLaunch::Accepted(Box::new(effective_launch(
-        params,
-        result,
-        host.deadline_unix_ms,
+    let stdin = policy_stdin_for_launch(params.stdin.as_ref(), request_id)?;
+    let decision = policy::evaluate_launch(
+        host,
+        policy::PolicyLaunchRequest {
+            settings_id: params.settings_id.clone(),
+            mode: params.mode.clone(),
+            model: params.model.clone(),
+            argv: params.argv.clone(),
+            env: params.env.clone(),
+            stdin,
+        },
         request_id,
-    )?)))
+    )?;
+    match decision {
+        policy::PolicyDecision::Accepted(plan) => Ok(PolicyLaunch::Accepted(Box::new(
+            effective_launch(params, plan, host.deadline_unix_ms, request_id)?,
+        ))),
+        policy::PolicyDecision::Rejected(plan) => {
+            Ok(PolicyLaunch::Rejected(policy_rejection_reason(&plan)))
+        }
+    }
 }
 
 fn effective_launch(
     params: &LaunchParams,
-    result: Value,
+    plan: policy::PolicyLaunchPlan,
     deadline_unix_ms: Option<u64>,
     request_id: &str,
 ) -> Result<EffectiveLaunch, ProviderFailure> {
-    let argv = validated_policy_argv(&result, request_id)?;
-    project_effective_launch(params, &result, argv, deadline_unix_ms, request_id)
-}
-
-fn validated_policy_argv(result: &Value, request_id: &str) -> Result<Vec<String>, ProviderFailure> {
-    let argv = policy_argv(result);
-    validate_policy_argv(&argv, request_id)?;
-    Ok(argv)
-}
-
-fn project_effective_launch(
-    params: &LaunchParams,
-    result: &Value,
-    argv: Vec<String>,
-    deadline_unix_ms: Option<u64>,
-    request_id: &str,
-) -> Result<EffectiveLaunch, ProviderFailure> {
-    let stdin = policy_stdin(result);
-    let prompt = policy_prompt(result);
+    validate_policy_argv(&plan.argv, request_id)?;
+    let stdin = plan.stdin.map(String::into_bytes);
+    let prompt = plan.prompt;
     let argv = resume_argv(
         params,
-        argv,
+        plan.argv,
         stdin.as_deref(),
         prompt.as_deref(),
         request_id,
@@ -199,11 +193,11 @@ fn project_effective_launch(
     let argv = split_oversized_prompt_argv(argv, request_id)?;
     Ok(EffectiveLaunch {
         argv,
-        env: effective_env_from_policy(result, request_id)?,
+        env: plan.env,
         stdin,
         _prompt: prompt,
         resume_observation_request,
-        route_evidence: result.get("markers").cloned().unwrap_or_else(|| json!([])),
+        route_evidence: json!(plan.markers),
     })
 }
 
@@ -277,7 +271,7 @@ fn resume_observation_request(
 ) -> Option<ResumeObservationRequest> {
     let session_id = known_provider_session_id(params)?;
     let prompt = submitted_resume_payload(argv, stdin, prompt)?;
-    let route = model_alias(params.model.get("name")?.as_str()?)?;
+    let route = model_alias(params.model.name())?;
     let (provider_id, model_id) = route.provider_model.split_once('/')?;
     Some(ResumeObservationRequest::new(
         argv.first()?.clone(),
@@ -477,48 +471,9 @@ fn empty_resume_payload_failure(request_id: &str) -> ProviderFailure {
     )
 }
 
-fn effective_env_from_policy(
-    result: &Value,
-    request_id: &str,
-) -> Result<BTreeMap<String, String>, ProviderFailure> {
-    let Some(env) = policy_env_object(result) else {
-        return Ok(BTreeMap::new());
-    };
-    policy_env_entries(env, request_id)
-}
-
-fn policy_env_object(result: &Value) -> Option<&serde_json::Map<String, Value>> {
-    result.get("env").and_then(Value::as_object)
-}
-
-fn policy_env_entries(
-    env: &serde_json::Map<String, Value>,
-    request_id: &str,
-) -> Result<BTreeMap<String, String>, ProviderFailure> {
-    env.iter()
-        .map(|(key, value)| policy_env_entry(key, value, request_id))
-        .collect()
-}
-
-fn policy_rejection_reason(result: &Value) -> String {
-    let diagnostics = policy_diagnostics(result);
+fn policy_rejection_reason(plan: &policy::PolicyLaunchPlan) -> String {
+    let diagnostics = json!(plan.diagnostics);
     format!("policy.evaluate rejected launch params; diagnostics={diagnostics}")
-}
-
-fn policy_params_for_launch(
-    params: &LaunchParams,
-    request_id: &str,
-) -> Result<policy::PolicyEvaluateParams, ProviderFailure> {
-    let value = launch_policy_value(params, request_id)?;
-    parse_launch_policy_params(value, request_id)
-}
-
-fn parse_launch_policy_params(
-    value: Value,
-    request_id: &str,
-) -> Result<policy::PolicyEvaluateParams, ProviderFailure> {
-    serde_json::from_value(value)
-        .map_err(|err| invalid_launch_policy_params_failure(request_id, err))
 }
 
 fn policy_stdin_for_launch(
@@ -1350,48 +1305,6 @@ fn invalid_launch_params_failure(request_id: &str, err: serde_json::Error) -> Pr
     )
 }
 
-fn policy_result_accepted(result: &Value) -> bool {
-    result.get("accepted").and_then(Value::as_bool) == Some(true)
-}
-
-fn policy_argv(result: &Value) -> Vec<String> {
-    owned_strings(policy_argv_strings(result))
-}
-
-fn policy_argv_strings(result: &Value) -> Vec<&str> {
-    let Some(values) = policy_argv_values(result) else {
-        return Vec::new();
-    };
-    policy_argv_string_refs(policy_argv_string_values(values))
-}
-
-fn policy_argv_values(result: &Value) -> Option<&Vec<Value>> {
-    result.get("argv").and_then(Value::as_array)
-}
-
-fn policy_argv_string_values(values: &[Value]) -> Vec<&Value> {
-    values
-        .iter()
-        .filter(|value| policy_value_is_string(value))
-        .collect()
-}
-
-fn policy_value_is_string(value: &Value) -> bool {
-    value.as_str().is_some()
-}
-
-fn policy_argv_string_refs(values: Vec<&Value>) -> Vec<&str> {
-    values.into_iter().map(policy_string_ref).collect()
-}
-
-fn policy_string_ref(value: &Value) -> &str {
-    value.as_str().expect("filtered policy argv string")
-}
-
-fn owned_strings(values: Vec<&str>) -> Vec<String> {
-    values.into_iter().map(ToOwned::to_owned).collect()
-}
-
 fn validate_policy_argv(argv: &[String], request_id: &str) -> Result<(), ProviderFailure> {
     if argv.is_empty() {
         return Err(empty_policy_argv_failure(request_id));
@@ -1404,88 +1317,6 @@ fn empty_policy_argv_failure(request_id: &str) -> ProviderFailure {
         request_id,
         "empty_policy_argv",
         "policy.evaluate returned no launch argv",
-    )
-}
-
-fn policy_stdin(result: &Value) -> Option<Vec<u8>> {
-    policy_stdin_text(result).map(stdin_text_bytes)
-}
-
-fn policy_stdin_text(result: &Value) -> Option<&str> {
-    result.get("stdin").and_then(Value::as_str)
-}
-
-fn stdin_text_bytes(stdin: &str) -> Vec<u8> {
-    stdin.as_bytes().to_vec()
-}
-
-fn policy_prompt(result: &Value) -> Option<String> {
-    result
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn policy_env_entry(
-    key: &str,
-    value: &Value,
-    request_id: &str,
-) -> Result<(String, String), ProviderFailure> {
-    let value = policy_env_string(value, request_id)?;
-    Ok(policy_env_pair(key, value))
-}
-
-fn policy_env_string<'a>(value: &'a Value, request_id: &str) -> Result<&'a str, ProviderFailure> {
-    value
-        .as_str()
-        .ok_or_else(|| invalid_policy_env_failure(request_id))
-}
-
-fn policy_env_pair(key: &str, value: &str) -> (String, String) {
-    (key.to_string(), value.to_string())
-}
-
-fn invalid_policy_env_failure(request_id: &str) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "invalid_policy_env",
-        "policy.evaluate returned a non-string env value",
-    )
-}
-
-fn policy_diagnostics(result: &Value) -> Value {
-    result
-        .get("diagnostics")
-        .cloned()
-        .unwrap_or_else(|| json!([]))
-}
-
-fn launch_policy_value(params: &LaunchParams, request_id: &str) -> Result<Value, ProviderFailure> {
-    let stdin = policy_stdin_for_launch(params.stdin.as_ref(), request_id)?;
-    Ok(launch_policy_json(params, stdin))
-}
-
-fn launch_policy_json(params: &LaunchParams, stdin: Option<String>) -> Value {
-    json!({
-        "settings_id": params.settings_id.clone(),
-        "mode": params.mode.clone(),
-        "model": params.model.clone(),
-        "launch": {
-            "argv": params.argv.clone(),
-            "env": params.env.clone(),
-            "stdin": stdin,
-        }
-    })
-}
-
-fn invalid_launch_policy_params_failure(
-    request_id: &str,
-    err: serde_json::Error,
-) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "invalid_launch_policy_params",
-        format!("launch params could not be evaluated by policy: {err}"),
     )
 }
 

@@ -216,8 +216,7 @@ fn contract_quota_probe() {
 
 #[test]
 fn contract_quota_probe_uses_native_opencode_auth_adapter_by_default() {
-    let raw_windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
-        .expect("captured usage fixture should parse");
+    let raw_windows = native_wham_expected_windows();
     let home = HomeFixture::new("agent-runner-opencode-native-quota-home");
     home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
     let curl = FakeNativeCurl::new();
@@ -233,6 +232,29 @@ fn contract_quota_probe_uses_native_opencode_auth_adapter_by_default() {
     );
     assert_available_probe_result(&result, &raw_windows);
     curl.assert_native_invocation();
+}
+
+#[test]
+fn contract_native_quota_failure_names_wham_boundary() {
+    let home = HomeFixture::new("agent-runner-opencode-native-quota-failure-home");
+    home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
+    let curl = FakeNativeCurl::http_failure(503, r#"{"detail":"maintenance"}"#);
+    let path = curl.path_env();
+    let result = success_result(
+        invoke_with_env(
+            "quota.probe",
+            quota_base_params(),
+            &[("HOME", home.path_str()), ("PATH", path.as_str())],
+        ),
+        "quota.schema.json#/$defs/QuotaProbeResponse",
+        "quota.schema.json#/$defs/QuotaProbeResult",
+    );
+
+    assert_eq!(result["available"], false);
+    let detail = result["detail"].as_str().expect("native failure detail");
+    assert!(detail.contains("ChatGPT WHAM API returned HTTP 503"));
+    assert!(detail.contains("maintenance"));
+    assert!(!detail.contains("chatgpt-usage"));
 }
 
 #[test]

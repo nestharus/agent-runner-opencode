@@ -1,10 +1,11 @@
-//! Declared roles: orchestration, parser, mapper, validator, formatter
+//! Declared roles: adapter, parser, validator, mapper, formatter
 //! adapter_declarations:
 //!   - component: src/quota_adapter.rs
 //!     role: adapter
 //!     Translates:
-//!       - chatgpt-usage rolling-window stdout JSON
-//!       - chatgpt-usage auth-path argv boundary
+//!       - authenticated ChatGPT WHAM HTTP responses to QuotaObservation
+//!       - explicit chatgpt-usage test-override stdout to QuotaObservation
+//!       - source-specific transport and protocol failures to QuotaObservationFailure
 
 use crate::shell::{self, ShellOutput};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -18,49 +19,164 @@ const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const HTTP_STATUS_MARKER: &str = "__oulipoly_http_status__:";
 const SCRIPT_OVERRIDE_ENV: &str = "AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaObservationSource {
+    WhamApi,
+    ScriptTestOverride,
+}
+
 #[derive(Debug)]
-pub struct ChatgptUsageWindow {
+pub struct QuotaWindow {
     pub name: Option<String>,
     pub used_percent: f64,
     pub resets_at: String,
 }
 
-pub fn parse_chatgpt_usage_windows(raw: &[u8]) -> Result<Vec<ChatgptUsageWindow>, String> {
-    let parsed = parse_usage_json(raw)?;
-    parse_windows(usage_windows(&parsed)?)
+#[derive(Debug)]
+pub struct QuotaObservation {
+    pub source: QuotaObservationSource,
+    pub windows: Vec<QuotaWindow>,
 }
 
-pub fn run_chatgpt_usage(auth_path: &Path) -> std::io::Result<ShellOutput> {
-    if chatgpt_usage_script_override_enabled() {
-        return run_chatgpt_usage_script(auth_path);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaFailureSource {
+    AuthFile,
+    WhamTransport,
+    WhamHttp,
+    WhamProtocol,
+    ScriptOverrideTransport,
+    ScriptOverrideExit,
+    ScriptOverrideProtocol,
+}
+
+#[derive(Debug)]
+pub struct QuotaObservationFailure {
+    pub source: QuotaFailureSource,
+    pub detail: String,
+    http_status: Option<u16>,
+}
+
+impl QuotaObservationFailure {
+    pub fn needs_auth_refresh(&self) -> bool {
+        if self.source == QuotaFailureSource::WhamHttp && self.http_status == Some(401) {
+            return true;
+        }
+        let detail = self.detail.to_ascii_lowercase();
+        detail.contains("http 401")
+            || detail.contains("token is expired")
+            || detail.contains("authentication token is expired")
     }
-    run_chatgpt_usage_native(auth_path)
 }
 
-fn run_chatgpt_usage_script(auth_path: &Path) -> std::io::Result<ShellOutput> {
-    let argv = chatgpt_usage_argv(auth_path);
-    shell::run(&argv)
+pub fn observe_quota(auth_path: &Path) -> Result<QuotaObservation, QuotaObservationFailure> {
+    if script_override_enabled() {
+        observe_script_override(auth_path)
+    } else {
+        observe_wham_api(auth_path)
+    }
 }
 
-fn run_chatgpt_usage_native(auth_path: &Path) -> std::io::Result<ShellOutput> {
-    let tokens = match read_auth_tokens(auth_path) {
-        Ok(tokens) => tokens,
-        Err(error) => return Ok(failed_output(3, error)),
-    };
-    let output = run_curl_usage(&tokens)?;
-    Ok(project_curl_usage_output(output))
+fn observe_script_override(auth_path: &Path) -> Result<QuotaObservation, QuotaObservationFailure> {
+    let output = run_script_override(auth_path).map_err(|err| {
+        failure(
+            QuotaFailureSource::ScriptOverrideTransport,
+            format!("chatgpt-usage test override failed to start: {err}"),
+        )
+    })?;
+    if output.status != 0 {
+        return Err(failure(
+            QuotaFailureSource::ScriptOverrideExit,
+            shell_failure_detail("chatgpt-usage test override", &output),
+        ));
+    }
+    let windows = parse_script_override_windows(&output.stdout).map_err(|detail| {
+        failure(
+            QuotaFailureSource::ScriptOverrideProtocol,
+            format!("chatgpt-usage test override output is invalid: {detail}"),
+        )
+    })?;
+    Ok(QuotaObservation {
+        source: QuotaObservationSource::ScriptTestOverride,
+        windows,
+    })
 }
 
-fn chatgpt_usage_script_override_enabled() -> bool {
+fn observe_wham_api(auth_path: &Path) -> Result<QuotaObservation, QuotaObservationFailure> {
+    let tokens = read_auth_tokens(auth_path)
+        .map_err(|detail| failure(QuotaFailureSource::AuthFile, detail))?;
+    let output = run_curl_usage(&tokens).map_err(|err| {
+        failure(
+            QuotaFailureSource::WhamTransport,
+            format!("ChatGPT WHAM request failed to start: {err}"),
+        )
+    })?;
+    if output.status != 0 {
+        return Err(failure(
+            QuotaFailureSource::WhamTransport,
+            shell_failure_detail("ChatGPT WHAM curl transport", &output),
+        ));
+    }
+    let (body, status) = split_http_body_and_status(&output.stdout)
+        .map_err(|detail| failure(QuotaFailureSource::WhamProtocol, detail))?;
+    let status_code = parse_http_status(status)
+        .map_err(|detail| failure(QuotaFailureSource::WhamProtocol, detail))?;
+    if !(200..300).contains(&status_code) {
+        return Err(http_failure(status_code, body));
+    }
+    let parsed = parse_wham_usage_json(body).map_err(|err| {
+        failure(
+            QuotaFailureSource::WhamProtocol,
+            format!("ChatGPT WHAM response must be JSON: {err}"),
+        )
+    })?;
+    let windows = parse_wham_windows(&parsed)
+        .map_err(|detail| failure(QuotaFailureSource::WhamProtocol, detail))?;
+    Ok(QuotaObservation {
+        source: QuotaObservationSource::WhamApi,
+        windows,
+    })
+}
+
+fn failure(source: QuotaFailureSource, detail: String) -> QuotaObservationFailure {
+    QuotaObservationFailure {
+        source,
+        detail,
+        http_status: None,
+    }
+}
+
+fn http_failure(status: u16, body: &str) -> QuotaObservationFailure {
+    QuotaObservationFailure {
+        source: QuotaFailureSource::WhamHttp,
+        detail: format!(
+            "ChatGPT WHAM API returned HTTP {status}: {}",
+            http_error_detail(body)
+        ),
+        http_status: Some(status),
+    }
+}
+
+fn shell_failure_detail(participant: &str, output: &ShellOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return format!("{participant} exited with status {}", output.status);
+    }
+    format!(
+        "{participant} exited with status {}: {stderr}",
+        output.status
+    )
+}
+
+fn script_override_enabled() -> bool {
     std::env::var_os(SCRIPT_OVERRIDE_ENV).is_some()
 }
 
-fn chatgpt_usage_argv(auth_path: &Path) -> Vec<String> {
-    vec!["chatgpt-usage".to_string(), auth_path_arg(auth_path)]
-}
-
-fn auth_path_arg(auth_path: &Path) -> String {
-    auth_path.to_string_lossy().into_owned()
+fn run_script_override(auth_path: &Path) -> std::io::Result<ShellOutput> {
+    shell::run(&[
+        "chatgpt-usage".to_string(),
+        auth_path.to_string_lossy().into_owned(),
+    ])
 }
 
 struct AuthTokens {
@@ -69,53 +185,27 @@ struct AuthTokens {
 }
 
 fn read_auth_tokens(path: &Path) -> Result<AuthTokens, String> {
-    let raw = read_auth_file(path).map_err(auth_file_read_error)?;
-    let parsed = parse_auth_json(&raw).map_err(auth_file_json_error)?;
-    required_auth_tokens(auth_tokens_from_json(&parsed))
-}
-
-fn read_auth_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    fs::read(path)
-}
-
-fn parse_auth_json(raw: &[u8]) -> Result<Value, serde_json::Error> {
-    serde_json::from_slice(raw)
-}
-
-fn auth_tokens_from_json(parsed: &Value) -> Option<AuthTokens> {
-    opencode_auth_tokens(parsed)
-}
-
-fn required_auth_tokens(tokens: Option<AuthTokens>) -> Result<AuthTokens, String> {
-    tokens.ok_or_else(missing_auth_tokens_error)
-}
-
-fn auth_file_read_error(err: std::io::Error) -> String {
-    format!("failed to read auth file: {err}")
-}
-
-fn auth_file_json_error(err: serde_json::Error) -> String {
-    format!("auth file must be JSON: {err}")
-}
-
-fn missing_auth_tokens_error() -> String {
-    "missing ChatGPT access token or account id in auth file".to_string()
-}
-
-fn opencode_auth_tokens(parsed: &Value) -> Option<AuthTokens> {
-    auth_tokens(
-        parsed.pointer("/openai/access")?.as_str()?,
-        parsed.pointer("/openai/accountId")?.as_str()?,
-    )
-}
-
-fn auth_tokens(access_token: &str, account_id: &str) -> Option<AuthTokens> {
-    let access_token = nonempty_string(access_token)?;
-    let account_id = nonempty_string(account_id)?;
-    Some(AuthTokens {
+    let raw = fs::read(path).map_err(|err| format!("failed to read OpenCode auth file: {err}"))?;
+    let parsed: Value = serde_json::from_slice(&raw)
+        .map_err(|err| format!("OpenCode auth file must be JSON: {err}"))?;
+    let access_token = parsed
+        .pointer("/openai/access")
+        .and_then(Value::as_str)
+        .and_then(nonempty_string)
+        .ok_or_else(missing_auth_tokens_error)?;
+    let account_id = parsed
+        .pointer("/openai/accountId")
+        .and_then(Value::as_str)
+        .and_then(nonempty_string)
+        .ok_or_else(missing_auth_tokens_error)?;
+    Ok(AuthTokens {
         access_token,
         account_id,
     })
+}
+
+fn missing_auth_tokens_error() -> String {
+    "OpenCode auth file is missing a ChatGPT access token or account id".to_string()
 }
 
 fn nonempty_string(value: &str) -> Option<String> {
@@ -154,15 +244,11 @@ fn run_curl_usage(tokens: &AuthTokens) -> std::io::Result<ShellOutput> {
         .expect("curl stdin is piped")
         .write_all(curl_usage_config(tokens).as_bytes())?;
     let output = child.wait_with_output()?;
-    Ok(shell_output_from_process(output))
-}
-
-fn shell_output_from_process(output: std::process::Output) -> ShellOutput {
-    ShellOutput {
+    Ok(ShellOutput {
         stdout: output.stdout,
         stderr: output.stderr,
         status: output.status.code().unwrap_or(1),
-    }
+    })
 }
 
 fn curl_usage_config(tokens: &AuthTokens) -> String {
@@ -177,238 +263,112 @@ fn curl_config_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn project_curl_usage_output(output: ShellOutput) -> ShellOutput {
-    if output.status != 0 {
-        return output;
-    }
-    match wham_usage_windows_stdout(&output.stdout) {
-        Ok(stdout) => ShellOutput {
-            stdout,
-            stderr: Vec::new(),
-            status: 0,
-        },
-        Err(error) => failed_output(4, error),
-    }
-}
-
-fn wham_usage_windows_stdout(raw: &[u8]) -> Result<Vec<u8>, String> {
-    let (body, status) = split_http_body_and_status(raw)?;
-    if validate_success_http_status(status).is_err() {
-        return Err(http_status_failure(status, body));
-    }
-    let parsed = parse_wham_usage_json(body).map_err(wham_usage_json_error)?;
-    wham_usage_windows_bytes(&parsed).map_err(json_bytes_error)
-}
-
 fn split_http_body_and_status(raw: &[u8]) -> Result<(&str, &str), String> {
     let text = std::str::from_utf8(raw)
-        .map_err(|err| format!("ChatGPT usage response must be UTF-8: {err}"))?;
+        .map_err(|err| format!("ChatGPT WHAM response must be UTF-8: {err}"))?;
     let (body, status) = text
         .rsplit_once(HTTP_STATUS_MARKER)
-        .ok_or_else(|| "curl output missing HTTP status marker".to_string())?;
+        .ok_or_else(|| "curl output missing ChatGPT WHAM HTTP status marker".to_string())?;
     Ok((body.trim_end_matches('\n'), status.trim()))
 }
 
-fn format_http_error(status: &str, body: &str) -> String {
-    format!(
-        "ChatGPT API returned HTTP {status}: {}",
-        http_error_detail(body)
-    )
-}
-
-fn http_error_detail(body: &str) -> String {
-    let parsed = parse_http_error_body(body);
-    let detail = parsed.as_ref().and_then(http_error_detail_value);
-    if let Some(detail) = nonempty_http_error_detail(detail) {
-        return owned_http_error_detail(detail);
-    }
-    trimmed_http_error_body(body)
-}
-
-fn validate_success_http_status(status: &str) -> Result<(), ()> {
-    successful_http_status(status).then_some(()).ok_or(())
-}
-
-fn successful_http_status(status: &str) -> bool {
-    status.starts_with('2')
-}
-
-fn http_status_failure(status: &str, body: &str) -> String {
-    format_http_error(status, body)
+fn parse_http_status(status: &str) -> Result<u16, String> {
+    status
+        .parse::<u16>()
+        .map_err(|err| format!("ChatGPT WHAM HTTP status is invalid: {err}"))
 }
 
 fn parse_wham_usage_json(body: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(body)
 }
 
-fn wham_usage_json_error(err: serde_json::Error) -> String {
-    format!("ChatGPT usage response must be JSON: {err}")
-}
-
-fn wham_usage_windows_bytes(parsed: &Value) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&usage_windows_result(parsed))
-}
-
-fn json_bytes_error(err: serde_json::Error) -> String {
-    err.to_string()
-}
-
-fn parse_http_error_body(body: &str) -> Option<Value> {
-    serde_json::from_str::<Value>(body).ok()
-}
-
-fn http_error_detail_value(parsed: &Value) -> Option<&str> {
-    parsed
-        .pointer("/detail")
-        .or_else(|| parsed.pointer("/error/message"))
-        .and_then(Value::as_str)
-}
-
-fn nonempty_http_error_detail(detail: Option<&str>) -> Option<&str> {
-    detail.filter(|detail| !detail.trim().is_empty())
-}
-
-fn owned_http_error_detail(detail: &str) -> String {
-    detail.to_string()
-}
-
-fn trimmed_http_error_body(body: &str) -> String {
-    body.trim().to_string()
-}
-
-fn usage_windows_result(parsed: &Value) -> Value {
-    let windows = ["secondary_window", "primary_window"]
+fn parse_wham_windows(parsed: &Value) -> Result<Vec<QuotaWindow>, String> {
+    ["secondary_window", "primary_window"]
         .into_iter()
-        .filter_map(|name| usage_window(parsed, name))
-        .collect::<Vec<_>>();
-    serde_json::json!({ "windows": windows })
-}
-
-fn usage_window(parsed: &Value, name: &str) -> Option<Value> {
-    let window = parsed.pointer(&format!("/rate_limit/{name}"))?;
-    let reset_at = window.get("reset_at")?.as_i64()?;
-    let used_percent = window.get("used_percent")?.as_f64()?;
-    Some(serde_json::json!({
-        "used_percent": used_percent,
-        "resets_at": unix_seconds_to_rfc3339(reset_at)?,
-    }))
-}
-
-fn unix_seconds_to_rfc3339(seconds: i64) -> Option<String> {
-    DateTime::<Utc>::from_timestamp(seconds, 0)
-        .map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true))
-}
-
-fn failed_output(status: i32, message: String) -> ShellOutput {
-    ShellOutput {
-        stdout: Vec::new(),
-        stderr: message.into_bytes(),
-        status,
-    }
-}
-
-fn parse_window(index: usize, window: &Value) -> Result<ChatgptUsageWindow, String> {
-    let object = window_object(index, window)?;
-    let used_percent = window_used_percent(index, object)?;
-    validate_used_percent(index, used_percent)?;
-    let resets_at = window_resets_at(index, object)?;
-    validate_resets_at(index, resets_at)?;
-    Ok(chatgpt_usage_window(object, used_percent, resets_at))
-}
-
-fn parse_usage_json(raw: &[u8]) -> Result<Value, String> {
-    serde_json::from_slice(raw).map_err(invalid_usage_json_error)
-}
-
-fn parse_windows(windows: &[Value]) -> Result<Vec<ChatgptUsageWindow>, String> {
-    windows
-        .iter()
-        .enumerate()
-        .map(|(index, window)| parse_window(index, window))
+        .filter_map(|name| {
+            parsed
+                .pointer(&format!("/rate_limit/{name}"))
+                .map(|window| parse_wham_window(name, window))
+        })
         .collect()
 }
 
-fn usage_windows(parsed: &Value) -> Result<&[Value], String> {
-    parsed
-        .get("windows")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .ok_or_else(missing_windows_error)
-}
-
-fn window_object(index: usize, window: &Value) -> Result<&serde_json::Map<String, Value>, String> {
-    window.as_object().ok_or_else(|| window_object_error(index))
-}
-
-fn window_used_percent(
-    index: usize,
-    object: &serde_json::Map<String, Value>,
-) -> Result<f64, String> {
-    object
+fn parse_wham_window(name: &str, window: &Value) -> Result<QuotaWindow, String> {
+    let reset_at = window
+        .get("reset_at")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("ChatGPT WHAM {name}.reset_at must be Unix seconds"))?;
+    let used_percent = window
         .get("used_percent")
         .and_then(Value::as_f64)
-        .ok_or_else(|| used_percent_error(index))
+        .ok_or_else(|| format!("ChatGPT WHAM {name}.used_percent must be numeric"))?;
+    validate_used_percent(name, used_percent)?;
+    let resets_at = DateTime::<Utc>::from_timestamp(reset_at, 0)
+        .map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .ok_or_else(|| format!("ChatGPT WHAM {name}.reset_at is out of range"))?;
+    Ok(QuotaWindow {
+        name: None,
+        used_percent,
+        resets_at,
+    })
 }
 
-fn window_resets_at(index: usize, object: &serde_json::Map<String, Value>) -> Result<&str, String> {
-    object
+fn http_error_detail(body: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let detail = parsed.as_ref().and_then(|value| {
+        value
+            .pointer("/detail")
+            .or_else(|| value.pointer("/error/message"))
+            .and_then(Value::as_str)
+    });
+    detail
+        .filter(|detail| !detail.trim().is_empty())
+        .unwrap_or_else(|| body.trim())
+        .to_string()
+}
+
+fn parse_script_override_windows(raw: &[u8]) -> Result<Vec<QuotaWindow>, String> {
+    let parsed: Value =
+        serde_json::from_slice(raw).map_err(|err| format!("stdout must be JSON: {err}"))?;
+    let windows = parsed
+        .get("windows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "windows must be an array".to_string())?;
+    windows
+        .iter()
+        .enumerate()
+        .map(|(index, window)| parse_script_override_window(index, window))
+        .collect()
+}
+
+fn parse_script_override_window(index: usize, window: &Value) -> Result<QuotaWindow, String> {
+    let object = window
+        .as_object()
+        .ok_or_else(|| format!("windows[{index}] must be an object"))?;
+    let used_percent = object
+        .get("used_percent")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("windows[{index}].used_percent must be numeric"))?;
+    validate_used_percent(&format!("windows[{index}]"), used_percent)?;
+    let resets_at = object
         .get("resets_at")
         .and_then(Value::as_str)
-        .ok_or_else(|| resets_at_error(index))
-}
-
-fn chatgpt_usage_window(
-    object: &serde_json::Map<String, Value>,
-    used_percent: f64,
-    resets_at: &str,
-) -> ChatgptUsageWindow {
-    ChatgptUsageWindow {
+        .ok_or_else(|| format!("windows[{index}].resets_at must be a string"))?;
+    DateTime::parse_from_rfc3339(resets_at)
+        .map_err(|err| format!("windows[{index}].resets_at invalid RFC3339: {err}"))?;
+    Ok(QuotaWindow {
         name: object
             .get("name")
             .and_then(Value::as_str)
             .map(str::to_string),
         used_percent,
         resets_at: resets_at.to_string(),
-    }
+    })
 }
 
-fn validate_used_percent(index: usize, used_percent: f64) -> Result<(), String> {
+fn validate_used_percent(label: &str, used_percent: f64) -> Result<(), String> {
     if (0.0..=100.0).contains(&used_percent) {
         return Ok(());
     }
-    Err(used_percent_range_error(index, used_percent))
-}
-
-fn validate_resets_at(index: usize, resets_at: &str) -> Result<(), String> {
-    DateTime::parse_from_rfc3339(resets_at)
-        .map(|_| ())
-        .map_err(|err| resets_at_parse_error(index, err))
-}
-
-fn invalid_usage_json_error(err: serde_json::Error) -> String {
-    format!("chatgpt-usage stdout must be JSON: {err}")
-}
-
-fn missing_windows_error() -> String {
-    "chatgpt-usage windows must be an array".to_string()
-}
-
-fn window_object_error(index: usize) -> String {
-    format!("windows[{index}] must be an object")
-}
-
-fn used_percent_error(index: usize) -> String {
-    format!("windows[{index}].used_percent must be numeric")
-}
-
-fn used_percent_range_error(index: usize, used_percent: f64) -> String {
-    format!("windows[{index}].used_percent out of range: {used_percent}")
-}
-
-fn resets_at_error(index: usize) -> String {
-    format!("windows[{index}].resets_at must be a string")
-}
-
-fn resets_at_parse_error(index: usize, err: chrono::ParseError) -> String {
-    format!("windows[{index}].resets_at invalid RFC3339: {err}")
+    Err(format!("{label}.used_percent out of range: {used_percent}"))
 }
