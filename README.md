@@ -191,11 +191,13 @@ filesystem target through the same lexical and canonical confinement guard
 before creating a directory or file. Each subsystem retains its own lifecycle
 rules after admission: settings and activity keep their interprocess locks,
 and migration and rotation keep their content-addressed atomic publication.
-One shared filesystem boundary durably publishes every newly created settings,
-migration, activity, rotation-artifact, and rotation-state directory link before
-a dependent file write or irreversible native import may proceed. A readable
-provider file can satisfy a retry only after that boundary re-syncs its parent,
-so a prior post-rename sync failure remains an error until durability completes.
+One shared filesystem boundary durably publishes every settings, migration,
+activity, launch-state, rotation-artifact, and rotation-state directory link
+before a dependent file write or irreversible native import may proceed. Every
+retry re-synchronizes the complete directory lineage, including links already
+visible after an earlier parent-sync failure. A readable provider file can
+satisfy a retry only after that boundary re-syncs its parent, so a prior
+post-rename sync failure remains an error until durability completes.
 
 Activity evidence is operational and explicitly best-effort. A directory,
 lock, write, or chain-validation failure is emitted as a stderr warning but
