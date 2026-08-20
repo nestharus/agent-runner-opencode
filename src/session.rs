@@ -700,9 +700,15 @@ fn persist_enumeration_snapshot(
         encoded_rows.push(bytes);
     }
     let snapshot_id = sha256_hex(
-        [identity_sha256.as_bytes(), &[0], &encoded_rows.concat()]
-            .concat()
-            .as_slice(),
+        [
+            request_id.as_bytes(),
+            &[0],
+            identity_sha256.as_bytes(),
+            &[0],
+            &encoded_rows.concat(),
+        ]
+        .concat()
+        .as_slice(),
     );
     let root = enumeration_snapshot_root(host, request_id)?;
     let _lock = acquire_enumeration_snapshot_lock(host, &root, request_id)?;

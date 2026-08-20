@@ -286,14 +286,16 @@ host working directory because neither path uses it. The directory is required
 only before a new native import, so removing or renaming it cannot strand a
 completed materialization.
 
-`session.enumerate` materializes one bounded, private pagination snapshot on
-the first page instead of relisting the complete native population for every
-cursor. Page size and admitted population are each capped at 256, list capture
-at 2 MiB, each row at 64 KiB, and each snapshot at 4 MiB. At most 32 abandoned
-snapshots are retained for 15 minutes; continuation cursors read only the
-requested rows. A terminal snapshot is retired only after the complete response
-is successfully written and flushed; a failed write or flush preserves the
-cursor for an exact retry, and a cleanup failure falls back to the existing
+`session.enumerate` materializes one bounded, request-bound private pagination
+snapshot on the first page instead of relisting the complete native population
+for every cursor. Exact retries of one initial request can converge on its
+snapshot, while distinct requests over identical rows receive independent
+cursor owners. Page size and admitted population are each capped at 256, list
+capture at 2 MiB, each row at 64 KiB, and each snapshot at 4 MiB. At most 32
+abandoned snapshots are retained for 15 minutes; continuation cursors read only
+the requested rows. A terminal snapshot is retired only after the complete
+response is successfully written and flushed; a failed write or flush preserves
+the cursor for an exact retry, and a cleanup failure falls back to the existing
 15-minute expiry.
 An above-bound native population fails explicitly.
 

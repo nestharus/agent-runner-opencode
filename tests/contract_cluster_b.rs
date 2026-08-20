@@ -208,6 +208,67 @@ fn contract_session_enumerate_retires_consumed_snapshot() {
 }
 
 #[test]
+fn contract_session_enumerate_distinct_requests_have_independent_snapshot_owners() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-independent-session-snapshots");
+    fs::create_dir_all(&data_root).expect("create independent session snapshot data root");
+    let host = json!({"data_root": data_root.to_string_lossy()});
+    let env = [("PATH", path.as_str())];
+
+    let first_a = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_limit_params(2),
+            host.clone(),
+            &env,
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    let first_b = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_limit_params(2),
+            host.clone(),
+            &env,
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    let cursor_a = first_a["next_cursor"].as_str().expect("first cursor A");
+    let cursor_b = first_b["next_cursor"].as_str().expect("first cursor B");
+    assert_ne!(
+        cursor_a, cursor_b,
+        "distinct initial requests must not share a cursor owner"
+    );
+
+    let terminal_a = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_cursor_params(2, cursor_a),
+            host.clone(),
+            &env,
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_second_enumerate_page(&terminal_a);
+    let terminal_b = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_cursor_params(2, cursor_b),
+            host,
+            &env,
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_second_enumerate_page(&terminal_b);
+    fs::remove_dir_all(&data_root).expect("remove independent session snapshot data root");
+}
+
+#[test]
 fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_handoff() {
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
