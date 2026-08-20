@@ -832,6 +832,85 @@ fn contract_oversized_predecessor_store_stays_routable_during_in_band_recovery()
 }
 
 #[test]
+fn contract_predecessor_recovery_never_publishes_above_its_readable_envelope() {
+    let host = HostRoots::new("agent-runner-opencode-settings-predecessor-publication-bound");
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(store_path.parent().expect("settings store parent"))
+        .expect("create predecessor settings root");
+    let make_store = |padding: usize| {
+        let mut large_values = opencode_settings_values(None);
+        large_values["extra_env"] = json!({
+            "PREDECESSOR_PAYLOAD": "x".repeat(padding)
+        });
+        let records = json!([
+            {
+                "id": "large-predecessor",
+                "display_name": "Large predecessor profile",
+                "version": "predecessor-v1",
+                "values": large_values,
+            },
+            {
+                "id": "small-predecessor",
+                "display_name": "Small predecessor profile",
+                "version": "predecessor-v1",
+                "values": opencode_settings_values(None),
+            }
+        ]);
+        format!(
+            "{{\"schema_version\":0,\"records\":{},\"history\":[],\"mutation_receipts\":{{}}}}",
+            serde_json::to_string(&records).expect("serialize predecessor records")
+        )
+        .into_bytes()
+    };
+    let maximum = 16 * 1024 * 1024;
+    let base = make_store(0).len();
+    let predecessor_bytes = make_store(maximum - base - 32);
+    assert!(predecessor_bytes.starts_with(br#"{"schema_version":0,"records":["#));
+    assert!(predecessor_bytes.len() <= maximum);
+    assert!(predecessor_bytes.len() > maximum - 64);
+    fs::write(&store_path, &predecessor_bytes).expect("write near-bound predecessor store");
+
+    let rejected = error_response(invoke_validated_with_host(
+        "settings.delete",
+        settings_delete_params("small-predecessor", "predecessor-v1"),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsDeleteRequest",
+    ));
+    assert_eq!(rejected["error"]["code"], "settings_capacity_exhausted");
+    assert_eq!(
+        fs::read(&store_path).expect("read unchanged predecessor store"),
+        predecessor_bytes,
+        "a fully serialized result above the transition envelope must not replace the last readable store"
+    );
+
+    let _ = success_result(
+        invoke_validated_with_host(
+            "settings.delete",
+            settings_delete_params("large-predecessor", "predecessor-v1"),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsDeleteRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsDeleteResponse",
+        "settings.schema.json#/$defs/SettingsDeleteResult",
+    );
+    let recovered_bytes = fs::read(&store_path).expect("read recovered settings store");
+    assert!(recovered_bytes.len() <= 4 * 1024 * 1024);
+    let remaining = success_result(
+        invoke_validated_with_host(
+            "settings.get",
+            settings_get_params("small-predecessor"),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsGetRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsGetResponse",
+        "settings.schema.json#/$defs/SettingsGetResult",
+    );
+    assert_eq!(remaining["record"]["id"], "small-predecessor");
+}
+
+#[test]
 fn contract_predecessor_store_above_transition_envelope_fails_explicitly() {
     let host = HostRoots::new("agent-runner-opencode-settings-predecessor-capacity-unsupported");
     let store_path = host

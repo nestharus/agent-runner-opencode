@@ -1042,10 +1042,13 @@ fn contract_launch_resume_preserves_session_shaped_positional_message() {
     let argv = wrapper_log_args(&wrapper_log);
     let boundary = argv_arg_index(&argv, "--");
     assert_eq!(
-        &argv[boundary + 1..],
+        &argv[boundary + 1..boundary + 3],
         &["--session", "literal-session-text"],
         "the managed session option must not rewrite positional message text"
     );
+    assert!(argv
+        .get(boundary + 3)
+        .is_some_and(|arg| { arg.starts_with("[OULIPOLY-DELIVERY ") && arg.ends_with(']') }));
 }
 
 #[test]

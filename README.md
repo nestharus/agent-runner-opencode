@@ -203,7 +203,9 @@ before the gate can execute the native command. Provider loss or publication
 failure closes an unreleased gate without admitting a native effect. Recovery
 refuses readmission while a published actor is live; once that actor is
 terminal (or a prepared record proves no actor was ever published), recovery
-binds a matching session when present and readmits the request only after a
+binds a matching session only when its user turn carries the provider-authored
+delivery identity embedded in that request's actual child payload, and readmits
+the request only after a
 same-context list bounded to 257 native rows proves no effect. Recovery admits
 at most 256 sessions, examines at most eight plausible candidates, captures at
 most 2 MiB of list output, and shares one five-second/host-deadline budget across
@@ -236,8 +238,12 @@ launch, matching bounded `opencode run --format json` `step_start` and successfu
 re-exporting and reparsing the growing transcript. A bare terminal process
 status is not completion authority.
 Before spawning a resumed turn, launch durably binds the request ID to its
-session, route, payload digest, delivery nonce, observation timestamp, and
-original recovery-command context. Post-spawn run events remain withheld until
+session, route, payload digest, provider-authored delivery nonce, observation
+timestamp, and original recovery-command context. The same nonce is embedded
+in the actual child payload and is required for transcript recovery, so
+identical sibling prompts cannot become request-local submission or completion
+evidence. Legacy durable records without that identity remain unresolved.
+Post-spawn run events remain withheld until
 the corresponding observation is durable. Recovery of a prepared, legacy
 terminal, submission-observed, or unresolved record may perform one bounded
 750 ms export in that original context.
@@ -295,8 +301,10 @@ capture at 2 MiB, each row at 64 KiB, and each snapshot at 4 MiB. At most 32
 abandoned snapshots are retained for 15 minutes; continuation cursors read only
 the requested rows. A terminal snapshot is retired only after the complete
 response is successfully written and flushed; a failed write or flush preserves
-the cursor for an exact retry, and a cleanup failure falls back to the existing
-15-minute expiry.
+the cursor for an exact retry. Before the terminal page is exposed, its manifest
+durably claims that handoff for the continuation request; a different terminal
+consumer or initial retry cannot reuse the snapshot while that claim is live.
+A cleanup failure falls back to the existing 15-minute expiry.
 An above-bound native population fails explicitly.
 
 ## State, evidence, and authority
@@ -317,7 +325,11 @@ records remain readable and usable. The predecessor recovery exception is
 non-growing and finite: only the exact schema-less predecessor serialization or
 an intermediate schema-zero recovery transaction can exceed the encoded bound,
 no admitted predecessor/recovery store may exceed 16 MiB or 4,096 records, and
-each admitted recovery mutation must reduce record count or encoded size.
+each admitted recovery mutation must reduce record count or encoded size. The
+fully serialized candidate—including upgraded values, history, and mutation
+receipt—is checked against that transition envelope before atomic publication,
+so a successful recovery mutation always leaves a store the next process can
+read.
 Settings lock admission is bounded by the earlier of the host deadline and five
 seconds. Migration artifacts are content-addressed, atomically published,
 confined to one of the two exact provider-owned roots, and retain hashes for the

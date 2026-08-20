@@ -704,6 +704,8 @@ fn mutate_store(
         || store.mutation_receipts.len() > MAX_SETTINGS_MUTATION_RECEIPTS
         || encoded.len() > MAX_SETTINGS_STORE_BYTES;
     let reduces_predecessor_capacity = predecessor_capacity_recovery
+        && store.records.len() <= MAX_PREDECESSOR_SETTINGS_RECORDS
+        && encoded.len() <= MAX_PREDECESSOR_SETTINGS_STORE_BYTES
         && store.records.len() <= before.len()
         && (store.records.len() < before.len()
             || predecessor_projected_bytes.is_some_and(|prior| encoded.len() < prior));
@@ -998,6 +1000,7 @@ fn write_store_path(
         .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
     ensure_store_path_contained(path, config_root, request_id)?;
     let bytes = serialize_store(store, request_id)?;
+    validate_serialized_store_capacity(store, bytes.len(), request_id)?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|err| store_io_failure(request_id, "settings_store_temp_create_failed", err))?;
     ensure_store_path_contained(tmp.path(), config_root, request_id)?;
@@ -1013,6 +1016,26 @@ fn write_store_path(
 
 fn serialize_store(store: &SettingsStore, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
     serde_json::to_vec(store).map_err(|err| settings_store_serialize_failure(request_id, err))
+}
+
+fn validate_serialized_store_capacity(
+    store: &SettingsStore,
+    encoded_bytes: usize,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let within_capacity = if store.schema_version == 0 {
+        store.records.len() <= MAX_PREDECESSOR_SETTINGS_RECORDS
+            && encoded_bytes <= MAX_PREDECESSOR_SETTINGS_STORE_BYTES
+    } else {
+        store.records.len() <= MAX_SETTINGS_RECORDS && encoded_bytes <= MAX_SETTINGS_STORE_BYTES
+    };
+    if within_capacity {
+        return Ok(());
+    }
+    Err(settings_capacity_failure(
+        request_id,
+        "the fully serialized mutation result exceeds its schema's readable store envelope",
+    ))
 }
 
 fn sync_store_parent(parent: &Path, request_id: &str) -> Result<(), ProviderFailure> {

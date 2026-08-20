@@ -597,6 +597,8 @@ pub fn fake_counted_resume_late_completion_script(
     completion_marker: &Path,
     payload: &str,
 ) -> String {
+    let delivery_marker_path = count_path.with_extension("delivery-marker");
+    let delivered_payload = format!("{payload}\n\n__PROVIDER_DELIVERY_MARKER__\n");
     let user = json!({
         "info": {
             "id": "msg-durable-resume-user",
@@ -609,7 +611,7 @@ pub fn fake_counted_resume_late_completion_script(
             },
             "time": {"created": 4_102_444_800_000_u64}
         },
-        "parts": [{"type": "text", "text": payload}]
+        "parts": [{"type": "text", "text": delivered_payload}]
     });
     let pending_export = json!({
         "info": {"id": resume_session_id(), "title": "durable resume contract"},
@@ -645,13 +647,19 @@ pub fn fake_counted_resume_late_completion_script(
     format!(
         "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
+  delivery=$(/bin/cat {delivery_marker_path})\n\
   if [ -e {completion_marker} ]; then\n\
-    printf '%s\\n' {completed_export}\n\
+    printf '%s\\n' {completed_export} | /bin/sed \"s/__PROVIDER_DELIVERY_MARKER__/$delivery/g\"\n\
   else\n\
-    printf '%s\\n' {pending_export}\n\
+    printf '%s\\n' {pending_export} | /bin/sed \"s/__PROVIDER_DELIVERY_MARKER__/$delivery/g\"\n\
   fi\n\
   exit 0\n\
 fi\n\
+for arg in \"$@\"; do\n\
+  case \"$arg\" in\n\
+    *OULIPOLY-DELIVERY*) printf '%s' \"$arg\" > {delivery_marker_path} ;;\n\
+  esac\n\
+done\n\
 count=0\n\
 if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
 count=$((count + 1))\n\
@@ -659,6 +667,7 @@ printf '%s\\n' \"$count\" > {count_path}\n\
 printf '%s\\n' {event}\n\
 exit 0\n",
         completion_marker = shell_single_quote(&path_string(completion_marker)),
+        delivery_marker_path = shell_single_quote(&path_string(&delivery_marker_path)),
         count_path = shell_single_quote(&path_string(count_path)),
         completed_export = shell_single_quote(&completed_export),
         pending_export = shell_single_quote(&pending_export),

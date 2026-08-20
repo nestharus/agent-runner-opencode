@@ -115,6 +115,8 @@ struct EnumerationSnapshotManifest {
     total_sessions: usize,
     created_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    #[serde(default)]
+    terminal_claim_request_sha256: Option<String>,
 }
 
 struct CapturedSession {
@@ -715,13 +717,17 @@ fn persist_enumeration_snapshot(
     let retained = prune_enumeration_snapshots(host, &root, request_id)?;
     let snapshot_root =
         confined_enumeration_snapshot_target(host, &root.join(&snapshot_id), request_id)?;
-    if snapshot_manifest(&snapshot_root, request_id).is_ok_and(|manifest| {
-        manifest.snapshot_id == snapshot_id
+    if let Ok(manifest) = snapshot_manifest(&snapshot_root, request_id) {
+        let reusable = manifest.snapshot_id == snapshot_id
             && manifest.identity_sha256 == identity_sha256
             && manifest.total_sessions == sessions.len()
-            && manifest.expires_at_unix_ms >= now_unix_ms()
-    }) {
-        return Ok(snapshot_id);
+            && manifest.expires_at_unix_ms >= now_unix_ms();
+        if reusable && manifest.terminal_claim_request_sha256.is_none() {
+            return Ok(snapshot_id);
+        }
+        if reusable {
+            return Err(session_snapshot_terminal_handoff_failure(request_id));
+        }
     }
     if snapshot_root.exists() {
         fs::remove_dir_all(&snapshot_root)
@@ -748,6 +754,7 @@ fn persist_enumeration_snapshot(
         total_sessions: sessions.len(),
         created_at_unix_ms,
         expires_at_unix_ms: created_at_unix_ms.saturating_add(SESSION_ENUMERATION_SNAPSHOT_TTL_MS),
+        terminal_claim_request_sha256: None,
     };
     let bytes = serde_json::to_vec(&manifest)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
@@ -775,7 +782,7 @@ fn load_enumeration_snapshot_page(
     let _lock = acquire_enumeration_snapshot_lock(host, &root, request_id)?;
     let snapshot_root =
         confined_enumeration_snapshot_target(host, &root.join(&snapshot_id), request_id)?;
-    let manifest = snapshot_manifest(&snapshot_root, request_id).map_err(|_| {
+    let mut manifest = snapshot_manifest(&snapshot_root, request_id).map_err(|_| {
         invalid_session_enumerate_cursor_failure(request_id, "snapshot is missing or invalid")
     })?;
     if manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
@@ -808,6 +815,22 @@ fn load_enumeration_snapshot_page(
         );
     }
     let complete = end == total;
+    if complete {
+        let request_sha256 = sha256_hex(request_id.as_bytes());
+        match manifest.terminal_claim_request_sha256.as_deref() {
+            Some(owner) if owner != request_sha256.as_str() => {
+                return Err(session_snapshot_terminal_handoff_failure(request_id));
+            }
+            Some(_) => {}
+            None => {
+                manifest.terminal_claim_request_sha256 = Some(request_sha256);
+                let bytes = serde_json::to_vec(&manifest)
+                    .map_err(|error| session_snapshot_failure(request_id, error))?;
+                write_enumeration_snapshot_file(&snapshot_root.join("manifest.json"), &bytes)
+                    .map_err(|error| session_snapshot_failure(request_id, error))?;
+            }
+        }
+    }
     Ok(EnumeratePage {
         sessions,
         warnings: Vec::new(),
@@ -1784,6 +1807,17 @@ fn session_snapshot_lock_timeout_failure(request_id: &str) -> ProviderFailure {
         request_id,
         "session_enumeration_snapshot_lock_timeout",
         "session enumeration snapshot lock could not be acquired before the operation deadline",
+    )
+}
+
+fn session_snapshot_terminal_handoff_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "session_enumeration_snapshot_terminal_handoff_in_progress",
+        "session enumeration snapshot already has a different terminal response handoff owner",
+        json!({
+            "required_action": "retry only the exact terminal continuation request until its response handoff completes",
+        }),
     )
 }
 

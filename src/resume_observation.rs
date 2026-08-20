@@ -33,16 +33,15 @@ pub struct ResumeObservationRequest {
 }
 
 #[derive(Clone)]
-struct RouteIdentity {
-    provider_id: String,
-    model_id: String,
-    variant: String,
+pub(crate) struct RouteIdentity {
+    pub provider_id: String,
+    pub model_id: String,
+    pub variant: String,
 }
 
 struct ResumeMatchIdentity<'a> {
     session_id: &'a str,
     prompt_sha256: String,
-    payload_sha256: &'a str,
     delivery_nonce: Option<&'a str>,
     started_at_unix_ms: u64,
     provider_id: &'a str,
@@ -76,27 +75,21 @@ pub enum ResumeCompletion {
 }
 
 impl ResumeObservationRequest {
-    pub fn new(
+    pub(crate) fn new(
         account_wrapper: String,
         session_id: String,
         payload: String,
+        delivery_nonce: String,
         started_at_unix_ms: u64,
-        provider_id: String,
-        model_id: String,
-        variant: String,
+        route: RouteIdentity,
     ) -> Self {
-        let delivery_nonce = delivery_nonce_from_payload(&payload);
         Self {
             account_wrapper,
             session_id,
             payload,
-            delivery_nonce,
+            delivery_nonce: Some(delivery_nonce),
             started_at_unix_ms,
-            route: RouteIdentity {
-                provider_id,
-                model_id,
-                variant,
-            },
+            route,
         }
     }
 
@@ -119,7 +112,6 @@ impl DurableResumeObservationRequest {
         ResumeMatchIdentity {
             session_id: &self.session_id,
             prompt_sha256: self.payload_sha256.clone(),
-            payload_sha256: &self.payload_sha256,
             delivery_nonce: self.delivery_nonce.as_deref(),
             started_at_unix_ms: self.started_at_unix_ms,
             provider_id: &self.provider_id,
@@ -179,6 +171,12 @@ pub fn observe_durable(
     working_directory: &str,
     env: &BTreeMap<String, String>,
 ) -> ResumeObservation {
+    // Durable records written before provider-authored delivery identities
+    // cannot distinguish identical sibling turns. They remain unresolved
+    // rather than using payload/time proximity as request-local evidence.
+    if request.delivery_nonce.is_none() {
+        return unconfirmed_observation();
+    }
     let Ok(native) = opencode::export_with_launch_context(
         &request.session_id,
         program,
@@ -218,6 +216,7 @@ fn observation_from_export(
     let completion = if submitted_index.is_some_and(|index| {
         native.messages[index + 1..]
             .iter()
+            .take_while(|message| message.info.role != "user")
             .any(|message| completed_assistant_message(message, identity))
     }) {
         ResumeCompletion::Observed
@@ -246,15 +245,9 @@ fn submitted_user_message(message: &OpencodeMessage, identity: &ResumeMatchIdent
                         .started_at_unix_ms
                         .saturating_sub(RESUME_MESSAGE_CLOCK_TOLERANCE_MS)
             })
-        && if let Some(delivery_nonce) = identity.delivery_nonce {
-            message_contains_delivery_nonce(message, delivery_nonce)
-        } else {
-            message.parts.iter().any(|part| {
-                part.get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| text_sha256_matches(text, identity.payload_sha256))
-            })
-        }
+        && identity
+            .delivery_nonce
+            .is_some_and(|delivery_nonce| message_contains_delivery_nonce(message, delivery_nonce))
 }
 
 fn completed_assistant_message(
@@ -278,6 +271,7 @@ fn message_model_matches(message: &OpencodeMessage, identity: &ResumeMatchIdenti
         && variant == Some(identity.variant)
 }
 
+#[cfg(test)]
 fn text_sha256_matches(text: &str, expected: &str) -> bool {
     sha256_hex(text.as_bytes()) == expected
         || text
@@ -289,9 +283,16 @@ fn text_sha256_matches(text: &str, expected: &str) -> bool {
 }
 
 fn message_contains_delivery_nonce(message: &OpencodeMessage, delivery_nonce: &str) -> bool {
-    let marker = delivery_marker(delivery_nonce);
     let fields = message_string_fields(message);
-    fields.iter().any(|field| field.contains(&marker)) || fields.concat().contains(&marker)
+    let joined = fields.join(" ");
+    let Some(start) = joined.rfind(DELIVERY_NONCE_PREFIX) else {
+        return false;
+    };
+    let tail = &joined[start + DELIVERY_NONCE_PREFIX.len()..];
+    let Some(end) = tail.find(DELIVERY_NONCE_SUFFIX) else {
+        return false;
+    };
+    tail[..end].trim() == delivery_nonce
 }
 
 fn message_string_fields(message: &OpencodeMessage) -> Vec<&str> {
@@ -311,22 +312,22 @@ fn value_string_fields(value: &Value) -> Vec<&str> {
     Vec::new()
 }
 
-fn delivery_nonce_from_payload(payload: &str) -> Option<String> {
-    let start = payload.find(DELIVERY_NONCE_PREFIX)? + DELIVERY_NONCE_PREFIX.len();
-    let tail = &payload[start..];
-    let end = tail.find(DELIVERY_NONCE_SUFFIX)?;
-    let nonce = tail[..end].trim();
-    (!nonce.is_empty()).then(|| nonce.to_string())
+pub(crate) fn delivery_marker(delivery_nonce: &str) -> String {
+    format!("{DELIVERY_NONCE_PREFIX}{delivery_nonce}{DELIVERY_NONCE_SUFFIX}")
 }
 
-fn delivery_marker(delivery_nonce: &str) -> String {
-    format!("{DELIVERY_NONCE_PREFIX}{delivery_nonce}{DELIVERY_NONCE_SUFFIX}")
+pub(crate) fn message_has_delivery_nonce(message: &OpencodeMessage, delivery_nonce: &str) -> bool {
+    message_contains_delivery_nonce(message, delivery_nonce)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::text_sha256_matches;
+    use super::{
+        observation_from_export, text_sha256_matches, ResumeCompletion, ResumeMatchIdentity,
+    };
     use crate::encoding::sha256_hex;
+    use crate::opencode;
+    use serde_json::json;
 
     #[test]
     fn quoted_native_text_matches_payload_with_literal_newline() {
@@ -348,5 +349,80 @@ mod tests {
             &native,
             &sha256_hex(payload.as_bytes())
         ));
+    }
+
+    #[test]
+    fn request_delivery_nonce_does_not_consume_identical_sibling_completion() {
+        let native = opencode::parse_export_stdout(
+            serde_json::to_vec(&json!({
+                "info": {"id": "session-1", "title": "sibling delivery"},
+                "messages": [
+                    {
+                        "info": {
+                            "id": "message-a",
+                            "role": "user",
+                            "sessionID": "session-1",
+                            "model": {
+                                "providerID": "openai",
+                                "modelID": "gpt-5.6-luna",
+                                "variant": "low"
+                            },
+                            "time": {"created": 10}
+                        },
+                        "parts": [{"type": "text", "text": "same payload\n\n[OULIPOLY-DELIVERY request-a]"}]
+                    },
+                    {
+                        "info": {
+                            "id": "message-b",
+                            "role": "user",
+                            "sessionID": "session-1",
+                            "model": {
+                                "providerID": "openai",
+                                "modelID": "gpt-5.6-luna",
+                                "variant": "low"
+                            },
+                            "time": {"created": 11}
+                        },
+                        "parts": [{"type": "text", "text": "same payload\n\n[OULIPOLY-DELIVERY request-a]\n\n[OULIPOLY-DELIVERY request-b]"}]
+                    },
+                    {
+                        "info": {
+                            "id": "assistant-b",
+                            "role": "assistant",
+                            "sessionID": "session-1",
+                            "providerID": "openai",
+                            "modelID": "gpt-5.6-luna",
+                            "variant": "low",
+                            "time": {"created": 12, "completed": 13}
+                        },
+                        "parts": [{"type": "text", "text": "done"}]
+                    }
+                ]
+            }))
+            .expect("serialize sibling export")
+            .as_slice(),
+        )
+        .expect("parse sibling export");
+        let payload_sha256 = sha256_hex(b"same payload");
+        let identity = ResumeMatchIdentity {
+            session_id: "session-1",
+            prompt_sha256: payload_sha256.clone(),
+            delivery_nonce: Some("request-a"),
+            started_at_unix_ms: 10,
+            provider_id: "openai",
+            model_id: "gpt-5.6-luna",
+            variant: "low",
+        };
+
+        let observation = observation_from_export(&native, &identity);
+
+        assert_eq!(observation.completion, ResumeCompletion::Unconfirmed);
+        assert_eq!(
+            observation
+                .submitted_user_turn
+                .as_ref()
+                .and_then(|marker| marker["message_id"].as_str()),
+            Some("message-a")
+        );
     }
 }

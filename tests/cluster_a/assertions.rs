@@ -503,18 +503,32 @@ pub fn assert_oversized_prompt_segments(wrapper_log_path: &Path, prompt: &str) {
     );
     let boundary = argv_arg_index_owned(&argv, "--");
     let segments = &argv[boundary + 1..];
-    assert!(segments.len() > 1, "oversized prompt must be tokenized");
+    let delivery = segments
+        .iter()
+        .position(|segment| segment.starts_with("[OULIPOLY-DELIVERY"))
+        .expect("provider delivery marker must follow the prompt");
+    let prompt_segments = &segments[..delivery];
+    assert!(
+        prompt_segments.len() > 1,
+        "oversized prompt must be tokenized"
+    );
     assert!(
         segments.iter().all(|segment| !segment.contains(' ')),
         "generated message tokens must not contain ASCII spaces"
     );
     for option_text in ["--share", "--attach", "--session", "-m"] {
         assert!(
-            segments.iter().any(|segment| segment == option_text),
+            prompt_segments.iter().any(|segment| segment == option_text),
             "{option_text} must remain positional message text"
         );
     }
-    assert_eq!(opencode_1_18_9_message(segments), prompt);
+    assert_eq!(opencode_1_18_9_message(prompt_segments), prompt);
+    assert!(
+        segments[delivery..]
+            .join(" ")
+            .starts_with("[OULIPOLY-DELIVERY "),
+        "provider delivery marker must remain recognizable after tokenization"
+    );
 }
 
 pub fn assert_short_prompt_argv_unchanged(wrapper_log_path: &Path) {
@@ -523,7 +537,11 @@ pub fn assert_short_prompt_argv_unchanged(wrapper_log_path: &Path) {
         .iter()
         .map(|arg| (*arg).to_string())
         .collect::<Vec<_>>();
-    assert_eq!(argv, expected);
+    assert_eq!(&argv[..expected.len()], expected);
+    assert_eq!(argv.len(), expected.len() + 1);
+    assert!(argv
+        .last()
+        .is_some_and(|arg| { arg.starts_with("[OULIPOLY-DELIVERY ") && arg.ends_with(']') }));
 }
 
 pub fn assert_oversized_resume_prompt(
@@ -705,10 +723,12 @@ pub fn assert_submitted_user_turn_message_id(marker: &Value) {
 }
 
 pub fn assert_submitted_user_turn_delivery_nonce(marker: &Value) {
-    assert_eq!(
-        marker["value"]["delivery_nonce"].as_str(),
-        Some("5169694d-de0f-40d1-890c-6e28e55bab27")
-    );
+    let nonce = marker["value"]["delivery_nonce"]
+        .as_str()
+        .expect("provider-authored delivery nonce");
+    assert_eq!(nonce.len(), 64);
+    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(nonce, "5169694d-de0f-40d1-890c-6e28e55bab27");
 }
 
 pub fn assert_empty_resume_payload_rejected(

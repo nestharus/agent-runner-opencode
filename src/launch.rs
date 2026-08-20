@@ -23,6 +23,7 @@ use crate::policy;
 use crate::request_custody::{CustodyError, RequestCustody};
 use crate::resume_observation::{
     self, DurableResumeObservationRequest, ResumeObservation, ResumeObservationRequest,
+    RouteIdentity as ResumeRouteIdentity,
 };
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,8 @@ struct LaunchRequestState {
     request_identity_sha256: String,
     binding_sha256: String,
     prompt_sha256: Option<String>,
+    #[serde(default)]
+    delivery_nonce: Option<String>,
     recovery: LaunchRecoveryIdentity,
     phase: LaunchRequestPhase,
     actor_process_group_id: Option<u32>,
@@ -230,7 +233,7 @@ pub(crate) fn stream<W: Write>(
         new_session,
         &declared_env,
     )?;
-    let effective = match launch_argv(&params, host, request_id)? {
+    let effective = match launch_argv(&params, host, request_id, &request_identity_sha256)? {
         PolicyLaunch::Accepted(effective) => *effective,
         PolicyLaunch::Rejected(reason) => {
             return stream_policy_rejection(request_id, writer, reason).map(|exit_code| {
@@ -284,6 +287,7 @@ pub(crate) fn stream<W: Write>(
                 request_identity_sha256,
                 binding_sha256,
                 prompt_sha256,
+                effective.delivery_nonce,
                 recovery,
             )?),
             None,
@@ -408,6 +412,7 @@ struct EffectiveLaunch {
     execution_env: BTreeMap<String, String>,
     stdin: Option<Vec<u8>>,
     prompt: Option<String>,
+    delivery_nonce: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
     route: policy::PolicyRouteIdentity,
     route_evidence: Value,
@@ -423,6 +428,7 @@ fn launch_argv(
     params: &LaunchParams,
     host: &HostContext,
     request_id: &str,
+    request_identity_sha256: &str,
 ) -> Result<PolicyLaunch, ProviderFailure> {
     validate_launch_session(params, request_id)?;
     let stdin = policy_stdin_for_launch(params.stdin.as_ref(), request_id)?;
@@ -440,7 +446,7 @@ fn launch_argv(
     )?;
     match decision {
         policy::PolicyDecision::Accepted(plan) => Ok(PolicyLaunch::Accepted(Box::new(
-            effective_launch(params, plan, host, request_id)?,
+            effective_launch(params, plan, host, request_id, request_identity_sha256)?,
         ))),
         policy::PolicyDecision::Rejected(plan) => {
             Ok(PolicyLaunch::Rejected(policy_rejection_reason(&plan)))
@@ -453,6 +459,7 @@ fn effective_launch(
     plan: policy::PolicyLaunchPlan,
     host: &HostContext,
     request_id: &str,
+    request_identity_sha256: &str,
 ) -> Result<EffectiveLaunch, ProviderFailure> {
     let policy::PolicyLaunchPlan {
         mut argv,
@@ -478,10 +485,27 @@ fn effective_launch(
     if let Some(program) = argv.first_mut() {
         *program = native_runtime.program().to_string();
     }
-    let stdin = stdin.map(String::into_bytes);
-    let argv = resume_argv(params, argv, stdin.as_deref(), request_id)?;
+    let argv = resume_argv(
+        params,
+        argv,
+        stdin.as_deref().map(str::as_bytes),
+        request_id,
+    )?;
+    let submitted_payload = submitted_launch_payload(&argv, stdin.as_deref().map(str::as_bytes));
+    let delivery_nonce = Some(launch_delivery_nonce(
+        host,
+        request_id,
+        request_identity_sha256,
+    ));
+    let (argv, stdin) = attach_launch_delivery_marker(
+        argv,
+        stdin,
+        delivery_nonce
+            .as_deref()
+            .expect("provider-authored launch delivery nonce"),
+    );
     let resume_observation_request =
-        resume_observation_request(params, stdin.as_deref(), &argv, &route);
+        resume_observation_request(params, submitted_payload, delivery_nonce.as_deref(), &route);
     let mut activity_targets = ActivityTargets::default();
     policy::append_route_activity_targets(&mut activity_targets, &route);
     let argv = split_oversized_prompt_argv(argv, request_id)?;
@@ -489,8 +513,9 @@ fn effective_launch(
         argv,
         env,
         execution_env,
-        stdin,
+        stdin: stdin.map(String::into_bytes),
         prompt,
+        delivery_nonce,
         resume_observation_request,
         route,
         route_evidence: json!(markers),
@@ -560,20 +585,24 @@ fn resume_argv(
 
 fn resume_observation_request(
     params: &LaunchParams,
-    stdin: Option<&[u8]>,
-    argv: &[String],
+    submitted_payload: Option<String>,
+    delivery_nonce: Option<&str>,
     route: &policy::PolicyRouteIdentity,
 ) -> Option<ResumeObservationRequest> {
     let session_id = known_provider_session_id(params)?;
-    let prompt = submitted_resume_payload(argv, stdin)?;
+    let prompt = submitted_payload?;
+    let delivery_nonce = delivery_nonce?;
     Some(ResumeObservationRequest::new(
         route.account_wrapper.clone(),
         session_id.to_string(),
         prompt,
+        delivery_nonce.to_string(),
         now_unix_ms(),
-        route.provider_id.clone(),
-        route.model_id.clone(),
-        route.effort.to_string(),
+        ResumeRouteIdentity {
+            provider_id: route.provider_id.clone(),
+            model_id: route.model_id.clone(),
+            variant: route.effort.to_string(),
+        },
     ))
 }
 
@@ -623,18 +652,63 @@ fn require_resume_payload_reaches_child(
             "resume launch with option-shaped positional values must place -- before the message so its exact native identity can be retained",
         ));
     }
-    if submitted_resume_payload(argv, stdin).is_some() {
+    if submitted_launch_payload(argv, stdin).is_some() {
         return Ok(());
     }
     Err(empty_resume_payload_failure(request_id))
 }
 
-fn submitted_resume_payload(argv: &[String], stdin: Option<&[u8]>) -> Option<String> {
+fn submitted_launch_payload(argv: &[String], stdin: Option<&[u8]>) -> Option<String> {
     stdin
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .filter(|text| !text.trim().is_empty())
         .map(str::to_string)
         .or_else(|| opencode_argv_payload(argv))
+}
+
+fn launch_delivery_nonce(
+    host: &HostContext,
+    request_id: &str,
+    request_identity_sha256: &str,
+) -> String {
+    sha256_hex(
+        [
+            b"agent-runner-opencode.launch.delivery.v1".as_slice(),
+            &[0],
+            host.app.as_bytes(),
+            &[0],
+            host.data_root.as_deref().unwrap_or_default().as_bytes(),
+            &[0],
+            request_id.as_bytes(),
+            &[0],
+            request_identity_sha256.as_bytes(),
+        ]
+        .concat()
+        .as_slice(),
+    )
+}
+
+fn attach_launch_delivery_marker(
+    mut argv: Vec<String>,
+    mut stdin: Option<String>,
+    delivery_nonce: &str,
+) -> (Vec<String>, Option<String>) {
+    let marker = resume_observation::delivery_marker(delivery_nonce);
+    if stdin
+        .as_ref()
+        .is_some_and(|payload| !payload.trim().is_empty())
+    {
+        let payload = stdin.as_mut().expect("checked launch stdin payload");
+        if !payload.ends_with('\n') {
+            payload.push('\n');
+        }
+        payload.push('\n');
+        payload.push_str(&marker);
+        payload.push('\n');
+        return (argv, stdin);
+    }
+    argv.push(marker);
+    (argv, stdin)
 }
 
 fn opencode_argv_payload(argv: &[String]) -> Option<String> {
@@ -1103,6 +1177,9 @@ fn reconcile_existing_launch_request(
         let mut state: LaunchRequestState = serde_json::from_slice(&bytes)
             .map_err(|error| launch_state_invalid(request_id, error))?;
         validate_launch_request_state(&state, request_id)?;
+        if state.schema_version == 5 {
+            state.delivery_nonce = None;
+        }
         if state.request_identity_sha256 != request_identity_sha256 {
             return Err(launch_request_reuse_conflict(
                 request_id,
@@ -1151,6 +1228,9 @@ fn reconcile_existing_launch_request(
     let mut state: ResumeLaunchRequestState =
         serde_json::from_slice(&bytes).map_err(|error| launch_state_invalid(request_id, error))?;
     validate_resume_launch_request_state(&state, request_id)?;
+    if state.schema_version == 5 {
+        state.observation.delivery_nonce = None;
+    }
     if state.request_identity_sha256 != request_identity_sha256 {
         return Err(resume_launch_request_reuse_conflict(
             request_id,
@@ -1236,6 +1316,7 @@ impl LaunchRequestGuard {
         request_identity_sha256: String,
         binding_sha256: String,
         prompt_sha256: Option<String>,
+        delivery_nonce: Option<String>,
         recovery: LaunchRecoveryContext,
     ) -> Result<Self, ProviderFailure> {
         let root = launch_state_root(host, request_id)?;
@@ -1256,6 +1337,9 @@ impl LaunchRequestGuard {
                 let mut state: LaunchRequestState = serde_json::from_slice(&bytes)
                     .map_err(|error| launch_state_invalid(request_id, error))?;
                 validate_launch_request_state(&state, request_id)?;
+                if state.schema_version == 5 {
+                    state.delivery_nonce = None;
+                }
                 if state.request_identity_sha256 != request_identity_sha256 {
                     return Err(launch_request_reuse_conflict(
                         request_id,
@@ -1309,12 +1393,13 @@ impl LaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = LaunchRequestState {
-            schema_version: 5,
+            schema_version: 6,
             operation_kind: LaunchOperationKind::NewSession,
             request_id: request_id.to_string(),
             request_identity_sha256,
             binding_sha256,
             prompt_sha256,
+            delivery_nonce,
             recovery: recovery.identity,
             phase: LaunchRequestPhase::Prepared,
             actor_process_group_id: None,
@@ -1413,6 +1498,9 @@ impl ResumeLaunchRequestGuard {
                 let mut state: ResumeLaunchRequestState = serde_json::from_slice(&bytes)
                     .map_err(|error| launch_state_invalid(request_id, error))?;
                 validate_resume_launch_request_state(&state, request_id)?;
+                if state.schema_version == 5 {
+                    state.observation.delivery_nonce = None;
+                }
                 if state.request_identity_sha256 != request_identity_sha256 {
                     return Err(resume_launch_request_reuse_conflict(
                         request_id,
@@ -1498,7 +1586,7 @@ impl ResumeLaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = ResumeLaunchRequestState {
-            schema_version: 5,
+            schema_version: 6,
             operation_kind: LaunchOperationKind::Resume,
             request_id: request_id.to_string(),
             request_identity_sha256,
@@ -1823,13 +1911,19 @@ fn recover_prepared_launch(
     if candidates.len() > MAX_LAUNCH_RECOVERY_CANDIDATES {
         return Ok(PreparedLaunchRecovery::Ambiguous(candidates));
     }
-    let Some(prompt_sha256) = state.prompt_sha256.as_deref() else {
+    let Some(delivery_nonce) = state.delivery_nonce.as_deref() else {
         return Ok(PreparedLaunchRecovery::Ambiguous(candidates));
     };
     let mut matched = Vec::new();
     for session_id in &candidates {
-        if recovered_session_matches_request(host, started, state, &env, session_id, prompt_sha256)?
-        {
+        if recovered_session_matches_request(
+            host,
+            started,
+            state,
+            &env,
+            session_id,
+            delivery_nonce,
+        )? {
             matched.push(session_id.clone());
         }
     }
@@ -1904,7 +1998,7 @@ fn recovered_session_matches_request(
     state: &LaunchRequestState,
     env: &BTreeMap<String, String>,
     session_id: &str,
-    prompt_sha256: &str,
+    delivery_nonce: &str,
 ) -> Result<bool, ProviderFailure> {
     let export = opencode::export_with_launch_context(
         session_id,
@@ -1917,7 +2011,21 @@ fn recovered_session_matches_request(
     if export.info.id != session_id {
         return Ok(false);
     }
-    Ok(export.messages.iter().any(|message| {
+    Ok(recovered_session_export_matches_request(
+        &export,
+        state,
+        session_id,
+        delivery_nonce,
+    ))
+}
+
+fn recovered_session_export_matches_request(
+    export: &opencode::OpencodeExport,
+    state: &LaunchRequestState,
+    session_id: &str,
+    delivery_nonce: &str,
+) -> bool {
+    export.messages.iter().any(|message| {
         let (provider_id, model_id, effort) = message.info.model_identity();
         message.info.role == "user"
             && message.info.session_id.as_deref() == Some(session_id)
@@ -1930,12 +2038,8 @@ fn recovered_session_matches_request(
                 .as_ref()
                 .and_then(|time| time.created)
                 .is_some_and(|created| created >= state.prepared_at_unix_ms.saturating_sub(5_000))
-            && message.parts.iter().any(|part| {
-                part.get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| sha256_hex(text.as_bytes()) == prompt_sha256)
-            })
-    }))
+            && resume_observation::message_has_delivery_nonce(message, delivery_nonce)
+    })
 }
 
 fn launch_state_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
@@ -2190,7 +2294,15 @@ fn validate_launch_request_state(
                 && state.observed_at_unix_ms.is_some()
         }
     };
-    if state.schema_version == 5
+    let schema_valid = match state.schema_version {
+        5 => true,
+        6 => state
+            .delivery_nonce
+            .as_deref()
+            .is_some_and(|nonce| !nonce.trim().is_empty()),
+        _ => false,
+    };
+    if schema_valid
         && state.operation_kind == LaunchOperationKind::NewSession
         && state.request_id == request_id
         && !state.request_identity_sha256.trim().is_empty()
@@ -2230,7 +2342,15 @@ fn validate_resume_launch_request_state(
         }
     };
     let observation = &state.observation;
-    if state.schema_version == 5
+    let schema_valid = match state.schema_version {
+        5 => true,
+        6 => observation
+            .delivery_nonce
+            .as_deref()
+            .is_some_and(|nonce| !nonce.trim().is_empty()),
+        _ => false,
+    };
+    if schema_valid
         && state.operation_kind == LaunchOperationKind::Resume
         && state.request_id == request_id
         && !state.request_identity_sha256.trim().is_empty()
@@ -3619,5 +3739,76 @@ mod custody_tests {
         );
         assert!(!first_state.exists());
         assert!(second_state.exists());
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn new_session_recovery_does_not_claim_an_identical_sibling_prompt() {
+        let export = opencode::parse_export_stdout(
+            serde_json::to_vec(&json!({
+                "info": {"id": "session-b", "title": "sibling session"},
+                "messages": [{
+                    "info": {
+                        "id": "message-b",
+                        "role": "user",
+                        "sessionID": "session-b",
+                        "model": {
+                            "providerID": "openai",
+                            "modelID": "gpt-5.6-luna",
+                            "variant": "low"
+                        },
+                        "time": {"created": 20}
+                    },
+                    "parts": [{
+                        "type": "text",
+                        "text": "identical prompt\n\n[OULIPOLY-DELIVERY request-a]\n\n[OULIPOLY-DELIVERY request-b]"
+                    }]
+                }]
+            }))
+            .expect("serialize sibling session export")
+            .as_slice(),
+        )
+        .expect("parse sibling session export");
+        let state = LaunchRequestState {
+            schema_version: 6,
+            operation_kind: LaunchOperationKind::NewSession,
+            request_id: "request-a".to_string(),
+            request_identity_sha256: "identity-a".to_string(),
+            binding_sha256: "binding-a".to_string(),
+            prompt_sha256: Some(sha256_hex(b"identical prompt")),
+            delivery_nonce: Some("request-a".to_string()),
+            recovery: LaunchRecoveryIdentity {
+                program: "opencode1".to_string(),
+                passthrough_env: BTreeMap::new(),
+                declared_env_sha256: "environment".to_string(),
+                working_directory: "/tmp".to_string(),
+                provider_id: "openai".to_string(),
+                model_id: "gpt-5.6-luna".to_string(),
+                effort: "low".to_string(),
+            },
+            phase: LaunchRequestPhase::Prepared,
+            actor_process_group_id: None,
+            provider_session_id: None,
+            terminal_status: None,
+            prepared_at_unix_ms: 20,
+            observed_at_unix_ms: None,
+        };
+
+        assert!(!recovered_session_export_matches_request(
+            &export,
+            &state,
+            "session-b",
+            "request-a"
+        ));
+        assert!(recovered_session_export_matches_request(
+            &export,
+            &state,
+            "session-b",
+            "request-b"
+        ));
     }
 }

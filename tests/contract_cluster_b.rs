@@ -14,6 +14,14 @@ struct RejectFlush {
     accepted: Vec<u8>,
 }
 
+struct InvokeDuringFlush {
+    accepted: Vec<u8>,
+    args: Vec<String>,
+    competing_request: Vec<u8>,
+    competing_exit: Option<i32>,
+    competing_stdout: Vec<u8>,
+}
+
 impl std::io::Write for RejectFlush {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.accepted.extend_from_slice(buffer);
@@ -25,6 +33,24 @@ impl std::io::Write for RejectFlush {
             std::io::ErrorKind::BrokenPipe,
             "simulated buffered terminal enumeration response loss",
         ))
+    }
+}
+
+impl std::io::Write for InvokeDuringFlush {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.accepted.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.competing_exit.is_none() {
+            self.competing_exit = Some(agent_runner_opencode::write_invocation(
+                &self.args,
+                &self.competing_request,
+                &mut self.competing_stdout,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -377,6 +403,75 @@ fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_hand
         consumed["error"]["code"],
         "invalid_session_enumerate_cursor"
     );
+    fs::remove_dir_all(&data_root).expect("remove isolated session snapshot data root");
+}
+
+#[test]
+fn contract_terminal_snapshot_claim_blocks_initial_retry_during_response_handoff() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-terminal-snapshot-claim");
+    fs::create_dir_all(&data_root).expect("create isolated session snapshot data root");
+    let host = json!({"data_root": data_root.to_string_lossy()});
+    let mut initial_request = support::validated_request_envelope(
+        "session.enumerate",
+        session_enumerate_limit_params(2),
+        host,
+        "session.schema.json#/$defs/SessionEnumerateRequest",
+    );
+    initial_request["request_id"] = json!("req-session-enumerate-terminal-claim-initial");
+    support::ensure_default_runtime_settings(&initial_request);
+    let prior_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", &path);
+    let args = vec![
+        "agent-runner-opencode".to_string(),
+        "session.enumerate".to_string(),
+    ];
+    let initial_bytes = serde_json::to_vec(&initial_request).expect("serialize initial request");
+    let mut initial_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(&args, &initial_bytes, &mut initial_stdout),
+        0
+    );
+    let initial_response: Value =
+        serde_json::from_slice(&initial_stdout).expect("parse initial response");
+    let cursor = initial_response["result"]["next_cursor"]
+        .as_str()
+        .expect("terminal continuation cursor");
+    let mut terminal_request = initial_request.clone();
+    terminal_request["request_id"] = json!("req-session-enumerate-terminal-claim-owner");
+    terminal_request["params"] = session_enumerate_cursor_params(2, cursor);
+    let mut handoff = InvokeDuringFlush {
+        accepted: Vec::new(),
+        args: args.clone(),
+        competing_request: initial_bytes,
+        competing_exit: None,
+        competing_stdout: Vec::new(),
+    };
+
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&terminal_request).expect("serialize terminal request"),
+            &mut handoff,
+        ),
+        0
+    );
+    assert_eq!(handoff.competing_exit, Some(2));
+    let competing: Value = serde_json::from_slice(&handoff.competing_stdout)
+        .expect("parse competing initial retry response");
+    assert_eq!(
+        competing["error"]["code"],
+        "session_enumeration_snapshot_terminal_handoff_in_progress"
+    );
+    let terminal: Value =
+        serde_json::from_slice(&handoff.accepted).expect("parse terminal response");
+    assert_second_enumerate_page(&terminal["result"]);
+
+    match prior_path {
+        Some(value) => std::env::set_var("PATH", value),
+        None => std::env::remove_var("PATH"),
+    }
     fs::remove_dir_all(&data_root).expect("remove isolated session snapshot data root");
 }
 
