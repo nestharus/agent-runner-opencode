@@ -80,15 +80,17 @@ while the optional `chatgpt-usage` test override parses its stdout only within
 the override branch. Source-aware failures retain whether auth-file parsing,
 WHAM transport/HTTP/protocol handling, or the explicit test override failed;
 each source assigns typed authentication-refresh advice before control returns
-to quota orchestration. Refresh availability is decided from the typed probe,
-and the quota command projects the observation or failure once into the public
-result.
+to quota orchestration. `quota.probe` is observation-only: authentication
+failures project actionable advice to call the separately durable
+`quota.refresh_auth` operation instead of mutating credentials inside the probe
+lifecycle. Refresh availability is decided from the typed probe, and the quota
+command projects the observation or failure once into the public result.
 
 The OpenCode auth crossing does not equate a zero-exit `auth list` with a
 refresh. It returns a typed observation that distinguishes command success from
-an observed before/after change in the selected credential source. Automatic
-retry and the public `refreshed` flag require that credential change;
-post-operation quota availability is reported independently.
+an observed before/after change in the selected credential source. The public
+`refreshed` flag requires that credential change; post-operation quota
+availability is reported independently.
 
 `quota.refresh_auth` also takes durable custody of each request before admitting
 the native auth command. The request binding includes the complete parameter

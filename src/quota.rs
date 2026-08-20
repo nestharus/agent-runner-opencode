@@ -525,56 +525,7 @@ fn probe_account(account: &AccountProfile) -> Value {
     if !auth_has_source(&auth_path) {
         return unreadable_auth_probe_result();
     }
-    let observation = run_probe(&auth_path);
-    if observation
-        .as_ref()
-        .is_err_and(QuotaObservationFailure::needs_auth_refresh)
-    {
-        return probe_after_auth_refresh(
-            account,
-            &auth_path,
-            observation.expect_err("refresh path requires an observation failure"),
-        );
-    }
-    probe_observation_result(observation)
-}
-
-fn probe_after_auth_refresh(
-    account: &AccountProfile,
-    auth_path: &Path,
-    first: QuotaObservationFailure,
-) -> Value {
-    match run_account_auth_refresh(account, auth_path) {
-        Ok(refresh) if refresh.credentials_refreshed() => {
-            probe_observation_result(run_probe(auth_path))
-        }
-        Ok(refresh) => unavailable_result(auth_refresh_not_observed_detail(&first, &refresh)),
-        Err(err) => unavailable_result(auth_refresh_spawn_failed_detail(&first, err)),
-    }
-}
-
-fn auth_refresh_not_observed_detail(
-    first: &QuotaObservationFailure,
-    refresh: &OpencodeAuthObservation,
-) -> String {
-    if !refresh.command_succeeded() {
-        return format!(
-            "{} (opencode auth list failed: {})",
-            first.detail,
-            opencode_command_failure_detail(&refresh.output)
-        );
-    }
-    format!("{} ({})", first.detail, auth_effect_detail(refresh.effect))
-}
-
-fn auth_refresh_spawn_failed_detail(
-    first: &QuotaObservationFailure,
-    err: std::io::Error,
-) -> String {
-    format!(
-        "{} (failed to run opencode auth refresh: {err})",
-        first.detail
-    )
+    probe_observation_result(run_probe(&auth_path))
 }
 
 fn unreadable_auth_probe_result() -> Value {
@@ -590,8 +541,18 @@ fn probe_observation_result(
 ) -> Value {
     match observation {
         Ok(observation) => available_probe_result(&observation.windows),
-        Err(failure) => unavailable_result(failure.detail),
+        Err(failure) => unavailable_result(quota_observation_failure_detail(failure)),
     }
+}
+
+fn quota_observation_failure_detail(failure: QuotaObservationFailure) -> String {
+    if failure.needs_auth_refresh() {
+        return format!(
+            "{} (authentication refresh required; invoke quota.refresh_auth with a new request_id before probing again)",
+            failure.detail
+        );
+    }
+    failure.detail
 }
 
 fn unavailable_result(detail: String) -> Value {

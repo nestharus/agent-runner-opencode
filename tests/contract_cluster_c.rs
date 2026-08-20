@@ -295,21 +295,21 @@ fn contract_native_wham_401_carries_typed_refresh_advice() {
     );
 
     assert!(
-        marker.exists(),
-        "structured WHAM 401 must request auth refresh; result={result}"
+        !marker.exists(),
+        "quota.probe must project refresh advice without mutating auth; result={result}"
     );
     assert_eq!(result["available"], false);
     let detail = result["detail"].as_str().expect("native 401 detail");
     assert!(detail.contains("ChatGPT WHAM API returned HTTP 401"));
+    assert!(detail.contains("invoke quota.refresh_auth"));
     assert!(!detail.contains("chatgpt-usage"));
 }
 
 #[test]
-fn contract_quota_probe_refreshes_native_auth_on_401_then_retries() {
-    let raw_windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
-        .expect("captured chatgpt-usage fixture should parse");
+fn contract_quota_probe_reports_refresh_requirement_without_mutating_auth() {
     let home = HomeFixture::new("agent-runner-opencode-quota-probe-refresh-home");
     let auth_path = home.write_paired_auth(opencode_auth_json("expired", "acct").as_bytes());
+    let auth_before = file_sha256(&auth_path);
     let marker = home.path.join("refresh-ran");
     let fake_usage = FakeChatgptUsage::with_script(fake_chatgpt_usage_401_then_success_script(
         &marker,
@@ -337,12 +337,24 @@ fn contract_quota_probe_refreshes_native_auth_on_401_then_retries() {
         "quota.schema.json#/$defs/QuotaProbeResult",
     );
 
-    assert_available_probe_result(&result, &raw_windows);
+    assert_eq!(result["available"], false);
+    assert!(result["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("invoke quota.refresh_auth")));
     assert_probe_invocation(fake_usage.log_path(), &auth_path);
     let log = optional_usage_log(fake_usage.log_path());
     assert!(
-        log.contains("auth argv=auth list"),
-        "quota.probe must invoke opencode auth list before retry; log={log:?}"
+        !log.contains("auth argv=auth list"),
+        "quota.probe must never invoke opencode auth list; log={log:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "quota.probe must not run the auth wrapper"
+    );
+    assert_eq!(
+        file_sha256(&auth_path),
+        auth_before,
+        "quota.probe must leave the selected credential source unchanged"
     );
 }
 
