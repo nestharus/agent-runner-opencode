@@ -14,6 +14,7 @@ use crate::account::{
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
 use crate::models::{default_model, model_alias, model_alias_matches, DEFAULT_MODEL_ALIAS};
+use crate::path_guard;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -367,6 +368,7 @@ fn mutate_store<T>(
         .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
     let lock_path = parent.join(STORE_LOCK_FILE);
     ensure_store_path_contained(&lock_path, &config_root, request_id)?;
+    ensure_store_path_contained(&path, &config_root, request_id)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -607,7 +609,10 @@ fn sync_store_parent(parent: &Path, request_id: &str) -> Result<(), ProviderFail
 }
 
 fn store_path(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    Ok(store_path_from_root(&config_root(host, request_id)?))
+    let config_root = config_root(host, request_id)?;
+    let path = store_path_from_root(&config_root);
+    ensure_store_path_contained(&path, &config_root, request_id)?;
+    Ok(path)
 }
 
 fn config_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
@@ -642,95 +647,9 @@ fn ensure_store_path_contained(
     config_root: &Path,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let canonical_root = canonical_store_path(config_root, request_id)?;
-    let canonical_target = canonical_store_create_path(path, request_id)?;
-    validate_store_path_contained(&canonical_target, &canonical_root, request_id)
-}
-
-fn validate_store_path_contained(
-    canonical_target: &Path,
-    canonical_root: &Path,
-    request_id: &str,
-) -> Result<(), ProviderFailure> {
-    if canonical_target.starts_with(canonical_root) {
-        return Ok(());
-    }
-    Err(settings_store_outside_provider_root_failure(request_id))
-}
-
-fn canonical_store_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    fs::canonicalize(path).map_err(|err| settings_store_canonicalize_failure(request_id, err))
-}
-
-fn canonical_store_create_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    let existing = existing_store_ancestor_path(path, request_id)?;
-    let mut canonical = canonical_store_path(existing, request_id)?;
-    append_store_suffix(
-        &mut canonical,
-        store_path_suffix(path, existing, request_id)?,
-        request_id,
-    )?;
-    Ok(canonical)
-}
-
-fn existing_store_ancestor_path<'a>(
-    path: &'a Path,
-    request_id: &str,
-) -> Result<&'a Path, ProviderFailure> {
-    existing_store_ancestor(path).ok_or_else(|| settings_store_missing_ancestor_failure(request_id))
-}
-
-fn store_path_suffix<'a>(
-    path: &'a Path,
-    existing: &'a Path,
-    request_id: &str,
-) -> Result<&'a Path, ProviderFailure> {
-    path.strip_prefix(existing)
-        .map_err(|_| settings_store_outside_provider_root_failure(request_id))
-}
-
-fn append_store_suffix(
-    canonical: &mut PathBuf,
-    suffix: &Path,
-    request_id: &str,
-) -> Result<(), ProviderFailure> {
-    for component in suffix.components() {
-        push_store_component(canonical, component, request_id)?;
-    }
-    Ok(())
-}
-
-fn push_store_component(
-    canonical: &mut PathBuf,
-    component: std::path::Component<'_>,
-    request_id: &str,
-) -> Result<(), ProviderFailure> {
-    ensure_store_component_pushable(component, request_id)?;
-    push_valid_store_component(canonical, component);
-    Ok(())
-}
-
-fn ensure_store_component_pushable(
-    component: std::path::Component<'_>,
-    request_id: &str,
-) -> Result<(), ProviderFailure> {
-    if is_store_component_pushable(component) {
-        return Ok(());
-    }
-    Err(settings_store_outside_provider_root_failure(request_id))
-}
-
-fn is_store_component_pushable(component: std::path::Component<'_>) -> bool {
-    matches!(
-        component,
-        std::path::Component::Normal(_) | std::path::Component::CurDir
-    )
-}
-
-fn push_valid_store_component(canonical: &mut PathBuf, component: std::path::Component<'_>) {
-    if let std::path::Component::Normal(part) = component {
-        canonical.push(part);
-    }
+    path_guard::confined_target(config_root, path)
+        .map(|_| ())
+        .map_err(|err| settings_store_confinement_failure(request_id, err))
 }
 
 fn store_io_failure(request_id: &str, code: &'static str, err: std::io::Error) -> ProviderFailure {
@@ -1607,14 +1526,6 @@ fn missing_config_root_failure(request_id: &str) -> ProviderFailure {
     )
 }
 
-fn settings_store_outside_provider_root_failure(request_id: &str) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "settings_store_outside_provider_root",
-        "settings store path must stay under host.config_root",
-    )
-}
-
 fn unknown_runtime_settings_id_failure(request_id: &str, settings_id: &str) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
@@ -1623,23 +1534,11 @@ fn unknown_runtime_settings_id_failure(request_id: &str, settings_id: &str) -> P
     )
 }
 
-fn settings_store_canonicalize_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
+fn settings_store_confinement_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
     ProviderFailure::internal(
         request_id,
-        "settings_store_canonicalize_failed",
-        format!("failed to canonicalize provider settings path: {err}"),
-    )
-}
-
-fn existing_store_ancestor(path: &Path) -> Option<&Path> {
-    path.ancestors().find(|ancestor| ancestor.exists())
-}
-
-fn settings_store_missing_ancestor_failure(request_id: &str) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "settings_store_outside_provider_root",
-        "settings store path must have an existing host.config_root ancestor",
+        "settings_store_confinement_failed",
+        format!("failed to confine provider settings path: {err}"),
     )
 }
 

@@ -3,6 +3,7 @@
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
+use crate::path_guard;
 use crate::settings::resolve_runtime_settings;
 use fs2::FileExt;
 use serde_json::{json, Value};
@@ -274,6 +275,8 @@ fn acquire_rotation_lock(
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
     let root = rotation_state_root(host, request_id)?;
+    let lock_path =
+        confined_rotation_state_target(host, &root.join("materialize.lock"), request_id)?;
     fs::create_dir_all(&root).map_err(|error| rotation_state_failure(request_id, error))?;
     set_private_directory_permissions(&root)
         .map_err(|error| rotation_state_failure(request_id, error))?;
@@ -282,7 +285,7 @@ fn acquire_rotation_lock(
         .write(true)
         .create(true)
         .truncate(false)
-        .open(root.join("materialize.lock"))
+        .open(lock_path)
         .map_err(|error| rotation_state_failure(request_id, error))?;
     lock.lock_exclusive()
         .map_err(|error| rotation_state_failure(request_id, error))?;
@@ -294,9 +297,10 @@ fn authorization_path(
     binding: &RotationBinding,
     request_id: &str,
 ) -> Result<PathBuf, ProviderFailure> {
-    Ok(rotation_state_root(host, request_id)?
+    let path = rotation_state_root(host, request_id)?
         .join("authorizations")
-        .join(format!("{}.json", binding_digest(binding))))
+        .join(format!("{}.json", binding_digest(binding)));
+    confined_rotation_state_target(host, &path, request_id)
 }
 
 fn materialization_receipt_path(
@@ -304,16 +308,26 @@ fn materialization_receipt_path(
     binding: &RotationBinding,
     request_id: &str,
 ) -> Result<PathBuf, ProviderFailure> {
-    Ok(rotation_state_root(host, request_id)?
+    let path = rotation_state_root(host, request_id)?
         .join("materializations")
-        .join(format!("{}.json", binding_digest(binding))))
+        .join(format!("{}.json", binding_digest(binding)));
+    confined_rotation_state_target(host, &path, request_id)
 }
 
 fn rotation_state_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
+    let data_root = rotation_data_root(host, request_id)?;
+    let path = data_root.join(ROTATION_STATE_DIR);
+    confined_rotation_state_target(host, &path, request_id)
+}
+
+fn rotation_data_root<'a>(
+    host: &'a HostContext,
+    request_id: &str,
+) -> Result<&'a Path, ProviderFailure> {
     host.data_root
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .map(|root| Path::new(root).join(ROTATION_STATE_DIR))
+        .map(Path::new)
         .ok_or_else(|| {
             ProviderFailure::invalid_request(
                 request_id,
@@ -321,6 +335,16 @@ fn rotation_state_root(host: &HostContext, request_id: &str) -> Result<PathBuf, 
                 "rotation operations require host.data_root",
             )
         })
+}
+
+fn confined_rotation_state_target(
+    host: &HostContext,
+    target: &Path,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let data_root = rotation_data_root(host, request_id)?;
+    path_guard::confined_target(data_root, target)
+        .map_err(|error| rotation_state_failure(request_id, error))
 }
 
 fn read_materialization_receipt(
@@ -387,9 +411,10 @@ fn write_rotation_decision_receipt(
     let bytes =
         serde_json::to_vec(&record).map_err(|error| rotation_state_failure(request_id, error))?;
     let digest = sha256_hex(&bytes);
-    let path = rotation_state_root(host, request_id)?
+    let candidate = rotation_state_root(host, request_id)?
         .join("decisions")
         .join(format!("{digest}.json"));
+    let path = confined_rotation_state_target(host, &candidate, request_id)?;
     write_private_bytes_atomic(&path, &bytes)
         .map_err(|error| rotation_state_failure(request_id, error))?;
     Ok(json!({
@@ -542,23 +567,15 @@ fn rotation_artifact_path(
     artifact_bytes: &[u8],
     request_id: &str,
 ) -> Result<PathBuf, ProviderFailure> {
-    let data_root = host
-        .data_root
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ProviderFailure::invalid_request(
-                request_id,
-                "rotation_data_root_missing",
-                "rotation.materialize requires host.data_root",
-            )
-        })?;
+    let data_root = rotation_data_root(host, request_id)?;
     let artifact_id = sha256_hex(artifact_bytes);
-    Ok(Path::new(data_root)
+    let path = data_root
         .join("provider-artifacts")
         .join("opencode")
         .join("rotation")
-        .join(format!("{artifact_id}.json")))
+        .join(format!("{artifact_id}.json"));
+    path_guard::confined_target(data_root, &path)
+        .map_err(|error| rotation_artifact_failure(request_id, error))
 }
 
 fn rotation_working_directory<'a>(

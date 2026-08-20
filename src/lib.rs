@@ -10,6 +10,7 @@ pub mod launch;
 pub mod migration;
 pub mod models;
 pub mod opencode;
+pub mod path_guard;
 pub mod policy;
 pub mod quota;
 pub mod quota_adapter;

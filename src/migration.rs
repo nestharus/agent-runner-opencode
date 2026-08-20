@@ -2,6 +2,7 @@
 
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
+use crate::path_guard;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
@@ -219,12 +220,9 @@ fn ensure_canonical_contained(
     config_root: &Path,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let canonical_root = canonical_path(config_root, request_id)?;
-    let canonical_requested = canonical_create_path(requested, request_id)?;
-    if canonical_requested.starts_with(canonical_root) {
-        return Ok(());
-    }
-    Err(invalid_artifact_root(request_id))
+    path_guard::confined_target(config_root, requested)
+        .map(|_| ())
+        .map_err(|_| invalid_artifact_root(request_id))
 }
 
 fn validated_normalized_absolute_path(
@@ -257,65 +255,6 @@ fn ensure_no_parent_component(path: &Path, request_id: &str) -> Result<(), Provi
         return Err(invalid_artifact_root(request_id));
     }
     Ok(())
-}
-
-fn canonical_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    fs::canonicalize(path)
-        .map_err(|err| migration_artifact_root_canonicalize_failure(request_id, err))
-}
-
-fn canonical_create_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    let existing = existing_ancestor_path(path, request_id)?;
-    let suffix = create_path_suffix(path, existing, request_id)?;
-    ensure_create_path_suffix(suffix, request_id)?;
-    let mut canonical = canonical_path(existing, request_id)?;
-    append_create_path_suffix(&mut canonical, suffix);
-    Ok(canonical)
-}
-
-fn existing_ancestor_path<'a>(
-    path: &'a Path,
-    request_id: &str,
-) -> Result<&'a Path, ProviderFailure> {
-    existing_ancestor(path).ok_or_else(|| invalid_artifact_root(request_id))
-}
-
-fn create_path_suffix<'a>(
-    path: &'a Path,
-    existing: &'a Path,
-    request_id: &str,
-) -> Result<&'a Path, ProviderFailure> {
-    path.strip_prefix(existing)
-        .map_err(|_| invalid_artifact_root(request_id))
-}
-
-fn ensure_create_path_suffix(suffix: &Path, request_id: &str) -> Result<(), ProviderFailure> {
-    for component in suffix.components() {
-        if !is_create_path_suffix_component(component) {
-            return Err(invalid_artifact_root(request_id));
-        }
-    }
-    Ok(())
-}
-
-fn is_create_path_suffix_component(component: Component<'_>) -> bool {
-    matches!(component, Component::Normal(_) | Component::CurDir)
-}
-
-fn append_create_path_suffix(canonical: &mut PathBuf, suffix: &Path) {
-    for component in suffix.components() {
-        push_create_path_component(canonical, component);
-    }
-}
-
-fn push_create_path_component(canonical: &mut PathBuf, component: Component<'_>) {
-    if let Component::Normal(part) = component {
-        canonical.push(part);
-    }
-}
-
-fn existing_ancestor(path: &Path) -> Option<&Path> {
-    path.ancestors().find(|ancestor| ancestor.exists())
 }
 
 fn has_parent_component(path: &Path) -> bool {
@@ -444,17 +383,6 @@ fn migration_confirmation_required_failure(request_id: &str) -> ProviderFailure 
         request_id,
         "migration_confirmation_required",
         "migration.apply requires confirmation.approved=true",
-    )
-}
-
-fn migration_artifact_root_canonicalize_failure(
-    request_id: &str,
-    err: std::io::Error,
-) -> ProviderFailure {
-    ProviderFailure::internal(
-        request_id,
-        "migration_artifact_root_canonicalize_failed",
-        format!("failed to canonicalize migration artifact root: {err}"),
     )
 }
 

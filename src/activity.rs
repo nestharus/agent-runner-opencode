@@ -6,6 +6,7 @@
 
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
+use crate::path_guard;
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
@@ -121,17 +122,18 @@ fn write_activity(
         .as_deref()
         .map(Path::new)
         .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "missing data root"))?;
+    path_guard::confined_target(data_root, root)?;
+    let lock_path = path_guard::confined_target(data_root, &root.join(ACTIVITY_LOCK))?;
+    let path = path_guard::confined_target(data_root, &root.join(ACTIVITY_FILE))?;
     fs::create_dir_all(root)?;
-    ensure_activity_root_contained(data_root, root)?;
     set_private_directory(root)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join(ACTIVITY_LOCK))?;
+        .open(lock_path)?;
     lock.lock_exclusive()?;
-    let path = root.join(ACTIVITY_FILE);
     let existing = match fs::read_to_string(&path) {
         Ok(existing) => existing,
         Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
@@ -207,18 +209,6 @@ fn validate_ledger(existing: &str) -> std::io::Result<(u64, String)> {
 
 fn invalid_ledger(message: &str) -> std::io::Error {
     std::io::Error::new(ErrorKind::InvalidData, message)
-}
-
-fn ensure_activity_root_contained(data_root: &Path, root: &Path) -> std::io::Result<()> {
-    let canonical_data_root = fs::canonicalize(data_root)?;
-    let canonical_root = fs::canonicalize(root)?;
-    if canonical_root.starts_with(canonical_data_root) {
-        return Ok(());
-    }
-    Err(std::io::Error::new(
-        ErrorKind::PermissionDenied,
-        "activity root escapes host.data_root",
-    ))
 }
 
 #[cfg(unix)]

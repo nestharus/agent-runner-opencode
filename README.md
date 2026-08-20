@@ -101,6 +101,12 @@ recording prompts, tokens, or environment values. Rotation authorizations,
 idempotency records, and decision receipts live under the adjacent
 `provider-state/opencode/rotation` tree.
 
+Settings, migration, activity, and rotation all pass every provider-owned
+filesystem target through the same lexical and canonical confinement guard
+before creating a directory or file. Each subsystem retains its own lifecycle
+rules after admission: settings and activity keep their interprocess locks,
+and migration and rotation keep their content-addressed atomic publication.
+
 Activity evidence is operational and explicitly best-effort. A directory,
 lock, write, or chain-validation failure is emitted as a stderr warning but
 does not deny or change the capability result. The recorder never appends past
