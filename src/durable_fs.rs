@@ -28,22 +28,36 @@ pub(crate) fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub(crate) fn read_file_bounded(path: &Path, maximum_bytes: usize) -> std::io::Result<Vec<u8>> {
+    read_file_bounded_or(path, maximum_bytes, |_| false).map(|(bytes, _)| bytes)
+}
+
+pub(crate) fn read_file_bounded_or(
+    path: &Path,
+    maximum_bytes: usize,
+    allow_oversized: impl FnOnce(&[u8]) -> bool,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut file = fs::File::open(path)?;
     let mut bytes = Vec::new();
-    fs::File::open(path)?
+    (&mut file)
         .take(maximum_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)?;
-    sync_directory(
-        path.parent()
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "file has no parent directory"))?,
-    )?;
-    if bytes.len() > maximum_bytes {
+    let oversized = bytes.len() > maximum_bytes;
+    if oversized && !allow_oversized(&bytes) {
         return Err(Error::new(
             ErrorKind::InvalidData,
             format!("file exceeds supported {maximum_bytes}-byte bound"),
         ));
     }
-    Ok(bytes)
+    if oversized {
+        file.read_to_end(&mut bytes)?;
+    }
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "file has no parent directory"))?,
+    )?;
+    Ok((bytes, oversized))
 }
 
 fn create_directory_chain(path: &Path, private: bool) -> std::io::Result<()> {

@@ -36,7 +36,14 @@ numbered account identity. Its optional
 by the prior schema are
 compatibility-projected to the current OpenCode-owned account, quota, and model
 shape while preserving record IDs and versions; the next mutation writes the
-upgraded store schema. An unrecognizable record fails the entire store with
+upgraded store schema. A predecessor-produced store above the current 4 MiB or
+256-record steady-state limits remains readable and routable during the
+transition. Creates and other growth are rejected, while a size-reducing update
+or record-reducing delete is committed in predecessor recovery form; each later
+process can continue that in-band reduction, and the first mutation that fits
+the current envelope atomically writes the current schema. Oversized files that
+claim the current schema are not admitted through this compatibility path. An
+unrecognizable record fails the entire store with
 `settings_store_upgrade_required` instead of remaining listable but unusable.
 Rotation assessment and materialization share one provider-state lock, so a
 decision cannot race native materialization. A denied assessment durably removes
@@ -231,8 +238,12 @@ bounded to 256 records, 1,024 retained history events, 4,096 live mutation
 receipts, and 4 MiB encoded; history keeps a hash-linked contiguous tail and
 expired receipts are removed before new admission. Capacity exhaustion rejects
 only a new settings mutation as `settings_capacity_exhausted`; existing bounded
-records remain readable and usable. Settings lock admission is bounded by the
-earlier of the host deadline and five seconds. Migration
+records remain readable and usable. The predecessor recovery exception is
+non-growing and finite: only the exact schema-less predecessor serialization or
+an intermediate schema-zero recovery transaction can exceed the encoded bound,
+and each admitted recovery mutation must reduce record count or encoded size.
+Settings lock admission is bounded by the earlier of the host deadline and five
+seconds. Migration
 artifacts are content-addressed, atomically published, confined to
 provider-owned roots, and retain hashes for the complete legacy input plus its
 provider/model records.

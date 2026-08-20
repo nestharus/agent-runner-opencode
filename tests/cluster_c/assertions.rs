@@ -570,6 +570,9 @@ pub fn make_path_executable(path: &Path) {
     set_path_permissions(path, permissions_with_mode(path_permissions(path), 0o755));
 }
 
+#[cfg(not(unix))]
+pub fn make_path_executable(_path: &Path) {}
+
 pub struct RefreshAuthFixture {
     pub home: HomeFixture,
     pub auth_path: PathBuf,

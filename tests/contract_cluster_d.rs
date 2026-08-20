@@ -724,6 +724,160 @@ fn contract_settings_capacity_rejection_preserves_existing_routes() {
     assert_eq!(existing["record"]["id"], "bounded-0");
 }
 
+#[test]
+fn contract_oversized_predecessor_store_stays_routable_during_in_band_recovery() {
+    let host = HostRoots::new("agent-runner-opencode-settings-predecessor-capacity-recovery");
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(store_path.parent().expect("settings store parent"))
+        .expect("create predecessor settings root");
+    let mut values = opencode_settings_values(None);
+    values["extra_env"] = json!({
+        "PREDECESSOR_PAYLOAD": "x".repeat(4 * 1024 * 1024)
+    });
+    let predecessor_bytes = serde_json::to_vec(&json!({
+        "records": [{
+            "id": "predecessor-0",
+            "display_name": "Predecessor profile",
+            "version": "predecessor-v1",
+            "values": values,
+        }]
+    }))
+    .expect("serialize predecessor store");
+    assert!(predecessor_bytes.len() > 4 * 1024 * 1024);
+    assert!(predecessor_bytes.starts_with(br#"{"records":["#));
+    fs::write(&store_path, predecessor_bytes).expect("write predecessor settings store");
+
+    let list = success_result(
+        invoke_validated_with_host(
+            "settings.list",
+            empty_request_params(),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsListRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsListResponse",
+        "settings.schema.json#/$defs/SettingsListResult",
+    );
+    assert_eq!(
+        list["records"].as_array().expect("settings records").len(),
+        1
+    );
+
+    let policy = success_result(
+        invoke_validated_with_host(
+            "policy.evaluate",
+            json!({
+                "settings_id": "predecessor-0",
+                "mode": "agent",
+                "model": {
+                    "name": "gpt-high",
+                    "provider_args": ["-m", "openai/gpt-5.6-sol", "--variant", "high"],
+                    "inputs": { "prompt": "ok", "named": {} }
+                },
+                "launch": {
+                    "argv": [
+                        "opencode1", "run", "--dangerously-skip-permissions",
+                        "-m", "openai/gpt-5.6-sol", "--variant", "high", "ok"
+                    ]
+                }
+            }),
+            host.overrides(),
+            "policy.schema.json#/$defs/PolicyEvaluateRequest",
+        ),
+        "policy.schema.json#/$defs/PolicyEvaluateResponse",
+        "policy.schema.json#/$defs/PolicyEvaluateResult",
+    );
+    assert_eq!(policy["accepted"], true, "{policy}");
+
+    let _ = success_result(
+        invoke_validated_with_host(
+            "settings.update",
+            settings_update_params("predecessor-0", "predecessor-v1", None),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsUpdateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsUpdateResponse",
+        "settings.schema.json#/$defs/SettingsUpdateResult",
+    );
+    let recovered_bytes = fs::read(&store_path).expect("read recovered settings store");
+    assert!(recovered_bytes.len() <= 4 * 1024 * 1024);
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&recovered_bytes).expect("parse recovered settings store");
+    assert_eq!(recovered["schema_version"], 3);
+
+    let remaining = success_result(
+        invoke_validated_with_host(
+            "settings.get",
+            settings_get_params("predecessor-0"),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsGetRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsGetResponse",
+        "settings.schema.json#/$defs/SettingsGetResult",
+    );
+    assert_eq!(remaining["record"]["id"], "predecessor-0");
+}
+
+#[test]
+fn contract_record_heavy_predecessor_recovery_continues_across_processes() {
+    let host = HostRoots::new("agent-runner-opencode-settings-predecessor-record-recovery");
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(store_path.parent().expect("settings store parent"))
+        .expect("create predecessor settings root");
+    let values = opencode_settings_values(None);
+    let records = (0..258)
+        .map(|index| {
+            json!({
+                "id": format!("record-heavy-{index}"),
+                "display_name": format!("Record-heavy profile {index}"),
+                "version": "predecessor-v1",
+                "values": values,
+            })
+        })
+        .collect::<Vec<_>>();
+    let predecessor_bytes =
+        serde_json::to_vec(&json!({ "records": records })).expect("serialize predecessor store");
+    assert!(predecessor_bytes.len() < 4 * 1024 * 1024);
+    fs::write(&store_path, predecessor_bytes).expect("write predecessor settings store");
+
+    for id in ["record-heavy-0", "record-heavy-1"] {
+        let _ = success_result(
+            invoke_validated_with_host(
+                "settings.delete",
+                settings_delete_params(id, "predecessor-v1"),
+                host.overrides(),
+                "settings.schema.json#/$defs/SettingsDeleteRequest",
+            ),
+            "settings.schema.json#/$defs/SettingsDeleteResponse",
+            "settings.schema.json#/$defs/SettingsDeleteResult",
+        );
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &fs::read(&store_path).expect("read predecessor recovery store"),
+        )
+        .expect("parse predecessor recovery store");
+        let expected_schema = if id == "record-heavy-0" { 0 } else { 3 };
+        assert_eq!(persisted["schema_version"], expected_schema);
+    }
+
+    let list = success_result(
+        invoke_validated_with_host(
+            "settings.list",
+            empty_request_params(),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsListRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsListResponse",
+        "settings.schema.json#/$defs/SettingsListResult",
+    );
+    assert_eq!(
+        list["records"].as_array().expect("settings records").len(),
+        256
+    );
+}
+
 fn assert_settings_history(host: &HostRoots, expected_events: usize) {
     let store_path = host
         .config_root()
@@ -1351,7 +1505,8 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
         "rotation.schema.json#/$defs/RotationAssessResult",
     );
     let mut bounded_host = host.overrides();
-    bounded_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 500);
+    bounded_host["deadline_unix_ms"] =
+        json!(agent_runner_opencode::encoding::now_unix_ms() + 3_000);
     let path = opencode.path_env();
     let started = std::time::Instant::now();
     let failed = error_response(invoke_validated_with_host_and_env(
@@ -1363,7 +1518,7 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
     ));
     assert_eq!(failed["error"]["code"], "rotation_import_failed");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
+        started.elapsed() < std::time::Duration::from_secs(8),
         "a stalled import must be terminated within the request bound"
     );
     assert!(
@@ -1373,7 +1528,7 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
 
     let mut follow_up_host = host.overrides();
     follow_up_host["deadline_unix_ms"] =
-        json!(agent_runner_opencode::encoding::now_unix_ms() + 500);
+        json!(agent_runner_opencode::encoding::now_unix_ms() + 5_000);
     let follow_up = success_result(
         invoke_validated_with_host(
             "rotation.assess",

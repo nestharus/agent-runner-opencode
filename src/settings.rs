@@ -35,6 +35,8 @@ const MAX_SETTINGS_HISTORY_EVENTS: usize = 1_024;
 const MAX_SETTINGS_MUTATION_RECEIPTS: usize = 4_096;
 const SETTINGS_RECEIPT_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const SETTINGS_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const PREDECESSOR_STORE_PREFIX: &[u8] = br#"{"records":["#;
+const PREDECESSOR_RECOVERY_STORE_PREFIX: &[u8] = br#"{"schema_version":0,"records":["#;
 
 #[derive(Deserialize)]
 struct SettingsCreateParams {
@@ -215,6 +217,8 @@ struct SettingsStore {
     history: Vec<Value>,
     #[serde(default)]
     mutation_receipts: BTreeMap<String, SettingsMutationReceipt>,
+    #[serde(skip)]
+    predecessor_capacity_recovery: bool,
 }
 
 impl Default for SettingsStore {
@@ -224,6 +228,7 @@ impl Default for SettingsStore {
             records: Vec::new(),
             history: Vec::new(),
             mutation_receipts: BTreeMap::new(),
+            predecessor_capacity_recovery: false,
         }
     }
 }
@@ -520,8 +525,8 @@ fn read_store_path(path: &Path, request_id: &str) -> Result<SettingsStore, Provi
     if !store_path_exists(path) {
         return Ok(SettingsStore::default());
     }
-    let bytes = read_store_bytes(path, request_id)?;
-    parse_store_bytes(&bytes, request_id)
+    let (bytes, predecessor_capacity_recovery) = read_store_bytes(path, request_id)?;
+    parse_store_bytes(&bytes, predecessor_capacity_recovery, request_id)
 }
 
 fn mutate_store(
@@ -556,6 +561,11 @@ fn mutate_store(
         return Err(settings_lock_timeout(request_id));
     }
     let mut store = read_store_path(&path, request_id)?;
+    let predecessor_capacity_recovery = store.predecessor_capacity_recovery;
+    let predecessor_projected_bytes = predecessor_capacity_recovery
+        .then(|| serialize_store(&store, request_id))
+        .transpose()?
+        .map(|bytes| bytes.len());
     if let Some(receipt) = store.mutation_receipts.get(request_id) {
         if receipt.operation == operation && receipt.binding_sha256 == binding_sha256 {
             return Ok(receipt.result.clone());
@@ -568,7 +578,9 @@ fn mutate_store(
         ));
     }
     prune_expired_settings_receipts(&mut store, now_unix_ms());
-    if store.mutation_receipts.len() >= MAX_SETTINGS_MUTATION_RECEIPTS {
+    if store.mutation_receipts.len() >= MAX_SETTINGS_MUTATION_RECEIPTS
+        && !predecessor_capacity_recovery
+    {
         return Err(settings_capacity_failure(
             request_id,
             "the 24-hour mutation receipt window is full",
@@ -576,12 +588,6 @@ fn mutate_store(
     }
     let before = store.records.clone();
     let result = mutation(&mut store)?;
-    if store.records.len() > MAX_SETTINGS_RECORDS {
-        return Err(settings_capacity_failure(
-            request_id,
-            "the settings record limit is reached",
-        ));
-    }
     append_settings_history(
         &mut store,
         &before,
@@ -599,11 +605,26 @@ fn mutate_store(
             recorded_at_unix_ms: now_unix_ms(),
         },
     );
-    if serialize_store(&store, request_id)?.len() > MAX_SETTINGS_STORE_BYTES {
+    let encoded = serialize_store(&store, request_id)?;
+    let exceeds_steady_state_capacity = store.records.len() > MAX_SETTINGS_RECORDS
+        || store.history.len() > MAX_SETTINGS_HISTORY_EVENTS
+        || store.mutation_receipts.len() > MAX_SETTINGS_MUTATION_RECEIPTS
+        || encoded.len() > MAX_SETTINGS_STORE_BYTES;
+    let reduces_predecessor_capacity = predecessor_capacity_recovery
+        && store.records.len() <= before.len()
+        && (store.records.len() < before.len()
+            || predecessor_projected_bytes.is_some_and(|prior| encoded.len() < prior));
+    if exceeds_steady_state_capacity && !reduces_predecessor_capacity {
         return Err(settings_capacity_failure(
             request_id,
-            "the encoded settings store size limit is reached",
+            "the mutation does not fit steady-state capacity or reduce a predecessor store toward it",
         ));
+    }
+    if exceeds_steady_state_capacity {
+        // Schema zero is the exact predecessor marker. Keeping it until the
+        // store fits ensures a later process can continue the same monotonic
+        // in-band recovery without admitting oversized current-schema state.
+        store.schema_version = 0;
     }
     write_store_path(&path, &config_root, &store, request_id)?;
     Ok(result)
@@ -728,15 +749,31 @@ fn store_path_exists(path: &Path) -> bool {
     path.exists()
 }
 
-fn read_store_bytes(path: &Path, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
-    durable_fs::read_file_bounded(path, MAX_SETTINGS_STORE_BYTES)
-        .map_err(|err| store_io_failure(request_id, "settings_store_read_failed", err))
+fn read_store_bytes(path: &Path, request_id: &str) -> Result<(Vec<u8>, bool), ProviderFailure> {
+    durable_fs::read_file_bounded_or(
+        path,
+        MAX_SETTINGS_STORE_BYTES,
+        is_predecessor_capacity_store,
+    )
+    .map_err(|err| store_io_failure(request_id, "settings_store_read_failed", err))
 }
 
-fn parse_store_bytes(bytes: &[u8], request_id: &str) -> Result<SettingsStore, ProviderFailure> {
-    let store = serde_json::from_slice(bytes)
+fn is_predecessor_capacity_store(bytes: &[u8]) -> bool {
+    bytes.starts_with(PREDECESSOR_STORE_PREFIX)
+        || bytes.starts_with(PREDECESSOR_RECOVERY_STORE_PREFIX)
+}
+
+fn parse_store_bytes(
+    bytes: &[u8],
+    predecessor_capacity_recovery: bool,
+    request_id: &str,
+) -> Result<SettingsStore, ProviderFailure> {
+    let store: SettingsStore = serde_json::from_slice(bytes)
         .map_err(|err| settings_store_parse_failure(request_id, err))?;
-    upgrade_persisted_store(store, request_id)
+    let predecessor_schema = store.schema_version == 0;
+    let mut store = upgrade_persisted_store(store, request_id)?;
+    store.predecessor_capacity_recovery = predecessor_capacity_recovery || predecessor_schema;
+    Ok(store)
 }
 
 fn upgrade_persisted_store(
@@ -1442,6 +1479,17 @@ fn parse_legacy_providers_toml(providers_toml: &str) -> Option<toml::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_compatibility_is_limited_to_authored_predecessor_markers() {
+        assert!(is_predecessor_capacity_store(br#"{"records":[]}"#));
+        assert!(is_predecessor_capacity_store(
+            br#"{"schema_version":0,"records":[]}"#
+        ));
+        assert!(!is_predecessor_capacity_store(
+            br#"{"schema_version":3,"records":[]}"#
+        ));
+    }
 
     #[test]
     fn settings_history_retains_a_bounded_contiguous_tail() {
