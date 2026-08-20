@@ -26,7 +26,7 @@ const SETTINGS_FIELDS: &[&str] = &[
     "working_directory",
     "mode",
 ];
-const MODEL_FIELDS: &[&str] = &["name", "provider_model", "variant"];
+const MODEL_FIELDS: &[&str] = &["selection", "name", "provider_model", "variant"];
 const QUOTA_FIELDS: &[&str] = &["source", "auth_path", "probe"];
 const LAUNCH_FIELDS: &[&str] = &[
     "dangerously_skip_permissions",
@@ -179,6 +179,20 @@ fn require_model(values: &Value, diagnostics: &mut Vec<Value>) {
         MODEL_FIELDS,
         diagnostics,
     );
+    if values.pointer("/model/selection").and_then(Value::as_str) == Some("requested") {
+        if values
+            .get("model")
+            .and_then(Value::as_object)
+            .is_some_and(|model| model.len() == 1)
+        {
+            return;
+        }
+        diagnostics.push(shape_diagnostic(
+            "values.model",
+            "requested model selection cannot also pin a model route",
+        ));
+        return;
+    }
     let Some(name) = model_name_value(values) else {
         diagnostics.push(invalid_model_alias_diagnostic(""));
         return;
@@ -366,7 +380,20 @@ fn quota_auth_path(account: &AccountProfile) -> &'static str {
 }
 
 fn model_schema_variants() -> Vec<Value> {
-    MODEL_ALIASES.iter().map(model_schema_variant).collect()
+    std::iter::once(requested_model_schema_variant())
+        .chain(MODEL_ALIASES.iter().map(model_schema_variant))
+        .collect()
+}
+
+fn requested_model_schema_variant() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "selection": { "const": "requested" }
+        },
+        "required": ["selection"]
+    })
 }
 
 fn model_schema_variant(model: &ModelAlias) -> Value {
@@ -378,7 +405,7 @@ fn model_schema_variant(model: &ModelAlias) -> Value {
             "provider_model": { "const": model.provider_model },
             "variant": { "const": model.effort }
         },
-        "required": MODEL_FIELDS
+        "required": ["name", "provider_model", "variant"]
     })
 }
 

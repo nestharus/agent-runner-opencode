@@ -239,9 +239,14 @@ fn assert_settings_schema_catalog(schema: &Value) {
     let variants = schema["properties"]["model"]["oneOf"]
         .as_array()
         .expect("model oneOf");
-    assert_eq!(variants.len(), 7);
+    assert_eq!(variants.len(), 8);
+    assert!(variants.iter().any(|variant| {
+        variant["properties"]["selection"]["const"] == "requested"
+            && variant["required"] == json!(["selection"])
+    }));
     let tuples = variants
         .iter()
+        .filter(|variant| variant["properties"].get("name").is_some())
         .map(|variant| {
             (
                 variant["properties"]["name"]["const"]
@@ -268,7 +273,7 @@ fn assert_settings_schema_catalog(schema: &Value) {
 }
 
 fn schema_valid_settings_examples() -> Vec<Value> {
-    expected_model_variants()
+    let mut examples = expected_model_variants()
         .into_iter()
         .map(|(name, provider_model, variant)| {
             json!({
@@ -291,7 +296,11 @@ fn schema_valid_settings_examples() -> Vec<Value> {
                 }
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut requested = examples[0].clone();
+    requested["model"] = json!({ "selection": "requested" });
+    examples.push(requested);
+    examples
 }
 
 fn assert_discovery_models_response(response: &Value) {

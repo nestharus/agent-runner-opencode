@@ -52,7 +52,7 @@ pub fn source_params(
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let params = parse_base_params(params, request_id)?;
-    let account = account_for_settings_id(host, &params.settings_id, request_id)?;
+    let account = account_from_settings_record(host, &params.settings_id, request_id)?;
     let auth_path = resolved_auth_path(account);
     Ok(source_result(account, &auth_path))
 }
@@ -63,7 +63,7 @@ pub fn probe_params(
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let params = parse_base_params(params, request_id)?;
-    let account = account_for_settings_id(host, &params.settings_id, request_id)?;
+    let account = account_from_settings_record(host, &params.settings_id, request_id)?;
     probe_account(account, request_id)
 }
 
@@ -73,7 +73,7 @@ pub fn refresh_auth_params(
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let params = parse_refresh_params(params, request_id)?;
-    let account = account_for_settings_id(host, &params.settings_id, request_id)?;
+    let account = account_from_settings_record(host, &params.settings_id, request_id)?;
     let checked_at_unix_ms = now_unix_ms();
     let refresh = run_account_auth_refresh(account);
     let refreshed = refresh_succeeded(&refresh);
@@ -257,7 +257,7 @@ fn parse_refresh_params(
         .map_err(|err| invalid_quota_refresh_params_failure(request_id, err))
 }
 
-fn account_for_settings_id(
+fn account_from_settings_record(
     host: &HostContext,
     settings_id: &str,
     request_id: &str,

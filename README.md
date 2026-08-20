@@ -19,12 +19,14 @@ name is a compatibility alias for account one; numbered wrappers are canonical
 persisted identities. Setup plans and legacy-provider migration both resolve
 their inputs through this same catalog and emit canonical numbered identities;
 unknown OpenCode-shaped references are diagnostic errors and are never mapped
-to account one. A contract field named `settings_id` is interpreted internally
-as an explicit runtime selection: its origin is either a declared account
-reference (with that account's default route) or an opaque persisted settings
-record (with record ID, version, account, and stored model route). Policy
-evidence publishes that origin instead of treating both token kinds as one
-settings-record identity. Stores written by the prior schema are
+to account one. A contract field named `settings_id` identifies only an opaque,
+persisted settings record; account or wrapper aliases are not accepted as a
+second hidden token kind. A record carries its ID, version, account, and either
+an exact stored route or the explicit `model.selection=requested` policy.
+Policy evidence publishes that record identity and its effective account.
+Rotation's `source_provider` and `target_provider` fields resolve only declared
+account/provider references, while its optional `settings_id` must be a
+persisted record for the target account. Stores written by the prior schema are
 compatibility-projected to the current OpenCode-owned account, quota, and model
 shape while preserving record IDs and versions; the next mutation writes the
 upgraded store schema. An unrecognizable record fails the entire store with

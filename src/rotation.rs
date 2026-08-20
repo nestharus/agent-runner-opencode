@@ -1,5 +1,6 @@
 //! Declared roles: mapper, validator, predicate, filter, formatter
 
+use crate::account::profile_for_account_reference;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
@@ -29,7 +30,7 @@ pub fn assess_params(
     validate_rotation_accounts(host, &binding, request_id)?;
     let allowed = met
         && facts_allow
-        && binding.source_selection_reference != binding.target_selection_reference;
+        && binding.source_provider_reference != binding.target_provider_reference;
     let authorization = persist_assessment_decision(host, &binding, allowed, request_id)?;
     Ok(assess_result(
         allowed,
@@ -48,17 +49,9 @@ pub fn materialize_params(
 ) -> Result<Value, ProviderFailure> {
     let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
     let source_account =
-        resolve_runtime_selection(host, &binding.source_selection_reference, request_id)
-            .map_err(|_| {
-                unknown_rotation_account(request_id, "source", &binding.source_selection_reference)
-            })?
-            .account;
+        rotation_account(&binding.source_provider_reference, request_id, "source")?;
     let target_account =
-        resolve_runtime_selection(host, &binding.target_selection_reference, request_id)
-            .map_err(|_| {
-                unknown_rotation_account(request_id, "target", &binding.target_selection_reference)
-            })?
-            .account;
+        rotation_account(&binding.target_provider_reference, request_id, "target")?;
     let working_directory = rotation_working_directory(host, request_id)?;
     let _lock = acquire_rotation_lock(host, request_id)?;
     let authorization = require_fresh_authorization(host, &binding, request_id)?;
@@ -77,7 +70,7 @@ pub fn materialize_params(
         .map_err(|error| rotation_artifact_failure(request_id, error))?;
     let target_session_id =
         opencode::import_session(&artifact_path, target_account, working_directory).map_err(
-            |error| rotation_import_failure(request_id, &binding.target_selection_reference, error),
+            |error| rotation_import_failure(request_id, &binding.target_provider_reference, error),
         )?;
     let artifact = rotation_artifact(&artifact_path, &artifact_bytes);
     let decision_artifact = write_rotation_decision_receipt(
@@ -90,8 +83,8 @@ pub fn materialize_params(
     )?;
     let host_state_plan = host_state_plan(HostStatePlanInput {
         chain_id: &binding.chain_id,
-        source_provider: &binding.source_selection_reference,
-        target_provider: &binding.target_selection_reference,
+        source_provider: &binding.source_provider_reference,
+        target_provider: &binding.target_provider_reference,
         source_session_id: &binding.source_session_id,
         target_session_id: &target_session_id,
         transition_reason: &binding.transition_reason,
@@ -145,11 +138,11 @@ fn facts_allow_rotation(params: &Value) -> bool {
 #[derive(Clone)]
 struct RotationBinding {
     chain_id: String,
-    source_selection_reference: String,
-    target_selection_reference: String,
+    source_provider_reference: String,
+    target_provider_reference: String,
     source_session_id: String,
     model_name: String,
-    settings_id: String,
+    settings_record_id: String,
     transition_reason: String,
     provider_instance_id: String,
     host_app: String,
@@ -163,15 +156,15 @@ fn rotation_binding(
 ) -> Result<RotationBinding, ProviderFailure> {
     Ok(RotationBinding {
         chain_id: required_string(params, "chain_id", request_id)?.to_string(),
-        source_selection_reference: required_string(params, "source_provider", request_id)?
+        source_provider_reference: required_string(params, "source_provider", request_id)?
             .to_string(),
-        target_selection_reference: required_string(params, "target_provider", request_id)?
+        target_provider_reference: required_string(params, "target_provider", request_id)?
             .to_string(),
         source_session_id: required_string(params, "source_session_id", request_id)?.to_string(),
         model_name: optional_string(params, "model_name")
             .unwrap_or("")
             .to_string(),
-        settings_id: optional_string(params, "settings_id")
+        settings_record_id: optional_string(params, "settings_id")
             .unwrap_or("")
             .to_string(),
         transition_reason: transition_reason(params).to_string(),
@@ -190,11 +183,11 @@ fn optional_string<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
 fn binding_value(binding: &RotationBinding) -> Value {
     json!({
         "chain_id": binding.chain_id,
-        "source_provider": binding.source_selection_reference,
-        "target_provider": binding.target_selection_reference,
+        "source_provider": binding.source_provider_reference,
+        "target_provider": binding.target_provider_reference,
         "source_session_id": binding.source_session_id,
         "model_name": binding.model_name,
-        "settings_id": binding.settings_id,
+        "settings_id": binding.settings_record_id,
         "transition_reason": binding.transition_reason,
         "provider_instance_id": binding.provider_instance_id,
         "host_app": binding.host_app,
@@ -210,13 +203,24 @@ fn validate_rotation_accounts(
     binding: &RotationBinding,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    resolve_runtime_selection(host, &binding.source_selection_reference, request_id).map_err(
-        |_| unknown_rotation_account(request_id, "source", &binding.source_selection_reference),
-    )?;
-    resolve_runtime_selection(host, &binding.target_selection_reference, request_id).map_err(
-        |_| unknown_rotation_account(request_id, "target", &binding.target_selection_reference),
-    )?;
+    rotation_account(&binding.source_provider_reference, request_id, "source")?;
+    let target = rotation_account(&binding.target_provider_reference, request_id, "target")?;
+    if !binding.settings_record_id.is_empty() {
+        let selection = resolve_runtime_selection(host, &binding.settings_record_id, request_id)?;
+        if selection.account.opencode_wrapper != target.opencode_wrapper {
+            return Err(rotation_settings_account_mismatch(request_id));
+        }
+    }
     Ok(())
+}
+
+fn rotation_account(
+    provider_reference: &str,
+    request_id: &str,
+    role: &str,
+) -> Result<&'static crate::account::AccountProfile, ProviderFailure> {
+    profile_for_account_reference(provider_reference)
+        .ok_or_else(|| unknown_rotation_account(request_id, role, provider_reference))
 }
 
 fn persist_assessment_decision(
@@ -712,6 +716,14 @@ fn unknown_rotation_account(request_id: &str, role: &str, provider: &str) -> Pro
         request_id,
         "rotation_account_unknown",
         format!("rotation {role} account is unknown: {provider}"),
+    )
+}
+
+fn rotation_settings_account_mismatch(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "rotation_settings_account_mismatch",
+        "rotation settings_id must identify a persisted record for target_provider",
     )
 }
 

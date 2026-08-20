@@ -2,8 +2,11 @@
 
 use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Map, Value};
+use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::Once;
 
 pub const CONTRACT: &str = "oulipoly.provider/v1";
 
@@ -62,6 +65,7 @@ pub fn invoke_validated_with_host_and_env(
 }
 
 pub fn invoke_with_request(subcommand: &str, request_json: Value) -> Output {
+    ensure_default_runtime_settings(&request_json);
     let stdin = request_stdin_bytes(&request_json);
     invoke_raw_stdin(subcommand, &stdin)
 }
@@ -72,6 +76,7 @@ pub fn invoke_with_request_and_env(
     request_json: Value,
     env: &[(&str, &str)],
 ) -> Output {
+    ensure_default_runtime_settings(&request_json);
     let stdin = request_stdin_bytes(&request_json);
     invoke_raw_stdin_with_env(subcommand, &stdin, env)
 }
@@ -116,13 +121,15 @@ pub fn assert_valid_request_envelope(request: &Value, request_schema: &str) {
 }
 
 pub fn host_context(host_overrides: Value) -> Value {
+    let config_root = default_test_root().join("config");
+    let data_root = default_test_root().join("data");
     let mut host = json!({
         "app": "oulipoly-agent-runner",
         "app_version": "0.0.0",
         "platform": "linux-x86_64",
         "working_directory": "/tmp",
-        "config_root": "/tmp/config",
-        "data_root": "/tmp/data",
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy(),
         "env": { "TERM": "xterm-256color" }
     });
     if let (Some(host), Some(overrides)) = (host.as_object_mut(), host_overrides.as_object()) {
@@ -131,6 +138,73 @@ pub fn host_context(host_overrides: Value) -> Value {
         }
     }
     host
+}
+
+fn default_test_root() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "agent-runner-opencode-contract-{}",
+        std::process::id()
+    ))
+}
+
+fn ensure_default_runtime_settings(request: &Value) {
+    static INITIALIZE: Once = Once::new();
+    let default_config_root = default_test_root().join("config");
+    if request.pointer("/host/config_root").and_then(Value::as_str) != default_config_root.to_str()
+    {
+        return;
+    }
+    INITIALIZE.call_once(|| {
+        let store_root = default_config_root.join("agent-runner-opencode");
+        fs::create_dir_all(&store_root).expect("create default provider settings fixture");
+        fs::create_dir_all(default_test_root().join("data"))
+            .expect("create default provider data fixture");
+        fs::write(
+            store_root.join("settings-store.json"),
+            serde_json::to_vec_pretty(&default_runtime_settings_store())
+                .expect("serialize default provider settings fixture"),
+        )
+        .expect("write default provider settings fixture");
+    });
+}
+
+fn default_runtime_settings_store() -> Value {
+    json!({
+        "schema_version": 2,
+        "records": (1..=5).map(default_runtime_settings_record).collect::<Vec<_>>(),
+        "history": []
+    })
+}
+
+fn default_runtime_settings_record(index: usize) -> Value {
+    let wrapper = format!("opencode{index}");
+    let auth_path = match index {
+        1 => "~/.local/share/opencode/auth.json".to_string(),
+        _ => format!("~/.opencode{index}/opencode/auth.json"),
+    };
+    json!({
+        "id": wrapper,
+        "display_name": format!("OpenCode account {index} test fixture"),
+        "version": "fixture-v1",
+        "values": {
+            "provider": "opencode",
+            "profile": wrapper,
+            "wrapper": wrapper,
+            "model": { "selection": "requested" },
+            "quota": {
+                "source": "opencode_auth",
+                "auth_path": auth_path,
+                "probe": "native_chatgpt_usage"
+            },
+            "launch": {
+                "dangerously_skip_permissions": true,
+                "format": "json",
+                "preserve_pure_wrapper": true
+            },
+            "extra_env": {},
+            "mode": "non_interactive"
+        }
+    })
 }
 
 pub fn json_stdout(output: &Output) -> Value {

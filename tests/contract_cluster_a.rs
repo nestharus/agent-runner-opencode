@@ -599,8 +599,8 @@ fn contract_policy_evaluate_accepts_luna_for_every_declared_account() {
             .expect("policy markers")
             .iter()
             .any(|marker| {
-                marker["name"] == "opencode.runtime_selection_origin"
-                    && marker["value"] == format!("declared account {account}")
+                marker["name"] == "opencode.settings_record_identity"
+                    && marker["value"] == format!("settings record {account} at version fixture-v1")
             }));
     }
 }
@@ -659,10 +659,10 @@ fn contract_policy_evaluate_accepts_host_candidate_argv_for_every_account_id() {
 }
 
 #[test]
-fn contract_policy_evaluate_accepts_host_candidate_argv_for_account_aliases() {
+fn contract_policy_evaluate_accepts_account_one_wrapper_command_aliases() {
     for (settings_id, command) in [
-        ("opencode", "opencode"),
-        ("opencode", "/tmp/host-bin/opencode"),
+        ("opencode1", "opencode"),
+        ("opencode1", "/tmp/host-bin/opencode"),
     ] {
         let output = invoke_with_env(
             "policy.evaluate",
@@ -672,7 +672,7 @@ fn contract_policy_evaluate_accepts_host_candidate_argv_for_account_aliases() {
 
         assert_output_success(
             &output,
-            &format!("policy.evaluate host candidate argv for alias {settings_id}"),
+            &format!("policy.evaluate wrapper command alias for {settings_id}"),
         );
         let response = json_stdout(&output);
         assert_policy_accepts_for_wrapper(&response, command);
@@ -743,10 +743,10 @@ fn contract_policy_evaluate_rejects_command_from_another_account() {
 }
 
 #[test]
-fn contract_policy_evaluate_accepts_account_one_provider_name_settings_id() {
+fn contract_policy_evaluate_accepts_account_one_persisted_settings_id() {
     let output = invoke_with_env(
         "policy.evaluate",
-        policy_evaluate_account_one_provider_name_settings_id_params(),
+        policy_evaluate_account_one_persisted_settings_id_params(),
         &[],
     );
 

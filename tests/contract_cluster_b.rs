@@ -48,7 +48,7 @@ fn contract_session_read_turns_projects_bounded_user_observation() {
     let path = prepend_path(fake_opencode.dir());
     let result = read_turns_result(
         json!({
-            "settings_id": "opencode",
+            "settings_id": "opencode1",
             "session_id": session_id,
             "turn_projection": "user_observation",
             "body_tail_limit": 4

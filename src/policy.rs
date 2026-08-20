@@ -135,7 +135,7 @@ fn diagnostics_for_policy(
     let mut diagnostics = launch_command_diagnostics(params, selection);
     if model.is_none() {
         diagnostics.push(invalid_model_diagnostic(params));
-    } else if selection.model.is_some() && selection.model != model {
+    } else if selection.exact_model().is_some() && selection.exact_model() != model {
         diagnostics.push(settings_model_mismatch_diagnostic(selection, model));
     }
     if model.is_some_and(|model| !model.supports_account(selection.account)) {
@@ -155,11 +155,11 @@ fn model_account_ineligible_diagnostic(
         "error",
         "model_account_ineligible",
         format!(
-            "model {} is not eligible for account {} selected by runtime reference {} ({})",
+            "model {} is not eligible for account {} selected by settings record {} ({})",
             requested.map(|model| model.name).unwrap_or("<invalid>"),
             selection.account.opencode_wrapper,
-            selection.requested_reference,
-            selection.origin_label(),
+            selection.settings_id,
+            selection.evidence_label(),
         ),
     )
 }
@@ -195,10 +195,10 @@ fn launch_command_diagnostics(
         "error",
         "settings_command_mismatch",
         format!(
-            "launch command must resolve to account {} selected by runtime reference {} ({})",
+            "launch command must resolve to account {} selected by settings record {} ({})",
             selection.account.opencode_wrapper,
-            selection.requested_reference,
-            selection.origin_label(),
+            selection.settings_id,
+            selection.evidence_label(),
         ),
     )]
 }
@@ -211,10 +211,10 @@ fn settings_model_mismatch_diagnostic(
         "error",
         "settings_model_mismatch",
         format!(
-            "model {} does not match the route stored by runtime reference {} ({})",
+            "model {} does not match the route stored by settings record {} ({})",
             requested.map(|model| model.name).unwrap_or("<invalid>"),
-            selection.requested_reference,
-            selection.origin_label(),
+            selection.settings_id,
+            selection.evidence_label(),
         ),
     )
 }
@@ -302,8 +302,8 @@ fn policy_markers(
     vec![
         json!({ "name": "opencode.command", "value": command.unwrap_or("") }),
         json!({ "name": "opencode.mode", "value": params.mode }),
-        json!({ "name": "opencode.runtime_selection_reference", "value": selection.requested_reference }),
-        json!({ "name": "opencode.runtime_selection_origin", "value": selection.origin_label() }),
+        json!({ "name": "opencode.settings_record_id", "value": selection.settings_id }),
+        json!({ "name": "opencode.settings_record_identity", "value": selection.evidence_label() }),
         json!({ "name": "opencode.account", "value": selection.account.opencode_wrapper }),
         json!({ "name": "opencode.account_hash", "value": selection.account.account_hash }),
         json!({ "name": "opencode.model_alias", "value": model.map(|model| model.name).unwrap_or("") }),

@@ -228,16 +228,45 @@ fn contract_generated_settings_id_is_usable_by_policy() {
             .is_empty(),
         "{policy}"
     );
-    let origin = policy["markers"]
+    let identity = policy["markers"]
         .as_array()
         .expect("policy markers")
         .iter()
-        .find(|marker| marker["name"] == "opencode.runtime_selection_origin")
-        .expect("runtime selection origin marker")["value"]
+        .find(|marker| marker["name"] == "opencode.settings_record_identity")
+        .expect("settings record identity marker")["value"]
         .as_str()
-        .expect("runtime selection origin text");
-    assert!(origin.starts_with("settings record "), "{origin}");
-    assert!(origin.contains(" at version "), "{origin}");
+        .expect("settings record identity text");
+    assert!(identity.starts_with("settings record "), "{identity}");
+    assert!(identity.contains(" at version "), "{identity}");
+}
+
+#[test]
+fn contract_account_reference_is_not_an_implicit_settings_record() {
+    let host = HostRoots::new("agent-runner-opencode-no-implicit-settings-record");
+    let response = error_response(invoke_validated_with_host(
+        "policy.evaluate",
+        json!({
+            "settings_id": "opencode1",
+            "mode": "agent",
+            "model": {
+                "name": "gpt-low",
+                "provider_args": ["-m", "openai/gpt-5.6-sol", "--variant", "low"],
+                "inputs": { "prompt": "ok", "named": {} }
+            },
+            "launch": {
+                "argv": [
+                    "opencode1", "run", "--dangerously-skip-permissions",
+                    "-m", "openai/gpt-5.6-sol", "--variant", "low", "ok"
+                ]
+            }
+        }),
+        host.overrides(),
+        "policy.schema.json#/$defs/PolicyEvaluateRequest",
+    ));
+    assert_eq!(response["error"]["code"], "unknown_settings_id");
+    assert!(response["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("persisted OpenCode settings record")));
 }
 
 #[test]

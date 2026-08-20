@@ -175,7 +175,6 @@ pub fn rotation_assess_params(allowed: bool) -> Value {
     json!({
         "operation": "rotation.assess",
         "chain_id": "chain-contract-d",
-        "settings_id": "opencode1",
         "model_name": "gpt-high",
         "source_provider": "opencode1",
         "target_provider": "opencode2",
@@ -202,7 +201,6 @@ pub fn rotation_materialize_params() -> Value {
     json!({
         "operation": "rotation.materialize",
         "chain_id": "chain-contract-d",
-        "settings_id": "opencode1",
         "model_name": "gpt-high",
         "source_provider": "opencode1",
         "target_provider": "opencode2",

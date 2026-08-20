@@ -1021,6 +1021,8 @@ fn session_account(
     settings_id: &str,
     request_id: &str,
 ) -> Result<&'static crate::account::AccountProfile, ProviderFailure> {
+    // Session storage is account-scoped; the settings record's model binding
+    // deliberately does not constrain read/enumerate/export operations.
     resolve_runtime_selection(host, settings_id, request_id).map(|selection| selection.account)
 }
 

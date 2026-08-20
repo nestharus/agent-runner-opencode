@@ -242,7 +242,7 @@ pub fn forbidden_policy_evaluate_params_for_account_host_candidate(
     params
 }
 
-pub fn policy_evaluate_account_one_provider_name_settings_id_params() -> Value {
+pub fn policy_evaluate_account_one_persisted_settings_id_params() -> Value {
     policy_evaluate_params_with_settings_id(policy_evaluate_params_with_host_candidate_argv())
 }
 
@@ -253,7 +253,7 @@ pub fn policy_evaluate_account_one_plain_host_command_params() -> Value {
 }
 
 pub fn policy_evaluate_params_with_settings_id(mut params: Value) -> Value {
-    params["settings_id"] = json!("opencode");
+    params["settings_id"] = json!("opencode1");
     params
 }
 
