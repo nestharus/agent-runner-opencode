@@ -10,6 +10,7 @@
 
 use crate::account::{profile_for_wrapper_reference, AccountProfile};
 use crate::activity::ActivityTargets;
+use crate::durable_fs;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
 use crate::models::{default_model, model_alias, DEFAULT_MODEL_ALIAS};
@@ -528,7 +529,7 @@ fn mutate_store(
     let path = store_path_from_root(&config_root);
     let parent = path.parent().expect("settings store always has parent");
     ensure_store_path_contained(parent, &config_root, request_id)?;
-    fs::create_dir_all(parent)
+    durable_fs::create_directories(parent)
         .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
     let lock_path = parent.join(STORE_LOCK_FILE);
     ensure_store_path_contained(&lock_path, &config_root, request_id)?;
@@ -785,7 +786,7 @@ fn write_store_path(
 ) -> Result<(), ProviderFailure> {
     let parent = path.parent().expect("settings store always has parent");
     ensure_store_path_contained(parent, config_root, request_id)?;
-    fs::create_dir_all(parent)
+    durable_fs::create_directories(parent)
         .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
     ensure_store_path_contained(path, config_root, request_id)?;
     let bytes = serialize_store(store, request_id)?;
@@ -807,8 +808,7 @@ fn serialize_store(store: &SettingsStore, request_id: &str) -> Result<Vec<u8>, P
 }
 
 fn sync_store_parent(parent: &Path, request_id: &str) -> Result<(), ProviderFailure> {
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    durable_fs::sync_directory(parent)
         .map_err(|err| store_io_failure(request_id, "settings_store_parent_sync_failed", err))
 }
 

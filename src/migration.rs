@@ -1,6 +1,7 @@
 //! Declared roles: mapper, validator, orchestration, accessor, formatter, predicate
 
 use crate::activity::ActivityTargets;
+use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::path_guard;
@@ -33,7 +34,7 @@ pub fn apply_params(
     ensure_confirmation(&params, request_id)?;
     let config_root = config_root(host, request_id)?;
     let artifact_root = artifact_root(&config_root, &params, request_id)?;
-    fs::create_dir_all(&artifact_root)
+    durable_fs::create_directories(&artifact_root)
         .map_err(|err| migration_artifact_dir_failure(request_id, err))?;
     let actions = planned_actions(&params);
     let summary = artifact_summary(&params, &actions);
@@ -386,8 +387,7 @@ fn write_artifact(path: &Path, bytes: &[u8], request_id: &str) -> Result<(), Pro
         Err(error) if fs::read(path).is_ok_and(|existing| existing == bytes) => {}
         Err(error) => return Err(migration_artifact_write_failure(request_id, error.error)),
     }
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    durable_fs::sync_directory(parent)
         .map_err(|error| migration_artifact_write_failure(request_id, error))
 }
 

@@ -175,8 +175,9 @@ filesystem target through the same lexical and canonical confinement guard
 before creating a directory or file. Each subsystem retains its own lifecycle
 rules after admission: settings and activity keep their interprocess locks,
 and migration and rotation keep their content-addressed atomic publication.
-Rotation durably publishes every newly created artifact and state directory
-link before a dependent file write or irreversible native import may proceed.
+One shared filesystem boundary durably publishes every newly created settings,
+migration, activity, rotation-artifact, and rotation-state directory link before
+a dependent file write or irreversible native import may proceed.
 
 Activity evidence is operational and explicitly best-effort. A directory,
 lock, write, or chain-validation failure is emitted as a stderr warning but

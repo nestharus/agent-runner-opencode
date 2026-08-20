@@ -5,6 +5,7 @@ pub mod activity;
 mod child_custody;
 pub mod discovery;
 pub mod dispatch;
+mod durable_fs;
 pub mod encoding;
 pub mod envelope;
 pub mod launch;

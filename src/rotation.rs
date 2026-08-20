@@ -2,6 +2,7 @@
 
 use crate::account::{profile_for_account_reference, AccountProfile};
 use crate::activity::ActivityTargets;
+use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
@@ -433,7 +434,7 @@ fn acquire_rotation_lock(
     let root = rotation_state_root(host, request_id)?;
     let lock_path =
         confined_rotation_state_target(host, &root.join("materialize.lock"), request_id)?;
-    create_private_directories_durable(&root)
+    durable_fs::create_private_directories(&root)
         .map_err(|error| rotation_state_failure(request_id, error))?;
     let lock = OpenOptions::new()
         .read(true)
@@ -823,12 +824,12 @@ fn write_private_bytes_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> 
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "state path has no parent")
     })?;
-    create_private_directories_durable(parent)?;
+    durable_fs::create_private_directories(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.as_file_mut().write_all(bytes)?;
     temporary.as_file_mut().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
-    fs::File::open(parent)?.sync_all()
+    durable_fs::sync_directory(parent)
 }
 
 fn now_unix_ms() -> u64 {
@@ -1000,9 +1001,9 @@ fn write_artifact_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             "artifact path has no parent",
         )
     })?;
-    create_private_directories_durable(parent)?;
+    durable_fs::create_private_directories(parent)?;
     match fs::read(path) {
-        Ok(existing) if existing == bytes => return sync_directory(parent),
+        Ok(existing) if existing == bytes => return durable_fs::sync_directory(parent),
         Ok(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1022,57 +1023,16 @@ fn write_artifact_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     drop(file);
     match fs::rename(&temporary, path) {
-        Ok(()) => sync_directory(parent),
+        Ok(()) => durable_fs::sync_directory(parent),
         Err(error) if fs::read(path).is_ok_and(|existing| existing == bytes) => {
             let _ = fs::remove_file(&temporary);
-            sync_directory(parent)
+            durable_fs::sync_directory(parent)
         }
         Err(error) => {
             let _ = fs::remove_file(&temporary);
             Err(error)
         }
     }
-}
-
-fn create_private_directories_durable(path: &Path) -> std::io::Result<()> {
-    let mut missing = Vec::new();
-    let mut ancestor = path;
-    while !ancestor.exists() {
-        missing.push(ancestor.to_path_buf());
-        ancestor = ancestor.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "artifact directory has no existing ancestor",
-            )
-        })?;
-    }
-    if !ancestor.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotADirectory,
-            "artifact directory ancestor is not a directory",
-        ));
-    }
-    for directory in missing.into_iter().rev() {
-        match fs::create_dir(&directory) {
-            Ok(()) => {}
-            Err(error)
-                if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
-            Err(error) => return Err(error),
-        }
-        set_private_directory_permissions(&directory)?;
-        let parent = directory.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "artifact directory has no parent",
-            )
-        })?;
-        sync_directory(parent)?;
-    }
-    set_private_directory_permissions(path)
-}
-
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    fs::File::open(path)?.sync_all()
 }
 
 fn private_artifact_file(path: &Path) -> std::io::Result<fs::File> {
@@ -1084,17 +1044,6 @@ fn private_artifact_file(path: &Path) -> std::io::Result<fs::File> {
         options.mode(0o600);
     }
     options.open(path)
-}
-
-#[cfg(unix)]
-fn set_private_directory_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_private_directory_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn validate_rotation_export(

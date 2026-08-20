@@ -4,6 +4,7 @@
 //! currently carry an authenticated principal or delegation, so this ledger
 //! records that absence explicitly instead of inventing an identity.
 
+use crate::durable_fs;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
 use crate::path_guard;
@@ -220,8 +221,7 @@ fn write_activity(
     path_guard::confined_target(data_root, root)?;
     let lock_path = path_guard::confined_target(data_root, &root.join(ACTIVITY_LOCK))?;
     let path = path_guard::confined_target(data_root, &root.join(ACTIVITY_FILE))?;
-    fs::create_dir_all(root)?;
-    set_private_directory(root)?;
+    durable_fs::create_private_directories(root)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -265,7 +265,7 @@ fn write_activity(
     temporary.as_file().sync_all()?;
     temporary.persist(&path).map_err(|error| error.error)?;
     set_private_file(&path)?;
-    fs::File::open(root)?.sync_all()
+    durable_fs::sync_directory(root)
 }
 
 fn validate_ledger(existing: &str) -> std::io::Result<(u64, String)> {
@@ -307,20 +307,9 @@ fn invalid_ledger(message: &str) -> std::io::Error {
 }
 
 #[cfg(unix)]
-fn set_private_directory(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(unix)]
 fn set_private_file(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 #[cfg(not(unix))]
