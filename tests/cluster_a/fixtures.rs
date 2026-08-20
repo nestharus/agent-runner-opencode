@@ -65,17 +65,6 @@ pub fn parse_opencode_fixture_events(fixture: &str) -> Vec<NumberedFixtureEvent>
         .collect()
 }
 
-pub fn non_empty_lines(lines: Vec<&str>) -> Vec<&str> {
-    lines
-        .into_iter()
-        .filter(|line| line_has_text(line))
-        .collect()
-}
-
-pub fn line_has_text(line: &str) -> bool {
-    !line.trim().is_empty()
-}
-
 pub fn fixture_event_type(numbered: &NumberedFixtureEvent) -> &str {
     numbered.event["type"].as_str().unwrap_or_else(|| {
         panic!(
@@ -253,18 +242,6 @@ pub fn value_json_text(value: &Value) -> String {
 
 pub fn text_contains(text: &str, needle: &str) -> bool {
     text.contains(needle)
-}
-
-pub fn non_empty_launch_stdout_lines(stdout: &[u8]) -> Vec<&str> {
-    non_empty_lines(launch_stdout_lines(stdout))
-}
-
-pub fn launch_stdout_lines(stdout: &[u8]) -> Vec<&str> {
-    launch_stdout_text(stdout).lines().collect()
-}
-
-pub fn launch_stdout_text(stdout: &[u8]) -> &str {
-    std::str::from_utf8(stdout).expect("launch stdout should be UTF-8 NDJSON")
 }
 
 pub struct FakeOpencodeWrapper {
@@ -569,38 +546,15 @@ pub fn shell_single_quote(value: &str) -> String {
 }
 
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(unique_temp_dir_name(prefix))
-}
-
-pub fn unique_temp_dir_name(prefix: &str) -> String {
-    formatted_temp_dir_name(prefix, current_time_nanos(), current_process_id())
-}
-
-pub fn current_time_nanos() -> u128 {
-    SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
-        .as_nanos()
-}
-
-pub fn current_process_id() -> u32 {
-    std::process::id()
-}
-
-pub fn formatted_temp_dir_name(prefix: &str, nanos: u128, process_id: u32) -> String {
-    format!("{prefix}-{process_id}-{nanos}")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
 pub fn prepend_path(dir: &Path) -> String {
-    joined_path_string(prepended_path_entries(dir))
-}
-
-pub fn prepended_path_entries(dir: &Path) -> Vec<PathBuf> {
-    vec![dir.to_path_buf()]
-}
-
-pub fn joined_path_string(paths: Vec<PathBuf>) -> String {
-    std::env::join_paths(paths)
+    std::env::join_paths([dir])
         .expect("join PATH entries")
         .to_string_lossy()
         .into_owned()
@@ -611,152 +565,62 @@ pub fn path_string(path: &Path) -> String {
 }
 
 pub fn expected_signal_kind_for_status(status: &Value) -> &'static str {
-    signal_kind_for_process_status(terminal_signal_status_kind(status), status)
-}
-
-pub fn terminal_signal_status_kind(status: &Value) -> &str {
-    required_terminal_signal_status_kind(terminal_signal_status_kind_value(status))
-}
-
-pub fn terminal_signal_status_kind_value(status: &Value) -> Option<&str> {
-    status["kind"].as_str()
-}
-
-pub fn required_terminal_signal_status_kind(kind: Option<&str>) -> &str {
-    kind.expect("status.kind")
-}
-
-pub fn signal_kind_for_process_status(kind: &str, status: &Value) -> &'static str {
-    match kind {
-        "exited" => signal_kind_for_exited_status(status),
+    match status["kind"].as_str().expect("status.kind") {
+        "exited" if status["code"].as_i64() == Some(0) => "clean_exit",
+        "exited" => "nonzero_exit",
         "signal_terminated" => "signal_exit",
         "spawn_error" => "spawn_error",
         "prolonged_silence" => "prolonged_silence",
         "cancelled" => "cancelled",
         "unknown" => "unknown",
-        other => unexpected_process_status_kind(other),
+        other => panic!("unexpected ProcessStatus kind {other}"),
     }
-}
-
-pub fn signal_kind_for_exited_status(status: &Value) -> &'static str {
-    if process_status_exit_success(status) {
-        "clean_exit"
-    } else {
-        "nonzero_exit"
-    }
-}
-
-pub fn process_status_exit_success(status: &Value) -> bool {
-    status["code"].as_i64() == Some(0)
-}
-
-pub fn unexpected_process_status_kind(other: &str) -> ! {
-    panic!("unexpected ProcessStatus kind {other}")
 }
 
 pub fn fixture_session_id() -> &'static str {
-    let event = fixture_first_event();
-    Box::leak(fixture_event_session_id_string(&event).into_boxed_str())
-}
-
-pub fn fixture_first_event() -> Value {
-    let first_line = fixture_first_line();
-    serde_json::from_str(first_line).expect("fixture first line should be JSON")
-}
-
-pub fn fixture_first_line() -> &'static str {
-    first_fixture_line(fixture_non_empty_lines())
-}
-
-pub fn fixture_non_empty_lines() -> Vec<&'static str> {
-    first_non_empty_fixture_lines(static_fixture_lines())
-}
-
-pub fn static_fixture_lines() -> Vec<&'static str> {
-    include_str!("../fixtures/opencode_launch_events.jsonl")
+    let first_line = include_str!("../fixtures/opencode_launch_events.jsonl")
         .lines()
-        .collect()
-}
-
-pub fn first_non_empty_fixture_lines(lines: Vec<&'static str>) -> Vec<&'static str> {
-    first_non_empty_line(lines).into_iter().collect()
-}
-
-pub fn first_non_empty_line(lines: Vec<&str>) -> Option<&str> {
-    lines.into_iter().find(|line| line_has_text(line))
-}
-
-pub fn first_fixture_line(lines: Vec<&'static str>) -> &'static str {
-    lines
-        .into_iter()
-        .next()
+        .find(|line| !line.trim().is_empty())
         .expect("opencode launch fixture should not be empty")
+        .to_string();
+    let event: Value =
+        serde_json::from_str(&first_line).expect("fixture first line should be JSON");
+    Box::leak(
+        event["sessionID"]
+            .as_str()
+            .expect("fixture first line should carry sessionID")
+            .to_owned()
+            .into_boxed_str(),
+    )
 }
 
-pub fn fixture_event_session_id_string(event: &Value) -> String {
-    owned_fixture_session_id(required_fixture_event_session_id(
-        fixture_event_session_id_value(event),
-    ))
-}
-
-pub fn fixture_event_session_id_value(event: &Value) -> Option<&str> {
-    event["sessionID"].as_str()
-}
-
-pub fn required_fixture_event_session_id(session_id: Option<&str>) -> &str {
-    session_id.expect("fixture first line should carry sessionID")
-}
-
-pub fn owned_fixture_session_id(session_id: &str) -> String {
-    session_id.to_owned()
-}
-
-pub fn unix_ms_now() -> u64 {
+pub fn short_deadline_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
         .as_millis() as u64
-}
-
-pub fn short_deadline_unix_ms() -> u64 {
-    unix_ms_now() + 250
+        + 250
 }
 
 pub fn string_array(value: &Value, label: &str) -> Vec<String> {
-    owned_string_array_entries(string_array_entries(value_array(value, label), label))
-}
-
-pub fn value_array<'a>(value: &'a Value, label: &str) -> &'a [Value] {
     value
         .as_array()
         .unwrap_or_else(|| panic!("{label} should be an array"))
-}
-
-pub fn string_array_entries<'a>(values: &'a [Value], label: &str) -> Vec<&'a str> {
-    values
         .iter()
-        .map(|value| string_array_entry(value, label))
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("{label} entries should be strings"))
+                .to_owned()
+        })
         .collect()
 }
 
-pub fn string_array_entry<'a>(value: &'a Value, label: &str) -> &'a str {
-    value
-        .as_str()
-        .unwrap_or_else(|| panic!("{label} entries should be strings"))
-}
-
-pub fn owned_string_array_entries(entries: Vec<&str>) -> Vec<String> {
-    entries.into_iter().map(str::to_owned).collect()
-}
-
 pub fn contains_subsequence(argv: &[String], expected: &[&str]) -> bool {
-    argv.windows(expected.len())
-        .any(|window| window_matches_expected(window, expected))
-}
-
-pub fn window_matches_expected(window: &[String], expected: &[&str]) -> bool {
-    window
-        .iter()
-        .map(String::as_str)
-        .eq(expected.iter().copied())
+    argv.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+    })
 }

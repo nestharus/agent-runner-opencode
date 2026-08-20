@@ -151,7 +151,7 @@ fn contract_session_enumerate_invalid_json_is_provider_error() {
         &[("PATH", path.as_str())],
     ));
 
-    assert_enumerate_error_code(&response, "invalid_opencode_session_list");
+    assert_eq!(response["error"]["code"], "invalid_opencode_session_list");
 }
 
 #[test]
@@ -165,8 +165,11 @@ fn contract_session_enumerate_nonzero_wrapper_exit_is_provider_error() {
         &[("PATH", path.as_str())],
     ));
 
-    assert_enumerate_error_code(&response, "session_list_failed");
-    assert_error_message_contains(&response, "list failed");
+    assert_eq!(response["error"]["code"], "session_list_failed");
+    assert!(response["error"]["message"]
+        .as_str()
+        .expect("error message string")
+        .contains("list failed"));
 }
 
 #[test]
@@ -253,7 +256,10 @@ fn contract_session_capture_rejects_conflicting_identity_carriers() {
             "session.schema.json#/$defs/SessionCaptureRequest",
         ));
         assert_eq!(response["error"]["code"], "invalid_session_capture_params");
-        assert_error_message_contains(&response, "conflicting session evidence");
+        assert!(response["error"]["message"]
+            .as_str()
+            .expect("error message string")
+            .contains("conflicting session evidence"));
     }
 }
 
@@ -296,7 +302,7 @@ fn contract_session_capture_rejects_live_report_workspace_mismatch() {
         &[("PATH", path.as_str())],
     ));
 
-    assert_error_code(&response, "invalid_session_capture_params");
+    assert_eq!(response["error"]["code"], "invalid_session_capture_params");
 }
 
 #[test]
@@ -314,7 +320,7 @@ fn contract_session_capture_rejects_live_report_invocation_mismatch() {
         &[("PATH", path.as_str())],
     ));
 
-    assert_error_code(&response, "invalid_session_capture_params");
+    assert_eq!(response["error"]["code"], "invalid_session_capture_params");
 }
 
 #[test]

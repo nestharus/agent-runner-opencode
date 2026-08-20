@@ -717,26 +717,14 @@ fn store_path(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderF
 }
 
 fn config_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    let Some(root) = host_config_root(host) else {
+    let Some(root) = host
+        .config_root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+    else {
         return Err(missing_config_root_failure(request_id));
     };
     Ok(PathBuf::from(root))
-}
-
-fn host_config_root(host: &HostContext) -> Option<&str> {
-    non_empty_config_root(raw_host_config_root(host))
-}
-
-fn raw_host_config_root(host: &HostContext) -> Option<&str> {
-    host.config_root.as_deref()
-}
-
-fn non_empty_config_root(root: Option<&str>) -> Option<&str> {
-    root.filter(|root| non_empty_text(root))
-}
-
-fn non_empty_text(value: &str) -> bool {
-    !value.trim().is_empty()
 }
 
 fn store_path_from_root(config_root: &Path) -> PathBuf {
@@ -826,11 +814,9 @@ fn new_record(
 }
 
 fn record_display_name(display_name: Option<String>, values: &Value) -> String {
-    non_empty_display_name(display_name).unwrap_or_else(|| default_display_name(values))
-}
-
-fn non_empty_display_name(display_name: Option<String>) -> Option<String> {
-    display_name.filter(|name| non_empty_text(name))
+    display_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| default_display_name(values))
 }
 
 fn unique_settings_id(store: &SettingsStore, values: &Value, request_id: &str) -> String {
@@ -897,30 +883,16 @@ fn summary_values(values: &Value) -> Value {
 
 fn sanitize_value(value: &Value) -> Value {
     match value {
-        Value::Object(object) => sanitize_object(object),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| !is_secret_key(key))
+                .map(|(key, value)| (key.clone(), sanitize_value(value)))
+                .collect(),
+        ),
         Value::Array(values) => Value::Array(values.iter().map(sanitize_value).collect()),
         _ => value.clone(),
     }
-}
-
-fn sanitize_object(object: &Map<String, Value>) -> Value {
-    let entries = non_secret_entries(object);
-    Value::Object(sanitized_entries(entries))
-}
-
-fn non_secret_entries(object: &Map<String, Value>) -> Vec<(&String, &Value)> {
-    object
-        .iter()
-        .filter(|(key, _)| !is_secret_key(key))
-        .collect()
-}
-
-fn sanitized_entries(entries: Vec<(&String, &Value)>) -> Map<String, Value> {
-    let mut sanitized = Map::new();
-    for (key, value) in entries {
-        sanitized.insert(key.clone(), sanitize_value(value));
-    }
-    sanitized
 }
 
 fn is_secret_key(key: &str) -> bool {
@@ -1129,17 +1101,11 @@ fn legacy_unrecognized_provider_diagnostic(provider: String) -> Value {
 }
 
 fn legacy_models(legacy: &Value) -> Vec<String> {
-    legacy_models_object(legacy)
-        .map(legacy_model_names)
+    legacy
+        .get("models")
+        .and_then(Value::as_object)
+        .map(|models| models.keys().cloned().collect())
         .unwrap_or_default()
-}
-
-fn legacy_models_object(legacy: &Value) -> Option<&Map<String, Value>> {
-    legacy.get("models").and_then(Value::as_object)
-}
-
-fn legacy_model_names(models: &Map<String, Value>) -> Vec<String> {
-    models.keys().cloned().collect()
 }
 
 fn write_migrated_settings(

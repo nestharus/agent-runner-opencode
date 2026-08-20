@@ -66,42 +66,35 @@ pub fn brain_unsupported(request_id: String) -> ProviderFailure {
 }
 
 fn executable_evidence(program: &str) -> Value {
-    executable_evidence_json(program, executable_probe(program))
-}
-
-struct ExecutableProbe {
-    path: Option<PathBuf>,
-    version: Value,
-}
-
-fn executable_probe(program: &str) -> ExecutableProbe {
-    ExecutableProbe {
-        path: find_on_path(program),
-        version: command_output_evidence(program, &["--version"]),
-    }
-}
-
-fn executable_evidence_json(program: &str, probe: ExecutableProbe) -> Value {
+    let path = find_on_path(program);
+    let version = match shell::run(&[program.to_string(), "--version".to_string()]) {
+        Ok(output) => {
+            let stdout = sanitized_command_output(&output.stdout, 500);
+            let stderr = sanitized_command_output(&output.stderr, 500);
+            json!({
+                "present": true,
+                "status": output.status,
+                "ready": output.status == 0,
+                "stdout_present": stdout.present,
+                "stderr_present": stderr.present,
+                "stdout_bytes": stdout.byte_len,
+                "stderr_bytes": stderr.byte_len,
+                "stdout": stdout.excerpt,
+                "stderr": stderr.excerpt,
+                "redacted": stdout.redacted || stderr.redacted,
+            })
+        }
+        Err(err) => json!({
+            "present": false,
+            "error": redacted_excerpt(&err.to_string(), 300),
+        }),
+    };
     json!({
         "program": program,
-        "present": probe.path.is_some(),
-        "path": probe.path.map(|path| path.to_string_lossy().into_owned()),
-        "version": probe.version,
+        "present": path.is_some(),
+        "path": path.map(|path| path.to_string_lossy().into_owned()),
+        "version": version,
     })
-}
-
-fn command_output_evidence(program: &str, args: &[&str]) -> Value {
-    let argv = command_argv(program, args);
-    match shell::run(&argv) {
-        Ok(output) => command_success_evidence(output),
-        Err(err) => command_error_evidence(err),
-    }
-}
-
-fn command_success_evidence(output: shell::ShellOutput) -> Value {
-    let stdout = sanitized_command_output(&output.stdout, 500);
-    let stderr = sanitized_command_output(&output.stderr, 500);
-    command_success_json(output.status, stdout, stderr)
 }
 
 struct SanitizedOutput {
@@ -112,9 +105,14 @@ struct SanitizedOutput {
 }
 
 fn sanitized_command_output(bytes: &[u8], max_len: usize) -> SanitizedOutput {
-    let text = decoded_output_text(bytes);
+    let text = String::from_utf8_lossy(bytes);
     let (redacted, changed) = redact_sensitive_text(&text);
-    sanitized_output(bytes, redacted.trim(), changed, max_len)
+    SanitizedOutput {
+        present: !bytes.is_empty(),
+        byte_len: bytes.len(),
+        excerpt: bounded_text(redacted.trim(), max_len),
+        redacted: changed,
+    }
 }
 
 fn redacted_excerpt(text: &str, max_len: usize) -> String {
@@ -123,49 +121,28 @@ fn redacted_excerpt(text: &str, max_len: usize) -> String {
 }
 
 fn redact_sensitive_text(text: &str) -> (String, bool) {
-    let lines = redacted_lines(text);
-    (redacted_text(&lines), any_redacted_line(&lines))
-}
-
-struct RedactedLine {
-    text: String,
-    changed: bool,
-}
-
-fn redacted_lines(text: &str) -> Vec<RedactedLine> {
-    text.lines().map(redacted_line).collect()
-}
-
-fn redacted_line(line: &str) -> RedactedLine {
-    let changed = line_contains_secret(line);
-    RedactedLine {
-        text: redacted_line_text(line, changed),
-        changed,
-    }
-}
-
-fn redacted_line_text(line: &str, changed: bool) -> String {
-    if changed {
-        redacted_placeholder()
-    } else {
-        printable_line(line)
-    }
-}
-
-fn redacted_placeholder() -> String {
-    "[redacted]".to_string()
-}
-
-fn redacted_text(lines: &[RedactedLine]) -> String {
-    lines
-        .iter()
-        .map(|line| line.text.as_str())
+    let mut changed = false;
+    let redacted = text
+        .lines()
+        .map(|line| {
+            if line_contains_secret(line) {
+                changed = true;
+                "[redacted]".to_string()
+            } else {
+                line.chars()
+                    .map(|ch| {
+                        if ch.is_control() && ch != '\t' {
+                            ' '
+                        } else {
+                            ch
+                        }
+                    })
+                    .collect()
+            }
+        })
         .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn any_redacted_line(lines: &[RedactedLine]) -> bool {
-    lines.iter().any(|line| line.changed)
+        .join("\n");
+    (redacted, changed)
 }
 
 fn line_contains_secret(line: &str) -> bool {
@@ -207,27 +184,42 @@ fn is_token_shaped_fragment(fragment: &str) -> bool {
         || fragment.starts_with("xox")
 }
 
-fn printable_line(line: &str) -> String {
-    line.chars()
-        .map(|ch| {
-            if ch.is_control() && ch != '\t' {
-                ' '
-            } else {
-                ch
-            }
+fn profile_evidence(data_root: Option<&str>, profile_root: Option<&str>) -> Vec<Value> {
+    ACCOUNTS
+        .iter()
+        .map(|account| {
+            let wrapper_path = find_on_path(account.opencode_wrapper);
+            json!({
+                "profile": account.opencode_wrapper,
+                "wrapper": account.opencode_wrapper,
+                "wrapper_present": wrapper_path.is_some(),
+                "wrapper_path": wrapper_path.map(|path| path.to_string_lossy().into_owned()),
+                "opencode_auth_path": account.opencode_auth_path,
+                "opencode_auth_present": opencode_auth_file_present(account.opencode_auth_path),
+                "data_root": data_root,
+                "profile_root": profile_root,
+                "quota_probe": account.quota_probe_kind(),
+            })
         })
         .collect()
 }
 
-fn profile_evidence(data_root: Option<&str>, profile_root: Option<&str>) -> Vec<Value> {
-    ACCOUNTS
-        .iter()
-        .map(|account| profile_json(account, data_root, profile_root))
-        .collect()
-}
-
 fn auth_summary() -> String {
-    let present = auth_entries().join(", ");
+    let present = ACCOUNTS
+        .iter()
+        .map(|account| {
+            let state = if opencode_auth_file_present(account.opencode_auth_path) {
+                "present"
+            } else {
+                "missing"
+            };
+            format!(
+                "{}:{}:{}",
+                account.opencode_wrapper, state, account.opencode_auth_path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("OpenCode auth metadata only; {present}; quota probe native_chatgpt_usage")
 }
 
@@ -249,7 +241,10 @@ fn sync_diagnostics(params: &Value) -> Vec<Value> {
 }
 
 fn desired_profile_diagnostics(params: &Value) -> Vec<Value> {
-    desired_profile_values(params)
+    params
+        .get("desired_profiles")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
         .filter_map(|value| match value.as_str() {
@@ -337,37 +332,21 @@ fn sync_plan_result(operations: Vec<Value>, diagnostics: Vec<Value>) -> Value {
 }
 
 fn desired_profiles(params: &Value) -> Vec<String> {
-    desired_profile_values(params)
-        .map(desired_profile_strings)
-        .unwrap_or_else(default_profiles)
-}
-
-fn desired_profile_values(params: &Value) -> Option<&[Value]> {
-    params
+    let Some(values) = params
         .get("desired_profiles")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
-}
-
-fn desired_profile_strings(values: &[Value]) -> Vec<String> {
-    desired_profile_string_entries(values)
-        .into_iter()
+    else {
+        return default_profiles();
+    };
+    values
+        .iter()
+        .filter_map(Value::as_str)
         .filter_map(profile_for_wrapper_reference)
         .map(|account| account.opencode_wrapper.to_string())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-fn desired_profile_string_entries(values: &[Value]) -> Vec<&str> {
-    values
-        .iter()
-        .filter_map(desired_profile_string_entry)
-        .collect()
-}
-
-fn desired_profile_string_entry(value: &Value) -> Option<&str> {
-    value.as_str()
 }
 
 fn default_profiles() -> Vec<String> {
@@ -381,144 +360,18 @@ fn default_profiles() -> Vec<String> {
 fn sync_operations(desired: &[String]) -> Vec<Value> {
     desired
         .iter()
-        .map(|profile| sync_operation(profile.as_str()))
+        .map(|profile| {
+            json!({
+                "kind": "ensure_profile",
+                "profile": profile,
+                "schema_id": "opencode.settings/v1"
+            })
+        })
         .collect()
 }
 
-fn sync_operation(profile: &str) -> Value {
-    json!({"kind": "ensure_profile", "profile": profile, "schema_id": "opencode.settings/v1"})
-}
-
-fn command_argv(program: &str, args: &[&str]) -> Vec<String> {
-    let mut argv = vec![program.to_string()];
-    argv.extend(args.iter().map(|arg| (*arg).to_string()));
-    argv
-}
-
-fn command_error_evidence(err: std::io::Error) -> Value {
-    json!({
-        "present": false,
-        "error": redacted_excerpt(&err.to_string(), 300),
-    })
-}
-
-fn command_success_json(status: i32, stdout: SanitizedOutput, stderr: SanitizedOutput) -> Value {
-    json!({
-        "present": true,
-        "status": status,
-        "ready": status == 0,
-        "stdout_present": stdout.present,
-        "stderr_present": stderr.present,
-        "stdout_bytes": stdout.byte_len,
-        "stderr_bytes": stderr.byte_len,
-        "stdout": stdout.excerpt,
-        "stderr": stderr.excerpt,
-        "redacted": stdout.redacted || stderr.redacted,
-    })
-}
-
-fn decoded_output_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).to_string()
-}
-
-fn sanitized_output(
-    bytes: &[u8],
-    redacted: &str,
-    changed: bool,
-    max_len: usize,
-) -> SanitizedOutput {
-    SanitizedOutput {
-        present: !bytes.is_empty(),
-        byte_len: bytes.len(),
-        excerpt: bounded_text(redacted, max_len),
-        redacted: changed,
-    }
-}
-
-fn profile_json(
-    account: &crate::account::AccountProfile,
-    data_root: Option<&str>,
-    profile_root: Option<&str>,
-) -> Value {
-    profile_evidence_json(account, data_root, profile_root, profile_probe(account))
-}
-
-struct ProfileProbe {
-    wrapper_path: Option<PathBuf>,
-    opencode_auth_present: bool,
-}
-
-fn profile_probe(account: &crate::account::AccountProfile) -> ProfileProbe {
-    profile_probe_from_parts(
-        find_on_path(account.opencode_wrapper),
-        opencode_auth_file_present(account.opencode_auth_path),
-    )
-}
-
-fn profile_probe_from_parts(
-    wrapper_path: Option<PathBuf>,
-    opencode_auth_present: bool,
-) -> ProfileProbe {
-    ProfileProbe {
-        wrapper_path,
-        opencode_auth_present,
-    }
-}
-
 fn opencode_auth_file_present(path: &str) -> bool {
-    path_is_file(&expanded_auth_path(path))
-}
-
-fn expanded_auth_path(path: &str) -> PathBuf {
-    expand_tilde(path)
-}
-
-fn path_is_file(path: &Path) -> bool {
-    path.is_file()
-}
-
-fn profile_evidence_json(
-    account: &crate::account::AccountProfile,
-    data_root: Option<&str>,
-    profile_root: Option<&str>,
-    probe: ProfileProbe,
-) -> Value {
-    json!({
-        "profile": account.opencode_wrapper,
-        "wrapper": account.opencode_wrapper,
-        "wrapper_present": probe.wrapper_path.is_some(),
-        "wrapper_path": probe.wrapper_path.map(|path| path.to_string_lossy().into_owned()),
-        "opencode_auth_path": account.opencode_auth_path,
-        "opencode_auth_present": probe.opencode_auth_present,
-        "data_root": data_root,
-        "profile_root": profile_root,
-        "quota_probe": account.quota_probe_kind(),
-    })
-}
-
-fn auth_entries() -> Vec<String> {
-    ACCOUNTS.iter().map(auth_entry).collect()
-}
-
-fn auth_entry(account: &crate::account::AccountProfile) -> String {
-    format!(
-        "{}:{}:{}",
-        account.opencode_wrapper,
-        auth_state(account.opencode_auth_path),
-        account.opencode_auth_path
-    )
-}
-
-fn auth_state(path: &str) -> &'static str {
-    auth_state_label(opencode_auth_file_present(path))
-}
-
-fn auth_state_label(present: bool) -> &'static str {
-    if present {
-        "present"
-    } else {
-        "missing"
-    }
+    expand_tilde(path).is_file()
 }
 
 fn settings_schema_mismatch_diagnostic() -> Value {
