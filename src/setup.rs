@@ -1,12 +1,17 @@
 //! Declared roles: accessor, mapper, orchestration, validator, predicate, filter, formatter, parser
 
 use crate::account::{profile_for_wrapper_reference, ACCOUNTS};
-use crate::encoding::bounded_text;
+use crate::child_custody::ChildCustody;
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
+use crate::operation_bounds;
 use crate::shell;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+const SETUP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Command {
@@ -38,9 +43,9 @@ pub fn detect_params(
 ) -> Result<Value, ProviderFailure> {
     let data_root = string_param(&params, "data_root").or(host.data_root.as_deref());
     let profile_root = string_param(&params, "profile_root");
-    let opencode = executable_evidence("opencode");
-    let curl = executable_evidence("curl");
-    let profiles = profile_evidence(data_root, profile_root);
+    let opencode = executable_evidence("opencode", host.deadline_unix_ms);
+    let curl = executable_evidence("curl", host.deadline_unix_ms);
+    let profiles = profile_evidence(data_root, profile_root, host.deadline_unix_ms);
     let installed = setup_installed(&opencode, &curl, &profiles);
     Ok(detect_result(opencode, curl, profiles, installed))
 }
@@ -66,28 +71,52 @@ pub fn brain_unsupported(request_id: String) -> ProviderFailure {
     )
 }
 
-fn executable_evidence(program: &str) -> Value {
+fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
     let path = find_on_path(program);
-    let version = match shell::run(&[program.to_string(), "--version".to_string()]) {
-        Ok(output) => {
-            let stdout = sanitized_command_output(&output.stdout, 500);
-            let stderr = sanitized_command_output(&output.stderr, 500);
-            json!({
-                "present": true,
-                "status": output.status,
-                "ready": output.status == 0,
-                "stdout_present": stdout.present,
-                "stderr_present": stderr.present,
-                "stdout_bytes": stdout.byte_len,
-                "stderr_bytes": stderr.byte_len,
-                "stdout": stdout.excerpt,
-                "stderr": stderr.excerpt,
-                "redacted": stdout.redacted || stderr.redacted,
-            })
+    let version = match (
+        &path,
+        operation_bounds::remaining_timeout(deadline_unix_ms, SETUP_PROBE_TIMEOUT),
+    ) {
+        (Some(path), Some(timeout)) => {
+            let program = path.to_string_lossy().into_owned();
+            let mut command = shell::command(&program);
+            command
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let output = command
+                .spawn()
+                .and_then(|child| ChildCustody::new(child).wait_with_output_timeout(timeout));
+            match output {
+                Ok(Some(output)) => json!({
+                    "present": true,
+                    "status": output.status.code().unwrap_or(1),
+                    "ready": output.status.success(),
+                }),
+                Ok(None) => json!({
+                    "present": true,
+                    "ready": false,
+                    "timed_out": true,
+                    "error": format!("{program} --version exceeded the setup probe deadline"),
+                }),
+                Err(err) => json!({
+                    "present": true,
+                    "ready": false,
+                    "error": err.to_string(),
+                }),
+            }
         }
-        Err(err) => json!({
+        (Some(_), None) => json!({
+            "present": true,
+            "ready": false,
+            "timed_out": true,
+            "error": "host deadline expired before the setup probe",
+        }),
+        (None, _) => json!({
             "present": false,
-            "error": redacted_excerpt(&err.to_string(), 300),
+            "ready": false,
+            "error": format!("{program} was not found in PATH"),
         }),
     };
     json!({
@@ -98,105 +127,27 @@ fn executable_evidence(program: &str) -> Value {
     })
 }
 
-struct SanitizedOutput {
-    present: bool,
-    byte_len: usize,
-    excerpt: String,
-    redacted: bool,
-}
-
-fn sanitized_command_output(bytes: &[u8], max_len: usize) -> SanitizedOutput {
-    let text = String::from_utf8_lossy(bytes);
-    let (redacted, changed) = redact_sensitive_text(&text);
-    SanitizedOutput {
-        present: !bytes.is_empty(),
-        byte_len: bytes.len(),
-        excerpt: bounded_text(redacted.trim(), max_len),
-        redacted: changed,
-    }
-}
-
-fn redacted_excerpt(text: &str, max_len: usize) -> String {
-    let (redacted, _) = redact_sensitive_text(text);
-    bounded_text(redacted.trim(), max_len)
-}
-
-fn redact_sensitive_text(text: &str) -> (String, bool) {
-    let mut changed = false;
-    let redacted = text
-        .lines()
-        .map(|line| {
-            if line_contains_secret(line) {
-                changed = true;
-                "[redacted]".to_string()
-            } else {
-                line.chars()
-                    .map(|ch| {
-                        if ch.is_control() && ch != '\t' {
-                            ' '
-                        } else {
-                            ch
-                        }
-                    })
-                    .collect()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    (redacted, changed)
-}
-
-fn line_contains_secret(line: &str) -> bool {
-    let lowered = line.to_ascii_lowercase();
-    secret_keyword_present(&lowered) || token_shaped_fragment_present(line)
-}
-
-fn secret_keyword_present(lowered: &str) -> bool {
-    [
-        "api_key",
-        "authorization",
-        "bearer",
-        "credential",
-        "password",
-        "private_key",
-        "refresh",
-        "secret",
-        "token",
-    ]
-    .iter()
-    .any(|needle| lowered.contains(needle))
-}
-
-fn token_shaped_fragment_present(line: &str) -> bool {
-    line.split(|ch: char| !is_token_fragment_char(ch))
-        .any(is_token_shaped_fragment)
-}
-
-fn is_token_fragment_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+' | '/' | '=')
-}
-
-fn is_token_shaped_fragment(fragment: &str) -> bool {
-    fragment.len() >= 32
-        || fragment.starts_with("sk-")
-        || fragment.starts_with("eyJ")
-        || fragment.starts_with("ghp_")
-        || fragment.starts_with("gho_")
-        || fragment.starts_with("xox")
-}
-
-fn profile_evidence(data_root: Option<&str>, profile_root: Option<&str>) -> Vec<Value> {
+fn profile_evidence(
+    data_root: Option<&str>,
+    profile_root: Option<&str>,
+    deadline_unix_ms: Option<u64>,
+) -> Vec<Value> {
     ACCOUNTS
         .iter()
         .map(|account| {
-            let wrapper_path = find_on_path(account.opencode_wrapper);
+            let wrapper = executable_evidence(account.opencode_wrapper, deadline_unix_ms);
+            let auth_present = opencode_auth_file_present(account.opencode_auth_path);
+            let wrapper_ready = evidence_ready(&wrapper);
             json!({
                 "profile": account.opencode_wrapper,
                 "wrapper": account.opencode_wrapper,
-                "wrapper_present": wrapper_path.is_some(),
-                "wrapper_path": wrapper_path.map(|path| path.to_string_lossy().into_owned()),
+                "wrapper_present": evidence_present(&wrapper),
+                "wrapper_ready": wrapper_ready,
+                "wrapper_path": wrapper.get("path").cloned().unwrap_or(Value::Null),
+                "wrapper_version": wrapper.get("version").cloned().unwrap_or(Value::Null),
                 "opencode_auth_path": account.opencode_auth_path,
-                "opencode_auth_present": opencode_auth_file_present(account.opencode_auth_path),
+                "opencode_auth_present": auth_present,
+                "profile_ready": wrapper_ready && auth_present,
                 "data_root": data_root,
                 "profile_root": profile_root,
                 "quota_probe": account.quota_probe_kind(),
@@ -224,13 +175,37 @@ fn auth_summary() -> String {
     format!("OpenCode auth metadata only; {present}; quota probe native_chatgpt_usage")
 }
 
-fn setup_warnings(installed: bool) -> Vec<Value> {
-    if installed {
-        return Vec::new();
+fn setup_warnings(opencode: &Value, curl: &Value, profiles: &[Value]) -> Vec<Value> {
+    let mut warnings = Vec::new();
+    if !evidence_ready(opencode) {
+        warnings.push(json!(
+            "opencode executable probe did not complete successfully"
+        ));
     }
-    vec![json!(
-        "one or more opencode setup prerequisites were not detected"
-    )]
+    if !evidence_ready(curl) {
+        warnings.push(json!("curl executable probe did not complete successfully"));
+    }
+    for profile in profiles {
+        if profile.get("profile_ready").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let name = profile
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown profile");
+        let wrapper_ready = profile
+            .get("wrapper_ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let auth_present = profile
+            .get("opencode_auth_present")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        warnings.push(json!(format!(
+            "{name} is not ready: wrapper_ready={wrapper_ready}, opencode_auth_present={auth_present}"
+        )));
+    }
+    warnings
 }
 
 fn sync_diagnostics(params: &Value) -> Vec<Value> {
@@ -293,7 +268,11 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 fn setup_installed(opencode: &Value, curl: &Value, profiles: &[Value]) -> bool {
-    evidence_present(opencode) && evidence_present(curl) && any_wrapper_present(profiles)
+    evidence_ready(opencode)
+        && evidence_ready(curl)
+        && profiles
+            .iter()
+            .all(|profile| profile.get("profile_ready").and_then(Value::as_bool) == Some(true))
 }
 
 fn evidence_present(evidence: &Value) -> bool {
@@ -303,13 +282,13 @@ fn evidence_present(evidence: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn any_wrapper_present(profiles: &[Value]) -> bool {
-    profiles
-        .iter()
-        .any(|profile| profile.get("wrapper_present").and_then(Value::as_bool) == Some(true))
+fn evidence_ready(evidence: &Value) -> bool {
+    evidence_present(evidence)
+        && evidence.pointer("/version/ready").and_then(Value::as_bool) == Some(true)
 }
 
 fn detect_result(opencode: Value, curl: Value, profiles: Vec<Value>, installed: bool) -> Value {
+    let warnings = setup_warnings(&opencode, &curl, &profiles);
     json!({
         "installed": installed,
         "binary": {
@@ -318,7 +297,7 @@ fn detect_result(opencode: Value, curl: Value, profiles: Vec<Value>, installed: 
         },
         "auth": auth_summary(),
         "profiles": profiles,
-        "warnings": setup_warnings(installed),
+        "warnings": warnings,
     })
 }
 

@@ -83,6 +83,14 @@ fn candidate_context(
             "curl was not found in the selected quota-observer PATH",
         )
     })?;
+    if !durable_fs::is_executable_file(&program)
+        .map_err(|error| quota_observer_failure(request_id, error))?
+    {
+        return Err(quota_observer_failure(
+            request_id,
+            "curl is not an executable regular file",
+        ));
+    }
     let program_bytes =
         fs::read(&program).map_err(|error| quota_observer_failure(request_id, error))?;
     let program = program.to_str().ok_or_else(|| {
@@ -113,7 +121,11 @@ fn resolve_program(program: &str, environment: &BTreeMap<String, String>) -> Opt
         .into_iter()
         .flat_map(std::env::split_paths)
         .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| {
+            durable_fs::is_executable_file(candidate)
+                .ok()
+                .is_some_and(|executable| executable)
+        })
         .and_then(|candidate| fs::canonicalize(candidate).ok())
 }
 
@@ -155,6 +167,17 @@ fn validate_observer_context(
         return Err(quota_observer_failure(
             request_id,
             "persisted quota observer identity is inconsistent",
+        ));
+    }
+    if !durable_fs::is_executable_file(Path::new(&context.program))
+        .map_err(|error| quota_observer_failure(request_id, error))?
+    {
+        return Err(quota_observer_failure(
+            request_id,
+            format!(
+                "bound quota observer for account {} is no longer executable",
+                account.opencode_wrapper
+            ),
         ));
     }
     let bytes =

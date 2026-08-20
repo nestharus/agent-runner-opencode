@@ -136,7 +136,7 @@ pub fn assert_settings_migrate_result(
 pub fn assert_setup_detect_installed(detect: &Value, data_root: &str, profile_root: &str) {
     assert_setup_auth_sentinel_absent(detect);
     assert_eq!(detect["installed"], true);
-    assert!(detect["warnings"].as_array().is_some());
+    assert!(detect["warnings"].as_array().expect("warnings").is_empty());
     assert!(
         detect.get("binary").is_some(),
         "detect should report binary evidence"
@@ -145,27 +145,19 @@ pub fn assert_setup_detect_installed(detect: &Value, data_root: &str, profile_ro
         detect.get("auth").is_some(),
         "detect should report auth readiness"
     );
-    assert_detect_contains_sentinels(detect);
+    assert_detect_binary_readiness(detect);
     assert_detect_contains_roots(detect, data_root, profile_root);
     assert_detect_profiles(detect);
 }
 
-pub fn assert_detect_contains_sentinels(detect: &Value) {
-    assert!(
-        json_contains_string(&detect["binary"], OPENCODE_VERSION_SENTINEL),
-        "detect binary evidence should include fake opencode --version sentinel {OPENCODE_VERSION_SENTINEL}; binary={}",
-        detect["binary"]
-    );
-    assert!(
-        json_contains_string(&detect["binary"], "curl")
-            || json_contains_string(&detect["auth"], "native_chatgpt_usage")
-            || json_contains_string(&detect["profiles"], "native_chatgpt_usage"),
-        "detect provider-owned evidence should identify the native quota prerequisites; detect={detect}"
-    );
-    assert!(
-        json_contains_string(&detect["binary"], CURL_VERSION_SENTINEL),
-        "detect provider-owned evidence should include curl readiness sentinel {CURL_VERSION_SENTINEL}; detect={detect}"
-    );
+pub fn assert_detect_binary_readiness(detect: &Value) {
+    for program in ["opencode", "curl"] {
+        assert_eq!(
+            detect["binary"][program]["version"]["ready"], true,
+            "setup must prove {program} readiness; detect={detect}"
+        );
+        assert_eq!(detect["binary"][program]["version"]["status"], 0);
+    }
 }
 
 pub fn assert_detect_contains_roots(detect: &Value, data_root: &str, profile_root: &str) {
@@ -199,6 +191,11 @@ pub fn assert_detect_profiles(detect: &Value) {
         profiles.len() >= 5,
         "detect should report the five opencode profiles"
     );
+    assert!(profiles.iter().all(|profile| {
+        profile["wrapper_ready"] == true
+            && profile["opencode_auth_present"] == true
+            && profile["profile_ready"] == true
+    }));
 }
 
 pub fn assert_setup_install_result(install: &Value) {

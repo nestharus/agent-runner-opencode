@@ -9,10 +9,6 @@ pub const UPDATE_SECRET_TOKEN: &str = "opencode_contract_update_secret_token_mus
 
 pub const SETUP_AUTH_SENTINEL: &str = "SETUP_AUTH_SENTINEL_DO_NOT_LEAK";
 
-pub const OPENCODE_VERSION_SENTINEL: &str = "opencode 0.0.0-contract";
-
-pub const CURL_VERSION_SENTINEL: &str = "curl 0.0.0-contract";
-
 pub const ROTATION_SOURCE_SESSION: &str = "ses_source_contract_d";
 
 pub const PROVIDERS_TOML: &str = r#"

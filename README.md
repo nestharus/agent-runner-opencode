@@ -309,6 +309,16 @@ and accepts no environment-selected observer branch. Auth refresh binds both
 the native OpenCode runtime identity and this quota-observer identity before it
 admits a credential mutation.
 
+`setup.detect` reports provider-wide `installed=true` only after exact-path
+`--version` probes succeed for `opencode`, `curl`, and every one of the five
+account wrappers, and every account's OpenCode auth file is present. Each probe
+uses the earlier of the host deadline and a two-second ceiling. A missing,
+non-executable, failing, or stalled dependency leaves the provider non-installed
+and produces a tool- or profile-specific warning; regular-file presence alone
+is never readiness. Native runtime and quota-observer admission independently
+enforce executable-file status before binding an implementation identity and on
+every later reuse.
+
 ### Native dependency identity upgrades
 
 Wrapper and quota-observer files must not be replaced in place while their

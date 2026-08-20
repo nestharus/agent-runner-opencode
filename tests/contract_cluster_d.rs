@@ -1465,6 +1465,80 @@ fn contract_setup_detect_missing_dependency_diagnostics() {
     fs::remove_dir_all(&empty_path).expect("remove empty PATH fixture");
 }
 
+#[cfg(unix)]
+#[test]
+fn contract_setup_detect_rejects_present_but_unusable_dependencies() {
+    let host = HostRoots::new("agent-runner-opencode-setup-unusable-dependencies");
+    let tool_root = unique_temp_dir("agent-runner-opencode-unusable-setup-tools");
+    fs::create_dir_all(&tool_root).expect("create unusable setup tool root");
+    for program in ["opencode", "curl", "opencode1"] {
+        fs::write(tool_root.join(program), b"regular but not executable\n")
+            .expect("write non-executable setup dependency");
+    }
+    let home = HomeFixture::new("agent-runner-opencode-setup-unusable-home");
+    home.write_all_opencode_auths();
+    let path = path_string(&tool_root);
+    let detect = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.detect",
+            setup_detect_data_root_params(&path_string(host.data_root())),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupDetectRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupDetectResponse",
+        "setup.schema.json#/$defs/SetupDetectResult",
+    );
+
+    assert_eq!(detect["installed"], false);
+    assert_eq!(detect["binary"]["opencode"]["present"], true);
+    assert_eq!(detect["binary"]["opencode"]["version"]["ready"], false);
+    assert_eq!(detect["binary"]["curl"]["present"], true);
+    assert_eq!(detect["binary"]["curl"]["version"]["ready"], false);
+    let profiles = detect["profiles"].as_array().expect("profile evidence");
+    assert_eq!(profiles[0]["wrapper_present"], true);
+    assert_eq!(profiles[0]["wrapper_ready"], false);
+    assert_eq!(profiles[0]["profile_ready"], false);
+    assert!(profiles[1..]
+        .iter()
+        .all(|profile| profile["wrapper_present"] == false));
+    assert!(!detect["warnings"].as_array().expect("warnings").is_empty());
+    fs::remove_dir_all(&tool_root).expect("remove unusable setup tool root");
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_setup_detect_bounds_hanging_version_probe() {
+    let host = HostRoots::new("agent-runner-opencode-setup-probe-timeout");
+    let tool_root = unique_temp_dir("agent-runner-opencode-hanging-setup-tools");
+    fs::create_dir_all(&tool_root).expect("create hanging setup tool root");
+    write_executable(
+        &tool_root.join("opencode"),
+        "#!/bin/sh\nwhile :; do :; done\n",
+    );
+    let home = HomeFixture::new("agent-runner-opencode-setup-probe-timeout-home");
+    let path = path_string(&tool_root);
+    let mut bounded_host = host.overrides();
+    bounded_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 500);
+    let started = std::time::Instant::now();
+    let detect = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.detect",
+            setup_detect_data_root_params(&path_string(host.data_root())),
+            bounded_host,
+            "setup.schema.json#/$defs/SetupDetectRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupDetectResponse",
+        "setup.schema.json#/$defs/SetupDetectResult",
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(detect["installed"], false);
+    assert_eq!(detect["binary"]["opencode"]["version"]["timed_out"], true);
+    assert!(!detect["warnings"].as_array().expect("warnings").is_empty());
+    fs::remove_dir_all(&tool_root).expect("remove hanging setup tool root");
+}
+
 #[test]
 fn contract_setup_install_sync_plan_missing_prerequisite() {
     let host = HostRoots::new("agent-runner-opencode-setup-plan-missing-prerequisite");

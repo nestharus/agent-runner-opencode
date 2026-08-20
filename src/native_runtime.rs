@@ -182,6 +182,17 @@ fn candidate_context(
             ),
         )
     })?;
+    if !durable_fs::is_executable_file(&program)
+        .map_err(|error| native_runtime_failure(request_id, error))?
+    {
+        return Err(native_runtime_failure(
+            request_id,
+            format!(
+                "canonical wrapper {} is not an executable regular file",
+                account.opencode_wrapper
+            ),
+        ));
+    }
     let program_bytes =
         fs::read(&program).map_err(|error| native_runtime_failure(request_id, error))?;
     let program = program.to_str().ok_or_else(|| {
@@ -249,9 +260,9 @@ fn resolve_program(program: &str, env: &BTreeMap<String, String>) -> Option<Path
             .find(|candidate| candidate.is_file())?
     };
     let canonical = fs::canonicalize(candidate).ok()?;
-    fs::metadata(&canonical)
+    durable_fs::is_executable_file(&canonical)
         .ok()
-        .is_some_and(|metadata| metadata.is_file())
+        .is_some_and(|executable| executable)
         .then_some(canonical)
 }
 
@@ -291,6 +302,17 @@ fn validate_runtime_context(
         return Err(native_runtime_failure(
             request_id,
             "persisted native runtime identity is inconsistent",
+        ));
+    }
+    if !durable_fs::is_executable_file(Path::new(&context.program))
+        .map_err(|error| native_runtime_failure(request_id, error))?
+    {
+        return Err(native_runtime_failure(
+            request_id,
+            format!(
+                "bound native wrapper for account {} is no longer executable",
+                account.opencode_wrapper
+            ),
         ));
     }
     let bytes =

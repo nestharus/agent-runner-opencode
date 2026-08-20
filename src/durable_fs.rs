@@ -28,6 +28,22 @@ pub(crate) fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+pub(crate) fn is_executable_file(path: &Path) -> std::io::Result<bool> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn read_file_bounded(path: &Path, maximum_bytes: usize) -> std::io::Result<Vec<u8>> {
     read_file_bounded_or(path, maximum_bytes, |_| false).map(|(bytes, _)| bytes)
