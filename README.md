@@ -37,6 +37,10 @@ compatibility-projected to the current OpenCode-owned account, quota, and model
 shape while preserving record IDs and versions; the next mutation writes the
 upgraded store schema. An unrecognizable record fails the entire store with
 `settings_store_upgrade_required` instead of remaining listable but unusable.
+Rotation assessment and materialization share one provider-state lock, so a
+decision cannot race native materialization. A denied assessment durably removes
+any earlier binding-matched authorization—including parent-directory
+synchronization on an already-absent retry—before reporting denial.
 
 ## Model routes
 

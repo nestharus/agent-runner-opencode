@@ -35,6 +35,7 @@ pub fn assess_params(
         && facts_allow
         && binding.source_provider_id != binding.target_provider_id
         && binding.source_account.opencode_wrapper != binding.target_account.opencode_wrapper;
+    let _lock = acquire_rotation_lock(host, request_id)?;
     let authorization = persist_assessment_decision(host, &binding, allowed, request_id)?;
     Ok(assess_result(
         allowed,
@@ -372,11 +373,18 @@ fn persist_assessment_decision(
 ) -> Result<Option<Value>, ProviderFailure> {
     let path = authorization_path(host, binding, request_id)?;
     if !allowed {
+        let parent = path
+            .parent()
+            .expect("rotation authorization always has a parent");
+        durable_fs::create_private_directories(parent)
+            .map_err(|error| rotation_state_failure(request_id, error))?;
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(rotation_state_failure(request_id, error)),
         }
+        durable_fs::sync_directory(parent)
+            .map_err(|error| rotation_state_failure(request_id, error))?;
         return Ok(None);
     }
     let issued_at_unix_ms = now_unix_ms();

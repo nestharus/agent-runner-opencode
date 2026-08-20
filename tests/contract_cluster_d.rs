@@ -1330,6 +1330,48 @@ fn contract_rotation_materialize_requires_matching_prior_assessment() {
 }
 
 #[test]
+fn contract_rotation_denial_retires_prior_authorization_before_materialization() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-denial-retirement");
+    let opencode = RotationOpencodeFixture::new();
+    let allowed = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    assert_rotation_allowed(&allowed);
+    let denied = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(false),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    assert_rotation_denied(&denied);
+
+    let path = opencode.path_env();
+    let response = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(response["error"]["code"], "rotation_authorization_required");
+    assert!(
+        !opencode.import_was_attempted(),
+        "durable denial must retire the prior grant before native export/import"
+    );
+}
+
+#[test]
 fn contract_migration_plan_apply() {
     let host = HostRoots::new("agent-runner-opencode-migration");
     let live = LiveConfigFixture::new(host.config_root());
