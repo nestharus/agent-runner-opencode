@@ -102,6 +102,18 @@ pub fn assert_settings_invalid_result(invalid: &Value) {
     );
 }
 
+pub fn assert_settings_invalid_model_result(invalid: &Value, code: &str) {
+    assert_settings_invalid_result(invalid);
+    assert!(
+        invalid["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == code),
+        "expected {code} diagnostic; result={invalid:?}"
+    );
+}
+
 pub fn assert_settings_migrate_result(
     result: &Value,
     config_root: &Path,

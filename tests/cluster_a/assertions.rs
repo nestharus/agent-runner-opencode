@@ -768,6 +768,40 @@ pub fn assert_policy_accepts_for_wrapper(response: &Value, wrapper: &str) {
     assert_policy_env(policy_result_env(result));
 }
 
+pub fn assert_policy_accepts_model(response: &Value, provider_model: &str, effort: &str) {
+    assert_policy_response_shape(response);
+    assert_policy_response_secret_absent(response);
+    let result = policy_result(response);
+    assert_policy_accepted(result);
+    let argv = policy_result_argv(result);
+    assert_eq!(argv.first().map(String::as_str), Some("opencode1"));
+    assert!(
+        pure_semantics_preserved(&argv),
+        "policy must preserve wrapper-owned pure semantics; argv={argv:?}"
+    );
+    assert_contains_subsequence(
+        &argv,
+        &[
+            "run",
+            "--format",
+            "json",
+            "--dangerously-skip-permissions",
+            "-m",
+            provider_model,
+            "--variant",
+            effort,
+        ],
+    );
+    assert_policy_env(policy_result_env(result));
+}
+
+pub fn assert_policy_rejects_invalid_model(response: &Value) {
+    assert_policy_response_shape(response);
+    let result = policy_result(response);
+    assert_policy_rejected(result, "inconsistent model identity must be rejected");
+    assert_policy_diagnostic(policy_diagnostics(result), "invalid_model", "provider args");
+}
+
 pub fn assert_policy_accepted(result: &Value) {
     assert_eq!(result["accepted"], true);
 }

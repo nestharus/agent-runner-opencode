@@ -5,7 +5,7 @@ mod support;
 
 use cluster_a::*;
 use std::time::{Duration, Instant};
-use support::{invoke, invoke_with_env, invoke_with_host_and_env, json_stdout};
+use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env, json_stdout};
 
 #[test]
 fn characterization_opencode_launch_json_events() {
@@ -467,6 +467,39 @@ fn contract_policy_evaluate() {
     assert_output_success(&output, "policy.evaluate");
     let response = json_stdout(&output);
     assert_policy_accepts(&response);
+}
+
+#[test]
+fn contract_policy_evaluate_accepts_luna_max() {
+    let output = invoke_validated(
+        "policy.evaluate",
+        policy_evaluate_luna_max_params(),
+        "policy.schema.json#/$defs/PolicyEvaluateRequest",
+    );
+    assert_output_success(&output, "policy.evaluate Luna max");
+    assert_policy_accepts_model(&json_stdout(&output), "openai/gpt-5.6-luna", "max");
+}
+
+#[test]
+fn contract_policy_evaluate_rejects_model_identity_mismatch() {
+    let output = invoke_validated(
+        "policy.evaluate",
+        policy_evaluate_model_mismatch_params(),
+        "policy.schema.json#/$defs/PolicyEvaluateRequest",
+    );
+    assert_output_success(&output, "policy.evaluate model mismatch");
+    assert_policy_rejects_invalid_model(&json_stdout(&output));
+}
+
+#[test]
+fn contract_policy_evaluate_rejects_extra_model_provider_arg() {
+    let output = invoke_validated(
+        "policy.evaluate",
+        policy_evaluate_extra_model_arg_params(),
+        "policy.schema.json#/$defs/PolicyEvaluateRequest",
+    );
+    assert_output_success(&output, "policy.evaluate extra model arg");
+    assert_policy_rejects_invalid_model(&json_stdout(&output));
 }
 
 #[test]

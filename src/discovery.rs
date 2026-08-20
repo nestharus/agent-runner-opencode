@@ -1,7 +1,7 @@
 //! Declared roles: formatter, accessor, mapper
 
 use crate::account::{AccountProfile, ACCOUNTS};
-use crate::models::{ModelAlias, MODEL_ALIASES, PROVIDER_MODEL};
+use crate::models::{ModelAlias, MODEL_ALIASES};
 use serde_json::{json, Value};
 
 pub fn models() -> Value {
@@ -25,8 +25,8 @@ fn model_aliases() -> Vec<Value> {
 fn model_alias_json(model: &ModelAlias) -> Value {
     json!({
         "name": model.name,
-        "provider_model": PROVIDER_MODEL,
-        "provider_args": ["-m", PROVIDER_MODEL, "--variant", model.effort],
+        "provider_model": model.provider_model,
+        "provider_args": ["-m", model.provider_model, "--variant", model.effort],
     })
 }
 

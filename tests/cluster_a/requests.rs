@@ -131,15 +131,38 @@ pub fn launch_params_with_policy_effective_argv_env(
 }
 
 pub fn policy_evaluate_params() -> Value {
+    policy_evaluate_params_for_model("gpt-low", "openai/gpt-5.6-sol", "low")
+}
+
+pub fn policy_evaluate_params_for_model(alias: &str, provider_model: &str, effort: &str) -> Value {
     json!({
         "settings_id": "opencode1",
         "mode": "agent",
-        "model": model_request("low"),
+        "model": model_request_for(alias, provider_model, effort),
         "launch": {
-            "argv": host_candidate_argv("low"),
+            "argv": host_candidate_argv_for_model("opencode1", provider_model, effort),
             "working_directory": env!("CARGO_MANIFEST_DIR")
         }
     })
+}
+
+pub fn policy_evaluate_luna_max_params() -> Value {
+    policy_evaluate_params_for_model("gpt-luna-max", "openai/gpt-5.6-luna", "max")
+}
+
+pub fn policy_evaluate_model_mismatch_params() -> Value {
+    let mut params = policy_evaluate_luna_max_params();
+    params["model"]["provider_args"] = json!(["-m", "openai/gpt-5.6-sol", "--variant", "max"]);
+    params
+}
+
+pub fn policy_evaluate_extra_model_arg_params() -> Value {
+    let mut params = policy_evaluate_params();
+    params["model"]["provider_args"]
+        .as_array_mut()
+        .expect("model provider args")
+        .push(json!("--share"));
+    params
 }
 
 pub fn policy_evaluate_params_with_host_candidate_argv() -> Value {
@@ -268,9 +291,13 @@ pub fn wrapper_env(path: &str, log_path: &str) -> Value {
 }
 
 pub fn model_request(effort: &str) -> Value {
+    model_request_for(&format!("gpt-{effort}"), "openai/gpt-5.6-sol", effort)
+}
+
+pub fn model_request_for(alias: &str, provider_model: &str, effort: &str) -> Value {
     json!({
-        "name": format!("gpt-{effort}"),
-        "provider_args": ["-m", "openai/gpt-5.6-sol", "--variant", effort],
+        "name": alias,
+        "provider_args": ["-m", provider_model, "--variant", effort],
         "inputs": {
             "prompt": "reply with the single word: ok",
             "named": {}
@@ -306,6 +333,14 @@ pub fn host_candidate_argv(effort: &str) -> Vec<&str> {
 }
 
 pub fn host_candidate_argv_for_command<'a>(command: &'a str, effort: &'a str) -> Vec<&'a str> {
+    host_candidate_argv_for_model(command, "openai/gpt-5.6-sol", effort)
+}
+
+pub fn host_candidate_argv_for_model<'a>(
+    command: &'a str,
+    provider_model: &'a str,
+    effort: &'a str,
+) -> Vec<&'a str> {
     let mut argv = vec![command];
     if command.rsplit('/').next() == Some("opencode") {
         argv.push("--pure");
@@ -314,7 +349,7 @@ pub fn host_candidate_argv_for_command<'a>(command: &'a str, effort: &'a str) ->
         "run",
         "--dangerously-skip-permissions",
         "-m",
-        "openai/gpt-5.6-sol",
+        provider_model,
         "--variant",
         effort,
         "reply with the single word: ok",

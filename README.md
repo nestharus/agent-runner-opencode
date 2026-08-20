@@ -5,7 +5,7 @@ provider contract.
 
 One CLI, two underlying tools:
 
-- **opencode** owns the model lifecycle — `launch` (`opencode --pure run -m openai/gpt-5.6-sol
+- **opencode** owns the model lifecycle — `launch` (`opencode --pure run -m <provider-model>
   --variant <effort>`), `session` (read_turns/capture/export/replace/locate), `terminal`
   classification, and `policy` application.
 - **codex** owns **only** `quota` — ChatGPT plan-window usage via `chatgpt-usage
@@ -20,6 +20,12 @@ configured OpenCode command, preserves its wrapper or `--pure` prefix, and adds 
 model, and effort flags; it does not select an account wrapper, derive `XDG_DATA_HOME`, or filter
 environment names. The static account map remains authoritative only for account identity and
 codex-backed quota/auth attribution.
+
+The provider-owned model catalog maps each runner alias to one exact OpenCode model and effort.
+Current aliases preserve the GPT-5.6 Sol `gpt-low` through `gpt-max` routes and add
+`gpt-luna-max` for `openai/gpt-5.6-luna --variant max`. Policy accepts only the exact
+`provider_args` advertised by `discovery.models`, then reconstructs the managed launch prefix from
+that resolved identity.
 
 This provider implements the one-shot invocation convention:
 

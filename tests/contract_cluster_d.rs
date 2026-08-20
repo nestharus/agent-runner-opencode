@@ -132,6 +132,34 @@ fn contract_settings_validate() {
     assert_settings_invalid_result(&invalid);
 }
 
+#[test]
+fn contract_settings_validate_accepts_luna_max_and_rejects_mismatched_identity() {
+    let host = HostRoots::new("agent-runner-opencode-settings-validate-luna");
+    let valid = success_result(
+        invoke_validated_with_host(
+            "settings.validate",
+            luna_settings_validate_params(),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsValidateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsValidateResponse",
+        "settings.schema.json#/$defs/SettingsValidateResult",
+    );
+    assert_settings_valid_result(&valid);
+
+    let invalid = success_result(
+        invoke_validated_with_host(
+            "settings.validate",
+            mismatched_luna_settings_validate_params(),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsValidateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsValidateResponse",
+        "settings.schema.json#/$defs/SettingsValidateResult",
+    );
+    assert_settings_invalid_model_result(&invalid, "invalid_provider_model");
+}
+
 fn normalized_account_cases() -> [(&'static str, &'static str); 5] {
     [
         ("opencode1", "~/.codex/auth.json"),

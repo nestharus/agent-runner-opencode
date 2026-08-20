@@ -229,28 +229,29 @@ fn assert_discovery_models_response(response: &Value) {
     let models = response["result"]["models"]
         .as_array()
         .expect("models array");
-    assert_eq!(models.len(), 5);
-    for (alias, effort) in expected_model_variants() {
-        assert_model_variant(models, alias, effort);
+    assert_eq!(models.len(), 6);
+    for (alias, provider_model, effort) in expected_model_variants() {
+        assert_model_variant(models, alias, provider_model, effort);
     }
 }
 
-fn expected_model_variants() -> [(&'static str, &'static str); 5] {
+fn expected_model_variants() -> [(&'static str, &'static str, &'static str); 6] {
     [
-        ("gpt-low", "low"),
-        ("gpt-medium", "medium"),
-        ("gpt-high", "high"),
-        ("gpt-xhigh", "xhigh"),
-        ("gpt-max", "max"),
+        ("gpt-low", "openai/gpt-5.6-sol", "low"),
+        ("gpt-medium", "openai/gpt-5.6-sol", "medium"),
+        ("gpt-high", "openai/gpt-5.6-sol", "high"),
+        ("gpt-xhigh", "openai/gpt-5.6-sol", "xhigh"),
+        ("gpt-max", "openai/gpt-5.6-sol", "max"),
+        ("gpt-luna-max", "openai/gpt-5.6-luna", "max"),
     ]
 }
 
-fn assert_model_variant(models: &[Value], alias: &str, effort: &str) {
+fn assert_model_variant(models: &[Value], alias: &str, provider_model: &str, effort: &str) {
     let model = find_by_field(models, "name", alias);
-    assert_eq!(model["provider_model"], "openai/gpt-5.6-sol", "{alias}");
+    assert_eq!(model["provider_model"], provider_model, "{alias}");
     assert_eq!(
         model["provider_args"],
-        json!(["-m", "openai/gpt-5.6-sol", "--variant", effort]),
+        json!(["-m", provider_model, "--variant", effort]),
         "{alias} provider args"
     );
 }

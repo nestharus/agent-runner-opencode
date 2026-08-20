@@ -11,7 +11,7 @@
 use crate::account::ACCOUNTS;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
-use crate::models::{default_model_effort, effort_values, DEFAULT_MODEL_ALIAS, PROVIDER_MODEL};
+use crate::models::{default_model, model_alias, model_alias_matches, DEFAULT_MODEL_ALIAS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -643,15 +643,34 @@ fn invalid_wrapper_diagnostic() -> Value {
 }
 
 fn require_model(values: &Value, diagnostics: &mut Vec<Value>) {
-    require_provider_model(values, diagnostics);
-    require_model_variant(values, diagnostics);
-}
-
-fn require_provider_model(values: &Value, diagnostics: &mut Vec<Value>) {
-    if provider_model_value(values) == Some(PROVIDER_MODEL) {
+    let Some(name) = model_name_value(values) else {
+        diagnostics.push(invalid_model_alias_diagnostic(""));
+        return;
+    };
+    let Some(model) = model_alias(name) else {
+        diagnostics.push(invalid_model_alias_diagnostic(name));
+        return;
+    };
+    if model_alias_matches(
+        name,
+        provider_model_value(values),
+        model_variant_value(values),
+    ) {
         return;
     }
-    diagnostics.push(invalid_provider_model_diagnostic());
+    if provider_model_value(values) != Some(model.provider_model) {
+        diagnostics.push(invalid_provider_model_diagnostic(
+            name,
+            model.provider_model,
+        ));
+    }
+    if model_variant_value(values) != Some(model.effort) {
+        diagnostics.push(invalid_model_variant_diagnostic(name, model.effort));
+    }
+}
+
+fn model_name_value(values: &Value) -> Option<&str> {
+    values.pointer("/model/name").and_then(Value::as_str)
 }
 
 fn provider_model_value(values: &Value) -> Option<&str> {
@@ -660,36 +679,33 @@ fn provider_model_value(values: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn invalid_provider_model_diagnostic() -> Value {
+fn invalid_model_alias_diagnostic(name: &str) -> Value {
     diagnostic(
         "error",
-        "values.model.provider_model",
-        "provider_model must be openai/gpt-5.6-sol",
-        "invalid_provider_model",
+        "values.model.name",
+        format!("unknown provider model alias: {name}"),
+        "invalid_model_alias",
     )
 }
 
-fn require_model_variant(values: &Value, diagnostics: &mut Vec<Value>) {
-    if known_model_variant(model_variant_value(values)) {
-        return;
-    }
-    diagnostics.push(invalid_model_variant_diagnostic());
+fn invalid_provider_model_diagnostic(name: &str, expected: &str) -> Value {
+    diagnostic(
+        "error",
+        "values.model.provider_model",
+        format!("provider_model for {name} must be {expected}"),
+        "invalid_provider_model",
+    )
 }
 
 fn model_variant_value(values: &Value) -> Option<&str> {
     values.pointer("/model/variant").and_then(Value::as_str)
 }
 
-fn known_model_variant(variant: Option<&str>) -> bool {
-    let valid_efforts = effort_values();
-    variant.is_some_and(|variant| valid_efforts.contains(&variant))
-}
-
-fn invalid_model_variant_diagnostic() -> Value {
+fn invalid_model_variant_diagnostic(name: &str, expected: &str) -> Value {
     diagnostic(
         "error",
         "values.model.variant",
-        "variant must be low, medium, high, xhigh, or max",
+        format!("variant for {name} must be {expected}"),
         "invalid_model_variant",
     )
 }
@@ -1032,14 +1048,15 @@ fn migration_account(provider: &str) -> &'static crate::account::AccountProfile 
 }
 
 fn migrated_values_for_account(account: &crate::account::AccountProfile) -> Value {
+    let model = default_model();
     json!({
         "provider": "opencode",
         "profile": account.opencode_wrapper,
         "wrapper": account.opencode_wrapper,
         "model": {
             "name": DEFAULT_MODEL_ALIAS,
-            "provider_model": PROVIDER_MODEL,
-            "variant": default_model_effort()
+            "provider_model": model.provider_model,
+            "variant": model.effort
         },
         "quota": {
             "source": "codex",

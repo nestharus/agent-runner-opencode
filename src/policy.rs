@@ -2,7 +2,7 @@
 
 use crate::account::profile_for_settings_id;
 use crate::envelope::ProviderFailure;
-use crate::models::PROVIDER_MODEL;
+use crate::models::{model_alias, provider_args_match, ModelAlias};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -52,12 +52,17 @@ pub fn evaluate_params(params: Value, request_id: &str) -> Result<Value, Provide
 
 pub fn evaluate(params: PolicyEvaluateParams, request_id: &str) -> Result<Value, ProviderFailure> {
     policy_account(&params.settings_id, request_id)?;
-    let diagnostics = diagnostics_for_policy(&params);
-    Ok(policy_result(&params, diagnostics))
+    let model = resolved_model(&params);
+    let diagnostics = diagnostics_for_policy(&params, model);
+    Ok(policy_result(&params, model, diagnostics))
 }
 
-fn policy_result(params: &PolicyEvaluateParams, diagnostics: Vec<Value>) -> Value {
-    let argv = effective_argv(params);
+fn policy_result(
+    params: &PolicyEvaluateParams,
+    model: Option<&ModelAlias>,
+    diagnostics: Vec<Value>,
+) -> Value {
+    let argv = effective_argv(params, model);
     json!({
         "accepted": policy_accepted(&diagnostics),
         "argv": argv,
@@ -96,8 +101,11 @@ fn parse_policy_params(
     serde_json::from_value(params).map_err(|err| invalid_policy_params_failure(request_id, err))
 }
 
-fn effective_argv(params: &PolicyEvaluateParams) -> Vec<String> {
+fn effective_argv(params: &PolicyEvaluateParams, model: Option<&ModelAlias>) -> Vec<String> {
     let Some(prefix) = configured_launch_prefix(params) else {
+        return params.launch.argv.clone().unwrap_or_default();
+    };
+    let Some(model) = model else {
         return params.launch.argv.clone().unwrap_or_default();
     };
     let mut argv = prefix.to_vec();
@@ -107,11 +115,11 @@ fn effective_argv(params: &PolicyEvaluateParams) -> Vec<String> {
         "json".to_string(),
         "--dangerously-skip-permissions".to_string(),
         "-m".to_string(),
-        PROVIDER_MODEL.to_string(),
+        model.provider_model.to_string(),
         "--variant".to_string(),
-        model_effort(params).to_string(),
+        model.effort.to_string(),
     ]);
-    argv.extend(policy_launch_args(params));
+    argv.extend(policy_launch_args(params, Some(model)));
     argv
 }
 
@@ -135,31 +143,35 @@ fn valid_launch_command_prefix(prefix: &[String]) -> bool {
     intrinsic_host_launch_command(command) && options.iter().all(|arg| arg == "--pure")
 }
 
-fn model_effort(params: &PolicyEvaluateParams) -> &str {
-    provider_arg_after(&params.model.provider_args, "--variant")
-        .or_else(|| effort_from_model_name(&params.model.name))
-        .unwrap_or("medium")
-}
-
-fn provider_arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.windows(2)
-        .find(|window| window[0] == flag)
-        .map(|window| window[1].as_str())
-}
-
-fn effort_from_model_name(name: &str) -> Option<&str> {
-    name.strip_prefix("gpt-")
-        .filter(|effort| !effort.is_empty())
+fn resolved_model(params: &PolicyEvaluateParams) -> Option<&'static ModelAlias> {
+    model_alias(&params.model.name)
+        .filter(|model| provider_args_match(model, &params.model.provider_args))
 }
 
 fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, String> {
     input.cloned().unwrap_or_default()
 }
 
-fn diagnostics_for_policy(params: &PolicyEvaluateParams) -> Vec<Value> {
+fn diagnostics_for_policy(params: &PolicyEvaluateParams, model: Option<&ModelAlias>) -> Vec<Value> {
     let mut diagnostics = launch_command_diagnostics(params);
-    diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(params)));
+    if model.is_none() {
+        diagnostics.push(invalid_model_diagnostic(params));
+    }
+    diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(
+        params, model,
+    )));
     diagnostics
+}
+
+fn invalid_model_diagnostic(params: &PolicyEvaluateParams) -> Value {
+    diagnostic(
+        "error",
+        "invalid_model",
+        format!(
+            "model {} must use the exact provider args advertised by discovery.models",
+            params.model.name
+        ),
+    )
 }
 
 fn launch_command_diagnostics(params: &PolicyEvaluateParams) -> Vec<Value> {
@@ -181,28 +193,30 @@ fn forbidden_argv_diagnostics(input: &[String]) -> Vec<Value> {
         .collect()
 }
 
-fn policy_launch_args(params: &PolicyEvaluateParams) -> Vec<String> {
+fn policy_launch_args(params: &PolicyEvaluateParams, model: Option<&ModelAlias>) -> Vec<String> {
     let argv = params.launch.argv.as_deref().unwrap_or_default();
-    stripped_policy_launch_args(params, argv)
+    stripped_policy_launch_args(argv, model)
         .unwrap_or(argv)
         .to_vec()
 }
 
 fn stripped_policy_launch_args<'a>(
-    params: &PolicyEvaluateParams,
     argv: &'a [String],
+    model: Option<&ModelAlias>,
 ) -> Option<&'a [String]> {
-    let effort = model_effort(params);
-    strip_host_candidate_prefix(argv, effort)
-        .or_else(|| strip_policy_effective_prefix(argv, effort))
+    let model = model?;
+    strip_host_candidate_prefix(argv, model).or_else(|| strip_policy_effective_prefix(argv, model))
 }
 
-fn strip_host_candidate_prefix<'a>(argv: &'a [String], effort: &str) -> Option<&'a [String]> {
-    strip_intrinsic_launch_prefix(argv, &host_candidate_args(effort))
+fn strip_host_candidate_prefix<'a>(argv: &'a [String], model: &ModelAlias) -> Option<&'a [String]> {
+    strip_intrinsic_launch_prefix(argv, &host_candidate_args(model))
 }
 
-fn strip_policy_effective_prefix<'a>(argv: &'a [String], effort: &str) -> Option<&'a [String]> {
-    strip_intrinsic_launch_prefix(argv, &policy_effective_args(effort))
+fn strip_policy_effective_prefix<'a>(
+    argv: &'a [String],
+    model: &ModelAlias,
+) -> Option<&'a [String]> {
+    strip_intrinsic_launch_prefix(argv, &policy_effective_args(model))
 }
 
 fn strip_intrinsic_launch_prefix<'a>(
@@ -218,27 +232,27 @@ fn strip_intrinsic_launch_prefix<'a>(
     Some(&argv[run_index + args_after_command.len()..])
 }
 
-fn host_candidate_args(effort: &str) -> Vec<String> {
+fn host_candidate_args(model: &ModelAlias) -> Vec<String> {
     vec![
         "run".to_string(),
         "--dangerously-skip-permissions".to_string(),
         "-m".to_string(),
-        PROVIDER_MODEL.to_string(),
+        model.provider_model.to_string(),
         "--variant".to_string(),
-        effort.to_string(),
+        model.effort.to_string(),
     ]
 }
 
-fn policy_effective_args(effort: &str) -> Vec<String> {
+fn policy_effective_args(model: &ModelAlias) -> Vec<String> {
     vec![
         "run".to_string(),
         "--format".to_string(),
         "json".to_string(),
         "--dangerously-skip-permissions".to_string(),
         "-m".to_string(),
-        PROVIDER_MODEL.to_string(),
+        model.provider_model.to_string(),
         "--variant".to_string(),
-        effort.to_string(),
+        model.effort.to_string(),
     ]
 }
 

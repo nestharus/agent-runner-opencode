@@ -66,6 +66,22 @@ pub fn invalid_settings_validate_params() -> Value {
     settings_validate_params(invalid_opencode_settings_values())
 }
 
+pub fn luna_settings_validate_params() -> Value {
+    let mut values = opencode_settings_values(None);
+    values["model"] = json!({
+        "name": "gpt-luna-max",
+        "provider_model": "openai/gpt-5.6-luna",
+        "variant": "max"
+    });
+    settings_validate_params(values)
+}
+
+pub fn mismatched_luna_settings_validate_params() -> Value {
+    let mut params = luna_settings_validate_params();
+    params["values"]["model"]["provider_model"] = json!("openai/gpt-5.6-sol");
+    params
+}
+
 pub fn settings_validate_params(values: Value) -> Value {
     json!({ "values": values })
 }
@@ -74,7 +90,7 @@ pub fn invalid_opencode_settings_values() -> Value {
     json!({
         "provider": "opencode",
         "wrapper": "opencode99",
-        "model": { "provider_model": "", "variant": "impossible" },
+        "model": { "name": "unknown-model", "provider_model": "", "variant": "impossible" },
         "quota": { "auth_path": "" }
     })
 }
