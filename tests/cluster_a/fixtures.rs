@@ -448,20 +448,37 @@ exit 0\n"
 pub fn fake_wrapper_nul_log_resume_confirming_export_script(prompt: &str) -> String {
     let export = json!({
         "info": {"id": resume_session_id(), "title": "resume contract"},
-        "messages": [{
-            "info": {
-                "id": "msg-user",
-                "role": "user",
-                "sessionID": resume_session_id(),
-                "model": {
+        "messages": [
+            {
+                "info": {
+                    "id": "msg-user",
+                    "role": "user",
+                    "sessionID": resume_session_id(),
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.6-sol",
+                        "variant": "low"
+                    },
+                    "time": {"created": 4_102_444_800_000_u64}
+                },
+                "parts": [{"type": "text", "text": prompt}]
+            },
+            {
+                "info": {
+                    "id": "msg-assistant",
+                    "role": "assistant",
+                    "sessionID": resume_session_id(),
                     "providerID": "openai",
                     "modelID": "gpt-5.6-sol",
-                    "variant": "low"
+                    "variant": "low",
+                    "time": {
+                        "created": 4_102_444_800_001_u64,
+                        "completed": 4_102_444_800_002_u64
+                    }
                 },
-                "time": {"created": 4_102_444_800_000_u64}
-            },
-            "parts": [{"type": "text", "text": prompt}]
-        }]
+                "parts": [{"type": "text", "text": "done"}]
+            }
+        ]
     })
     .to_string();
     format!(

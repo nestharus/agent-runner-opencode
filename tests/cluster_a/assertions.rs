@@ -639,6 +639,42 @@ pub fn assert_no_produced_assistant_response_marker(events: &[Value]) {
     );
 }
 
+pub fn assert_unresolved_resume_completion(output: &std::process::Output, events: &[Value]) {
+    assert_output_status_code(
+        output,
+        Some(1),
+        "a submitted resume without a completed response must be non-clean",
+    );
+    let markers = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "marker" && event["name"] == "oulipoly.resume_completion_unresolved"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        markers.len(),
+        1,
+        "unresolved resume completion must have one explicit handoff marker; events={events:?}"
+    );
+    assert_eq!(
+        markers[0]["value"]["state"],
+        "submitted_user_turn_without_completed_assistant_response"
+    );
+    assert_eq!(
+        markers[0]["value"]["provider_session_id"],
+        resume_session_id()
+    );
+    assert!(markers[0]["value"]["required_action"]
+        .as_str()
+        .is_some_and(|action| action.contains("reconcile")));
+    let final_event = final_launch_event(events);
+    assert_eq!(final_event["status"]["kind"], "unknown");
+    assert_eq!(final_event["terminal_signal"]["kind"], "unknown");
+    assert!(final_event["terminal_signal"]["evidence"]
+        .as_str()
+        .is_some_and(|evidence| evidence.contains("completion remains unconfirmed")));
+}
+
 pub fn assert_submitted_user_turn_marker_value(marker: &Value) {
     assert_submitted_user_turn_provider_session(marker);
     assert_submitted_user_turn_prompt_hash(marker);

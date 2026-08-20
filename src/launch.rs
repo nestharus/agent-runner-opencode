@@ -47,6 +47,7 @@ const POLICY_MANAGED_FLAGS_WITH_VALUE: &[&str] = &["--format", "-m", "--variant"
 const POLICY_MANAGED_FLAGS_WITHOUT_VALUE: &[&str] = &["--dangerously-skip-permissions"];
 const PRODUCED_ASSISTANT_RESPONSE_MARKER: &str = "oulipoly.produced_assistant_response";
 const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
+const RESUME_COMPLETION_UNRESOLVED_MARKER: &str = "oulipoly.resume_completion_unresolved";
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
@@ -789,6 +790,7 @@ struct LaunchState {
     completed_resume_at: Option<Instant>,
     next_resume_completion_probe: Option<Instant>,
     resume_completion_probes: usize,
+    unresolved_resume_completion: Option<Value>,
     session_id: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
     deadline_unix_ms: Option<u64>,
@@ -824,6 +826,7 @@ impl LaunchState {
             completed_resume_at: None,
             next_resume_completion_probe,
             resume_completion_probes: 0,
+            unresolved_resume_completion: None,
             session_id: None,
             resume_observation_request,
             deadline_unix_ms,
@@ -1063,9 +1066,23 @@ impl LaunchState {
 
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
         self.capture_session_from_parser_tail(writer)?;
-        self.probe_completed_resume_now();
-        self.confirm_submitted_user_turn(writer)?;
-        self.confirm_produced_assistant_response(writer)?;
+        let final_resume_observation = self
+            .resume_observation_request
+            .as_ref()
+            .map(resume_observation::observe);
+        let completion_observed = self.completed_resume_at.is_some()
+            || final_resume_observation
+                .as_ref()
+                .is_some_and(|observation| observation.completion_observed());
+        let submitted_user_turn =
+            final_resume_observation.and_then(|observation| observation.submitted_user_turn);
+        self.confirm_submitted_user_turn(submitted_user_turn.as_ref(), writer)?;
+        self.confirm_produced_assistant_response(completion_observed, writer)?;
+        self.retain_unresolved_resume_completion(
+            submitted_user_turn.as_ref(),
+            completion_observed,
+            writer,
+        )?;
         self.emit_integrity_evidence(writer)?;
         let status = self.finished_status();
         let signal = self.terminal_signal_for(&status);
@@ -1076,38 +1093,71 @@ impl LaunchState {
 
     fn confirm_submitted_user_turn<W: Write>(
         &mut self,
+        marker_value: Option<&Value>,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
-        let Some(marker_value) = self.submitted_user_turn_marker_value() else {
+        let Some(marker_value) = marker_value else {
             return Ok(());
         };
-        self.marker_with_value(SUBMITTED_USER_TURN_MARKER.to_string(), marker_value, writer)
+        self.marker_with_value(
+            SUBMITTED_USER_TURN_MARKER.to_string(),
+            marker_value.clone(),
+            writer,
+        )
     }
 
     fn confirm_produced_assistant_response<W: Write>(
         &mut self,
+        completion_observed: bool,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
-        if self.completed_resume_at.is_none() {
+        if !completion_observed {
             return Ok(());
         }
         self.marker(PRODUCED_ASSISTANT_RESPONSE_MARKER.to_string(), writer)
     }
 
-    fn submitted_user_turn_marker_value(&self) -> Option<Value> {
-        let request = self.resume_observation_request.as_ref()?;
-        resume_observation::observe(request).submitted_user_turn
+    fn retain_unresolved_resume_completion<W: Write>(
+        &mut self,
+        submitted_user_turn: Option<&Value>,
+        completion_observed: bool,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
+        let Some(submitted_user_turn) = submitted_user_turn.filter(|_| !completion_observed) else {
+            return Ok(());
+        };
+        let unresolved = json!({
+            "state": "submitted_user_turn_without_completed_assistant_response",
+            "provider_session_id": submitted_user_turn["provider_session_id"],
+            "prompt_sha256": submitted_user_turn["prompt_sha256"],
+            "required_action": "reconcile the provider session before retrying the submitted turn",
+        });
+        self.unresolved_resume_completion = Some(unresolved.clone());
+        self.marker_with_value(
+            RESUME_COMPLETION_UNRESOLVED_MARKER.to_string(),
+            unresolved,
+            writer,
+        )
     }
 
     fn finished_status(&self) -> ProcessStatus {
         let status = self.final_status.clone().unwrap_or(ProcessStatus::Unknown);
-        if is_clean_exit_status(&status) && !self.integrity_failures.is_empty() {
+        if is_clean_exit_status(&status)
+            && (!self.integrity_failures.is_empty() || self.unresolved_resume_completion.is_some())
+        {
             return ProcessStatus::Unknown;
         }
         status
     }
 
     fn terminal_signal_for(&self, status: &ProcessStatus) -> Value {
+        if matches!(status, ProcessStatus::Unknown) && self.unresolved_resume_completion.is_some() {
+            return json!({
+                "kind": "unknown",
+                "evidence": "resume submission confirmed; assistant response completion remains unconfirmed",
+                "observed_at_unix_ms": now_unix_ms(),
+            });
+        }
         if let Some(signal) = self.final_opencode_error_signal(status) {
             return signal;
         }

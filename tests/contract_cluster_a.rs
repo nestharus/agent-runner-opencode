@@ -344,7 +344,7 @@ fn contract_launch_resume_forwards_session_and_stdin_payload() {
 }
 
 #[test]
-fn contract_launch_resume_emits_submitted_user_turn_marker_after_export_confirms_payload() {
+fn contract_launch_resume_returns_non_clean_when_submitted_turn_has_no_completed_response() {
     let fake_wrapper = FakeOpencodeWrapper::with_script(
         fake_wrapper_resume_confirming_export_script().to_string(),
     );
@@ -354,11 +354,11 @@ fn contract_launch_resume_emits_submitted_user_turn_marker_after_export_confirms
 
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
-    assert_output_success(&output, "launch resume confirmed payload");
     let events = launch_events_from_output(&output, "launch resume confirmed payload stdout");
     assert_monotonic_launch_events(&events);
     assert_submitted_user_turn_marker(&events);
     assert_no_produced_assistant_response_marker(&events);
+    assert_unresolved_resume_completion(&output, &events);
 }
 
 #[test]

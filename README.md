@@ -116,7 +116,10 @@ model, and variant. A bare native `step_finish` is not completion authority.
 The named resume-observation boundary owns this transcript traversal and
 returns either evidence-backed completion or explicit uncertainty; launch only
 orchestrates its probes alongside process supervision and projects the result
-to contract markers.
+to contract markers. If export proves the resumed user turn was submitted but
+cannot prove a completed assistant response, launch emits an unresolved
+completion marker and returns a non-clean unknown terminal result so the caller
+must reconcile the named provider session before retrying the turn.
 If a lingering OpenCode process is terminated after response confirmation,
 the exit event retains the real process signal while a separate marker records
 the confirmed application response.
