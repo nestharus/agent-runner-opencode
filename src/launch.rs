@@ -11,7 +11,6 @@
 
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
-use crate::models::model_alias;
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
 use crate::policy;
 use crate::resume_observation::{self, ResumeObservationRequest};
@@ -173,12 +172,20 @@ fn effective_launch(
     deadline_unix_ms: Option<u64>,
     request_id: &str,
 ) -> Result<EffectiveLaunch, ProviderFailure> {
-    validate_policy_argv(&plan.argv, request_id)?;
-    let stdin = plan.stdin.map(String::into_bytes);
-    let prompt = plan.prompt;
+    let policy::PolicyLaunchPlan {
+        argv,
+        env,
+        stdin,
+        prompt,
+        diagnostics: _,
+        markers,
+        route,
+    } = plan;
+    validate_policy_argv(&argv, request_id)?;
+    let stdin = stdin.map(String::into_bytes);
     let argv = resume_argv(
         params,
-        plan.argv,
+        argv,
         stdin.as_deref(),
         prompt.as_deref(),
         request_id,
@@ -189,15 +196,16 @@ fn effective_launch(
         prompt.as_deref(),
         &argv,
         deadline_unix_ms,
+        &route,
     );
     let argv = split_oversized_prompt_argv(argv, request_id)?;
     Ok(EffectiveLaunch {
         argv,
-        env: plan.env,
+        env,
         stdin,
         _prompt: prompt,
         resume_observation_request,
-        route_evidence: json!(plan.markers),
+        route_evidence: json!(markers),
     })
 }
 
@@ -268,19 +276,18 @@ fn resume_observation_request(
     prompt: Option<&str>,
     argv: &[String],
     deadline_unix_ms: Option<u64>,
+    route: &policy::PolicyRouteIdentity,
 ) -> Option<ResumeObservationRequest> {
     let session_id = known_provider_session_id(params)?;
     let prompt = submitted_resume_payload(argv, stdin, prompt)?;
-    let route = model_alias(params.model.name())?;
-    let (provider_id, model_id) = route.provider_model.split_once('/')?;
     Some(ResumeObservationRequest::new(
-        argv.first()?.clone(),
+        route.account_wrapper.clone(),
         session_id.to_string(),
         prompt,
         now_unix_ms(),
         deadline_unix_ms,
-        provider_id.to_string(),
-        model_id.to_string(),
+        route.provider_id.clone(),
+        route.model_id.clone(),
         route.effort.to_string(),
     ))
 }
@@ -471,8 +478,8 @@ fn empty_resume_payload_failure(request_id: &str) -> ProviderFailure {
     )
 }
 
-fn policy_rejection_reason(plan: &policy::PolicyLaunchPlan) -> String {
-    let diagnostics = json!(plan.diagnostics);
+fn policy_rejection_reason(plan: &policy::PolicyRejection) -> String {
+    let diagnostics = plan.diagnostics_json();
     format!("policy.evaluate rejected launch params; diagnostics={diagnostics}")
 }
 

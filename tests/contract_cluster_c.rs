@@ -258,6 +258,37 @@ fn contract_native_quota_failure_names_wham_boundary() {
 }
 
 #[test]
+fn contract_native_wham_401_carries_typed_refresh_advice() {
+    let home = HomeFixture::new("agent-runner-opencode-native-quota-401-home");
+    home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
+    let marker = home.path.join("native-wham-refresh-ran");
+    let curl = FakeNativeCurl::http_failure(
+        401,
+        r#"{"detail":"Provided authentication token is expired."}"#,
+    );
+    let fake_auth = FakeOpencodeAuth::touches_marker("opencode3", &marker);
+    let path = prepend_paths(&[fake_auth.dir(), &curl.dir]);
+    let result = success_result(
+        invoke_with_env(
+            "quota.probe",
+            quota_base_params(),
+            &[("HOME", home.path_str()), ("PATH", path.as_str())],
+        ),
+        "quota.schema.json#/$defs/QuotaProbeResponse",
+        "quota.schema.json#/$defs/QuotaProbeResult",
+    );
+
+    assert!(
+        marker.exists(),
+        "structured WHAM 401 must request auth refresh; result={result}"
+    );
+    assert_eq!(result["available"], false);
+    let detail = result["detail"].as_str().expect("native 401 detail");
+    assert!(detail.contains("ChatGPT WHAM API returned HTTP 401"));
+    assert!(!detail.contains("chatgpt-usage"));
+}
+
+#[test]
 fn contract_quota_probe_refreshes_native_auth_on_401_then_retries() {
     let raw_windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
         .expect("captured chatgpt-usage fixture should parse");

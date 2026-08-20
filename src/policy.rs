@@ -23,12 +23,6 @@ pub(crate) struct PolicyModelRequest {
     inputs: ModelInputs,
 }
 
-impl PolicyModelRequest {
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
-}
-
 #[derive(Clone, Deserialize)]
 struct ModelInputs {
     prompt: Option<String>,
@@ -86,11 +80,48 @@ pub(crate) struct PolicyLaunchPlan {
     pub prompt: Option<String>,
     pub diagnostics: Vec<PolicyDiagnostic>,
     pub markers: Vec<PolicyMarker>,
+    pub route: PolicyRouteIdentity,
+}
+
+pub(crate) struct PolicyRejection {
+    argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    stdin: Option<String>,
+    prompt: Option<String>,
+    diagnostics: Vec<PolicyDiagnostic>,
+    markers: Vec<PolicyMarker>,
+}
+
+pub(crate) struct PolicyRouteIdentity {
+    pub account_wrapper: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub effort: String,
 }
 
 pub(crate) enum PolicyDecision {
     Accepted(PolicyLaunchPlan),
-    Rejected(PolicyLaunchPlan),
+    Rejected(PolicyRejection),
+}
+
+struct PolicyPlanCandidate {
+    argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    stdin: Option<String>,
+    prompt: Option<String>,
+    diagnostics: Vec<PolicyDiagnostic>,
+    markers: Vec<PolicyMarker>,
+}
+
+#[derive(Serialize)]
+struct PolicyEvaluateWireResult {
+    accepted: bool,
+    argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    stdin: Option<String>,
+    prompt: Option<String>,
+    diagnostics: Vec<PolicyDiagnostic>,
+    markers: Vec<PolicyMarker>,
 }
 
 pub fn evaluate_params(
@@ -132,21 +163,22 @@ fn evaluate(
     let selection = resolve_runtime_selection(host, &params.settings_id, request_id)?;
     let model = resolved_model(&params);
     let diagnostics = diagnostics_for_policy(&params, &selection, model);
-    let plan = policy_plan(&params, &selection, model, diagnostics);
-    if policy_accepted(&plan.diagnostics) {
-        Ok(PolicyDecision::Accepted(plan))
-    } else {
-        Ok(PolicyDecision::Rejected(plan))
+    let plan = policy_plan_candidate(&params, &selection, model, diagnostics);
+    match model {
+        Some(model) if policy_accepted(&plan.diagnostics) => Ok(PolicyDecision::Accepted(
+            plan.into_accepted(&selection, model),
+        )),
+        _ => Ok(PolicyDecision::Rejected(plan.into_rejection())),
     }
 }
 
-fn policy_plan(
+fn policy_plan_candidate(
     params: &PolicyInput,
     selection: &RuntimeSelection,
     model: Option<&ModelAlias>,
     diagnostics: Vec<PolicyDiagnostic>,
-) -> PolicyLaunchPlan {
-    PolicyLaunchPlan {
+) -> PolicyPlanCandidate {
+    PolicyPlanCandidate {
         argv: effective_argv(params, model),
         env: effective_env(params.launch.env.as_ref()),
         stdin: params.launch.stdin.clone(),
@@ -157,19 +189,7 @@ fn policy_plan(
 }
 
 fn project_policy_result(decision: PolicyDecision) -> Value {
-    let (accepted, plan) = match decision {
-        PolicyDecision::Accepted(plan) => (true, plan),
-        PolicyDecision::Rejected(plan) => (false, plan),
-    };
-    json!({
-        "accepted": accepted,
-        "argv": plan.argv,
-        "env": plan.env,
-        "stdin": plan.stdin,
-        "prompt": plan.prompt,
-        "diagnostics": plan.diagnostics,
-        "markers": plan.markers,
-    })
+    json!(PolicyEvaluateWireResult::from(decision))
 }
 
 fn policy_accepted(diagnostics: &[PolicyDiagnostic]) -> bool {
@@ -197,6 +217,79 @@ impl From<PolicyEvaluateWireParams> for PolicyInput {
 impl PolicyDiagnostic {
     fn is_error(&self) -> bool {
         self.severity == "error"
+    }
+}
+
+impl PolicyPlanCandidate {
+    fn into_accepted(self, selection: &RuntimeSelection, model: &ModelAlias) -> PolicyLaunchPlan {
+        let route = resolved_route_identity(selection, model);
+        PolicyLaunchPlan {
+            argv: self.argv,
+            env: self.env,
+            stdin: self.stdin,
+            prompt: self.prompt,
+            diagnostics: self.diagnostics,
+            markers: self.markers,
+            route,
+        }
+    }
+
+    fn into_rejection(self) -> PolicyRejection {
+        PolicyRejection {
+            argv: self.argv,
+            env: self.env,
+            stdin: self.stdin,
+            prompt: self.prompt,
+            diagnostics: self.diagnostics,
+            markers: self.markers,
+        }
+    }
+}
+
+impl PolicyRejection {
+    pub(crate) fn diagnostics_json(&self) -> Value {
+        json!(self.diagnostics)
+    }
+}
+
+impl From<PolicyDecision> for PolicyEvaluateWireResult {
+    fn from(decision: PolicyDecision) -> Self {
+        match decision {
+            PolicyDecision::Accepted(plan) => Self {
+                accepted: true,
+                argv: plan.argv,
+                env: plan.env,
+                stdin: plan.stdin,
+                prompt: plan.prompt,
+                diagnostics: plan.diagnostics,
+                markers: plan.markers,
+            },
+            PolicyDecision::Rejected(plan) => Self {
+                accepted: false,
+                argv: plan.argv,
+                env: plan.env,
+                stdin: plan.stdin,
+                prompt: plan.prompt,
+                diagnostics: plan.diagnostics,
+                markers: plan.markers,
+            },
+        }
+    }
+}
+
+fn resolved_route_identity(
+    selection: &RuntimeSelection,
+    model: &ModelAlias,
+) -> PolicyRouteIdentity {
+    let (provider_id, model_id) = model
+        .provider_model
+        .split_once('/')
+        .expect("catalog provider model includes provider and model ids");
+    PolicyRouteIdentity {
+        account_wrapper: selection.account.opencode_wrapper.to_string(),
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        effort: model.effort.to_string(),
     }
 }
 

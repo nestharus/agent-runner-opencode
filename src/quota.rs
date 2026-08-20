@@ -129,14 +129,6 @@ fn probe_account(account: &AccountProfile) -> Value {
     probe_observation_result(observation)
 }
 
-fn probe_account_without_refresh(account: &AccountProfile) -> Value {
-    let auth_path = resolved_auth_path(account);
-    if !auth_has_source(&auth_path) {
-        return unreadable_auth_probe_result();
-    }
-    probe_observation_result(run_probe(&auth_path))
-}
-
 fn probe_after_auth_refresh(
     account: &AccountProfile,
     auth_path: &Path,
@@ -298,10 +290,13 @@ fn opencode_command_failure_detail(output: &crate::shell::ShellOutput) -> String
 }
 
 fn refresh_available(account: &AccountProfile) -> bool {
-    probe_account_without_refresh(account)
-        .get("available")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    quota_observation_without_refresh(account).is_ok()
+}
+
+fn quota_observation_without_refresh(
+    account: &AccountProfile,
+) -> Result<QuotaObservation, QuotaObservationFailure> {
+    run_probe(&resolved_auth_path(account))
 }
 
 fn run_account_auth_refresh(

@@ -49,22 +49,22 @@ pub enum QuotaFailureSource {
     ScriptOverrideProtocol,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaRefreshAdvice {
+    DoNotRefresh,
+    RefreshAuthentication,
+}
+
 #[derive(Debug)]
 pub struct QuotaObservationFailure {
     pub source: QuotaFailureSource,
     pub detail: String,
-    http_status: Option<u16>,
+    refresh_advice: QuotaRefreshAdvice,
 }
 
 impl QuotaObservationFailure {
     pub fn needs_auth_refresh(&self) -> bool {
-        if self.source == QuotaFailureSource::WhamHttp && self.http_status == Some(401) {
-            return true;
-        }
-        let detail = self.detail.to_ascii_lowercase();
-        detail.contains("http 401")
-            || detail.contains("token is expired")
-            || detail.contains("authentication token is expired")
+        self.refresh_advice == QuotaRefreshAdvice::RefreshAuthentication
     }
 }
 
@@ -84,9 +84,10 @@ fn observe_script_override(auth_path: &Path) -> Result<QuotaObservation, QuotaOb
         )
     })?;
     if output.status != 0 {
-        return Err(failure(
+        return Err(failure_with_refresh_advice(
             QuotaFailureSource::ScriptOverrideExit,
             shell_failure_detail("chatgpt-usage test override", &output),
+            script_refresh_advice(&output),
         ));
     }
     let windows = parse_script_override_windows(&output.stdout).map_err(|detail| {
@@ -141,7 +142,19 @@ fn failure(source: QuotaFailureSource, detail: String) -> QuotaObservationFailur
     QuotaObservationFailure {
         source,
         detail,
-        http_status: None,
+        refresh_advice: QuotaRefreshAdvice::DoNotRefresh,
+    }
+}
+
+fn failure_with_refresh_advice(
+    source: QuotaFailureSource,
+    detail: String,
+    refresh_advice: QuotaRefreshAdvice,
+) -> QuotaObservationFailure {
+    QuotaObservationFailure {
+        source,
+        detail,
+        refresh_advice,
     }
 }
 
@@ -152,7 +165,23 @@ fn http_failure(status: u16, body: &str) -> QuotaObservationFailure {
             "ChatGPT WHAM API returned HTTP {status}: {}",
             http_error_detail(body)
         ),
-        http_status: Some(status),
+        refresh_advice: if status == 401 {
+            QuotaRefreshAdvice::RefreshAuthentication
+        } else {
+            QuotaRefreshAdvice::DoNotRefresh
+        },
+    }
+}
+
+fn script_refresh_advice(output: &ShellOutput) -> QuotaRefreshAdvice {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("http 401")
+        || stderr.contains("token is expired")
+        || stderr.contains("authentication token is expired")
+    {
+        QuotaRefreshAdvice::RefreshAuthentication
+    } else {
+        QuotaRefreshAdvice::DoNotRefresh
     }
 }
 
