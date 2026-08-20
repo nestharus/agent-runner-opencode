@@ -16,6 +16,7 @@ use crate::native_runtime::{self, NativeRuntimeContext};
 use crate::opencode::{OpencodeAuthEffect, OpencodeAuthObservation};
 use crate::path_guard;
 use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
+use crate::quota_observer::{self, QuotaObserverContext};
 use crate::runtime_selection::{
     append_resolved_activity_targets, resolve_runtime_selection, RuntimeSelection,
 };
@@ -135,7 +136,8 @@ pub fn probe_params(
     let params = parse_base_params(params, request_id)?;
     let account = account_from_settings_record(host, &params.settings_id, request_id)?;
     let auth_path = observed_auth_path(host, account, request_id)?;
-    Ok(probe_auth_path(&auth_path))
+    let observer = quota_observer::resolve(host, account, request_id)?;
+    Ok(probe_auth_path(&auth_path, &observer))
 }
 
 pub fn refresh_auth_params(
@@ -153,7 +155,7 @@ pub fn refresh_auth_params(
         &host.app,
     );
     let _request_lock = acquire_quota_refresh_request_lock(host, request_id)?;
-    let (mut operation, account, runtime, auth_path) =
+    let (mut operation, account, runtime, observer, auth_path) =
         match read_quota_refresh_operation(host, request_id)? {
             Some(operation) => {
                 validate_quota_refresh_operation(&operation, request_id)?;
@@ -194,19 +196,21 @@ pub fn refresh_auth_params(
                 }
                 let operation =
                     upgrade_prepared_quota_refresh_runtime_binding(host, operation, request_id)?;
-                let (account, runtime, auth_path) =
+                let (account, runtime, observer, auth_path) =
                     quota_refresh_operation_route(host, &operation, request_id)?;
-                (operation, account, runtime, auth_path)
+                (operation, account, runtime, observer, auth_path)
             }
             None => {
                 let selection = resolve_runtime_selection(host, &parsed.settings_id, request_id)?;
                 let account = selection.account;
                 let runtime = native_runtime::resolve_for_account(host, account, request_id)?;
+                let observer = quota_observer::resolve(host, account, request_id)?;
                 let auth_path = resolved_auth_path(account, &runtime);
                 let binding = quota_refresh_binding(
                     &params_sha256,
                     &selection,
                     &runtime,
+                    &observer,
                     &auth_path,
                     provider_instance_id,
                     &host.app,
@@ -224,7 +228,7 @@ pub fn refresh_auth_params(
                     result: None,
                 };
                 write_quota_refresh_operation(host, &operation, request_id)?;
-                (operation, account, runtime, auth_path)
+                (operation, account, runtime, observer, auth_path)
             }
         };
     let _account_lock = acquire_quota_refresh_account_lock(host, account, &auth_path, request_id)?;
@@ -237,7 +241,7 @@ pub fn refresh_auth_params(
     let available = refresh
         .as_ref()
         .is_ok_and(OpencodeAuthObservation::command_succeeded)
-        && refresh_available(account, &runtime);
+        && refresh_available(account, &runtime, &observer);
     let result = refresh_auth_result(
         refreshed,
         available,
@@ -259,6 +263,9 @@ fn upgrade_prepared_quota_refresh_runtime_binding(
     if operation.binding["native_runtime_identity_sha256"]
         .as_str()
         .is_some()
+        && operation.binding["quota_observer_identity_sha256"]
+            .as_str()
+            .is_some()
     {
         return Ok(operation);
     }
@@ -275,6 +282,7 @@ fn upgrade_prepared_quota_refresh_runtime_binding(
         ));
     }
     let runtime = native_runtime::resolve_for_account(host, account, request_id)?;
+    let observer = quota_observer::resolve(host, account, request_id)?;
     let expected_auth_path = resolved_auth_path(account, &runtime);
     if operation.binding["auth_source_path"].as_str()
         != Some(expected_auth_path.to_string_lossy().as_ref())
@@ -285,6 +293,7 @@ fn upgrade_prepared_quota_refresh_runtime_binding(
         ));
     }
     operation.binding["native_runtime_identity_sha256"] = json!(runtime.identity_sha256());
+    operation.binding["quota_observer_identity_sha256"] = json!(observer.identity_sha256());
     operation.binding_sha256 = quota_refresh_binding_sha256(&operation.binding);
     write_quota_refresh_operation(host, &operation, request_id)?;
     Ok(operation)
@@ -294,6 +303,7 @@ fn quota_refresh_binding(
     params_sha256: &str,
     selection: &RuntimeSelection,
     runtime: &NativeRuntimeContext,
+    observer: &QuotaObserverContext,
     auth_path: &Path,
     provider_instance_id: Option<&str>,
     host_app: &str,
@@ -306,6 +316,7 @@ fn quota_refresh_binding(
         "account": selection.account.opencode_wrapper,
         "account_index": selection.account.opencode_index,
         "native_runtime_identity_sha256": runtime.identity_sha256(),
+        "quota_observer_identity_sha256": observer.identity_sha256(),
         "auth_source_path": auth_path.display().to_string(),
         "provider_instance_id": provider_instance_id,
         "host_app": host_app,
@@ -348,7 +359,15 @@ fn quota_refresh_operation_route(
     host: &HostContext,
     operation: &QuotaRefreshOperation,
     request_id: &str,
-) -> Result<(&'static AccountProfile, NativeRuntimeContext, PathBuf), ProviderFailure> {
+) -> Result<
+    (
+        &'static AccountProfile,
+        NativeRuntimeContext,
+        QuotaObserverContext,
+        PathBuf,
+    ),
+    ProviderFailure,
+> {
     let account_name = operation.binding["account"]
         .as_str()
         .ok_or_else(|| quota_refresh_operation_invalid(request_id, "binding account is missing"))?;
@@ -379,7 +398,16 @@ fn quota_refresh_operation_route(
             "binding native runtime identity is inconsistent",
         ));
     }
-    Ok((account, runtime, auth_path))
+    let observer = quota_observer::resolve(host, account, request_id)?;
+    if operation.binding["quota_observer_identity_sha256"].as_str()
+        != Some(observer.identity_sha256())
+    {
+        return Err(quota_refresh_operation_invalid(
+            request_id,
+            "binding quota observer identity is inconsistent",
+        ));
+    }
+    Ok((account, runtime, observer, auth_path))
 }
 
 fn quota_refresh_binding_sha256(binding: &Value) -> String {
@@ -653,19 +681,22 @@ fn readable_source_id(
     has_source.then(|| source_id(account, auth_path))
 }
 
-fn probe_auth_path(auth_path: &Path) -> Value {
+fn probe_auth_path(auth_path: &Path, observer: &QuotaObserverContext) -> Value {
     if !auth_has_source(auth_path) {
         return unreadable_auth_probe_result();
     }
-    probe_observation_result(run_probe(auth_path))
+    probe_observation_result(run_probe(auth_path, observer))
 }
 
 fn unreadable_auth_probe_result() -> Value {
     unavailable_result("native opencode auth source is missing or unreadable".to_string())
 }
 
-fn run_probe(auth_path: &Path) -> Result<QuotaObservation, QuotaObservationFailure> {
-    quota_adapter::observe_quota(auth_path)
+fn run_probe(
+    auth_path: &Path,
+    observer: &QuotaObserverContext,
+) -> Result<QuotaObservation, QuotaObservationFailure> {
+    quota_adapter::observe_quota(auth_path, observer)
 }
 
 fn probe_observation_result(
@@ -811,15 +842,20 @@ fn opencode_command_failure_detail(output: &crate::shell::ShellOutput) -> String
     )
 }
 
-fn refresh_available(account: &AccountProfile, runtime: &NativeRuntimeContext) -> bool {
-    quota_observation_without_refresh(account, runtime).is_ok()
+fn refresh_available(
+    account: &AccountProfile,
+    runtime: &NativeRuntimeContext,
+    observer: &QuotaObserverContext,
+) -> bool {
+    quota_observation_without_refresh(account, runtime, observer).is_ok()
 }
 
 fn quota_observation_without_refresh(
     account: &AccountProfile,
     runtime: &NativeRuntimeContext,
+    observer: &QuotaObserverContext,
 ) -> Result<QuotaObservation, QuotaObservationFailure> {
-    run_probe(&resolved_auth_path(account, runtime))
+    run_probe(&resolved_auth_path(account, runtime), observer)
 }
 
 fn run_account_auth_refresh(

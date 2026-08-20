@@ -6,9 +6,8 @@ provider contract.
 OpenCode owns every account-scoped boundary: model launch, sessions, native
 session export/import for account rotation, authentication, and quota
 attribution. Quota is read from the selected wrapper's native OpenCode auth
-file and queried through the ChatGPT usage endpoint with `curl`; Codex
-configuration and credentials are neither read nor modified. The optional
-`chatgpt-usage` executable path exists only as a test override.
+file and queried through the ChatGPT usage endpoint with a durably bound
+`curl`; Codex configuration and credentials are neither read nor modified.
 
 The provider recognizes five account-pinned wrappers, `opencode1` through
 `opencode5`. The selected settings record, wrapper command, session commands,
@@ -81,10 +80,9 @@ resume observation; launch does not recover those identities from public model
 JSON or generated argv.
 
 Quota probing likewise converges on a typed `QuotaObservation`. The native
-adapter translates authenticated WHAM HTTP responses directly into that type,
-while the optional `chatgpt-usage` test override parses its stdout only within
-the override branch. Source-aware failures retain whether auth-file parsing,
-WHAM transport/HTTP/protocol handling, or the explicit test override failed;
+adapter translates authenticated WHAM HTTP responses directly into that type.
+Source-aware failures retain whether auth-file parsing or WHAM
+transport/HTTP/protocol handling failed;
 each source assigns typed authentication-refresh advice before control returns
 to quota orchestration. `quota.probe` is observation-only: authentication
 failures project actionable advice to call the separately durable
@@ -264,6 +262,16 @@ the current invocation but do not change the state identity. A different
 wrapper, stable environment, or changed wrapper implementation is rejected
 before another native effect rather than silently addressing a second state
 namespace with the same account/session labels.
+
+Quota probes use a separate durable implementation context under
+`host.data_root/provider-state/opencode/quota-observers`. The first probe for an
+account resolves `curl` once, records its canonical path, content hash, and
+minimal cleared environment, and every later probe reuses that exact observer.
+The adapter owns one fixed `chatgpt_wham_curl/v1` request contract, disables
+ambient curl configuration, supplies credentials through stdin configuration,
+and accepts no environment-selected observer branch. Auth refresh binds both
+the native OpenCode runtime identity and this quota-observer identity before it
+admits a credential mutation.
 
 Activity evidence is operational and explicitly best-effort. A directory,
 lock, write, or chain-validation failure is emitted as a stderr warning but

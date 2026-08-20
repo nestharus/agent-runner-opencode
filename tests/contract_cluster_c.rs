@@ -103,56 +103,28 @@ impl std::io::Write for RejectWrites {
 }
 
 #[test]
-fn characterization_chatgpt_usage_windows() {
-    let windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
-        .expect("captured chatgpt-usage fixture should parse");
-    assert_usage_windows_fixture(&windows);
-    assert_malformed_usage_inputs_rejected();
-}
-
-#[test]
 fn contract_quota_source() {
     let home = HomeFixture::new("agent-runner-opencode-quota-source-home");
     home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
-    let fake_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
-    let path = prepend_path(fake_usage.dir());
 
     let result = success_result(
         invoke_with_env(
             "quota.source",
             quota_base_params(),
-            &[
-                ("HOME", home.path_str()),
-                ("PATH", path.as_str()),
-                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
-                (
-                    "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                    fake_usage.log_path_str(),
-                ),
-            ],
+            &[("HOME", home.path_str())],
         ),
         "quota.schema.json#/$defs/QuotaSourceResponse",
         "quota.schema.json#/$defs/QuotaSourceResult",
     );
 
     assert_present_source_result(&result);
-    assert_no_chatgpt_usage_invocation(fake_usage.log_path());
 
     let missing_home = HomeFixture::new("agent-runner-opencode-quota-source-missing-home");
-    let missing_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
-    let missing_path = prepend_path(missing_usage.dir());
     let missing = success_result(
         invoke_with_env(
             "quota.source",
             quota_base_params(),
-            &[
-                ("HOME", missing_home.path_str()),
-                ("PATH", missing_path.as_str()),
-                (
-                    "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                    missing_usage.log_path_str(),
-                ),
-            ],
+            &[("HOME", missing_home.path_str())],
         ),
         "quota.schema.json#/$defs/QuotaSourceResponse",
         "quota.schema.json#/$defs/QuotaSourceResult",
@@ -161,24 +133,14 @@ fn contract_quota_source() {
         &missing,
         "missing-auth source response must still report freshness",
     );
-    assert_no_chatgpt_usage_invocation(missing_usage.log_path());
 
     let unreadable_home = HomeFixture::new("agent-runner-opencode-quota-source-unreadable-home");
     unreadable_home.write_unreadable_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
-    let unreadable_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
-    let unreadable_path = prepend_path(unreadable_usage.dir());
     let unreadable = success_result(
         invoke_with_env(
             "quota.source",
             quota_base_params(),
-            &[
-                ("HOME", unreadable_home.path_str()),
-                ("PATH", unreadable_path.as_str()),
-                (
-                    "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                    unreadable_usage.log_path_str(),
-                ),
-            ],
+            &[("HOME", unreadable_home.path_str())],
         ),
         "quota.schema.json#/$defs/QuotaSourceResponse",
         "quota.schema.json#/$defs/QuotaSourceResult",
@@ -187,7 +149,6 @@ fn contract_quota_source() {
         &unreadable,
         "unreadable-auth source response must still report freshness",
     );
-    assert_no_chatgpt_usage_invocation(unreadable_usage.log_path());
 }
 
 #[test]
@@ -201,107 +162,71 @@ fn contract_quota_source_uses_all_f6_account_mappings() {
             mapping.opencode_auth_relative,
             opencode_auth_json("sentinel", "acct").as_bytes(),
         );
-        let fake_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
-        let path = prepend_path(fake_usage.dir());
-
         let result = success_result(
             invoke_with_env(
                 "quota.source",
                 quota_params(mapping.settings_id),
-                &[
-                    ("HOME", home.path_str()),
-                    ("PATH", path.as_str()),
-                    (
-                        "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                        fake_usage.log_path_str(),
-                    ),
-                ],
+                &[("HOME", home.path_str())],
             ),
             "quota.schema.json#/$defs/QuotaSourceResponse",
             "quota.schema.json#/$defs/QuotaSourceResult",
         );
 
         assert_f6_source_mapping(&result, mapping);
-        assert_no_chatgpt_usage_invocation(fake_usage.log_path());
     }
 }
 
 #[test]
 fn contract_quota_probe() {
-    let raw_windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
-        .expect("captured chatgpt-usage fixture should parse");
+    let raw_windows = native_wham_expected_windows();
     let home = HomeFixture::new("agent-runner-opencode-quota-probe-home");
-    let auth_path = home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
-    let fake_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
-    let path = prepend_path(fake_usage.dir());
+    home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
+    let curl = FakeNativeCurl::new();
+    let path = curl.path_env();
 
     let result = success_result(
         invoke_with_env(
             "quota.probe",
             quota_base_params(),
-            &[
-                ("HOME", home.path_str()),
-                ("PATH", path.as_str()),
-                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
-                (
-                    "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                    fake_usage.log_path_str(),
-                ),
-            ],
+            &[("HOME", home.path_str()), ("PATH", path.as_str())],
         ),
         "quota.schema.json#/$defs/QuotaProbeResponse",
         "quota.schema.json#/$defs/QuotaProbeResult",
     );
     assert_available_probe_result(&result, &raw_windows);
-    assert_probe_invocation(fake_usage.log_path(), &auth_path);
+    curl.assert_native_invocation();
 
-    let failing_usage = FakeChatgptUsage::failure(17, "forced quota probe failure");
-    let failing_path = prepend_path(failing_usage.dir());
+    let failing_curl = FakeNativeCurl::transport_failure(17, "forced quota probe failure");
+    let failing_path = failing_curl.path_env();
     let unavailable = success_result(
         invoke_with_env(
             "quota.probe",
             quota_base_params(),
-            &[
-                ("HOME", home.path_str()),
-                ("PATH", failing_path.as_str()),
-                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
-                (
-                    "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                    failing_usage.log_path_str(),
-                ),
-            ],
+            &[("HOME", home.path_str()), ("PATH", failing_path.as_str())],
         ),
         "quota.schema.json#/$defs/QuotaProbeResponse",
         "quota.schema.json#/$defs/QuotaProbeResult",
     );
     assert_unavailable_probe_result(&unavailable);
 
-    for (case_name, malformed_stdout) in [
+    for (case_name, malformed_body) in [
         ("invalid JSON", "{"),
         (
             "out-of-range used_percent",
-            r#"{"windows":[{"used_percent":150,"resets_at":"2026-06-04T11:24:05Z"}]}"#,
+            r#"{"rate_limit":{"primary_window":{"used_percent":150,"reset_at":1780572245}}}"#,
         ),
         (
-            "bad RFC3339 resets_at",
-            r#"{"windows":[{"used_percent":25,"resets_at":"not-rfc3339"}]}"#,
+            "non-numeric reset_at",
+            r#"{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":"not-unix-seconds"}}}"#,
         ),
     ] {
-        let malformed_usage = FakeChatgptUsage::success(malformed_stdout);
-        let malformed_path = prepend_path(malformed_usage.dir());
+        let malformed_curl = FakeNativeCurl::with_response(200, malformed_body);
+        let malformed_path = malformed_curl.path_env();
         assert_malformed_probe_rejected(
             invoke_with_env(
                 "quota.probe",
                 quota_base_params(),
-                &[
-                    ("HOME", home.path_str()),
-                    ("PATH", malformed_path.as_str()),
-                    ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
-                    (
-                        "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                        malformed_usage.log_path_str(),
-                    ),
-                ],
+                &[("HOME", home.path_str()), ("PATH", malformed_path.as_str())],
             ),
             case_name,
         );
@@ -329,6 +254,98 @@ fn contract_quota_probe_uses_native_opencode_auth_adapter_by_default() {
 }
 
 #[test]
+fn contract_quota_observer_identity_is_reused_across_provider_processes() {
+    let runtime = IsolatedQuotaSettings::new();
+    let home = HomeFixture::new("agent-runner-opencode-bound-quota-observer-home");
+    home.write_auth_at(
+        ".opencode3/opencode/auth.json",
+        opencode_auth_json("sentinel", "acct").as_bytes(),
+    );
+    let admitted_curl = FakeNativeCurl::new();
+    let admitted_path = admitted_curl.path_env();
+    let first = success_result(
+        support::invoke_validated_with_host_and_env(
+            "quota.probe",
+            quota_base_params(),
+            runtime.host_overrides(),
+            "quota.schema.json#/$defs/QuotaProbeRequest",
+            &[("HOME", home.path_str()), ("PATH", admitted_path.as_str())],
+        ),
+        "quota.schema.json#/$defs/QuotaProbeResponse",
+        "quota.schema.json#/$defs/QuotaProbeResult",
+    );
+    assert_available_probe_result(&first, &native_wham_expected_windows());
+
+    let ambient_curl = FakeNativeCurl::http_failure(503, r#"{"detail":"wrong observer"}"#);
+    let ambient_path = ambient_curl.path_env();
+    let second = success_result(
+        support::invoke_validated_with_host_and_env(
+            "quota.probe",
+            quota_base_params(),
+            runtime.host_overrides(),
+            "quota.schema.json#/$defs/QuotaProbeRequest",
+            &[("HOME", home.path_str()), ("PATH", ambient_path.as_str())],
+        ),
+        "quota.schema.json#/$defs/QuotaProbeResponse",
+        "quota.schema.json#/$defs/QuotaProbeResult",
+    );
+    assert_available_probe_result(&second, &native_wham_expected_windows());
+    assert!(
+        !ambient_curl.invocation_path.exists(),
+        "later ambient PATH must not replace the bound quota observer"
+    );
+
+    std::fs::write(admitted_curl.dir.join("curl"), "#!/bin/sh\nexit 0\n")
+        .expect("mutate admitted quota observer fixture");
+    let changed = support::invoke_validated_with_host_and_env(
+        "quota.probe",
+        quota_base_params(),
+        runtime.host_overrides(),
+        "quota.schema.json#/$defs/QuotaProbeRequest",
+        &[("HOME", home.path_str()), ("PATH", ambient_path.as_str())],
+    );
+    assert!(!changed.status.success());
+    let changed_response = json_stdout(&changed);
+    support::assert_valid(
+        &changed_response,
+        "quota.schema.json#/$defs/QuotaProbeErrorResponse",
+    );
+    assert_eq!(
+        changed_response["error"]["code"],
+        "quota_observer_implementation_changed"
+    );
+}
+
+#[test]
+fn contract_quota_observer_rejects_curl_config_injection_before_spawn() {
+    let home = HomeFixture::new("agent-runner-opencode-quota-config-injection-home");
+    let auth = serde_json::to_vec(&json!({
+        "openai": {
+            "access": "sentinel\nurl = \"https://attacker.invalid\"",
+            "accountId": "acct",
+        }
+    }))
+    .expect("serialize hostile auth fixture");
+    home.write_paired_auth(&auth);
+    let curl = FakeNativeCurl::new();
+    let path = curl.path_env();
+    let result = success_result(
+        invoke_with_env(
+            "quota.probe",
+            quota_base_params(),
+            &[("HOME", home.path_str()), ("PATH", path.as_str())],
+        ),
+        "quota.schema.json#/$defs/QuotaProbeResponse",
+        "quota.schema.json#/$defs/QuotaProbeResult",
+    );
+    assert_eq!(result["available"], false);
+    assert!(result["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("control character")));
+    assert!(!curl.invocation_path.exists(), "unsafe auth reached curl");
+}
+
+#[test]
 fn contract_native_quota_failure_names_wham_boundary() {
     let home = HomeFixture::new("agent-runner-opencode-native-quota-failure-home");
     home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
@@ -348,7 +365,6 @@ fn contract_native_quota_failure_names_wham_boundary() {
     let detail = result["detail"].as_str().expect("native failure detail");
     assert!(detail.contains("ChatGPT WHAM API returned HTTP 503"));
     assert!(detail.contains("maintenance"));
-    assert!(!detail.contains("chatgpt-usage"));
 }
 
 #[test]
@@ -381,7 +397,6 @@ fn contract_native_wham_401_carries_typed_refresh_advice() {
     let detail = result["detail"].as_str().expect("native 401 detail");
     assert!(detail.contains("ChatGPT WHAM API returned HTTP 401"));
     assert!(detail.contains("invoke quota.refresh_auth"));
-    assert!(!detail.contains("chatgpt-usage"));
 }
 
 #[test]
@@ -390,27 +405,19 @@ fn contract_quota_probe_reports_refresh_requirement_without_mutating_auth() {
     let auth_path = home.write_paired_auth(opencode_auth_json("expired", "acct").as_bytes());
     let auth_before = file_sha256(&auth_path);
     let marker = home.path.join("refresh-ran");
-    let fake_usage = FakeChatgptUsage::with_script(fake_chatgpt_usage_401_then_success_script(
-        &marker,
-        CHATGPT_USAGE_WINDOWS_RAW,
-    ));
+    let curl = FakeNativeCurl::http_failure(
+        401,
+        r#"{"detail":"Provided authentication token is expired."}"#,
+    );
     let fake_auth =
         FakeOpencodeAuth::touches_marker_and_rewrites_auth("opencode3", &marker, &auth_path);
-    let path = prepend_paths(&[fake_auth.dir(), fake_usage.dir()]);
+    let path = prepend_paths(&[fake_auth.dir(), &curl.dir]);
 
     let result = success_result(
         invoke_with_env(
             "quota.probe",
             quota_base_params(),
-            &[
-                ("HOME", home.path_str()),
-                ("PATH", path.as_str()),
-                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
-                (
-                    "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                    fake_usage.log_path_str(),
-                ),
-            ],
+            &[("HOME", home.path_str()), ("PATH", path.as_str())],
         ),
         "quota.schema.json#/$defs/QuotaProbeResponse",
         "quota.schema.json#/$defs/QuotaProbeResult",
@@ -420,12 +427,7 @@ fn contract_quota_probe_reports_refresh_requirement_without_mutating_auth() {
     assert!(result["detail"]
         .as_str()
         .is_some_and(|detail| detail.contains("invoke quota.refresh_auth")));
-    assert_probe_invocation(fake_usage.log_path(), &auth_path);
-    let log = optional_usage_log(fake_usage.log_path());
-    assert!(
-        !log.contains("auth argv=auth list"),
-        "quota.probe must never invoke opencode auth list; log={log:?}"
-    );
+    curl.assert_native_invocation();
     assert!(
         !marker.exists(),
         "quota.probe must not run the auth wrapper"
@@ -500,7 +502,7 @@ fn contract_quota_refresh_auth_replays_committed_observation_after_response_loss
     );
     fixture.assert_auth_changed();
     assert_eq!(
-        optional_usage_log(fixture.fake_usage.log_path())
+        optional_usage_log(&fixture.quota_log_path)
             .matches("auth argv=auth list")
             .count(),
         1,
@@ -524,7 +526,7 @@ fn contract_quota_refresh_auth_replays_committed_observation_after_response_loss
         "exact retries must replay one receipt"
     );
     assert_eq!(
-        optional_usage_log(fixture.fake_usage.log_path())
+        optional_usage_log(&fixture.quota_log_path)
             .matches("auth argv=auth list")
             .count(),
         1,
@@ -546,7 +548,7 @@ fn contract_quota_refresh_auth_replays_committed_observation_after_response_loss
         "quota_refresh_request_conflict"
     );
     assert_eq!(
-        optional_usage_log(fixture.fake_usage.log_path())
+        optional_usage_log(&fixture.quota_log_path)
             .matches("auth argv=auth list")
             .count(),
         1,
@@ -613,7 +615,7 @@ fn contract_quota_refresh_auth_does_not_repeat_an_unsettled_native_effect() {
         "quota_refresh_reconciliation_required"
     );
     assert_eq!(
-        optional_usage_log(fixture.fake_usage.log_path())
+        optional_usage_log(&fixture.quota_log_path)
             .matches("auth argv=auth list")
             .count(),
         1,
@@ -630,22 +632,14 @@ fn contract_quota_refresh_auth_does_not_repeat_an_unsettled_native_effect() {
 fn contract_auth_list_without_credential_change_is_not_reported_as_refresh() {
     let home = HomeFixture::new("agent-runner-opencode-quota-list-only-home");
     home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
-    let fake_usage = FakeChatgptUsage::success(CHATGPT_USAGE_WINDOWS_RAW);
+    let curl = FakeNativeCurl::new();
     let fake_auth = FakeOpencodeAuth::success("opencode3");
-    let path = prepend_paths(&[fake_auth.dir(), fake_usage.dir()]);
+    let path = prepend_paths(&[fake_auth.dir(), &curl.dir]);
     let result = success_result(
         invoke_with_env(
             "quota.refresh_auth",
             quota_refresh_auth_params(),
-            &[
-                ("HOME", home.path_str()),
-                ("PATH", path.as_str()),
-                ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
-                (
-                    "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                    fake_usage.log_path_str(),
-                ),
-            ],
+            &[("HOME", home.path_str()), ("PATH", path.as_str())],
         ),
         "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
         "quota.schema.json#/$defs/QuotaRefreshAuthResult",

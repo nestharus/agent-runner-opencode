@@ -3,56 +3,6 @@
 
 use super::*;
 
-pub fn assert_usage_windows_fixture(windows: &[RawUsageWindow]) {
-    assert_eq!(
-        windows.len(),
-        2,
-        "fixture should contain exactly two windows"
-    );
-    assert_eq!(windows[0].used_percent, 4.0);
-    assert_eq!(windows[0].resets_at, "2026-06-11T06:24:05Z");
-    assert_eq!(windows[1].used_percent, 25.0);
-    assert_eq!(windows[1].resets_at, "2026-06-04T11:24:05Z");
-    for window in windows {
-        assert_usage_window_valid(window);
-    }
-}
-
-pub fn assert_usage_window_valid(window: &RawUsageWindow) {
-    assert!(
-        (0.0..=100.0).contains(&window.used_percent),
-        "used_percent must be in 0..=100: {}",
-        window.used_percent
-    );
-    assert!(
-        epoch_ms(&window.resets_at) > 0,
-        "resets_at must be RFC3339 and convert to a Unix millisecond timestamp"
-    );
-}
-
-pub fn assert_malformed_usage_inputs_rejected() {
-    for (raw, reason) in malformed_usage_cases() {
-        assert!(
-            parse_chatgpt_usage_windows(raw).is_err(),
-            "{reason} should be rejected before contract projection"
-        );
-    }
-}
-
-pub fn malformed_usage_cases() -> [(&'static str, &'static str); 3] {
-    [
-        ("{", "invalid JSON"),
-        (
-            r#"{"windows":[{"used_percent":150,"resets_at":"2026-06-04T11:24:05Z"}]}"#,
-            "out-of-range used_percent",
-        ),
-        (
-            r#"{"windows":[{"used_percent":25,"resets_at":"not-rfc3339"}]}"#,
-            "bad RFC3339 resets_at",
-        ),
-    ]
-}
-
 pub fn assert_present_source_result(result: &Value) {
     assert_eq!(result["has_source"], true);
     assert_freshness_present(result, "quota.source must report freshness");
@@ -128,7 +78,7 @@ pub fn assert_projected_window(projected: &Value, raw: &RawUsageWindow) {
     let expected = projected_remaining_ratio(raw);
     assert_eq!(
         remaining_ratio, expected,
-        "remaining_ratio must exactly project chatgpt-usage used_percent"
+        "remaining_ratio must exactly project WHAM used_percent"
     );
     assert!(
         (0.0..=1.0).contains(&remaining_ratio),
@@ -155,30 +105,6 @@ pub fn raw_resets_at_epoch_ms(raw: &RawUsageWindow) -> i64 {
     epoch_ms(&raw.resets_at)
 }
 
-pub fn assert_probe_invocation(log_path: &Path, auth_path: &Path) {
-    let invocation = probe_invocation_log(log_path);
-    assert!(
-        probe_invocation_contains_auth_path(&invocation, auth_path),
-        "quota.probe must invoke chatgpt-usage with native opencode3 auth path; log={invocation:?}"
-    );
-    assert!(
-        !probe_invocation_contains_stale_codex_auth(&invocation),
-        "quota.probe must not invoke stale codex auth path; log={invocation:?}"
-    );
-}
-
-pub fn probe_invocation_log(log_path: &Path) -> String {
-    fs::read_to_string(log_path).expect("read fake usage log")
-}
-
-pub fn probe_invocation_contains_auth_path(invocation: &str, auth_path: &Path) -> bool {
-    invocation.contains(auth_path.to_string_lossy().as_ref())
-}
-
-pub fn probe_invocation_contains_stale_codex_auth(invocation: &str) -> bool {
-    invocation.contains(WRONG_CODEX_AUTH_RELATIVE)
-}
-
 pub fn assert_unavailable_probe_result(unavailable: &Value) {
     assert_eq!(unavailable["available"], false);
     assert_eq!(
@@ -187,7 +113,7 @@ pub fn assert_unavailable_probe_result(unavailable: &Value) {
             .expect("windows array")
             .len(),
         0,
-        "nonzero chatgpt-usage exit should not fabricate quota windows"
+        "quota-observer transport failure should not fabricate quota windows"
     );
     assert!(
         unavailable["detail"].as_str().is_some_and(|detail| detail
@@ -351,7 +277,7 @@ pub fn assert_malformed_probe_unavailable(
     assert_quota_probe_response(response);
     assert_eq!(
         response["result"]["available"], false,
-        "{case_name} malformed chatgpt-usage stdout must not be reported as available"
+        "{case_name} malformed WHAM response must not be reported as available"
     );
     assert_empty_probe_windows(response, case_name);
     assert_probe_detail_present(response, case_name);
@@ -364,7 +290,7 @@ pub fn assert_empty_probe_windows(response: &Value, case_name: &str) {
             .expect("windows array")
             .len(),
         0,
-        "{case_name} malformed chatgpt-usage stdout must not fabricate quota windows"
+        "{case_name} malformed WHAM response must not fabricate quota windows"
     );
 }
 
@@ -409,68 +335,6 @@ pub const F6_ACCOUNT_MAPPINGS: &[F6AccountMapping] = &[
 pub struct RawUsageWindow {
     pub used_percent: f64,
     pub resets_at: String,
-}
-
-pub fn parse_chatgpt_usage_windows(raw: &str) -> Result<Vec<RawUsageWindow>, String> {
-    let parsed = parse_usage_json(raw)?;
-    parse_usage_windows(usage_windows(&parsed)?)
-}
-
-pub fn parse_usage_json(raw: &str) -> Result<Value, String> {
-    serde_json::from_str(raw).map_err(|err| err.to_string())
-}
-
-pub fn parse_usage_windows(windows: &[Value]) -> Result<Vec<RawUsageWindow>, String> {
-    windows
-        .iter()
-        .enumerate()
-        .map(|(index, window)| parse_usage_window(index, window))
-        .collect()
-}
-
-pub fn usage_windows(parsed: &Value) -> Result<&[Value], String> {
-    parsed
-        .get("windows")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .ok_or_else(|| "windows must be an array".to_string())
-}
-
-pub fn parse_usage_window(index: usize, window: &Value) -> Result<RawUsageWindow, String> {
-    let used_percent = usage_window_used_percent(index, window)?;
-    ensure_usage_percent_in_range(index, used_percent)?;
-    let resets_at = usage_window_resets_at(index, window)?;
-    ensure_rfc3339(index, resets_at)?;
-    Ok(raw_usage_window(used_percent, resets_at))
-}
-
-pub fn usage_window_used_percent(index: usize, window: &Value) -> Result<f64, String> {
-    window
-        .get("used_percent")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| format!("windows[{index}].used_percent must be numeric"))
-}
-
-pub fn ensure_usage_percent_in_range(index: usize, used_percent: f64) -> Result<(), String> {
-    if (0.0..=100.0).contains(&used_percent) {
-        return Ok(());
-    }
-    Err(format!(
-        "windows[{index}].used_percent out of range: {used_percent}"
-    ))
-}
-
-pub fn usage_window_resets_at(index: usize, window: &Value) -> Result<&str, String> {
-    window
-        .get("resets_at")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("windows[{index}].resets_at must be a string"))
-}
-
-pub fn ensure_rfc3339(index: usize, resets_at: &str) -> Result<(), String> {
-    DateTime::parse_from_rfc3339(resets_at)
-        .map(|_| ())
-        .map_err(|err| format!("windows[{index}].resets_at invalid RFC3339: {err}"))
 }
 
 pub fn raw_usage_window(used_percent: f64, resets_at: &str) -> RawUsageWindow {
@@ -563,12 +427,6 @@ impl Drop for HomeFixture {
     }
 }
 
-pub struct FakeChatgptUsage {
-    pub dir: PathBuf,
-    pub log_path: PathBuf,
-    pub log_path_string: String,
-}
-
 pub struct FakeNativeCurl {
     pub dir: PathBuf,
     pub invocation_path: PathBuf,
@@ -586,7 +444,7 @@ impl FakeNativeCurl {
         Self::with_response(status, body)
     }
 
-    fn with_response(status: u16, body: &str) -> Self {
+    pub fn with_response(status: u16, body: &str) -> Self {
         let dir = unique_temp_dir("agent-runner-opencode-fake-native-curl");
         fs::create_dir_all(&dir).expect("create fake native curl dir");
         let invocation_path = dir.join("curl-invocation.log");
@@ -594,7 +452,7 @@ impl FakeNativeCurl {
             "#!/bin/sh\n\
 config=$(/bin/cat)\n\
 case \"$config\" in\n\
-  *'Authorization: Bearer sentinel'*'ChatGPT-Account-Id: acct'*) ;;\n\
+  *'Authorization: Bearer '*'ChatGPT-Account-Id: acct'*) ;;\n\
   *) printf '%s\\n' 'missing expected auth stdin' >&2; exit 64 ;;\n\
 esac\n\
 printf '%s\\n' \"$*\" > {}\n\
@@ -613,12 +471,38 @@ printf '%s' '__oulipoly_http_status__:{}'\n",
         }
     }
 
+    pub fn transport_failure(exit_code: u8, stderr: &str) -> Self {
+        let dir = unique_temp_dir("agent-runner-opencode-fake-native-curl-failure");
+        fs::create_dir_all(&dir).expect("create failing fake curl dir");
+        let invocation_path = dir.join("curl-invocation.log");
+        let script = format!(
+            "#!/bin/sh\n\
+/bin/cat >/dev/null\n\
+printf '%s\\n' \"$*\" > {}\n\
+printf '%s\\n' {} >&2\n\
+exit {exit_code}\n",
+            shell_single_quote(&invocation_path.to_string_lossy()),
+            shell_single_quote(stderr),
+        );
+        let curl_path = dir.join("curl");
+        fs::write(&curl_path, script).expect("write failing fake curl");
+        make_path_executable(&curl_path);
+        Self {
+            dir,
+            invocation_path,
+        }
+    }
+
     pub fn path_env(&self) -> String {
         prepend_path(&self.dir)
     }
 
     pub fn assert_native_invocation(&self) {
         let argv = fs::read_to_string(&self.invocation_path).expect("fake curl invocation");
+        assert!(
+            argv.starts_with("-q "),
+            "curl must disable ambient config: {argv:?}"
+        );
         assert!(argv.contains("--max-time 20"), "curl argv={argv:?}");
         assert!(argv.contains("-K -"), "curl argv={argv:?}");
         assert!(
@@ -681,80 +565,17 @@ impl FakeOpencodeAuth {
     }
 }
 
-impl FakeChatgptUsage {
-    pub fn success(stdout: &str) -> Self {
-        Self::with_script(fake_chatgpt_usage_success_script(stdout))
-    }
-
-    pub fn failure(exit_code: u8, stderr: &str) -> Self {
-        Self::with_script(fake_chatgpt_usage_failure_script(exit_code, stderr))
-    }
-
-    pub fn with_script(script: String) -> Self {
-        let dir = fake_chatgpt_usage_dir();
-        create_fake_chatgpt_usage_dir(&dir);
-        write_fake_chatgpt_usage_script(&fake_chatgpt_usage_script_path(&dir), script);
-        let log_path = fake_chatgpt_usage_log_path(&dir);
-        let log_path_string = log_path.to_string_lossy().into_owned();
-        Self {
-            dir,
-            log_path,
-            log_path_string,
-        }
-    }
-
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    pub fn log_path(&self) -> &Path {
-        &self.log_path
-    }
-
-    pub fn log_path_str(&self) -> &str {
-        &self.log_path_string
-    }
-}
-
-pub fn fake_chatgpt_usage_dir() -> PathBuf {
-    unique_temp_dir("agent-runner-opencode-fake-chatgpt-usage")
-}
-
-pub fn create_fake_chatgpt_usage_dir(dir: &Path) {
-    fs::create_dir_all(dir).expect("create fake chatgpt-usage dir");
-}
-
-pub fn fake_chatgpt_usage_script_path(dir: &Path) -> PathBuf {
-    dir.join("chatgpt-usage")
-}
-
-pub fn fake_chatgpt_usage_log_path(dir: &Path) -> PathBuf {
-    dir.join("chatgpt-usage.log")
-}
-
-pub fn write_fake_chatgpt_usage_script(script_path: &Path, script: String) {
-    fs::write(script_path, script).expect("write fake chatgpt-usage");
-    make_fake_chatgpt_usage_executable(script_path);
-}
-
-#[cfg(unix)]
-pub fn make_fake_chatgpt_usage_executable(script_path: &Path) {
-    make_path_executable(script_path);
-}
-
 #[cfg(unix)]
 pub fn make_path_executable(path: &Path) {
     set_path_permissions(path, permissions_with_mode(path_permissions(path), 0o755));
 }
 
-#[cfg(not(unix))]
-pub fn make_fake_chatgpt_usage_executable(_script_path: &Path) {}
-
 pub struct RefreshAuthFixture {
     pub home: HomeFixture,
     pub auth_path: PathBuf,
     pub before: String,
-    pub fake_usage: FakeChatgptUsage,
+    pub quota_log_path: PathBuf,
+    pub _fake_curl: FakeNativeCurl,
     pub _fake_auth: FakeOpencodeAuth,
     pub path: String,
 }
@@ -765,27 +586,28 @@ impl RefreshAuthFixture {
         let auth_path =
             home.write_paired_auth(opencode_auth_json("refresh-sentinel", "acct").as_bytes());
         let before = file_sha256(&auth_path);
-        let fake_usage = FakeChatgptUsage::failure(17, "probe unavailable during refresh");
+        let quota_log_path = home.path.join("quota-operation.log");
+        let fake_curl = FakeNativeCurl::transport_failure(17, "probe unavailable during refresh");
         let fake_auth = FakeOpencodeAuth::rewrites_auth("opencode3", &auth_path);
-        let path = prepend_paths(&[fake_auth.dir(), fake_usage.dir()]);
+        let path = prepend_paths(&[fake_auth.dir(), &fake_curl.dir]);
         Self {
             home,
             auth_path,
             before,
-            fake_usage,
+            quota_log_path,
+            _fake_curl: fake_curl,
             _fake_auth: fake_auth,
             path,
         }
     }
 
-    pub fn env(&self) -> [(&str, &str); 4] {
+    pub fn env(&self) -> [(&str, &str); 3] {
         [
             ("HOME", self.home.path_str()),
             ("PATH", self.path.as_str()),
-            ("AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT", "1"),
             (
                 "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
-                self.fake_usage.log_path_str(),
+                self.quota_log_path.to_str().expect("quota log path UTF-8"),
             ),
         ]
     }
@@ -799,17 +621,11 @@ impl RefreshAuthFixture {
     }
 
     pub fn assert_auth_command_invoked(&self) {
-        let log = optional_usage_log(self.fake_usage.log_path());
+        let log = optional_usage_log(&self.quota_log_path);
         assert!(
             log.contains("auth list"),
             "quota.refresh_auth must invoke opencode auth list; log={log:?}"
         );
-    }
-}
-
-impl Drop for FakeChatgptUsage {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -822,47 +638,6 @@ impl Drop for FakeOpencodeAuth {
 pub fn opencode_auth_json(access: &str, account_id: &str) -> String {
     format!(
         r#"{{"openai":{{"access":"{access}","accountId":"{account_id}","refresh":"refresh-sentinel","expires":4102444800,"type":"oauth"}}}}"#
-    )
-}
-
-pub fn fake_chatgpt_usage_success_script(stdout: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
-  printf 'argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
-fi\n\
-printf '%s' {}\n\
-exit 0\n",
-        shell_single_quote(stdout)
-    )
-}
-
-pub fn fake_chatgpt_usage_failure_script(exit_code: u8, stderr: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
-  printf 'argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
-fi\n\
-printf '%s\\n' {} >&2\n\
-exit {exit_code}\n",
-        shell_single_quote(stderr)
-    )
-}
-
-pub fn fake_chatgpt_usage_401_then_success_script(marker: &Path, stdout: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
-  printf 'argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
-fi\n\
-if [ -e {marker} ]; then\n\
-  printf '%s' {stdout}\n\
-  exit 0\n\
-fi\n\
-printf '%s\\n' 'ChatGPT API returned HTTP 401: Provided authentication token is expired. Please try signing in again.' >&2\n\
-exit 4\n",
-        marker = shell_single_quote(&marker.to_string_lossy()),
-        stdout = shell_single_quote(stdout)
     )
 }
 
@@ -901,14 +676,6 @@ exit 0\n",
         shell_single_quote(&opencode_auth_json("sentinel-refreshed", "acct")),
         shell_single_quote(&auth_path.to_string_lossy()),
     )
-}
-
-pub fn assert_no_chatgpt_usage_invocation(log_path: &Path) {
-    let log = optional_usage_log(log_path);
-    assert!(
-        log.trim().is_empty(),
-        "quota.source must not invoke chatgpt-usage; log={log:?}"
-    );
 }
 
 pub fn optional_usage_log(log_path: &Path) -> String {

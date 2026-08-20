@@ -17,6 +17,7 @@ pub mod path_guard;
 pub mod policy;
 pub mod quota;
 pub mod quota_adapter;
+pub mod quota_observer;
 pub mod resume_observation;
 pub mod rotation;
 pub mod runtime_selection;

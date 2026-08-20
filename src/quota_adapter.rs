@@ -4,11 +4,11 @@
 //!     role: adapter
 //!     Translates:
 //!       - authenticated ChatGPT WHAM HTTP responses to QuotaObservation
-//!       - explicit chatgpt-usage test-override stdout to QuotaObservation
 //!       - source-specific transport and protocol failures to QuotaObservationFailure
 
 use crate::child_custody::ChildCustody;
-use crate::shell::{self, ShellOutput};
+use crate::quota_observer::QuotaObserverContext;
+use crate::shell::ShellOutput;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 use std::fs;
@@ -18,12 +18,10 @@ use std::process::Stdio;
 
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const HTTP_STATUS_MARKER: &str = "__oulipoly_http_status__:";
-const SCRIPT_OVERRIDE_ENV: &str = "AGENT_RUNNER_OPENCODE_USE_CHATGPT_USAGE_SCRIPT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaObservationSource {
     WhamApi,
-    ScriptTestOverride,
 }
 
 #[derive(Debug)]
@@ -45,9 +43,6 @@ pub enum QuotaFailureSource {
     WhamTransport,
     WhamHttp,
     WhamProtocol,
-    ScriptOverrideTransport,
-    ScriptOverrideExit,
-    ScriptOverrideProtocol,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,44 +64,20 @@ impl QuotaObservationFailure {
     }
 }
 
-pub fn observe_quota(auth_path: &Path) -> Result<QuotaObservation, QuotaObservationFailure> {
-    if script_override_enabled() {
-        observe_script_override(auth_path)
-    } else {
-        observe_wham_api(auth_path)
-    }
+pub fn observe_quota(
+    auth_path: &Path,
+    observer: &QuotaObserverContext,
+) -> Result<QuotaObservation, QuotaObservationFailure> {
+    observe_wham_api(auth_path, observer)
 }
 
-fn observe_script_override(auth_path: &Path) -> Result<QuotaObservation, QuotaObservationFailure> {
-    let output = run_script_override(auth_path).map_err(|err| {
-        failure(
-            QuotaFailureSource::ScriptOverrideTransport,
-            format!("chatgpt-usage test override failed to start: {err}"),
-        )
-    })?;
-    if output.status != 0 {
-        return Err(failure_with_refresh_advice(
-            QuotaFailureSource::ScriptOverrideExit,
-            shell_failure_detail("chatgpt-usage test override", &output),
-            script_refresh_advice(&output),
-        ));
-    }
-    let windows = parse_script_override_windows(&output.stdout).map_err(|detail| {
-        failure(
-            QuotaFailureSource::ScriptOverrideProtocol,
-            format!("chatgpt-usage test override output is invalid: {detail}"),
-        )
-    })?;
-    Ok(QuotaObservation {
-        source: QuotaObservationSource::ScriptTestOverride,
-        windows,
-    })
-}
-
-fn observe_wham_api(auth_path: &Path) -> Result<QuotaObservation, QuotaObservationFailure> {
+fn observe_wham_api(
+    auth_path: &Path,
+    observer: &QuotaObserverContext,
+) -> Result<QuotaObservation, QuotaObservationFailure> {
     let tokens = read_auth_tokens(auth_path)
         .map_err(|detail| failure(QuotaFailureSource::AuthFile, detail))?;
-    let output = run_curl_usage(&tokens).map_err(|err| {
+    let output = run_curl_usage(&tokens, observer).map_err(|err| {
         failure(
             QuotaFailureSource::WhamTransport,
             format!("ChatGPT WHAM request failed to start: {err}"),
@@ -147,18 +118,6 @@ fn failure(source: QuotaFailureSource, detail: String) -> QuotaObservationFailur
     }
 }
 
-fn failure_with_refresh_advice(
-    source: QuotaFailureSource,
-    detail: String,
-    refresh_advice: QuotaRefreshAdvice,
-) -> QuotaObservationFailure {
-    QuotaObservationFailure {
-        source,
-        detail,
-        refresh_advice,
-    }
-}
-
 fn http_failure(status: u16, body: &str) -> QuotaObservationFailure {
     QuotaObservationFailure {
         source: QuotaFailureSource::WhamHttp,
@@ -174,18 +133,6 @@ fn http_failure(status: u16, body: &str) -> QuotaObservationFailure {
     }
 }
 
-fn script_refresh_advice(output: &ShellOutput) -> QuotaRefreshAdvice {
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    if stderr.contains("http 401")
-        || stderr.contains("token is expired")
-        || stderr.contains("authentication token is expired")
-    {
-        QuotaRefreshAdvice::RefreshAuthentication
-    } else {
-        QuotaRefreshAdvice::DoNotRefresh
-    }
-}
-
 fn shell_failure_detail(participant: &str, output: &ShellOutput) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
@@ -196,17 +143,6 @@ fn shell_failure_detail(participant: &str, output: &ShellOutput) -> String {
         "{participant} exited with status {}: {stderr}",
         output.status
     )
-}
-
-fn script_override_enabled() -> bool {
-    std::env::var_os(SCRIPT_OVERRIDE_ENV).is_some()
-}
-
-fn run_script_override(auth_path: &Path) -> std::io::Result<ShellOutput> {
-    shell::run(&[
-        "chatgpt-usage".to_string(),
-        auth_path.to_string_lossy().into_owned(),
-    ])
 }
 
 struct AuthTokens {
@@ -228,10 +164,21 @@ fn read_auth_tokens(path: &Path) -> Result<AuthTokens, String> {
         .and_then(Value::as_str)
         .and_then(nonempty_string)
         .ok_or_else(missing_auth_tokens_error)?;
+    validate_curl_header_value("access token", &access_token)?;
+    validate_curl_header_value("account id", &account_id)?;
     Ok(AuthTokens {
         access_token,
         account_id,
     })
+}
+
+fn validate_curl_header_value(label: &str, value: &str) -> Result<(), String> {
+    if value.chars().all(|character| !character.is_control()) {
+        return Ok(());
+    }
+    Err(format!(
+        "OpenCode auth {label} contains a control character that cannot enter the fixed WHAM request"
+    ))
 }
 
 fn missing_auth_tokens_error() -> String {
@@ -246,6 +193,7 @@ fn nonempty_string(value: &str) -> Option<String> {
 fn curl_usage_argv() -> Vec<String> {
     vec![
         "curl".to_string(),
+        "-q".to_string(),
         "-sS".to_string(),
         "--max-time".to_string(),
         "20".to_string(),
@@ -257,12 +205,17 @@ fn curl_usage_argv() -> Vec<String> {
     ]
 }
 
-fn run_curl_usage(tokens: &AuthTokens) -> std::io::Result<ShellOutput> {
+fn run_curl_usage(
+    tokens: &AuthTokens,
+    observer: &QuotaObserverContext,
+) -> std::io::Result<ShellOutput> {
     let argv = curl_usage_argv();
     let (program, args) = argv
         .split_first()
         .expect("curl usage argv is constructed with a program");
-    let child = shell::command(program)
+    debug_assert_eq!(program, "curl");
+    let child = observer
+        .command()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -357,45 +310,6 @@ fn http_error_detail(body: &str) -> String {
         .filter(|detail| !detail.trim().is_empty())
         .unwrap_or_else(|| body.trim())
         .to_string()
-}
-
-fn parse_script_override_windows(raw: &[u8]) -> Result<Vec<QuotaWindow>, String> {
-    let parsed: Value =
-        serde_json::from_slice(raw).map_err(|err| format!("stdout must be JSON: {err}"))?;
-    let windows = parsed
-        .get("windows")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "windows must be an array".to_string())?;
-    windows
-        .iter()
-        .enumerate()
-        .map(|(index, window)| parse_script_override_window(index, window))
-        .collect()
-}
-
-fn parse_script_override_window(index: usize, window: &Value) -> Result<QuotaWindow, String> {
-    let object = window
-        .as_object()
-        .ok_or_else(|| format!("windows[{index}] must be an object"))?;
-    let used_percent = object
-        .get("used_percent")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| format!("windows[{index}].used_percent must be numeric"))?;
-    validate_used_percent(&format!("windows[{index}]"), used_percent)?;
-    let resets_at = object
-        .get("resets_at")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("windows[{index}].resets_at must be a string"))?;
-    DateTime::parse_from_rfc3339(resets_at)
-        .map_err(|err| format!("windows[{index}].resets_at invalid RFC3339: {err}"))?;
-    Ok(QuotaWindow {
-        name: object
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        used_percent,
-        resets_at: resets_at.to_string(),
-    })
 }
 
 fn validate_used_percent(label: &str, used_percent: f64) -> Result<(), String> {
