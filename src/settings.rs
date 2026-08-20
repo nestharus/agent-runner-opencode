@@ -8,18 +8,21 @@
 //!       - opaque settings version tokens and stale-write conflict detection
 //!       - opencode.settings/v1 semantic validation and legacy mapping
 
-use crate::account::ACCOUNTS;
+use crate::account::{profile_for_settings_id, AccountProfile, ACCOUNTS};
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
 use crate::models::{default_model, model_alias, model_alias_matches, DEFAULT_MODEL_ALIAS};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::fs;
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const STORE_DIR: &str = "agent-runner-opencode";
 const STORE_FILE: &str = "settings-store.json";
+const STORE_LOCK_FILE: &str = ".settings-store.lock";
 
 #[derive(Deserialize)]
 struct SettingsCreateParams {
@@ -61,16 +64,25 @@ pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, Provi
         host,
         params,
         request_id,
+        provider_instance_id,
         ..
     } = request;
     match subcommand {
         "settings.list" => list_params(&host, &request_id),
         "settings.get" => get_params(&host, params, &request_id),
-        "settings.create" => create_params(&host, params, &request_id),
-        "settings.update" => update_params(&host, params, &request_id),
-        "settings.delete" => delete_params(&host, params, &request_id),
+        "settings.create" => {
+            create_params(&host, params, &request_id, provider_instance_id.as_deref())
+        }
+        "settings.update" => {
+            update_params(&host, params, &request_id, provider_instance_id.as_deref())
+        }
+        "settings.delete" => {
+            delete_params(&host, params, &request_id, provider_instance_id.as_deref())
+        }
         "settings.validate" => validate_params(params, &request_id),
-        "settings.migrate" => migrate_params(&host, params, &request_id),
+        "settings.migrate" => {
+            migrate_params(&host, params, &request_id, provider_instance_id.as_deref())
+        }
         unknown => Err(unknown_settings_subcommand_failure(request_id, unknown)),
     }
 }
@@ -78,6 +90,8 @@ pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, Provi
 #[derive(Serialize, Deserialize, Default)]
 struct SettingsStore {
     records: Vec<SettingsRecord>,
+    #[serde(default)]
+    history: Vec<Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -86,6 +100,40 @@ struct SettingsRecord {
     display_name: String,
     version: String,
     values: Value,
+}
+
+pub struct RuntimeSettings {
+    pub settings_id: String,
+    pub account: &'static AccountProfile,
+    pub model: Option<&'static crate::models::ModelAlias>,
+}
+
+pub fn resolve_runtime_settings(
+    host: &HostContext,
+    settings_id: &str,
+    request_id: &str,
+) -> Result<RuntimeSettings, ProviderFailure> {
+    if let Some(account) = profile_for_settings_id(settings_id) {
+        return Ok(RuntimeSettings {
+            settings_id: settings_id.to_string(),
+            account,
+            model: None,
+        });
+    }
+    let store = read_store(host, request_id)?;
+    let record = find_record(&store, settings_id, request_id)
+        .map_err(|_| unknown_runtime_settings_id_failure(request_id, settings_id))?;
+    let diagnostics = validate_values(&record.values);
+    ensure_valid_settings(request_id, &diagnostics)?;
+    let wrapper = wrapper_value(&record.values);
+    let account = account_for_settings_reference(wrapper)
+        .ok_or_else(|| unknown_runtime_settings_id_failure(request_id, settings_id))?;
+    let model = model_name_value(&record.values).and_then(model_alias);
+    Ok(RuntimeSettings {
+        settings_id: record.id.clone(),
+        account,
+        model,
+    })
 }
 
 pub fn list_params(host: &HostContext, request_id: &str) -> Result<Value, ProviderFailure> {
@@ -109,15 +157,24 @@ pub fn create_params(
     host: &HostContext,
     params: Value,
     request_id: &str,
+    provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
     let params: SettingsCreateParams =
         parse_params(params, request_id, "invalid_settings_create_params")?;
     let values = normalize_settings_value(sanitize_value(&params.values));
     let diagnostics = validate_values(&values);
-    let mut store = read_store(host, request_id)?;
-    let record = new_record(params.display_name, values);
-    insert_record(&mut store, record.clone());
-    write_store(host, &store, request_id)?;
+    ensure_valid_settings(request_id, &diagnostics)?;
+    let record = mutate_store(
+        host,
+        request_id,
+        provider_instance_id,
+        "settings.create",
+        |store| {
+            let record = new_record(store, params.display_name, values, request_id);
+            insert_record(store, record.clone());
+            Ok(record)
+        },
+    )?;
     Ok(settings_record_result(&record, diagnostics))
 }
 
@@ -125,16 +182,24 @@ pub fn update_params(
     host: &HostContext,
     params: Value,
     request_id: &str,
+    provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
     let params: SettingsUpdateParams =
         parse_params(params, request_id, "invalid_settings_update_params")?;
-    let mut store = read_store(host, request_id)?;
-    let index = record_index(&store, &params.id, request_id)?;
-    ensure_version(indexed_record(&store, index), &params.version, request_id)?;
     let values = normalize_settings_value(sanitize_value(&params.values));
     let diagnostics = validate_values(&values);
-    let record = update_record(&mut store, index, &params.id, values);
-    write_store(host, &store, request_id)?;
+    ensure_valid_settings(request_id, &diagnostics)?;
+    let record = mutate_store(
+        host,
+        request_id,
+        provider_instance_id,
+        "settings.update",
+        |store| {
+            let index = record_index(store, &params.id, request_id)?;
+            ensure_version(indexed_record(store, index), &params.version, request_id)?;
+            Ok(update_record(store, index, &params.id, values, request_id))
+        },
+    )?;
     Ok(settings_record_result(&record, diagnostics))
 }
 
@@ -142,14 +207,22 @@ pub fn delete_params(
     host: &HostContext,
     params: Value,
     request_id: &str,
+    provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
     let params: SettingsDeleteParams =
         parse_params(params, request_id, "invalid_settings_delete_params")?;
-    let mut store = read_store(host, request_id)?;
-    let index = record_index(&store, &params.id, request_id)?;
-    ensure_version(indexed_record(&store, index), &params.version, request_id)?;
-    remove_record(&mut store, index);
-    write_store(host, &store, request_id)?;
+    mutate_store(
+        host,
+        request_id,
+        provider_instance_id,
+        "settings.delete",
+        |store| {
+            let index = record_index(store, &params.id, request_id)?;
+            ensure_version(indexed_record(store, index), &params.version, request_id)?;
+            remove_record(store, index);
+            Ok(())
+        },
+    )?;
     Ok(settings_delete_result(params.id))
 }
 
@@ -166,6 +239,7 @@ pub fn migrate_params(
     host: &HostContext,
     params: Value,
     request_id: &str,
+    provider_instance_id: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
     let params: SettingsMigrateParams =
         parse_params(params, request_id, "invalid_settings_migrate_params")?;
@@ -173,7 +247,8 @@ pub fn migrate_params(
     let warnings = legacy_warnings(&params.legacy);
     let diagnostics = legacy_diagnostics(&params.legacy);
     if !params.dry_run {
-        write_migrated_settings(host, &params.legacy, request_id)?;
+        ensure_valid_settings(request_id, &diagnostics)?;
+        write_migrated_settings(host, &params.legacy, request_id, provider_instance_id)?;
     }
     let requires_user_input = settings_requires_user_input(&diagnostics);
     Ok(settings_migrate_result(
@@ -204,6 +279,18 @@ fn settings_delete_result(id: String) -> Value {
 
 fn settings_valid(diagnostics: &[Value]) -> bool {
     diagnostics.is_empty()
+}
+
+fn ensure_valid_settings(request_id: &str, diagnostics: &[Value]) -> Result<(), ProviderFailure> {
+    if settings_valid(diagnostics) {
+        return Ok(());
+    }
+    Err(ProviderFailure::invalid_settings(
+        request_id,
+        "settings_validation_failed",
+        "provider settings contain error diagnostics",
+        json!({ "diagnostics": diagnostics }),
+    ))
 }
 
 fn settings_validate_result(valid: bool, diagnostics: Vec<Value>) -> Value {
@@ -250,6 +337,125 @@ fn read_store_path(path: &Path, request_id: &str) -> Result<SettingsStore, Provi
     parse_store_bytes(&bytes, request_id)
 }
 
+fn mutate_store<T>(
+    host: &HostContext,
+    request_id: &str,
+    provider_instance_id: Option<&str>,
+    operation: &str,
+    mutation: impl FnOnce(&mut SettingsStore) -> Result<T, ProviderFailure>,
+) -> Result<T, ProviderFailure> {
+    let config_root = config_root(host, request_id)?;
+    let path = store_path_from_root(&config_root);
+    let parent = path.parent().expect("settings store always has parent");
+    ensure_store_path_contained(parent, &config_root, request_id)?;
+    fs::create_dir_all(parent)
+        .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
+    let lock_path = parent.join(STORE_LOCK_FILE);
+    ensure_store_path_contained(&lock_path, &config_root, request_id)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| store_io_failure(request_id, "settings_store_lock_open_failed", err))?;
+    lock.lock_exclusive()
+        .map_err(|err| store_io_failure(request_id, "settings_store_lock_failed", err))?;
+    let mut store = read_store_path(&path, request_id)?;
+    let before = store.records.clone();
+    let result = mutation(&mut store)?;
+    append_settings_history(
+        &mut store,
+        &before,
+        operation,
+        request_id,
+        provider_instance_id,
+        &host.app,
+    );
+    write_store_path(&path, &config_root, &store, request_id)?;
+    Ok(result)
+}
+
+fn append_settings_history(
+    store: &mut SettingsStore,
+    before: &[SettingsRecord],
+    operation: &str,
+    request_id: &str,
+    provider_instance_id: Option<&str>,
+    host_app: &str,
+) {
+    let previous_event_sha256 = store
+        .history
+        .last()
+        .and_then(|entry| entry.get("event_sha256"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut event = json!({
+        "sequence": store.history.len() + 1,
+        "operation": operation,
+        "request_id": request_id,
+        "provider_instance_id": provider_instance_id,
+        "host_app": host_app,
+        "recorded_at_unix_ms": now_unix_ms(),
+        "prior_records_sha256": records_digest(before),
+        "result_records_sha256": records_digest(&store.records),
+        "changes": settings_record_changes(before, &store.records),
+        "previous_event_sha256": previous_event_sha256,
+    });
+    let event_sha256 = sha256_hex(event.to_string().as_bytes());
+    event["event_sha256"] = json!(event_sha256);
+    store.history.push(event);
+}
+
+fn records_digest(records: &[SettingsRecord]) -> String {
+    sha256_hex(
+        serde_json::to_string(records)
+            .unwrap_or_default()
+            .as_bytes(),
+    )
+}
+
+fn settings_record_changes(before: &[SettingsRecord], after: &[SettingsRecord]) -> Vec<Value> {
+    let before = records_by_id(before);
+    let after = records_by_id(after);
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|id| {
+            let prior = before.get(*id).copied();
+            let result = after.get(*id).copied();
+            (record_identity(prior) != record_identity(result)).then(|| {
+                json!({
+                    "settings_id": id,
+                    "prior_version": prior.map(|record| record.version.as_str()),
+                    "result_version": result.map(|record| record.version.as_str()),
+                    "prior_values_sha256": prior.map(|record| sha256_hex(record.values.to_string().as_bytes())),
+                    "result_values_sha256": result.map(|record| sha256_hex(record.values.to_string().as_bytes())),
+                    "tombstone": prior.is_some() && result.is_none(),
+                })
+            })
+        })
+        .collect()
+}
+
+fn records_by_id(records: &[SettingsRecord]) -> BTreeMap<&str, &SettingsRecord> {
+    records
+        .iter()
+        .map(|record| (record.id.as_str(), record))
+        .collect()
+}
+
+fn record_identity(record: Option<&SettingsRecord>) -> Option<(&str, String)> {
+    record.map(|record| {
+        (
+            record.version.as_str(),
+            sha256_hex(record.values.to_string().as_bytes()),
+        )
+    })
+}
+
 fn store_path_exists(path: &Path) -> bool {
     path.exists()
 }
@@ -262,49 +468,39 @@ fn parse_store_bytes(bytes: &[u8], request_id: &str) -> Result<SettingsStore, Pr
     serde_json::from_slice(bytes).map_err(|err| settings_store_parse_failure(request_id, err))
 }
 
-fn write_store(
-    host: &HostContext,
+fn write_store_path(
+    path: &Path,
+    config_root: &Path,
     store: &SettingsStore,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let config_root = config_root(host, request_id)?;
-    let path = store_path_from_root(&config_root);
     let parent = path.parent().expect("settings store always has parent");
-    ensure_store_path_contained(parent, &config_root, request_id)?;
+    ensure_store_path_contained(parent, config_root, request_id)?;
     fs::create_dir_all(parent)
         .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
-    let tmp = store_temp_path(parent);
-    ensure_store_path_contained(&tmp, &config_root, request_id)?;
-    ensure_store_path_contained(&path, &config_root, request_id)?;
-    write_store_temp(&tmp, store, request_id)?;
-    fs::rename(&tmp, &path)
-        .map_err(|err| store_io_failure(request_id, "settings_store_rename_failed", err))
-}
-
-fn write_store_temp(
-    path: &Path,
-    store: &SettingsStore,
-    request_id: &str,
-) -> Result<(), ProviderFailure> {
+    ensure_store_path_contained(path, config_root, request_id)?;
     let bytes = serialize_store(store, request_id)?;
-    write_store_temp_bytes(path, &bytes, request_id)
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| store_io_failure(request_id, "settings_store_temp_create_failed", err))?;
+    ensure_store_path_contained(tmp.path(), config_root, request_id)?;
+    tmp.write_all(&bytes)
+        .map_err(|err| store_io_failure(request_id, "settings_store_temp_write_failed", err))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|err| store_io_failure(request_id, "settings_store_temp_sync_failed", err))?;
+    tmp.persist(path)
+        .map_err(|err| store_io_failure(request_id, "settings_store_rename_failed", err.error))?;
+    sync_store_parent(parent, request_id)
 }
 
 fn serialize_store(store: &SettingsStore, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
     serde_json::to_vec(store).map_err(|err| settings_store_serialize_failure(request_id, err))
 }
 
-fn write_store_temp_bytes(
-    path: &Path,
-    bytes: &[u8],
-    request_id: &str,
-) -> Result<(), ProviderFailure> {
-    let mut file = fs::File::create(path)
-        .map_err(|err| store_io_failure(request_id, "settings_store_temp_create_failed", err))?;
-    file.write_all(bytes)
-        .map_err(|err| store_io_failure(request_id, "settings_store_temp_write_failed", err))?;
-    file.sync_all()
-        .map_err(|err| store_io_failure(request_id, "settings_store_temp_sync_failed", err))
+fn sync_store_parent(parent: &Path, request_id: &str) -> Result<(), ProviderFailure> {
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| store_io_failure(request_id, "settings_store_parent_sync_failed", err))
 }
 
 fn store_path(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
@@ -483,8 +679,9 @@ fn update_record(
     index: usize,
     id: &str,
     values: Value,
+    request_id: &str,
 ) -> SettingsRecord {
-    let version = version_token(id, &values);
+    let version = version_token(id, &values, request_id);
     replace_record(indexed_record_mut(store, index), version, values);
     indexed_record(store, index).clone()
 }
@@ -509,11 +706,16 @@ fn ensure_version(
     Err(stale_settings_version_failure(request_id))
 }
 
-fn new_record(display_name: Option<String>, values: Value) -> SettingsRecord {
-    let id = settings_id(&values);
+fn new_record(
+    store: &SettingsStore,
+    display_name: Option<String>,
+    values: Value,
+    request_id: &str,
+) -> SettingsRecord {
+    let id = unique_settings_id(store, &values, request_id);
     SettingsRecord {
         display_name: record_display_name(display_name, &values),
-        version: version_token(&id, &values),
+        version: version_token(&id, &values, request_id),
         id,
         values,
     }
@@ -527,8 +729,12 @@ fn non_empty_display_name(display_name: Option<String>) -> Option<String> {
     display_name.filter(|name| non_empty_text(name))
 }
 
-fn settings_id(values: &Value) -> String {
-    settings_id_for_base(settings_id_base(values))
+fn unique_settings_id(store: &SettingsStore, values: &Value, request_id: &str) -> String {
+    let base = settings_id_base(values);
+    (0_u64..)
+        .map(|attempt| settings_id_for_base(base, request_id, attempt))
+        .find(|candidate| selected_record(store, candidate).is_none())
+        .expect("unbounded settings identifier search must find a free identity")
 }
 
 fn settings_id_base(values: &Value) -> &str {
@@ -539,13 +745,14 @@ fn settings_id_base(values: &Value) -> &str {
         .unwrap_or("opencode")
 }
 
-fn settings_id_for_base(wrapper: &str) -> String {
-    let digest = sha256_hex(format!("{}:{}", wrapper, now_unix_ms()).as_bytes());
-    format!("{wrapper}-{}", &digest[..12])
+fn settings_id_for_base(wrapper: &str, request_id: &str, attempt: u64) -> String {
+    let digest =
+        sha256_hex(format!("{wrapper}:{request_id}:{}:{attempt}", now_unix_ms()).as_bytes());
+    format!("{wrapper}-{}", &digest[..24])
 }
 
-fn version_token(id: &str, values: &Value) -> String {
-    let digest = sha256_hex(format!("{}:{}:{}", id, now_unix_ms(), values).as_bytes());
+fn version_token(id: &str, values: &Value, request_id: &str) -> String {
+    let digest = sha256_hex(format!("{id}:{request_id}:{}:{values}", now_unix_ms()).as_bytes());
     format!("v{}", &digest[..24])
 }
 
@@ -586,11 +793,47 @@ fn summary_values(values: &Value) -> Value {
 
 fn validate_values(values: &Value) -> Vec<Value> {
     let mut diagnostics = Vec::new();
+    require_object_shape(
+        values,
+        "values",
+        &[
+            "provider",
+            "profile",
+            "wrapper",
+            "model",
+            "quota",
+            "launch",
+            "extra_env",
+            "working_directory",
+            "mode",
+        ],
+        &mut diagnostics,
+    );
     require_string(values, "provider", "opencode", &mut diagnostics);
     require_known_wrapper(values, &mut diagnostics);
+    require_matching_profile(values, &mut diagnostics);
     require_model(values, &mut diagnostics);
     require_quota(values, &mut diagnostics);
+    require_launch(values, &mut diagnostics);
+    require_optional_fields(values, &mut diagnostics);
     diagnostics
+}
+
+fn require_object_shape(value: &Value, path: &str, allowed: &[&str], diagnostics: &mut Vec<Value>) {
+    let Some(object) = value.as_object() else {
+        diagnostics.push(shape_diagnostic(path, "must be an object"));
+        return;
+    };
+    for key in object.keys().filter(|key| !allowed.contains(&key.as_str())) {
+        diagnostics.push(shape_diagnostic(
+            format!("{path}.{key}"),
+            "field is not part of opencode.settings/v1",
+        ));
+    }
+}
+
+fn shape_diagnostic(path: impl Into<String>, message: impl Into<String>) -> Value {
+    diagnostic("error", path, message, "invalid_settings_schema_shape")
 }
 
 fn require_string(values: &Value, key: &str, expected: &str, diagnostics: &mut Vec<Value>) {
@@ -642,7 +885,25 @@ fn invalid_wrapper_diagnostic() -> Value {
     )
 }
 
+fn require_matching_profile(values: &Value, diagnostics: &mut Vec<Value>) {
+    if values.get("profile").is_none()
+        || values.get("profile").and_then(Value::as_str) == Some(wrapper_value(values))
+    {
+        return;
+    }
+    diagnostics.push(shape_diagnostic(
+        "values.profile",
+        "profile must identify the same OpenCode account as wrapper",
+    ));
+}
+
 fn require_model(values: &Value, diagnostics: &mut Vec<Value>) {
+    require_object_shape(
+        values.get("model").unwrap_or(&Value::Null),
+        "values.model",
+        &["name", "provider_model", "variant"],
+        diagnostics,
+    );
     let Some(name) = model_name_value(values) else {
         diagnostics.push(invalid_model_alias_diagnostic(""));
         return;
@@ -711,25 +972,117 @@ fn invalid_model_variant_diagnostic(name: &str, expected: &str) -> Value {
 }
 
 fn require_quota(values: &Value, diagnostics: &mut Vec<Value>) {
-    if has_quota_auth_path(values) {
+    require_object_shape(
+        values.get("quota").unwrap_or(&Value::Null),
+        "values.quota",
+        &["source", "auth_path", "probe"],
+        diagnostics,
+    );
+    let Some(account) = settings_value_account(values) else {
+        diagnostics.push(invalid_quota_auth_path_diagnostic());
+        return;
+    };
+    if quota_source(values) == Some(account.quota_source_kind())
+        && quota_auth_path(values) == Some(account.quota_auth_path())
+        && quota_probe(values) == Some(account.quota_probe_kind())
+    {
         return;
     }
     diagnostics.push(invalid_quota_auth_path_diagnostic());
 }
 
-fn has_quota_auth_path(values: &Value) -> bool {
-    quota_auth_path(values).is_some_and(non_empty_text)
+fn require_launch(values: &Value, diagnostics: &mut Vec<Value>) {
+    let launch = values.get("launch").unwrap_or(&Value::Null);
+    require_object_shape(
+        launch,
+        "values.launch",
+        &[
+            "dangerously_skip_permissions",
+            "format",
+            "preserve_pure_wrapper",
+        ],
+        diagnostics,
+    );
+    if launch.get("format").and_then(Value::as_str) != Some("json") {
+        diagnostics.push(shape_diagnostic(
+            "values.launch.format",
+            "format must be json",
+        ));
+    }
+    if launch
+        .get("dangerously_skip_permissions")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        diagnostics.push(shape_diagnostic(
+            "values.launch.dangerously_skip_permissions",
+            "dangerously_skip_permissions must be true",
+        ));
+    }
+    if launch.get("preserve_pure_wrapper").is_some()
+        && launch
+            .get("preserve_pure_wrapper")
+            .and_then(Value::as_bool)
+            .is_none()
+    {
+        diagnostics.push(shape_diagnostic(
+            "values.launch.preserve_pure_wrapper",
+            "preserve_pure_wrapper must be a boolean",
+        ));
+    }
+}
+
+fn require_optional_fields(values: &Value, diagnostics: &mut Vec<Value>) {
+    if let Some(extra_env) = values.get("extra_env") {
+        match extra_env.as_object() {
+            Some(entries) if entries.values().all(Value::is_string) => {}
+            _ => diagnostics.push(shape_diagnostic(
+                "values.extra_env",
+                "extra_env must map names to string values",
+            )),
+        }
+    }
+    if values.get("working_directory").is_some()
+        && values
+            .get("working_directory")
+            .and_then(Value::as_str)
+            .is_none_or(|directory| directory.is_empty())
+    {
+        diagnostics.push(shape_diagnostic(
+            "values.working_directory",
+            "working_directory must be a non-empty string",
+        ));
+    }
+    if values.get("mode").is_some()
+        && !matches!(
+            values.get("mode").and_then(Value::as_str),
+            Some("interactive" | "non_interactive")
+        )
+    {
+        diagnostics.push(shape_diagnostic(
+            "values.mode",
+            "mode must be interactive or non_interactive",
+        ));
+    }
+}
+
+fn quota_source(values: &Value) -> Option<&str> {
+    values.pointer("/quota/source").and_then(Value::as_str)
 }
 
 fn quota_auth_path(values: &Value) -> Option<&str> {
     values.pointer("/quota/auth_path").and_then(Value::as_str)
 }
 
+fn quota_probe(values: &Value) -> Option<&str> {
+    values.pointer("/quota/probe").and_then(Value::as_str)
+}
+
 fn invalid_quota_auth_path_diagnostic() -> Value {
     diagnostic(
         "error",
         "values.quota.auth_path",
-        "quota.auth_path must be non-empty",
+        "quota source, auth_path, and probe must match the selected OpenCode account",
         "invalid_quota_auth_path",
     )
 }
@@ -844,9 +1197,9 @@ fn normalize_quota_value(
     account: &crate::account::AccountProfile,
 ) {
     let quota = child_object(object, "quota");
-    quota.insert("source".to_string(), json!("codex"));
-    quota.insert("auth_path".to_string(), json!(account.codex_auth_path));
-    quota.insert("usage_command".to_string(), json!("chatgpt-usage"));
+    quota.insert("source".to_string(), json!(account.quota_source_kind()));
+    quota.insert("auth_path".to_string(), json!(account.quota_auth_path()));
+    quota.insert("probe".to_string(), json!(account.quota_probe_kind()));
 }
 
 fn normalize_launch_value(object: &mut Map<String, Value>) {
@@ -1017,23 +1370,36 @@ fn write_migrated_settings(
     host: &HostContext,
     legacy: &Value,
     request_id: &str,
+    provider_instance_id: Option<&str>,
 ) -> Result<(), ProviderFailure> {
-    let mut store = read_store(host, request_id)?;
-    append_records(&mut store, migrated_records(legacy_provider_names(legacy)));
-    write_store(host, &store, request_id)
+    let providers = legacy_provider_names(legacy);
+    mutate_store(
+        host,
+        request_id,
+        provider_instance_id,
+        "settings.migrate",
+        |store| {
+            for provider in providers {
+                upsert_migrated_record(store, &provider, request_id);
+            }
+            Ok(())
+        },
+    )
 }
 
-fn migrated_records(providers: Vec<String>) -> Vec<SettingsRecord> {
-    providers.into_iter().map(migrated_record).collect()
-}
-
-fn migrated_record(provider: String) -> SettingsRecord {
-    let values = migrated_values(&provider);
-    new_record(Some(provider), values)
-}
-
-fn append_records(store: &mut SettingsStore, records: Vec<SettingsRecord>) {
-    store.records.extend(records);
+fn upsert_migrated_record(store: &mut SettingsStore, provider: &str, request_id: &str) {
+    let values = migrated_values(provider);
+    if let Some(index) = store
+        .records
+        .iter()
+        .position(|record| record.values.get("profile").and_then(Value::as_str) == Some(provider))
+    {
+        let id = store.records[index].id.clone();
+        update_record(store, index, &id, values, request_id);
+        return;
+    }
+    let record = new_record(store, Some(provider.to_string()), values, request_id);
+    insert_record(store, record);
 }
 
 fn migrated_values(provider: &str) -> Value {
@@ -1059,9 +1425,9 @@ fn migrated_values_for_account(account: &crate::account::AccountProfile) -> Valu
             "variant": model.effort
         },
         "quota": {
-            "source": "codex",
-            "auth_path": account.codex_auth_path,
-            "usage_command": "chatgpt-usage"
+            "source": account.quota_source_kind(),
+            "auth_path": account.quota_auth_path(),
+            "probe": account.quota_probe_kind()
         },
         "launch": {
             "format": "json",
@@ -1106,10 +1472,6 @@ fn settings_store_serialize_failure(request_id: &str, err: serde_json::Error) ->
     )
 }
 
-fn store_temp_path(parent: &Path) -> PathBuf {
-    parent.join(format!(".{STORE_FILE}.{}.tmp", std::process::id()))
-}
-
 fn missing_config_root_failure(request_id: &str) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
@@ -1123,6 +1485,14 @@ fn settings_store_outside_provider_root_failure(request_id: &str) -> ProviderFai
         request_id,
         "settings_store_outside_provider_root",
         "settings store path must stay under host.config_root",
+    )
+}
+
+fn unknown_runtime_settings_id_failure(request_id: &str, settings_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "unknown_settings_id",
+        format!("unknown opencode settings_id: {settings_id}"),
     )
 }
 

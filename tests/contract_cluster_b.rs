@@ -131,7 +131,13 @@ fn contract_session_enumerate_honors_limit() {
     let result = enumerate_result(session_enumerate_limit_params(2), &path);
 
     assert_limited_enumerate_result(&result, 2);
-    assert_session_list_limit_forwarded(fake_opencode.log_path(), 2);
+    assert_session_list_is_exhaustive(fake_opencode.log_path());
+
+    let cursor = result["next_cursor"]
+        .as_str()
+        .expect("truncated page cursor");
+    let second = enumerate_result(session_enumerate_cursor_params(2, cursor), &path);
+    assert_second_enumerate_page(&second);
 }
 
 #[test]
@@ -167,8 +173,14 @@ fn contract_session_enumerate_nonzero_wrapper_exit_is_provider_error() {
 #[ignore = "live opencode auth/network session export proof; run explicitly when external dependencies are available"]
 fn integration_session_export_live() {
     let session_id = live_opencode_session_id();
+    let path = std::env::var("PATH").expect("live PATH");
+    let home = std::env::var("HOME").expect("live HOME");
     let result = success_result(
-        invoke("session.export", session_params(&session_id)),
+        invoke_with_env(
+            "session.export",
+            session_params_for_settings("opencode5", &session_id),
+            &[("PATH", path.as_str()), ("HOME", home.as_str())],
+        ),
         "session.schema.json#/$defs/SessionExportResponse",
         "session.schema.json#/$defs/SessionExportResult",
     );

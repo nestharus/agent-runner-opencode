@@ -110,7 +110,7 @@ pub fn assert_f6_source_mapping(result: &Value, mapping: &F6AccountMapping) {
 }
 
 pub fn assert_available_probe_result(result: &Value, raw_windows: &[RawUsageWindow]) {
-    assert_eq!(result["available"], true);
+    assert_eq!(result["available"], true, "probe result={result}");
     assert!(
         result["checked_at_unix_ms"].as_u64().is_some(),
         "probe must include checked_at_unix_ms"
@@ -567,6 +567,60 @@ pub struct FakeChatgptUsage {
     pub dir: PathBuf,
     pub log_path: PathBuf,
     pub log_path_string: String,
+}
+
+pub struct FakeNativeCurl {
+    pub dir: PathBuf,
+    pub invocation_path: PathBuf,
+}
+
+impl FakeNativeCurl {
+    pub fn new() -> Self {
+        let dir = unique_temp_dir("agent-runner-opencode-fake-native-curl");
+        fs::create_dir_all(&dir).expect("create fake native curl dir");
+        let invocation_path = dir.join("curl-invocation.log");
+        let script = format!(
+            "#!/bin/sh\n\
+config=$(/bin/cat)\n\
+case \"$config\" in\n\
+  *'Authorization: Bearer sentinel'*'ChatGPT-Account-Id: acct'*) ;;\n\
+  *) printf '%s\\n' 'missing expected auth stdin' >&2; exit 64 ;;\n\
+esac\n\
+printf '%s\\n' \"$*\" > {}\n\
+printf '%s\\n' '{{\"rate_limit\":{{\"secondary_window\":{{\"used_percent\":4,\"reset_at\":1781159045}},\"primary_window\":{{\"used_percent\":25,\"reset_at\":1780572245}}}}}}'\n\
+printf '%s' '__oulipoly_http_status__:200'\n",
+            shell_single_quote(&invocation_path.to_string_lossy())
+        );
+        let curl_path = dir.join("curl");
+        fs::write(&curl_path, script).expect("write fake curl");
+        make_path_executable(&curl_path);
+        Self {
+            dir,
+            invocation_path,
+        }
+    }
+
+    pub fn path_env(&self) -> String {
+        prepend_path(&self.dir)
+    }
+
+    pub fn assert_native_invocation(&self) {
+        let argv = fs::read_to_string(&self.invocation_path).expect("fake curl invocation");
+        assert!(argv.contains("--max-time 20"), "curl argv={argv:?}");
+        assert!(argv.contains("-K -"), "curl argv={argv:?}");
+        assert!(
+            argv.contains("https://chatgpt.com/backend-api/wham/usage"),
+            "curl argv={argv:?}"
+        );
+        assert!(!argv.contains("sentinel"));
+        assert!(!argv.contains("acct"));
+    }
+}
+
+impl Drop for FakeNativeCurl {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
 }
 
 pub struct FakeOpencodeAuth {

@@ -4,6 +4,7 @@ pub const SOL_PROVIDER_MODEL: &str = "openai/gpt-5.6-sol";
 pub const LUNA_PROVIDER_MODEL: &str = "openai/gpt-5.6-luna";
 pub const DEFAULT_MODEL_ALIAS: &str = "gpt-high";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelAlias {
     pub name: &'static str,
     pub provider_model: &'static str,
@@ -37,6 +38,11 @@ pub const MODEL_ALIASES: &[ModelAlias] = &[
         effort: "max",
     },
     ModelAlias {
+        name: "gpt-luna-low",
+        provider_model: LUNA_PROVIDER_MODEL,
+        effort: "low",
+    },
+    ModelAlias {
         name: "gpt-luna-max",
         provider_model: LUNA_PROVIDER_MODEL,
         effort: "max",
@@ -52,26 +58,48 @@ pub fn model_alias(name: &str) -> Option<&'static ModelAlias> {
 }
 
 pub fn model_alias_matches(name: &str, provider_model: Option<&str>, effort: Option<&str>) -> bool {
-    model_alias(name).is_some_and(|model| {
-        provider_model == Some(model.provider_model) && effort == Some(model.effort)
-    })
+    model_alias(name).is_some_and(|model| model.matches(provider_model, effort))
 }
 
 pub fn provider_args_match(model: &ModelAlias, args: &[String]) -> bool {
-    matches!(
-        args,
-        [model_flag, provider_model, variant_flag, effort]
-            if model_flag == "-m"
-                && provider_model == model.provider_model
-                && variant_flag == "--variant"
-                && effort == model.effort
-    )
+    args == model.provider_args()
 }
 
 pub fn default_model() -> &'static ModelAlias {
     model_alias(DEFAULT_MODEL_ALIAS).expect("default model alias must exist in model catalogue")
 }
 
-pub fn default_model_effort() -> &'static str {
-    default_model().effort
+impl ModelAlias {
+    pub fn matches(&self, provider_model: Option<&str>, effort: Option<&str>) -> bool {
+        provider_model == Some(self.provider_model) && effort == Some(self.effort)
+    }
+
+    pub fn provider_args(&self) -> Vec<String> {
+        vec![
+            "-m".to_string(),
+            self.provider_model.to_string(),
+            "--variant".to_string(),
+            self.effort.to_string(),
+        ]
+    }
+
+    pub fn host_candidate_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "run".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+        args.extend(self.provider_args());
+        args
+    }
+
+    pub fn policy_effective_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "run".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+        args.extend(self.provider_args());
+        args
+    }
 }

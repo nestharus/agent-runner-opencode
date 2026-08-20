@@ -1,42 +1,100 @@
 # agent-runner-opencode
 
-Standalone **opencode/codex hybrid** provider CLI for the `oulipoly.provider/v1` external
+Standalone OpenCode provider CLI for the `oulipoly.provider/v1` external
 provider contract.
 
-One CLI, two underlying tools:
+OpenCode owns every account-scoped boundary: model launch, sessions, native
+session export/import for account rotation, authentication, and quota
+attribution. Quota is read from the selected wrapper's native OpenCode auth
+file and queried through the ChatGPT usage endpoint with `curl`; Codex
+configuration and credentials are neither read nor modified. The optional
+`chatgpt-usage` executable path exists only as a test override.
 
-- **opencode** owns the model lifecycle — `launch` (`opencode --pure run -m <provider-model>
-  --variant <effort>`), `session` (read_turns/capture/export/replace/locate), `terminal`
-  classification, and `policy` application.
-- **codex** owns **only** `quota` — ChatGPT plan-window usage via `chatgpt-usage
-  ~/.codexN/auth.json`, which opencode cannot report. This is why the provider needs both.
+The provider recognizes five account-pinned wrappers, `opencode1` through
+`opencode5`. The selected settings record, wrapper command, session commands,
+auth path, quota probe, refresh command, and rotation target must resolve to
+the same profile. Persisted opaque settings IDs are operational IDs and can be
+used anywhere a `settings_id` is accepted.
 
-5 account-pinned profiles (the `~/.local/bin/opencodeN` launch wrappers; RFQ key purged,
-native OAuth, `--pure`, infinite bash). Account map is shuffled between the tools:
-opencode1=codex1, opencode2=codex5, opencode3=codex2, opencode4=codex3, opencode5=codex4.
+## Model routes
 
-Agent Runner configuration owns the launch command and child environment. Policy validates the
-configured OpenCode command, preserves its wrapper or `--pure` prefix, and adds the required output,
-model, and effort flags; it does not select an account wrapper, derive `XDG_DATA_HOME`, or filter
-environment names. The static account map remains authoritative only for account identity and
-codex-backed quota/auth attribution.
+One catalog in `src/models.rs` owns alias matching and every public or launch
+projection. The current routes are:
 
-The provider-owned model catalog maps each runner alias to one exact OpenCode model and effort.
-Current aliases preserve the GPT-5.6 Sol `gpt-low` through `gpt-max` routes and add
-`gpt-luna-max` for `openai/gpt-5.6-luna --variant max`. Policy accepts only the exact
-`provider_args` advertised by `discovery.models`, then reconstructs the managed launch prefix from
-that resolved identity.
+| Runner alias | OpenCode model | Variant |
+| --- | --- | --- |
+| `gpt-low` | `openai/gpt-5.6-sol` | `low` |
+| `gpt-medium` | `openai/gpt-5.6-sol` | `medium` |
+| `gpt-high` | `openai/gpt-5.6-sol` | `high` |
+| `gpt-xhigh` | `openai/gpt-5.6-sol` | `xhigh` |
+| `gpt-max` | `openai/gpt-5.6-sol` | `max` |
+| `gpt-luna-low` | `openai/gpt-5.6-luna` | `low` |
+| `gpt-luna-max` | `openai/gpt-5.6-luna` | `max` |
 
-This provider implements the one-shot invocation convention:
+Policy accepts only the exact `provider_args` advertised by
+`discovery.models`, requires the configured wrapper to match the selected
+settings profile, and reconstructs the managed launch prefix. Launch emits a
+redacted route marker containing the account, alias, provider model, and
+variant actually selected.
+
+## Invocation and lifecycle
+
+The one-shot invocation form is:
 
 ```text
 agent-runner-opencode <subcommand>
 ```
 
-Each subcommand reads one JSON request envelope on stdin. Non-launch commands write one JSON
-response envelope on stdout. `launch` writes newline-delimited JSON events and finishes with
-an `exit` event.
+Each invocation reads one JSON envelope from stdin. Non-launch commands write
+one JSON response. `launch` writes NDJSON events ending in an `exit` event.
+Child processes run in a provider-owned process group; every return path owns
+termination and direct-child reaping. Drain queues and terminal-capture tails
+are bounded. Pipe read failures, malformed native events, and capture
+truncation are emitted as explicit evidence markers. Independent stdout and
+stderr pipes are sequenced in provider receipt order; the provider makes no
+claim about an unknowable pre-receipt cross-pipe emission order.
 
-The CLI never links the host-side `oulipoly-provider` crate; it implements the versioned JSON
-Schema contract in `contract/v1/` directly. `provider_id = "opencode"`, settings schema
-`opencode.settings/v1`.
+For resumed sessions, model switching is allowed per turn. Delivery and
+completion are credited only when bounded native export observes the submitted
+payload and a completed assistant message for the requested session, provider
+model, and variant. A bare native `step_finish` is not completion authority.
+If a lingering OpenCode process is terminated after response confirmation,
+the exit event retains the real process signal while a separate marker records
+the confirmed application response.
+
+Generic canonical `session.replace` remains unsupported: OpenCode has no
+stable canonical-transcript replacement API. Rotation's native full-session
+export/import is a separate, representation-bounded capability. It requires a
+fresh provider-issued assessment authorization, emits a decision receipt,
+preserves an observed post-import session ID as recoverable state, and uses a
+durable receipt so retries do not repeat the import.
+
+## State, evidence, and authority
+
+Settings are stored under `host.config_root/agent-runner-opencode` using an
+interprocess lock and atomic file transactions. The same transaction records a
+hash-chained mutation history with request/provider identity, predecessor and
+result versions, value hashes, and tombstones. Migration artifacts are
+content-addressed, atomically published, confined to provider-owned roots, and
+retain hashes for the complete legacy input plus its provider/model records.
+
+When `host.data_root` is present, a redacted hash-chained activity ledger is
+written under `provider-state/opencode/activity`. It joins requests across
+policy, launch, session, quota, settings, migration, and rotation without
+recording prompts, tokens, or environment values. Rotation authorizations,
+idempotency records, and decision receipts live under the adjacent
+`provider-state/opencode/rotation` tree.
+
+The v1 host envelope supplies a request ID and optional provider instance ID,
+but no authenticated human/service principal or delegation. The provider
+records that absence explicitly. Agent Runner remains responsible for
+authenticating a principal, authorizing delegation, and binding those
+identities to the request and provider instance before invocation; the
+provider must not invent that authority.
+
+## Contract provenance
+
+The CLI implements the versioned JSON schemas in `contract/v1` directly and
+does not link the host-side `oulipoly-provider` crate. The directory is an exact
+commit-pinned snapshot of Agent Runner; see `contract/v1/UPSTREAM.md`. The old
+`.s9b-step6a-contract.md` is retained only as historical design evidence.

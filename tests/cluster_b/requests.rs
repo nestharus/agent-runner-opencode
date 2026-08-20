@@ -10,6 +10,13 @@ pub fn session_params(session_id: &str) -> Value {
     })
 }
 
+pub fn session_params_for_settings(settings_id: &str, session_id: &str) -> Value {
+    json!({
+        "settings_id": settings_id,
+        "session_id": session_id
+    })
+}
+
 pub fn session_enumerate_params() -> Value {
     json!({
         "settings_id": "opencode1"
@@ -25,6 +32,12 @@ pub fn session_enumerate_limit_params(limit: u64) -> Value {
         "include_turn_count": true,
         "since_unix_ms": null
     })
+}
+
+pub fn session_enumerate_cursor_params(limit: u64, cursor: &str) -> Value {
+    let mut params = session_enumerate_limit_params(limit);
+    params["cursor"] = json!(cursor);
+    params
 }
 
 pub fn launch_capture_params(session_id: &str) -> Value {

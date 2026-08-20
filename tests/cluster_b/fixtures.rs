@@ -48,14 +48,14 @@ pub fn successful_live_opencode_missing_session_id(
     stdout: &str,
 ) -> ! {
     assert_live_opencode_success(output, stdout);
-    panic!("live opencode1 run did not emit sessionID; stdout: {stdout}")
+    panic!("live opencode5 Luna run did not emit sessionID; stdout: {stdout}")
 }
 
 pub fn run_live_opencode() -> std::process::Output {
-    Command::new("opencode1")
+    Command::new("opencode5")
         .args(live_opencode_args())
         .output()
-        .expect("spawn live opencode1 run")
+        .expect("spawn live opencode5 Luna run")
 }
 
 pub fn live_opencode_args() -> [&'static str; 8] {
@@ -64,7 +64,7 @@ pub fn live_opencode_args() -> [&'static str; 8] {
         "--format",
         "json",
         "-m",
-        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-luna",
         "--variant",
         "low",
         "reply with the single word: ok",
@@ -74,7 +74,7 @@ pub fn live_opencode_args() -> [&'static str; 8] {
 pub fn assert_live_opencode_success(output: &std::process::Output, stdout: &str) {
     assert!(
         output.status.success(),
-        "live opencode1 run failed; exit {:?}; stderr: {}; stdout: {}",
+        "live opencode5 Luna max run failed; exit {:?}; stderr: {}; stdout: {}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr),
         stdout

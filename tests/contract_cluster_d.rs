@@ -5,7 +5,9 @@ mod cluster_d;
 mod support;
 
 use cluster_d::*;
+use serde_json::json;
 use std::fs;
+use std::thread;
 use support::{
     invoke, invoke_validated, invoke_validated_with_host, invoke_validated_with_host_and_env,
 };
@@ -84,6 +86,226 @@ fn contract_settings_crud() {
         "settings.schema.json#/$defs/SettingsDeleteResult",
     );
     assert_settings_delete_result(&delete, &id);
+    assert_settings_history(&host, 3);
+}
+
+#[test]
+fn contract_settings_parallel_creates_do_not_lose_records() {
+    let host = HostRoots::new("agent-runner-opencode-settings-parallel-create");
+    let host_overrides = host.overrides();
+    let workers = (0..8)
+        .map(|_| {
+            let host_overrides = host_overrides.clone();
+            thread::spawn(move || {
+                invoke_validated_with_host(
+                    "settings.create",
+                    settings_create_params(None),
+                    host_overrides,
+                    "settings.schema.json#/$defs/SettingsCreateRequest",
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut ids = std::collections::BTreeSet::new();
+    for worker in workers {
+        let result = success_result(
+            worker.join().expect("settings.create worker"),
+            "settings.schema.json#/$defs/SettingsCreateResponse",
+            "settings.schema.json#/$defs/SettingsCreateResult",
+        );
+        ids.insert(settings_create_id(&result));
+    }
+    assert_eq!(ids.len(), 8, "parallel creates need unique identities");
+    let list = success_result(
+        invoke_validated_with_host(
+            "settings.list",
+            empty_request_params(),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsListRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsListResponse",
+        "settings.schema.json#/$defs/SettingsListResult",
+    );
+    assert_eq!(list["records"].as_array().expect("records").len(), 8);
+    assert_settings_history(&host, 8);
+}
+
+#[test]
+fn contract_settings_parallel_updates_preserve_optimistic_concurrency() {
+    let host = HostRoots::new("agent-runner-opencode-settings-parallel-update");
+    let created = success_result(
+        invoke_validated_with_host(
+            "settings.create",
+            settings_create_params(None),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsCreateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsCreateResponse",
+        "settings.schema.json#/$defs/SettingsCreateResult",
+    );
+    let id = settings_create_id(&created);
+    let version = settings_create_version(&created);
+    let workers = (0..2)
+        .map(|_| {
+            let host_overrides = host.overrides();
+            let id = id.clone();
+            let version = version.clone();
+            thread::spawn(move || {
+                invoke_validated_with_host(
+                    "settings.update",
+                    settings_update_params(&id, &version, None),
+                    host_overrides,
+                    "settings.schema.json#/$defs/SettingsUpdateRequest",
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let outputs = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("settings.update worker"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        1,
+        "exactly one update may consume a settings version"
+    );
+    for output in outputs.iter().filter(|output| !output.status.success()) {
+        let response = support::json_stdout(output);
+        assert_eq!(response["error"]["category"], "conflict", "{response}");
+    }
+    assert_settings_history(&host, 2);
+}
+
+#[test]
+fn contract_generated_settings_id_is_usable_by_policy() {
+    let host = HostRoots::new("agent-runner-opencode-settings-policy-identity");
+    let created = success_result(
+        invoke_validated_with_host(
+            "settings.create",
+            settings_create_params(None),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsCreateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsCreateResponse",
+        "settings.schema.json#/$defs/SettingsCreateResult",
+    );
+    let settings_id = settings_create_id(&created);
+    let policy = success_result(
+        invoke_validated_with_host(
+            "policy.evaluate",
+            json!({
+                "settings_id": settings_id,
+                "mode": "agent",
+                "model": {
+                    "name": "gpt-high",
+                    "provider_args": ["-m", "openai/gpt-5.6-sol", "--variant", "high"],
+                    "inputs": {
+                        "prompt": "ok",
+                        "named": {}
+                    }
+                },
+                "launch": {
+                    "argv": [
+                        "opencode1", "run", "--dangerously-skip-permissions",
+                        "-m", "openai/gpt-5.6-sol", "--variant", "high", "ok"
+                    ]
+                }
+            }),
+            host.overrides(),
+            "policy.schema.json#/$defs/PolicyEvaluateRequest",
+        ),
+        "policy.schema.json#/$defs/PolicyEvaluateResponse",
+        "policy.schema.json#/$defs/PolicyEvaluateResult",
+    );
+    assert_eq!(policy["accepted"], true, "{policy}");
+    assert!(
+        policy["diagnostics"]
+            .as_array()
+            .expect("policy diagnostics")
+            .is_empty(),
+        "{policy}"
+    );
+}
+
+#[test]
+fn contract_activity_evidence_is_redacted_private_and_hash_chained() {
+    let host = HostRoots::new("agent-runner-opencode-activity-ledger");
+    let _ = success_result(
+        invoke_validated_with_host(
+            "settings.create",
+            settings_create_params(Some(SECRET_TOKEN)),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsCreateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsCreateResponse",
+        "settings.schema.json#/$defs/SettingsCreateResult",
+    );
+    let ledger_path = host
+        .data_root()
+        .join("provider-state/opencode/activity/operations.jsonl");
+    let ledger = fs::read_to_string(&ledger_path).expect("activity ledger");
+    assert!(!ledger.contains(SECRET_TOKEN));
+    assert!(!ledger.contains("auth_token"));
+    let events = ledger
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("activity JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    let mut previous = String::new();
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["sequence"], index + 1);
+        assert_eq!(event["previous_event_sha256"], previous);
+        assert!(event["authenticated_principal"].is_null());
+        assert!(event["delegation"].is_null());
+        let recorded = event["event_sha256"]
+            .as_str()
+            .expect("event digest")
+            .to_string();
+        let mut unhashed = event.clone();
+        unhashed
+            .as_object_mut()
+            .expect("activity object")
+            .remove("event_sha256");
+        assert_eq!(recorded, sha256_hex(unhashed.to_string().as_bytes()));
+        previous = recorded;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&ledger_path)
+                .expect("activity metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+fn assert_settings_history(host: &HostRoots, expected_events: usize) {
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    let bytes = fs::read(&store_path).expect("settings store");
+    let store: serde_json::Value = serde_json::from_slice(&bytes).expect("settings store JSON");
+    let history = store["history"].as_array().expect("settings history");
+    assert_eq!(history.len(), expected_events);
+    let mut previous = "";
+    for (index, event) in history.iter().enumerate() {
+        assert_eq!(event["sequence"], index + 1);
+        assert_eq!(event["previous_event_sha256"], previous);
+        previous = event["event_sha256"]
+            .as_str()
+            .expect("history event digest");
+        assert_eq!(previous.len(), 64);
+    }
+    let serialized = String::from_utf8(bytes).expect("settings store UTF-8");
+    assert!(!serialized.contains(SECRET_TOKEN));
+    assert!(!serialized.contains(UPDATE_SECRET_TOKEN));
 }
 
 #[test]
@@ -162,11 +384,11 @@ fn contract_settings_validate_accepts_luna_max_and_rejects_mismatched_identity()
 
 fn normalized_account_cases() -> [(&'static str, &'static str); 5] {
     [
-        ("opencode1", "~/.codex/auth.json"),
-        ("opencode2", "~/.codex5/auth.json"),
-        ("opencode3", "~/.codex2/auth.json"),
-        ("opencode4", "~/.codex3/auth.json"),
-        ("opencode5", "~/.codex4/auth.json"),
+        ("opencode1", "~/.local/share/opencode/auth.json"),
+        ("opencode2", "~/.opencode2/opencode/auth.json"),
+        ("opencode3", "~/.opencode3/opencode/auth.json"),
+        ("opencode4", "~/.opencode4/opencode/auth.json"),
+        ("opencode5", "~/.opencode5/opencode/auth.json"),
     ]
 }
 
@@ -192,7 +414,7 @@ fn contract_setup_detect_install_sync() {
     let host = HostRoots::new("agent-runner-opencode-setup");
     let toolchain = FakeToolchain::new();
     let home = HomeFixture::new("agent-runner-opencode-setup-home");
-    home.write_all_codex_auths();
+    home.write_all_opencode_auths();
     let profile_root = host.data_root().join("provider-profile-root-contract");
     fs::create_dir_all(&profile_root).expect("create provider profile root fixture");
     fs::write(
@@ -349,18 +571,6 @@ fn contract_setup_brain_unsupported() {
 fn contract_rotation_assess_materialize() {
     let host = HostRoots::new("agent-runner-opencode-rotation");
     let opencode = RotationOpencodeFixture::new();
-    let allowed = success_result(
-        invoke_validated_with_host(
-            "rotation.assess",
-            rotation_assess_params(true),
-            host.overrides(),
-            "rotation.schema.json#/$defs/RotationAssessRequest",
-        ),
-        "rotation.schema.json#/$defs/RotationAssessResponse",
-        "rotation.schema.json#/$defs/RotationAssessResult",
-    );
-    assert_rotation_allowed(&allowed);
-
     let denied = success_result(
         invoke_validated_with_host(
             "rotation.assess",
@@ -372,6 +582,18 @@ fn contract_rotation_assess_materialize() {
         "rotation.schema.json#/$defs/RotationAssessResult",
     );
     assert_rotation_denied(&denied);
+
+    let allowed = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    assert_rotation_allowed(&allowed);
 
     let host_owned = RotationHostSentinels::new(host.data_root());
 
@@ -402,7 +624,7 @@ fn contract_rotation_assess_materialize() {
     assert_eq!(retried, materialized, "materialization must be retry-safe");
     let imported = opencode.imported_session();
     assert_eq!(opencode.imported_cwd(), host.working_directory());
-    assert_eq!(opencode.import_count(), 2);
+    assert_eq!(opencode.import_count(), 1);
     assert_eq!(imported["info"]["id"], ROTATION_SOURCE_SESSION);
     assert_eq!(imported["info"]["projectID"], "project_rotation_native");
     assert_eq!(
@@ -412,6 +634,25 @@ fn contract_rotation_assess_materialize() {
     assert_eq!(imported["messages"][0]["mode"], "build");
     assert_eq!(imported["nativeRoot"]["preserved"], true);
     host_owned.assert_unchanged();
+}
+
+#[test]
+fn contract_rotation_materialize_requires_matching_prior_assessment() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-no-assessment");
+    let opencode = RotationOpencodeFixture::new();
+    let path = opencode.path_env();
+    let response = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(response["error"]["code"], "rotation_authorization_required");
+    assert!(
+        !opencode.import_was_attempted(),
+        "authorization failure must precede native export/import side effects"
+    );
 }
 
 #[test]
@@ -444,4 +685,84 @@ fn contract_migration_plan_apply() {
     );
     assert_migration_apply_result(&apply, live.provider_artifact_root());
     snapshots.assert_after_apply(&host, &live);
+}
+
+#[test]
+fn contract_migration_apply_requires_true_confirmation_before_writes() {
+    let host = HostRoots::new("agent-runner-opencode-migration-confirmation");
+    let live = LiveConfigFixture::new(host.config_root());
+    let before = snapshot_tree(host.config_root());
+    for params in [
+        migration_apply_params_without_confirmation(&live),
+        migration_apply_params_with_false_confirmation(&live),
+    ] {
+        let response = error_response(invoke_validated_with_host(
+            "migration.apply",
+            params,
+            host.overrides(),
+            "migration.schema.json#/$defs/MigrationApplyRequest",
+        ));
+        assert_eq!(response["error"]["code"], "migration_confirmation_required");
+    }
+    assert_eq!(snapshot_tree(host.config_root()), before);
+}
+
+#[test]
+fn contract_migration_apply_rejects_artifact_root_outside_provider_ownership() {
+    let host = HostRoots::new("agent-runner-opencode-migration-root-boundary");
+    let live = LiveConfigFixture::new(host.config_root());
+    let forbidden_root = host.config_root().join("unowned-migration-output");
+    let response = error_response(invoke_validated_with_host(
+        "migration.apply",
+        migration_apply_params_with_artifact_root(&live, &forbidden_root),
+        host.overrides(),
+        "migration.schema.json#/$defs/MigrationApplyRequest",
+    ));
+    assert_eq!(
+        response["error"]["code"],
+        "artifact_root_outside_provider_root"
+    );
+    assert!(!forbidden_root.exists());
+}
+
+#[test]
+fn contract_migration_parallel_retries_converge_on_one_content_addressed_artifact() {
+    let host = HostRoots::new("agent-runner-opencode-migration-parallel");
+    let live = LiveConfigFixture::new(host.config_root());
+    let params = migration_apply_params(&live);
+    let workers = (0..8)
+        .map(|_| {
+            let params = params.clone();
+            let host_overrides = host.overrides();
+            thread::spawn(move || {
+                invoke_validated_with_host(
+                    "migration.apply",
+                    params,
+                    host_overrides,
+                    "migration.schema.json#/$defs/MigrationApplyRequest",
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut artifact_paths = std::collections::BTreeSet::new();
+    for worker in workers {
+        let result = success_result(
+            worker.join().expect("migration worker"),
+            "migration.schema.json#/$defs/MigrationApplyResponse",
+            "migration.schema.json#/$defs/MigrationApplyResult",
+        );
+        artifact_paths.insert(
+            result["artifacts"][0]["path"]
+                .as_str()
+                .expect("artifact path")
+                .to_string(),
+        );
+    }
+    assert_eq!(artifact_paths.len(), 1);
+    let files = fs::read_dir(live.provider_artifact_root())
+        .expect("artifact directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .count();
+    assert_eq!(files, 1);
 }

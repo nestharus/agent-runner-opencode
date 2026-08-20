@@ -8,6 +8,7 @@ pub const CONTRACT: &str = "oulipoly.provider/v1";
 
 pub const CATEGORY_UNSUPPORTED: &str = "unsupported";
 pub const CATEGORY_INVALID_REQUEST: &str = "invalid_request";
+pub const CATEGORY_INVALID_SETTINGS: &str = "invalid_settings";
 pub const CATEGORY_CONFLICT: &str = "conflict";
 pub const CATEGORY_FAILED: &str = "failed";
 
@@ -75,6 +76,23 @@ impl ProviderFailure {
             json!({}),
             false,
             3,
+        )
+    }
+
+    pub fn invalid_settings(
+        request_id: impl Into<String>,
+        code: &'static str,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        provider_failure(
+            request_id,
+            CATEGORY_INVALID_SETTINGS,
+            code,
+            message,
+            details,
+            false,
+            2,
         )
     }
 

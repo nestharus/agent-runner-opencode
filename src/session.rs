@@ -18,12 +18,12 @@
 //!       - opencode absent transcript path to SessionLocateTranscriptResult
 //!       - opencode unsupported transcript import to SessionReplaceResult boundary
 
-use crate::account::profile_for_settings_id;
 use crate::encoding::{encode_base64, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
 use crate::opencode::{
     self, OpencodeExport, OpencodeExportError, OpencodeMessage, OpencodeSessionListError,
 };
+use crate::settings::resolve_runtime_settings;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -101,10 +101,10 @@ pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, Provi
     } = request;
     match subcommand {
         "session.locate_transcript" => locate_transcript_params(params, &request_id),
-        "session.read_turns" => read_turns_params(params, &request_id),
-        "session.capture" => capture_params(params, host.working_directory.as_deref(), &request_id),
-        "session.enumerate" => enumerate_params(params, &request_id),
-        "session.export" => export_params(params, &request_id),
+        "session.read_turns" => read_turns_params(&host, params, &request_id),
+        "session.capture" => capture_params(&host, params, &request_id),
+        "session.enumerate" => enumerate_params(&host, params, &request_id),
+        "session.export" => export_params(&host, params, &request_id),
         "session.replace" => replace_params(params, &request_id),
         unknown => Err(unknown_session_subcommand_failure(request_id, unknown)),
     }
@@ -115,11 +115,15 @@ pub fn locate_transcript_params(params: Value, request_id: &str) -> Result<Value
     Ok(locate_transcript_result(params.session_id.as_deref()))
 }
 
-pub fn read_turns_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn read_turns_params(
+    host: &crate::envelope::HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let params = parse_session_params(params, request_id)?;
     validate_turn_projection(&params, request_id)?;
     let session_id = required_session_id(&params, request_id)?;
-    let native = export_native(&params.settings_id, &session_id, request_id)?;
+    let native = export_native(host, &params.settings_id, &session_id, request_id)?;
     let turns = match params.turn_projection.as_deref() {
         Some(USER_OBSERVATION_PROJECTION) => {
             user_observation_turns(&native, &session_id, params.body_tail_limit.unwrap_or(4))?
@@ -130,12 +134,12 @@ pub fn read_turns_params(params: Value, request_id: &str) -> Result<Value, Provi
 }
 
 pub fn capture_params(
+    host: &crate::envelope::HostContext,
     params: Value,
-    working_directory: Option<&str>,
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let params = parse_capture_params(params, request_id)?;
-    if let Some(captured) = capture_live_report(&params, working_directory, request_id)? {
+    if let Some(captured) = capture_live_report(host, &params, request_id)? {
         return Ok(capture_result(
             Some(captured),
             "live_report.provider_session_id",
@@ -148,8 +152,8 @@ pub fn capture_params(
 }
 
 fn capture_live_report(
+    host: &crate::envelope::HostContext,
     params: &SessionCaptureParams,
-    working_directory: Option<&str>,
     request_id: &str,
 ) -> Result<Option<String>, ProviderFailure> {
     let Some(report) = params.live_report.as_ref() else {
@@ -187,8 +191,8 @@ fn capture_live_report(
             ));
         }
     }
-    let native = export_native(&params.settings_id, &provider_session_id, request_id)?;
-    validate_live_report_working_directory(&native, working_directory, request_id)?;
+    let native = export_native(host, &params.settings_id, &provider_session_id, request_id)?;
+    validate_live_report_working_directory(&native, host.working_directory.as_deref(), request_id)?;
     Ok(Some(native.info.id))
 }
 
@@ -220,18 +224,26 @@ fn validate_live_report_working_directory(
     Ok(())
 }
 
-pub fn enumerate_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn enumerate_params(
+    host: &crate::envelope::HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let params = parse_enumerate_params(params, request_id)?;
     validate_enumerate_params(&params, request_id)?;
-    let native = enumerate_native(&params.settings_id, params.limit, request_id)?;
-    let (sessions, warnings) = enumerate_sessions(native, &params, request_id)?;
-    Ok(enumerate_result(sessions, warnings))
+    let native = enumerate_native(host, &params.settings_id, request_id)?;
+    let page = enumerate_sessions(native, &params, request_id)?;
+    Ok(enumerate_result(page))
 }
 
-pub fn export_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn export_params(
+    host: &crate::envelope::HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let params = parse_session_params(params, request_id)?;
     let session_id = required_session_id(&params, request_id)?;
-    let native = export_native(&params.settings_id, &session_id, request_id)?;
+    let native = export_native(host, &params.settings_id, &session_id, request_id)?;
     let records = canonical_records(&native, &session_id)?;
     let bytes = canonical_jsonl(&records);
     Ok(export_result(&bytes, records.len()))
@@ -316,11 +328,12 @@ fn validate_turn_projection(
 }
 
 fn export_native(
+    host: &crate::envelope::HostContext,
     settings_id: &str,
     session_id: &str,
     request_id: &str,
 ) -> Result<OpencodeExport, ProviderFailure> {
-    let account = session_account(settings_id, request_id)?;
+    let account = session_account(host, settings_id, request_id)?;
     let native = opencode::export(session_id, account)
         .map_err(|err| export_failure(request_id, session_id, err))?;
     validate_export_session_id(&native, session_id, request_id)?;
@@ -329,20 +342,27 @@ fn export_native(
 }
 
 fn enumerate_native(
+    host: &crate::envelope::HostContext,
     settings_id: &str,
-    limit: Option<usize>,
     request_id: &str,
 ) -> Result<Vec<Value>, ProviderFailure> {
-    let account = session_account(settings_id, request_id)?;
-    opencode::session_list(limit, account).map_err(|err| session_list_failure(request_id, err))
+    let account = session_account(host, settings_id, request_id)?;
+    opencode::session_list(None, account).map_err(|err| session_list_failure(request_id, err))
+}
+
+struct EnumeratePage {
+    sessions: Vec<Value>,
+    warnings: Vec<String>,
+    complete: bool,
+    next_cursor: Option<String>,
 }
 
 fn enumerate_sessions(
     native: Vec<Value>,
     params: &SessionEnumerateParams,
     request_id: &str,
-) -> Result<(Vec<Value>, Vec<String>), ProviderFailure> {
-    let mut warnings = enumerate_param_warnings(params);
+) -> Result<EnumeratePage, ProviderFailure> {
+    let mut warnings = Vec::new();
     let mut sessions = Vec::new();
     for (index, entry) in native.iter().enumerate() {
         if let Some(session) =
@@ -351,8 +371,7 @@ fn enumerate_sessions(
             sessions.push(session);
         }
     }
-    truncate_sessions(&mut sessions, params.limit);
-    Ok((sessions, warnings))
+    paginate_sessions(sessions, params, warnings, request_id)
 }
 
 fn enumerate_session_entry(
@@ -391,22 +410,65 @@ fn enumerate_session_entry(
     })))
 }
 
-fn enumerate_param_warnings(params: &SessionEnumerateParams) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if params
-        .cursor
-        .as_deref()
-        .is_some_and(|cursor| !cursor.trim().is_empty())
-    {
-        warnings.push("cursor is ignored by opencode session.enumerate v1".to_string());
+fn paginate_sessions(
+    sessions: Vec<Value>,
+    params: &SessionEnumerateParams,
+    warnings: Vec<String>,
+    request_id: &str,
+) -> Result<EnumeratePage, ProviderFailure> {
+    let identity = enumeration_identity(&sessions);
+    let offset = cursor_offset(params.cursor.as_deref(), &identity, request_id)?;
+    if offset > sessions.len() {
+        return Err(invalid_session_enumerate_cursor_failure(
+            request_id,
+            "cursor offset exceeds the current result population",
+        ));
     }
-    warnings
+    let limit = params
+        .limit
+        .unwrap_or(sessions.len().saturating_sub(offset));
+    let end = offset.saturating_add(limit).min(sessions.len());
+    let complete = end == sessions.len();
+    let next_cursor = (!complete).then(|| format!("v1:{end}:{identity}"));
+    Ok(EnumeratePage {
+        sessions: sessions
+            .into_iter()
+            .skip(offset)
+            .take(end - offset)
+            .collect(),
+        warnings,
+        complete,
+        next_cursor,
+    })
 }
 
-fn truncate_sessions(sessions: &mut Vec<Value>, limit: Option<usize>) {
-    if let Some(limit) = limit {
-        sessions.truncate(limit);
+fn enumeration_identity(sessions: &[Value]) -> String {
+    let ids = sessions
+        .iter()
+        .filter_map(|session| session["provider_session_id"].as_str())
+        .collect::<Vec<_>>()
+        .join("\0");
+    sha256_hex(ids.as_bytes())
+}
+
+fn cursor_offset(
+    cursor: Option<&str>,
+    identity: &str,
+    request_id: &str,
+) -> Result<usize, ProviderFailure> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let fields = cursor.split(':').collect::<Vec<_>>();
+    if fields.len() != 3 || fields[0] != "v1" || fields[2] != identity {
+        return Err(invalid_session_enumerate_cursor_failure(
+            request_id,
+            "cursor is malformed or the session population changed",
+        ));
     }
+    fields[1].parse::<usize>().map_err(|_| {
+        invalid_session_enumerate_cursor_failure(request_id, "cursor offset is not an integer")
+    })
 }
 
 fn required_enumerated_session_id(
@@ -566,6 +628,11 @@ fn export_failure(request_id: &str, session_id: &str, err: OpencodeExportError) 
         OpencodeExportError::InvalidJson(message) => {
             invalid_opencode_export_failure(request_id, message)
         }
+        OpencodeExportError::TimedOut => ProviderFailure::invalid_request(
+            request_id,
+            "opencode_export_timeout",
+            format!("opencode export timed out for {session_id}"),
+        ),
     }
 }
 
@@ -627,6 +694,7 @@ fn user_observation_turn(
 }
 
 fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, ProviderFailure> {
+    let (provider_id, model_id, variant) = message.info.model_identity();
     Ok(json!({
         "session_id": session_id,
         "turn_id": stable_turn_id(message, session_id),
@@ -638,6 +706,9 @@ fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, Pro
             "session_id": message.info.session_id,
             "created_unix_ms": message.info.time.as_ref().and_then(|time| time.created),
             "completed_unix_ms": message.info.time.as_ref().and_then(|time| time.completed),
+            "provider_id": provider_id,
+            "model_id": model_id,
+            "variant": variant,
             "parts": message.parts,
         },
     }))
@@ -686,6 +757,7 @@ fn canonical_record(
     session_id: &str,
     title: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
+    let (provider_id, model_id, variant) = message.info.model_identity();
     Ok(json!({
         "body": text_parts(message),
         "id": stable_turn_id(message, session_id),
@@ -693,6 +765,9 @@ fn canonical_record(
             "native_message_id": message.info.id,
             "native_session_id": message.info.session_id,
             "native_title": title,
+            "provider_id": provider_id,
+            "model_id": model_id,
+            "variant": variant,
             "source_format": NATIVE_FORMAT_ID,
         },
         "role": message.info.role,
@@ -854,12 +929,12 @@ fn capture_result(provider_session_id: Option<String>, source: &'static str) -> 
     })
 }
 
-fn enumerate_result(sessions: Vec<Value>, warnings: Vec<String>) -> Value {
+fn enumerate_result(page: EnumeratePage) -> Value {
     json!({
-        "sessions": sessions,
-        "complete": true,
-        "next_cursor": null,
-        "warnings": warnings,
+        "sessions": page.sessions,
+        "complete": page.complete,
+        "next_cursor": page.next_cursor,
+        "warnings": page.warnings,
     })
 }
 
@@ -925,6 +1000,14 @@ fn invalid_session_enumerate_limit_failure(request_id: &str) -> ProviderFailure 
     )
 }
 
+fn invalid_session_enumerate_cursor_failure(request_id: &str, message: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "invalid_session_enumerate_cursor",
+        format!("session.enumerate cursor is invalid: {message}"),
+    )
+}
+
 fn missing_session_id_failure(request_id: &str) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
@@ -934,19 +1017,11 @@ fn missing_session_id_failure(request_id: &str) -> ProviderFailure {
 }
 
 fn session_account(
+    host: &crate::envelope::HostContext,
     settings_id: &str,
     request_id: &str,
 ) -> Result<&'static crate::account::AccountProfile, ProviderFailure> {
-    profile_for_settings_id(settings_id)
-        .ok_or_else(|| unknown_settings_id_failure(request_id, settings_id))
-}
-
-fn unknown_settings_id_failure(request_id: &str, settings_id: &str) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "unknown_settings_id",
-        format!("unknown opencode settings_id: {settings_id}"),
-    )
+    resolve_runtime_settings(host, settings_id, request_id).map(|settings| settings.account)
 }
 
 fn session_export_id_mismatch_failure(

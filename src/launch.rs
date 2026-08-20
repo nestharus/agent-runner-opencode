@@ -9,9 +9,10 @@
 //!       - declared params.env entries and host-linkage env to env-cleared child env
 //!       - process terminal status to LaunchExitEvent
 
-use crate::account::profile_for_settings_id;
+use crate::account::profile_for_wrapper_command;
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
+use crate::models::model_alias;
 use crate::opencode::{
     self, first_session_id, EventParser, OpencodeEventMetadata, OpencodeExport, OpencodeMessage,
 };
@@ -22,7 +23,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
@@ -31,6 +32,11 @@ const COMPLETED_RESUME_GRACE: Duration = Duration::from_millis(500);
 const RESUME_COMPLETION_PROBE_DELAY: Duration = Duration::from_secs(1);
 const RESUME_COMPLETION_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const RESUME_MESSAGE_CLOCK_TOLERANCE_MS: u64 = 5_000;
+const MAX_RESUME_COMPLETION_PROBES: usize = 3;
+const RESUME_EXPORT_TIMEOUT: Duration = Duration::from_millis(750);
+const DRAIN_COMPLETION_GRACE: Duration = Duration::from_millis(500);
+const DRAIN_CHANNEL_CAPACITY: usize = 32;
+const TERMINAL_CAPTURE_LIMIT: usize = 1024 * 1024;
 const BASE_LAUNCH_ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME"];
 // Step-6a host-linkage contract: these runner bindings must survive env_clear.
 const HOST_LINKAGE_ENV_KEYS: &[&str] = &[
@@ -60,7 +66,15 @@ struct LaunchParams {
     working_directory: String,
     env: Option<BTreeMap<String, String>>,
     stdin: Option<BytePayload>,
-    session: Option<Value>,
+    session: Option<LaunchSession>,
+}
+
+#[derive(Deserialize)]
+struct LaunchSession {
+    known_provider_session_id: Option<String>,
+    start_mode: Option<String>,
+    #[serde(flatten)]
+    _extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +88,7 @@ enum DrainMessage {
     Stderr(Vec<u8>),
     StdoutDone,
     StderrDone,
+    ReadError { stdout: bool, message: String },
 }
 
 pub fn stream<W: Write>(
@@ -83,26 +98,31 @@ pub fn stream<W: Write>(
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
     let params = parse_launch_params(params, request_id)?;
-    let effective = match launch_argv(&params, request_id)? {
-        PolicyLaunch::Accepted(effective) => effective,
+    let effective = match launch_argv(&params, host, request_id)? {
+        PolicyLaunch::Accepted(effective) => *effective,
         PolicyLaunch::Rejected(reason) => {
             return stream_policy_rejection(request_id, writer, reason)
         }
     };
-    let mut child = match spawn_child(
+    let child = match spawn_child(
         &effective.argv,
         &params.working_directory,
         &effective.env,
-        effective.stdin.as_ref(),
+        effective.stdin.is_some(),
     ) {
         Ok(child) => child,
         Err(err) => return stream_spawn_error(request_id, writer, err),
     };
+    let mut custody = ChildCustody::new(child);
+    if let Err(err) = write_child_stdin(custody.child_mut(), effective.stdin.as_ref()) {
+        return stream_spawn_error(request_id, writer, err);
+    }
     stream_child(
         request_id,
         host,
-        &mut child,
+        custody.child_mut(),
         effective.resume_confirmation,
+        effective.route_evidence,
         writer,
     )
 }
@@ -117,40 +137,54 @@ struct EffectiveLaunch {
     stdin: Option<Vec<u8>>,
     _prompt: Option<String>,
     resume_confirmation: Option<ResumeConfirmation>,
+    route_evidence: Value,
 }
 
 #[derive(Clone)]
 struct ResumeConfirmation {
-    settings_id: String,
+    account_wrapper: String,
     session_id: String,
     prompt: String,
     delivery_nonce: Option<String>,
     started_at_unix_ms: u64,
+    deadline_unix_ms: Option<u64>,
+    provider_id: String,
+    model_id: String,
+    variant: String,
 }
 
 enum PolicyLaunch {
-    Accepted(EffectiveLaunch),
+    Accepted(Box<EffectiveLaunch>),
     Rejected(String),
 }
 
-fn launch_argv(params: &LaunchParams, request_id: &str) -> Result<PolicyLaunch, ProviderFailure> {
+fn launch_argv(
+    params: &LaunchParams,
+    host: &HostContext,
+    request_id: &str,
+) -> Result<PolicyLaunch, ProviderFailure> {
+    validate_launch_session(params, request_id)?;
     let policy_params = policy_params_for_launch(params, request_id)?;
-    let result = policy::evaluate(policy_params, request_id)?;
+    let result = policy::evaluate(host, policy_params, request_id)?;
     if !policy_result_accepted(&result) {
         return Ok(PolicyLaunch::Rejected(policy_rejection_reason(&result)));
     }
-    Ok(PolicyLaunch::Accepted(effective_launch(
-        params, result, request_id,
-    )?))
+    Ok(PolicyLaunch::Accepted(Box::new(effective_launch(
+        params,
+        result,
+        host.deadline_unix_ms,
+        request_id,
+    )?)))
 }
 
 fn effective_launch(
     params: &LaunchParams,
     result: Value,
+    deadline_unix_ms: Option<u64>,
     request_id: &str,
 ) -> Result<EffectiveLaunch, ProviderFailure> {
     let argv = validated_policy_argv(&result, request_id)?;
-    project_effective_launch(params, &result, argv, request_id)
+    project_effective_launch(params, &result, argv, deadline_unix_ms, request_id)
 }
 
 fn validated_policy_argv(result: &Value, request_id: &str) -> Result<Vec<String>, ProviderFailure> {
@@ -163,6 +197,7 @@ fn project_effective_launch(
     params: &LaunchParams,
     result: &Value,
     argv: Vec<String>,
+    deadline_unix_ms: Option<u64>,
     request_id: &str,
 ) -> Result<EffectiveLaunch, ProviderFailure> {
     let stdin = policy_stdin(result);
@@ -174,8 +209,13 @@ fn project_effective_launch(
         prompt.as_deref(),
         request_id,
     )?;
-    let resume_confirmation =
-        resume_confirmation(params, stdin.as_deref(), prompt.as_deref(), &argv);
+    let resume_confirmation = resume_confirmation(
+        params,
+        stdin.as_deref(),
+        prompt.as_deref(),
+        &argv,
+        deadline_unix_ms,
+    );
     let argv = split_oversized_prompt_argv(argv, request_id)?;
     Ok(EffectiveLaunch {
         argv,
@@ -183,6 +223,7 @@ fn project_effective_launch(
         stdin,
         _prompt: prompt,
         resume_confirmation,
+        route_evidence: result.get("markers").cloned().unwrap_or_else(|| json!([])),
     })
 }
 
@@ -252,16 +293,23 @@ fn resume_confirmation(
     stdin: Option<&[u8]>,
     prompt: Option<&str>,
     argv: &[String],
+    deadline_unix_ms: Option<u64>,
 ) -> Option<ResumeConfirmation> {
     let session_id = known_provider_session_id(params)?;
     let prompt = submitted_resume_payload(argv, stdin, prompt)?;
     let delivery_nonce = delivery_nonce_from_prompt(&prompt);
+    let route = model_alias(params.model.get("name")?.as_str()?)?;
+    let (provider_id, model_id) = route.provider_model.split_once('/')?;
     Some(ResumeConfirmation {
-        settings_id: params.settings_id.clone(),
+        account_wrapper: argv.first()?.clone(),
         session_id: session_id.to_string(),
         prompt,
         delivery_nonce,
         started_at_unix_ms: now_unix_ms(),
+        deadline_unix_ms,
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        variant: route.effort.to_string(),
     })
 }
 
@@ -273,8 +321,30 @@ fn raw_known_provider_session_id(params: &LaunchParams) -> Option<&str> {
     params
         .session
         .as_ref()
-        .and_then(|session| session.get("known_provider_session_id"))
-        .and_then(Value::as_str)
+        .and_then(|session| session.known_provider_session_id.as_deref())
+}
+
+fn validate_launch_session(params: &LaunchParams, request_id: &str) -> Result<(), ProviderFailure> {
+    let Some(session) = params.session.as_ref() else {
+        return Ok(());
+    };
+    match (
+        nonblank_optional_text(session.known_provider_session_id.as_deref()),
+        session.start_mode.as_deref(),
+    ) {
+        (None, None) => Ok(()),
+        (Some(_), Some("resume")) => Ok(()),
+        (Some(_), Some("create")) => Err(ProviderFailure::unsupported(
+            request_id,
+            "launch_session_create_unsupported",
+            "OpenCode cannot start a new session with a caller-selected provider session id",
+        )),
+        _ => Err(ProviderFailure::invalid_request(
+            request_id,
+            "invalid_launch_session",
+            "launch session requires a non-empty known_provider_session_id paired with start_mode resume or create",
+        )),
+    }
 }
 
 fn require_resume_payload_reaches_child(
@@ -522,16 +592,14 @@ fn spawn_child(
     argv: &[String],
     working_directory: &str,
     env: &BTreeMap<String, String>,
-    stdin: Option<&Vec<u8>>,
+    stdin_present: bool,
 ) -> std::io::Result<Child> {
-    let mut command = child_command(argv, working_directory, stdin.is_some());
+    let mut command = child_command(argv, working_directory, stdin_present);
     command.env_clear();
     let child_env = child_env(env);
     command.envs(child_env_pairs(&child_env));
     configure_process_group(&mut command);
-    let mut child = command.spawn()?;
-    write_child_stdin(&mut child, stdin)?;
-    Ok(child)
+    command.spawn()
 }
 
 fn child_command(argv: &[String], working_directory: &str, stdin_present: bool) -> Command {
@@ -610,21 +678,48 @@ fn write_child_stdin(child: &mut Child, stdin: Option<&Vec<u8>>) -> std::io::Res
     Ok(())
 }
 
+struct ChildCustody {
+    child: Child,
+}
+
+impl ChildCustody {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for ChildCustody {
+    fn drop(&mut self) {
+        let _ = terminate_child(&mut self.child);
+    }
+}
+
 fn stream_child<W: Write>(
     request_id: &str,
     host: &HostContext,
     child: &mut Child,
     resume_confirmation: Option<ResumeConfirmation>,
+    route_evidence: Value,
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, host.deadline_unix_ms, resume_confirmation);
+    let mut state = LaunchState::new(
+        request_id,
+        host.deadline_unix_ms,
+        resume_confirmation,
+        route_evidence,
+    );
     let receiver = start_drains(child);
+    state.emit_route_evidence(writer)?;
     run_supervision_loop(child, &receiver, &mut state, writer)?;
     state.finish(writer)
 }
 
 fn start_drains(child: &mut Child) -> Receiver<DrainMessage> {
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(DRAIN_CHANNEL_CAPACITY);
     if let Some(stdout) = child.stdout.take() {
         spawn_drain(stdout, sender.clone(), true);
     }
@@ -636,21 +731,33 @@ fn start_drains(child: &mut Child) -> Receiver<DrainMessage> {
 
 fn spawn_drain<R: Read + Send + 'static>(
     reader: R,
-    sender: mpsc::Sender<DrainMessage>,
+    sender: SyncSender<DrainMessage>,
     stdout: bool,
 ) {
     std::thread::spawn(move || drain_reader(reader, sender, stdout));
 }
 
-fn drain_reader<R: Read>(mut reader: R, sender: mpsc::Sender<DrainMessage>, stdout: bool) {
+fn drain_reader<R: Read>(mut reader: R, sender: SyncSender<DrainMessage>, stdout: bool) {
     let mut buffer = drain_buffer();
-    while let Ok(count) = read_drain_chunk(&mut reader, &mut buffer) {
-        if drain_read_complete(count) {
-            break;
-        }
-        let message = drain_chunk_message(stdout, drain_chunk(&buffer, count));
-        if drain_send_failed(send_drain_message(&sender, message)) {
-            return;
+    loop {
+        match read_drain_chunk(&mut reader, &mut buffer) {
+            Ok(count) if drain_read_complete(count) => break,
+            Ok(count) => {
+                let message = drain_chunk_message(stdout, drain_chunk(&buffer, count));
+                if drain_send_failed(send_drain_message(&sender, message)) {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = send_drain_message(
+                    &sender,
+                    DrainMessage::ReadError {
+                        stdout,
+                        message: error.to_string(),
+                    },
+                );
+                return;
+            }
         }
     }
     send_drain_done(&sender, stdout);
@@ -680,8 +787,26 @@ fn drain_chunk_bytes(chunk: &[u8]) -> Vec<u8> {
     chunk.to_vec()
 }
 
+fn retain_terminal_tail(target: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
+    if bytes.len() >= TERMINAL_CAPTURE_LIMIT {
+        target.clear();
+        target.extend_from_slice(&bytes[bytes.len() - TERMINAL_CAPTURE_LIMIT..]);
+        *truncated = true;
+        return;
+    }
+    let overflow = target
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(TERMINAL_CAPTURE_LIMIT);
+    if overflow > 0 {
+        target.drain(..overflow);
+        *truncated = true;
+    }
+    target.extend_from_slice(bytes);
+}
+
 fn send_drain_message(
-    sender: &mpsc::Sender<DrainMessage>,
+    sender: &SyncSender<DrainMessage>,
     message: DrainMessage,
 ) -> Result<(), mpsc::SendError<DrainMessage>> {
     sender.send(message)
@@ -691,7 +816,7 @@ fn drain_send_failed(result: Result<(), mpsc::SendError<DrainMessage>>) -> bool 
     result.is_err()
 }
 
-fn send_drain_done(sender: &mpsc::Sender<DrainMessage>, stdout: bool) {
+fn send_drain_done(sender: &SyncSender<DrainMessage>, stdout: bool) {
     let _ = send_drain_message(sender, drain_done_message(stdout));
 }
 
@@ -706,6 +831,7 @@ fn run_supervision_loop<W: Write>(
         enforce_deadline(child, state)?;
         state.probe_completed_resume();
         complete_terminal_resume(child, state);
+        close_lingering_process_group(child, state);
         match receiver.recv_timeout(state.wait_duration()) {
             Ok(message) => state.handle_drain_message(message, writer)?,
             Err(mpsc::RecvTimeoutError::Timeout) => state.heartbeat(writer)?,
@@ -719,17 +845,23 @@ fn complete_terminal_resume(child: &mut Child, state: &mut LaunchState) {
     if state.final_status.is_some() || !state.completed_resume_grace_elapsed() {
         return;
     }
-    terminate_child(child);
-    let _ = child.wait();
-    state.final_status = Some(ProcessStatus::Exited { code: 0 });
+    if let Some(status) = terminate_child(child) {
+        state.record_forced_exit(process_status_from_exit(status));
+    }
+}
+
+fn close_lingering_process_group(child: &mut Child, state: &mut LaunchState) {
+    if state.drains_done() || !state.child_exit_grace_elapsed() {
+        return;
+    }
+    let _ = terminate_child(child);
 }
 
 fn enforce_deadline(child: &mut Child, state: &mut LaunchState) -> Result<(), ProviderFailure> {
     if state.final_status.is_some() || !state.deadline_reached() {
         return Ok(());
     }
-    terminate_child(child);
-    let _ = child.wait();
+    let _ = terminate_child(child);
     state.final_status = Some(deadline_status());
     Ok(())
 }
@@ -740,9 +872,9 @@ fn capture_child_exit(child: &mut Child, state: &mut LaunchState) -> Result<(), 
     }
     if let Some(status) = child
         .try_wait()
-        .map_err(|err| spawn_failure("try_wait", err))?
+        .map_err(|err| spawn_failure(&state.request_id, "try_wait", err))?
     {
-        state.final_status = Some(process_status_from_exit(status));
+        state.record_child_exit(process_status_from_exit(status));
     }
     Ok(())
 }
@@ -752,7 +884,7 @@ fn stream_spawn_error<W: Write>(
     writer: &mut W,
     err: std::io::Error,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, None, None);
+    let mut state = LaunchState::new(request_id, None, None, json!([]));
     state.final_status = Some(spawn_error_status(err));
     state.mark_drains_done();
     state.finish(writer)
@@ -763,7 +895,7 @@ fn stream_policy_rejection<W: Write>(
     writer: &mut W,
     reason: String,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, None, None);
+    let mut state = LaunchState::new(request_id, None, None, json!([]));
     state.final_status = Some(policy_rejection_status(reason));
     state.mark_drains_done();
     state.finish(writer)
@@ -775,16 +907,23 @@ struct LaunchState {
     stdout_done: bool,
     stderr_done: bool,
     final_status: Option<ProcessStatus>,
+    child_exit_at: Option<Instant>,
+    forced_exit_status: Option<ProcessStatus>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    integrity_failures: Vec<String>,
     parser: EventParser,
     last_opencode_event: Option<OpencodeEventMetadata>,
     completed_resume_at: Option<Instant>,
     next_resume_completion_probe: Option<Instant>,
+    resume_completion_probes: usize,
     session_id: Option<String>,
     resume_confirmation: Option<ResumeConfirmation>,
     deadline_unix_ms: Option<u64>,
     next_heartbeat: Instant,
+    route_evidence: Value,
 }
 
 impl LaunchState {
@@ -792,6 +931,7 @@ impl LaunchState {
         request_id: &str,
         deadline_unix_ms: Option<u64>,
         resume_confirmation: Option<ResumeConfirmation>,
+        route_evidence: Value,
     ) -> Self {
         let next_resume_completion_probe = resume_confirmation
             .as_ref()
@@ -802,16 +942,23 @@ impl LaunchState {
             stdout_done: false,
             stderr_done: false,
             final_status: None,
+            child_exit_at: None,
+            forced_exit_status: None,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            integrity_failures: Vec::new(),
             parser: EventParser::default(),
             last_opencode_event: None,
             completed_resume_at: None,
             next_resume_completion_probe,
+            resume_completion_probes: 0,
             session_id: None,
             resume_confirmation,
             deadline_unix_ms,
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
+            route_evidence,
         }
     }
 
@@ -829,6 +976,18 @@ impl LaunchState {
             }
             DrainMessage::StderrDone => {
                 self.stderr_done = true;
+                Ok(())
+            }
+            DrainMessage::ReadError { stdout, message } => {
+                if stdout {
+                    self.stdout_done = true;
+                } else {
+                    self.stderr_done = true;
+                }
+                self.integrity_failures.push(format!(
+                    "{} pipe read failed: {message}",
+                    if stdout { "stdout" } else { "stderr" }
+                ));
                 Ok(())
             }
         }
@@ -854,11 +1013,11 @@ impl LaunchState {
     }
 
     fn record_stdout(&mut self, bytes: &[u8]) {
-        self.stdout.extend_from_slice(bytes);
+        retain_terminal_tail(&mut self.stdout, bytes, &mut self.stdout_truncated);
     }
 
     fn record_stderr(&mut self, bytes: &[u8]) {
-        self.stderr.extend_from_slice(bytes);
+        retain_terminal_tail(&mut self.stderr, bytes, &mut self.stderr_truncated);
     }
 
     fn project_stdout_bytes<W: Write>(
@@ -939,6 +1098,7 @@ impl LaunchState {
 
     fn session_from_stdout(&mut self, bytes: &[u8]) -> Option<String> {
         let events = self.parser.ingest(bytes);
+        self.record_parser_errors();
         self.record_opencode_events(&events);
         first_session_id(&events)
     }
@@ -953,20 +1113,24 @@ impl LaunchState {
 
     fn session_from_parser_tail(&mut self) -> Option<String> {
         let events = self.parser.finish();
+        self.record_parser_errors();
         self.record_opencode_events(&events);
         first_session_id(&events)
     }
 
     fn record_opencode_events(&mut self, events: &[OpencodeEventMetadata]) {
         if let Some(event) = events.last() {
-            if self.resume_confirmation.is_some()
-                && self.completed_resume_at.is_none()
-                && opencode::is_successful_terminal_event(event)
-            {
-                self.completed_resume_at = Some(Instant::now());
-            }
             self.last_opencode_event = Some(event.clone());
         }
+    }
+
+    fn record_parser_errors(&mut self) {
+        self.integrity_failures.extend(
+            self.parser
+                .take_errors()
+                .into_iter()
+                .map(|error| format!("native event parse failed: {error}")),
+        );
     }
 
     fn completed_resume_grace_elapsed(&self) -> bool {
@@ -978,10 +1142,23 @@ impl LaunchState {
         let Some(next_probe) = self.next_resume_completion_probe else {
             return;
         };
-        if self.completed_resume_at.is_some() || Instant::now() < next_probe {
+        if self.completed_resume_at.is_some()
+            || self.resume_completion_probes >= MAX_RESUME_COMPLETION_PROBES
+            || Instant::now() < next_probe
+        {
             return;
         }
         self.next_resume_completion_probe = Some(Instant::now() + RESUME_COMPLETION_PROBE_INTERVAL);
+        self.probe_completed_resume_now();
+    }
+
+    fn probe_completed_resume_now(&mut self) {
+        if self.completed_resume_at.is_some()
+            || self.resume_completion_probes >= MAX_RESUME_COMPLETION_PROBES
+        {
+            return;
+        }
+        self.resume_completion_probes += 1;
         let Some(confirmation) = self.resume_confirmation.as_ref() else {
             return;
         };
@@ -1016,8 +1193,10 @@ impl LaunchState {
 
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
         self.capture_session_from_parser_tail(writer)?;
+        self.probe_completed_resume_now();
         self.confirm_submitted_user_turn(writer)?;
         self.confirm_produced_assistant_response(writer)?;
+        self.emit_integrity_evidence(writer)?;
         let status = self.finished_status();
         let signal = self.terminal_signal_for(&status);
         let event = self.exit_event(&status, signal);
@@ -1051,7 +1230,11 @@ impl LaunchState {
     }
 
     fn finished_status(&self) -> ProcessStatus {
-        self.final_status.clone().unwrap_or(ProcessStatus::Unknown)
+        let status = self.final_status.clone().unwrap_or(ProcessStatus::Unknown);
+        if is_clean_exit_status(&status) && !self.integrity_failures.is_empty() {
+            return ProcessStatus::Unknown;
+        }
+        status
     }
 
     fn terminal_signal_for(&self, status: &ProcessStatus) -> Value {
@@ -1084,7 +1267,7 @@ impl LaunchState {
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
         assign_event_seq(&mut event, self.seq);
-        write_ndjson_event(writer, &event)?;
+        write_ndjson_event(&self.request_id, writer, &event)?;
         self.advance_seq();
         Ok(())
     }
@@ -1117,6 +1300,62 @@ impl LaunchState {
 
     fn is_complete(&self) -> bool {
         self.final_status.is_some() && self.stdout_done && self.stderr_done
+    }
+
+    fn drains_done(&self) -> bool {
+        self.stdout_done && self.stderr_done
+    }
+
+    fn record_child_exit(&mut self, status: ProcessStatus) {
+        self.final_status = Some(status);
+        self.child_exit_at.get_or_insert_with(Instant::now);
+    }
+
+    fn record_forced_exit(&mut self, status: ProcessStatus) {
+        self.forced_exit_status = Some(status.clone());
+        self.record_child_exit(status);
+    }
+
+    fn child_exit_grace_elapsed(&self) -> bool {
+        self.child_exit_at
+            .is_some_and(|exited_at| exited_at.elapsed() >= DRAIN_COMPLETION_GRACE)
+    }
+
+    fn emit_route_evidence<W: Write>(&mut self, writer: &mut W) -> Result<(), ProviderFailure> {
+        self.marker_with_value(
+            "oulipoly.launch_route".to_string(),
+            self.route_evidence.clone(),
+            writer,
+        )
+    }
+
+    fn emit_integrity_evidence<W: Write>(&mut self, writer: &mut W) -> Result<(), ProviderFailure> {
+        if self.stdout_truncated || self.stderr_truncated {
+            self.marker_with_value(
+                "oulipoly.terminal_capture_truncated".to_string(),
+                json!({
+                    "stdout": self.stdout_truncated,
+                    "stderr": self.stderr_truncated,
+                    "retained_tail_bytes_per_stream": TERMINAL_CAPTURE_LIMIT,
+                }),
+                writer,
+            )?;
+        }
+        if !self.integrity_failures.is_empty() {
+            self.marker_with_value(
+                "oulipoly.launch_evidence_loss".to_string(),
+                json!({ "failures": self.integrity_failures.clone() }),
+                writer,
+            )?;
+        }
+        if let Some(status) = self.forced_exit_status.as_ref() {
+            self.marker_with_value(
+                "oulipoly.response_cleanup_process_status".to_string(),
+                process_status_json(status),
+                writer,
+            )?;
+        }
+        Ok(())
     }
 
     fn mark_drains_done(&mut self) {
@@ -1185,6 +1424,7 @@ fn completed_assistant_message(
 ) -> bool {
     message.info.role == "assistant"
         && message.info.session_id.as_deref() == Some(confirmation.session_id.as_str())
+        && message_model_matches_confirmation(message, confirmation)
         && message
             .info
             .time
@@ -1193,8 +1433,28 @@ fn completed_assistant_message(
 }
 
 fn export_for_resume_confirmation(confirmation: &ResumeConfirmation) -> Option<OpencodeExport> {
-    let account = profile_for_settings_id(&confirmation.settings_id)?;
-    opencode::export(&confirmation.session_id, account).ok()
+    let account = profile_for_wrapper_command(&confirmation.account_wrapper)?;
+    let timeout = remaining_resume_export_timeout(confirmation)?;
+    opencode::export_with_timeout(&confirmation.session_id, account, timeout).ok()
+}
+
+fn remaining_resume_export_timeout(confirmation: &ResumeConfirmation) -> Option<Duration> {
+    let Some(deadline) = confirmation.deadline_unix_ms else {
+        return Some(RESUME_EXPORT_TIMEOUT);
+    };
+    let remaining_ms = deadline.saturating_sub(now_unix_ms());
+    (remaining_ms > 0)
+        .then(|| Duration::from_millis(remaining_ms.min(RESUME_EXPORT_TIMEOUT.as_millis() as u64)))
+}
+
+fn message_model_matches_confirmation(
+    message: &OpencodeMessage,
+    confirmation: &ResumeConfirmation,
+) -> bool {
+    let (provider_id, model_id, variant) = message.info.model_identity();
+    provider_id == Some(confirmation.provider_id.as_str())
+        && model_id == Some(confirmation.model_id.as_str())
+        && variant == Some(confirmation.variant.as_str())
 }
 
 fn export_session_matches_confirmation(
@@ -1249,6 +1509,7 @@ fn submitted_user_message_matches(
 ) -> bool {
     message.info.role.as_str() == "user"
         && message.info.session_id.as_deref() == Some(confirmation.session_id.as_str())
+        && message_model_matches_confirmation(message, confirmation)
         && message_confirms_resume_payload(message, confirmation)
 }
 
@@ -1547,22 +1808,34 @@ fn assign_event_seq(event: &mut Value, seq: u64) {
     event["seq"] = json!(seq);
 }
 
-fn write_ndjson_event<W: Write>(writer: &mut W, event: &Value) -> Result<(), ProviderFailure> {
-    write_json_event(writer, event)?;
-    write_event_newline(writer)?;
-    flush_event_writer(writer)
+fn write_ndjson_event<W: Write>(
+    request_id: &str,
+    writer: &mut W,
+    event: &Value,
+) -> Result<(), ProviderFailure> {
+    write_json_event(request_id, writer, event)?;
+    write_event_newline(request_id, writer)?;
+    flush_event_writer(request_id, writer)
 }
 
-fn write_json_event<W: Write>(writer: &mut W, event: &Value) -> Result<(), ProviderFailure> {
-    serde_json::to_writer(writer, event).map_err(json_write_failure)
+fn write_json_event<W: Write>(
+    request_id: &str,
+    writer: &mut W,
+    event: &Value,
+) -> Result<(), ProviderFailure> {
+    serde_json::to_writer(writer, event).map_err(|error| json_write_failure(request_id, error))
 }
 
-fn write_event_newline<W: Write>(writer: &mut W) -> Result<(), ProviderFailure> {
-    writer.write_all(b"\n").map_err(write_failure)
+fn write_event_newline<W: Write>(request_id: &str, writer: &mut W) -> Result<(), ProviderFailure> {
+    writer
+        .write_all(b"\n")
+        .map_err(|error| write_failure(request_id, error))
 }
 
-fn flush_event_writer<W: Write>(writer: &mut W) -> Result<(), ProviderFailure> {
-    writer.flush().map_err(write_failure)
+fn flush_event_writer<W: Write>(request_id: &str, writer: &mut W) -> Result<(), ProviderFailure> {
+    writer
+        .flush()
+        .map_err(|error| write_failure(request_id, error))
 }
 
 fn drain_bytes_message(stdout: bool, bytes: Vec<u8>) -> DrainMessage {
@@ -1724,25 +1997,25 @@ fn signal_status(_status: ExitStatus) -> ProcessStatus {
     ProcessStatus::Unknown
 }
 
-fn spawn_failure(context: &'static str, err: std::io::Error) -> ProviderFailure {
+fn spawn_failure(request_id: &str, context: &'static str, err: std::io::Error) -> ProviderFailure {
     ProviderFailure::internal(
-        "req-launch",
+        request_id,
         "launch_supervision_error",
         format!("{context} failed while supervising opencode: {err}"),
     )
 }
 
-fn write_failure(err: std::io::Error) -> ProviderFailure {
+fn write_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
     ProviderFailure::internal(
-        "req-launch",
+        request_id,
         "launch_write_error",
         format!("failed to write launch event: {err}"),
     )
 }
 
-fn json_write_failure(err: serde_json::Error) -> ProviderFailure {
+fn json_write_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
     ProviderFailure::internal(
-        "req-launch",
+        request_id,
         "launch_write_error",
         format!("failed to write launch event: {err}"),
     )
@@ -1773,23 +2046,17 @@ fn process_group_setup_failed(result: i32) -> bool {
 fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn terminate_child(child: &mut Child) {
+fn terminate_child(child: &mut Child) -> Option<ExitStatus> {
     let pgid = child_process_group_id(child);
     send_process_group_signal(pgid, SIGTERM);
     std::thread::sleep(TERMINATION_GRACE);
-    if child_still_running(child) {
-        send_process_group_signal(pgid, SIGKILL);
-    }
+    send_process_group_signal(pgid, SIGKILL);
+    child.wait().ok()
 }
 
 #[cfg(unix)]
 fn child_process_group_id(child: &Child) -> i32 {
     -(child.id() as i32)
-}
-
-#[cfg(unix)]
-fn child_still_running(child: &mut Child) -> bool {
-    child.try_wait().ok().flatten().is_none()
 }
 
 #[cfg(unix)]
@@ -1800,8 +2067,9 @@ fn send_process_group_signal(pgid: i32, signal: i32) {
 }
 
 #[cfg(not(unix))]
-fn terminate_child(child: &mut Child) {
+fn terminate_child(child: &mut Child) -> Option<ExitStatus> {
     let _ = child.kill();
+    child.wait().ok()
 }
 
 #[cfg(unix)]

@@ -16,10 +16,13 @@ use serde_json::Value;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 #[derive(Default)]
 pub struct EventParser {
     pending: Vec<u8>,
+    errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -70,6 +73,8 @@ pub struct OpencodeExportInfo {
     pub id: String,
     pub title: Option<String>,
     pub directory: Option<String>,
+    #[serde(default)]
+    pub model: Option<OpencodeModelIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -86,6 +91,42 @@ pub struct OpencodeMessageInfo {
     #[serde(rename = "sessionID")]
     pub session_id: Option<String>,
     pub time: Option<OpencodeMessageTime>,
+    #[serde(default)]
+    pub model: Option<OpencodeModelIdentity>,
+    #[serde(rename = "modelID")]
+    pub model_id: Option<String>,
+    #[serde(rename = "providerID")]
+    pub provider_id: Option<String>,
+    pub variant: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OpencodeModelIdentity {
+    #[serde(alias = "modelID")]
+    pub id: Option<String>,
+    #[serde(rename = "providerID")]
+    pub provider_id: Option<String>,
+    pub variant: Option<String>,
+}
+
+impl OpencodeMessageInfo {
+    pub fn model_identity(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
+        (
+            self.provider_id.as_deref().or_else(|| {
+                self.model
+                    .as_ref()
+                    .and_then(|model| model.provider_id.as_deref())
+            }),
+            self.model_id
+                .as_deref()
+                .or_else(|| self.model.as_ref().and_then(|model| model.id.as_deref())),
+            self.variant.as_deref().or_else(|| {
+                self.model
+                    .as_ref()
+                    .and_then(|model| model.variant.as_deref())
+            }),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -105,6 +146,7 @@ pub enum OpencodeExportError {
     Spawn(String),
     Failed { status: Option<i32>, stderr: String },
     InvalidJson(String),
+    TimedOut,
 }
 
 #[derive(Debug)]
@@ -125,7 +167,7 @@ impl EventParser {
     pub fn ingest(&mut self, bytes: &[u8]) -> Vec<OpencodeEventMetadata> {
         self.pending.extend_from_slice(bytes);
         let lines = drain_complete_lines(&mut self.pending);
-        parse_event_lines(&lines)
+        self.parse_lines(&lines)
     }
 
     pub fn finish(&mut self) -> Vec<OpencodeEventMetadata> {
@@ -133,7 +175,28 @@ impl EventParser {
             return Vec::new();
         }
         let line = std::mem::take(&mut self.pending);
-        parse_event_line(&line).into_iter().collect()
+        self.parse_lines(&[line])
+    }
+
+    pub fn take_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.errors)
+    }
+
+    fn parse_lines(&mut self, lines: &[Vec<u8>]) -> Vec<OpencodeEventMetadata> {
+        lines
+            .iter()
+            .filter_map(
+                |line| match serde_json::from_slice::<OpencodeEventMetadata>(line) {
+                    Ok(event) => pinned_native_event(event),
+                    Err(error) => {
+                        if self.errors.len() < 4 {
+                            self.errors.push(error.to_string());
+                        }
+                        None
+                    }
+                },
+            )
+            .collect()
     }
 }
 
@@ -154,14 +217,33 @@ pub fn export(
     session_id: &str,
     account: &AccountProfile,
 ) -> Result<OpencodeExport, OpencodeExportError> {
+    export_with_timeout(session_id, account, Duration::from_secs(20))
+}
+
+pub fn export_with_timeout(
+    session_id: &str,
+    account: &AccountProfile,
+    timeout: Duration,
+) -> Result<OpencodeExport, OpencodeExportError> {
     let mut stdout = tempfile::tempfile().map_err(export_capture_error)?;
     let stdout_writer = stdout.try_clone().map_err(export_capture_error)?;
-    let output = shell::command(account.opencode_wrapper)
+    let mut command = shell::command(account.opencode_wrapper);
+    command
         .arg("export")
         .arg(session_id)
         .stdout(Stdio::from(stdout_writer))
-        .output()
-        .map_err(export_spawn_error)?;
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(export_spawn_error)?;
+    let completed = child
+        .wait_timeout(timeout)
+        .map_err(export_spawn_error)?
+        .is_some();
+    if !completed {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(OpencodeExportError::TimedOut);
+    }
+    let output = child.wait_with_output().map_err(export_spawn_error)?;
     validate_export_status(&output)?;
     stdout
         .seek(SeekFrom::Start(0))
@@ -247,11 +329,6 @@ fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
     non_empty_lines(&drained)
 }
 
-fn parse_event_line(line: &[u8]) -> Option<OpencodeEventMetadata> {
-    let event = parse_native_event(line)?;
-    pinned_native_event(event)
-}
-
 fn is_pinned_native_event(event: &OpencodeEventMetadata) -> bool {
     is_pinned_part_event(event) || is_structured_error_event(event)
 }
@@ -261,24 +338,6 @@ fn is_pinned_part_event(event: &OpencodeEventMetadata) -> bool {
         event.event_type.as_str(),
         "step_start" | "text" | "step_finish"
     ) && event.part.is_object()
-}
-
-fn parse_event_lines(lines: &[Vec<u8>]) -> Vec<OpencodeEventMetadata> {
-    let parsed = parse_native_event_lines(lines);
-    let parsed = valid_native_events(parsed);
-    pinned_native_events(parsed)
-}
-
-fn parse_native_event_lines(lines: &[Vec<u8>]) -> Vec<Option<OpencodeEventMetadata>> {
-    lines.iter().map(|line| parse_native_event(line)).collect()
-}
-
-fn valid_native_events(events: Vec<Option<OpencodeEventMetadata>>) -> Vec<OpencodeEventMetadata> {
-    events.into_iter().flatten().collect()
-}
-
-fn pinned_native_events(events: Vec<OpencodeEventMetadata>) -> Vec<OpencodeEventMetadata> {
-    events.into_iter().filter(is_pinned_native_event).collect()
 }
 
 fn export_spawn_error(err: std::io::Error) -> OpencodeExportError {
@@ -405,10 +464,6 @@ fn is_non_empty_line(line: &[u8]) -> bool {
 
 fn owned_byte_lines(lines: Vec<&[u8]>) -> Vec<Vec<u8>> {
     lines.into_iter().map(Vec::from).collect()
-}
-
-fn parse_native_event(line: &[u8]) -> Option<OpencodeEventMetadata> {
-    serde_json::from_slice(line).ok()
 }
 
 fn pinned_native_event(event: OpencodeEventMetadata) -> Option<OpencodeEventMetadata> {

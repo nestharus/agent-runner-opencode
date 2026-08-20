@@ -1,6 +1,6 @@
 //! Declared roles: orchestration, parser, mapper, validator, formatter
 //! adapter_declarations:
-//!   - component: src/codex.rs
+//!   - component: src/quota_adapter.rs
 //!     role: adapter
 //!     Translates:
 //!       - chatgpt-usage rolling-window stdout JSON
@@ -83,7 +83,7 @@ fn parse_auth_json(raw: &[u8]) -> Result<Value, serde_json::Error> {
 }
 
 fn auth_tokens_from_json(parsed: &Value) -> Option<AuthTokens> {
-    codex_auth_tokens(parsed).or_else(|| opencode_auth_tokens(parsed))
+    opencode_auth_tokens(parsed)
 }
 
 fn required_auth_tokens(tokens: Option<AuthTokens>) -> Result<AuthTokens, String> {
@@ -100,13 +100,6 @@ fn auth_file_json_error(err: serde_json::Error) -> String {
 
 fn missing_auth_tokens_error() -> String {
     "missing ChatGPT access token or account id in auth file".to_string()
-}
-
-fn codex_auth_tokens(parsed: &Value) -> Option<AuthTokens> {
-    auth_tokens(
-        parsed.pointer("/tokens/access_token")?.as_str()?,
-        parsed.pointer("/tokens/account_id")?.as_str()?,
-    )
 }
 
 fn opencode_auth_tokens(parsed: &Value) -> Option<AuthTokens> {
@@ -294,8 +287,9 @@ fn usage_windows_result(parsed: &Value) -> Value {
 fn usage_window(parsed: &Value, name: &str) -> Option<Value> {
     let window = parsed.pointer(&format!("/rate_limit/{name}"))?;
     let reset_at = window.get("reset_at")?.as_i64()?;
+    let used_percent = window.get("used_percent")?.as_f64()?;
     Some(serde_json::json!({
-        "used_percent": window.get("used_percent").and_then(Value::as_f64).unwrap_or(0.0),
+        "used_percent": used_percent,
         "resets_at": unix_seconds_to_rfc3339(reset_at)?,
     }))
 }

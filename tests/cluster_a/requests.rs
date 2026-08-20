@@ -6,11 +6,28 @@ use agent_runner_opencode::encoding::sha256_hex;
 use super::*;
 
 pub fn launch_params(effort: &str) -> Value {
+    let alias = format!("gpt-{effort}");
+    launch_params_for_model(
+        "opencode1",
+        "opencode1",
+        &alias,
+        "openai/gpt-5.6-sol",
+        effort,
+    )
+}
+
+pub fn launch_params_for_model(
+    settings_id: &str,
+    command: &str,
+    alias: &str,
+    provider_model: &str,
+    effort: &str,
+) -> Value {
     json!({
-        "settings_id": "opencode1",
+        "settings_id": settings_id,
         "mode": "agent",
-        "model": model_request(effort),
-        "argv": host_candidate_argv(effort),
+        "model": model_request_for(alias, provider_model, effort),
+        "argv": host_candidate_argv_for_model(command, provider_model, effort),
         "working_directory": env!("CARGO_MANIFEST_DIR")
     })
 }
@@ -54,7 +71,10 @@ pub fn launch_params_with_argv_and_prompt_env(
 
 pub fn resume_launch_params_with_arg_payload() -> Value {
     let mut params = launch_params("low");
-    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["session"] = json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
     *params["argv"]
         .as_array_mut()
         .expect("launch argv")
@@ -70,7 +90,10 @@ pub fn resume_launch_params_with_arg_payload_env(path: &str, log_path: &str) -> 
 
 pub fn resume_launch_params_with_prompt_env(prompt: &str, path: &str, log_path: &str) -> Value {
     let mut params = launch_params_with_prompt(prompt);
-    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["session"] = json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
     launch_params_with_wrapper_env(params, path, log_path)
 }
 
@@ -86,7 +109,10 @@ pub fn resume_launch_params_with_arg_payload_prompt_env(
 
 pub fn resume_launch_params_with_stdin_payload() -> Value {
     let mut params = launch_params("low");
-    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["session"] = json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
     params["argv"].as_array_mut().expect("launch argv").pop();
     params["stdin"] = json!({
         "encoding": "utf8",
@@ -102,7 +128,10 @@ pub fn resume_launch_params_with_stdin_payload_env(path: &str, log_path: &str) -
 
 pub fn resume_launch_params_without_payload() -> Value {
     let mut params = launch_params("low");
-    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["session"] = json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
     params["argv"].as_array_mut().expect("launch argv").pop();
     params["model"]["inputs"]["prompt"] = json!("");
     params
@@ -148,6 +177,10 @@ pub fn policy_evaluate_params_for_model(alias: &str, provider_model: &str, effor
 
 pub fn policy_evaluate_luna_max_params() -> Value {
     policy_evaluate_params_for_model("gpt-luna-max", "openai/gpt-5.6-luna", "max")
+}
+
+pub fn policy_evaluate_luna_low_params() -> Value {
+    policy_evaluate_params_for_model("gpt-luna-low", "openai/gpt-5.6-luna", "low")
 }
 
 pub fn policy_evaluate_model_mismatch_params() -> Value {
@@ -237,8 +270,7 @@ pub fn forbidden_policy_evaluate_params(forbidden_flag: &str, forbidden_env_key:
 }
 
 pub fn policy_evaluate_params_with_env(settings_id: &str, env: &[(&str, &str)]) -> Value {
-    let mut params = policy_evaluate_params();
-    params["settings_id"] = json!(settings_id);
+    let mut params = policy_evaluate_params_for_account_host_candidate(settings_id);
     params["launch"]["env"] = env
         .iter()
         .map(|(key, value)| (key.to_string(), json!(value)))
@@ -278,6 +310,49 @@ pub fn launch_params_with_env(effort: &str, env: &[(&str, &str)]) -> Value {
     params
 }
 
+pub fn launch_luna_max_params_with_env(path: &str, log_path: &str) -> Value {
+    let params = launch_params_for_model(
+        "opencode1",
+        "opencode1",
+        "gpt-luna-max",
+        "openai/gpt-5.6-luna",
+        "max",
+    );
+    launch_params_with_wrapper_env(params, path, log_path)
+}
+
+pub fn launch_luna_low_params_with_env(path: &str, log_path: &str) -> Value {
+    let params = launch_params_for_model(
+        "opencode1",
+        "opencode1",
+        "gpt-luna-low",
+        "openai/gpt-5.6-luna",
+        "low",
+    );
+    launch_params_with_wrapper_env(params, path, log_path)
+}
+
+pub fn live_luna_low_launch_params(path: &str, home: &str) -> Value {
+    let mut params = launch_params_for_model(
+        "opencode5",
+        "opencode5",
+        "gpt-luna-low",
+        "openai/gpt-5.6-luna",
+        "low",
+    );
+    params["env"] = json!({ "PATH": path, "HOME": home });
+    params
+}
+
+pub fn launch_create_session_params_with_env(path: &str, log_path: &str) -> Value {
+    let mut params = launch_params_with_wrapper_env(launch_params("low"), path, log_path);
+    params["session"] = json!({
+        "known_provider_session_id": "ses_caller_selected_create",
+        "start_mode": "create"
+    });
+    params
+}
+
 pub fn launch_params_with_wrapper_env(mut params: Value, path: &str, log_path: &str) -> Value {
     params["env"] = wrapper_env(path, log_path);
     params
@@ -288,10 +363,6 @@ pub fn wrapper_env(path: &str, log_path: &str) -> Value {
         "PATH": path,
         "AGENT_RUNNER_OPENCODE_WRAPPER_LOG": log_path
     })
-}
-
-pub fn model_request(effort: &str) -> Value {
-    model_request_for(&format!("gpt-{effort}"), "openai/gpt-5.6-sol", effort)
 }
 
 pub fn model_request_for(alias: &str, provider_model: &str, effort: &str) -> Value {

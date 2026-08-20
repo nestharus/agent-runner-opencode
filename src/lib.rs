@@ -1,7 +1,7 @@
 //! Declared roles: accessor
 
 pub mod account;
-pub mod codex;
+pub mod activity;
 pub mod discovery;
 pub mod dispatch;
 pub mod encoding;
@@ -12,6 +12,7 @@ pub mod models;
 pub mod opencode;
 pub mod policy;
 pub mod quota;
+pub mod quota_adapter;
 pub mod rotation;
 pub mod schema;
 pub mod session;

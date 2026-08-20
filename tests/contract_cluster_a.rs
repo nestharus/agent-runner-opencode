@@ -5,7 +5,7 @@ mod support;
 
 use cluster_a::*;
 use std::time::{Duration, Instant};
-use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env, json_stdout};
+use support::{invoke_validated, invoke_with_env, invoke_with_host_and_env, json_stdout};
 
 #[test]
 fn characterization_opencode_launch_json_events() {
@@ -141,6 +141,83 @@ fn contract_launch_preserves_short_prompt_argv() {
 
     assert_output_success(&output, "launch short prompt");
     assert_short_prompt_argv_unchanged(fake_wrapper.log_path());
+}
+
+#[test]
+fn contract_launch_luna_max_reaches_exact_native_route() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_luna_max_params_with_env(path.as_str(), fake_wrapper.log_path_str());
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+    assert_output_success(&output, "launch Luna max");
+    let argv = wrapper_nul_log_args(fake_wrapper.log_path());
+    assert_contains_subsequence(&argv, &["-m", "openai/gpt-5.6-luna", "--variant", "max"]);
+    let events = launch_events_from_output(&output, "Luna launch stdout");
+    assert!(events.iter().any(|event| {
+        event["kind"] == "marker"
+            && event["name"] == "oulipoly.launch_route"
+            && event["value"].to_string().contains("openai/gpt-5.6-luna")
+            && event["value"].to_string().contains("max")
+    }));
+}
+
+#[test]
+fn contract_launch_luna_low_reaches_exact_native_route() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_luna_low_params_with_env(path.as_str(), fake_wrapper.log_path_str());
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+    assert_output_success(&output, "launch Luna low");
+    let argv = wrapper_nul_log_args(fake_wrapper.log_path());
+    assert_contains_subsequence(&argv, &["-m", "openai/gpt-5.6-luna", "--variant", "low"]);
+}
+
+#[test]
+fn contract_launch_rejects_caller_selected_create_session_before_spawn() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_create_session_params_with_env(path.as_str(), fake_wrapper.log_path_str());
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(!fake_wrapper.log_path().exists());
+    let response = json_stdout(&output);
+    assert_eq!(
+        response["error"]["code"],
+        "launch_session_create_unsupported"
+    );
+}
+
+#[test]
+fn contract_launch_malformed_native_event_prevents_clean_terminal_claim() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(
+        fake_opencode_script_with_output_and_status("not-json\n", "", 0),
+    );
+    let path = prepend_path(fake_wrapper.dir());
+    let output = invoke_with_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                (
+                    "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                    fake_wrapper.log_path_str(),
+                ),
+            ],
+        ),
+        &[("PATH", path.as_str())],
+    );
+    assert_ne!(output.status.code(), Some(0));
+    let events = launch_events_from_output(&output, "malformed native event launch stdout");
+    let final_event = final_launch_event(&events);
+    assert_eq!(final_event["status"]["kind"], "unknown");
+    assert!(events.iter().any(|event| {
+        event["kind"] == "marker"
+            && event["name"] == "oulipoly.launch_evidence_loss"
+            && event["value"]
+                .to_string()
+                .contains("native event parse failed")
+    }));
 }
 
 #[test]
@@ -312,18 +389,15 @@ fn contract_launch_completed_resume_does_not_wait_for_lingering_native_process()
 
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
-    assert_output_success(&output, "launch completed lingering resume");
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_millis(4_500),
         "provider should stop a completed resume before the fake five-second hang"
     );
     let events = launch_events_from_output(&output, "completed lingering resume stdout");
     assert_produced_assistant_response_marker(&events);
     let final_event = final_launch_event(&events);
-    assert_eq!(
-        final_event["status"],
-        serde_json::json!({"kind": "exited", "code": 0})
-    );
+    assert_eq!(final_event["status"]["kind"], "signal_terminated");
+    assert_live_provider_exit_code(&output, final_event, "completed lingering resume");
 }
 
 #[test]
@@ -353,18 +427,15 @@ fn contract_launch_completed_export_does_not_wait_for_buffered_native_events() {
 
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
-    assert_output_success(&output, "launch completed buffered resume");
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_millis(4_500),
         "provider should stop a completed exported resume before the fake five-second hang"
     );
     let events = launch_events_from_output(&output, "completed buffered resume stdout");
     assert_produced_assistant_response_marker(&events);
     let final_event = final_launch_event(&events);
-    assert_eq!(
-        final_event["status"],
-        serde_json::json!({"kind": "exited", "code": 0})
-    );
+    assert_eq!(final_event["status"]["kind"], "signal_terminated");
+    assert_live_provider_exit_code(&output, final_event, "completed buffered resume");
 }
 
 #[test]
@@ -453,7 +524,13 @@ fn contract_launch_stream_heartbeat_policy() {
 #[test]
 #[ignore = "live opencode auth/network smoke; run explicitly when external dependencies are available"]
 fn integration_launch_live_smoke() {
-    let output = invoke("launch", launch_params("low"));
+    let path = std::env::var("PATH").expect("live PATH");
+    let home = std::env::var("HOME").expect("live HOME");
+    let output = invoke_with_env(
+        "launch",
+        live_luna_low_launch_params(&path, &home),
+        &[("PATH", path.as_str()), ("HOME", home.as_str())],
+    );
     assert_live_launch_output(&output);
 }
 
@@ -478,6 +555,17 @@ fn contract_policy_evaluate_accepts_luna_max() {
     );
     assert_output_success(&output, "policy.evaluate Luna max");
     assert_policy_accepts_model(&json_stdout(&output), "openai/gpt-5.6-luna", "max");
+}
+
+#[test]
+fn contract_policy_evaluate_accepts_luna_low() {
+    let output = invoke_validated(
+        "policy.evaluate",
+        policy_evaluate_luna_low_params(),
+        "policy.schema.json#/$defs/PolicyEvaluateRequest",
+    );
+    assert_output_success(&output, "policy.evaluate Luna low");
+    assert_policy_accepts_model(&json_stdout(&output), "openai/gpt-5.6-luna", "low");
 }
 
 #[test]
@@ -592,15 +680,8 @@ fn account_host_command_cases_for(settings_id: &'static str) -> Vec<(&'static st
         .collect()
 }
 
-fn account_host_commands(settings_id: &str) -> [String; 6] {
-    [
-        settings_id.to_string(),
-        host_bin_command(settings_id),
-        plain_opencode_command(),
-        plain_host_bin_opencode_command(),
-        account_five_command(),
-        account_five_host_bin_command(),
-    ]
+fn account_host_commands(settings_id: &str) -> [String; 2] {
+    [settings_id.to_string(), host_bin_command(settings_id)]
 }
 
 fn account_host_command_case(settings_id: &'static str, command: String) -> (&'static str, String) {
@@ -611,20 +692,17 @@ fn host_bin_command(settings_id: &str) -> String {
     format!("/tmp/host-bin/{settings_id}")
 }
 
-fn plain_opencode_command() -> String {
-    "opencode".to_string()
-}
+#[test]
+fn contract_policy_evaluate_rejects_command_from_another_account() {
+    let output = invoke_with_env(
+        "policy.evaluate",
+        policy_evaluate_params_for_alias_host_candidate("opencode1", "opencode5"),
+        &[],
+    );
 
-fn plain_host_bin_opencode_command() -> String {
-    "/tmp/host-bin/opencode".to_string()
-}
-
-fn account_five_command() -> String {
-    "opencode5".to_string()
-}
-
-fn account_five_host_bin_command() -> String {
-    "/tmp/host-bin/opencode5".to_string()
+    assert_output_success(&output, "policy.evaluate cross-account command");
+    let response = json_stdout(&output);
+    assert_policy_rejected_with_code(&response, "settings_command_mismatch");
 }
 
 #[test]

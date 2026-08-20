@@ -9,7 +9,7 @@ use serde_json::json;
 use support::{invoke_with_env, invoke_with_host_and_env, json_stdout};
 
 #[test]
-fn characterization_codex_chatgpt_usage_windows() {
+fn characterization_chatgpt_usage_windows() {
     let windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
         .expect("captured chatgpt-usage fixture should parse");
     assert_usage_windows_fixture(&windows);
@@ -215,6 +215,27 @@ fn contract_quota_probe() {
 }
 
 #[test]
+fn contract_quota_probe_uses_native_opencode_auth_adapter_by_default() {
+    let raw_windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
+        .expect("captured usage fixture should parse");
+    let home = HomeFixture::new("agent-runner-opencode-native-quota-home");
+    home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
+    let curl = FakeNativeCurl::new();
+    let path = curl.path_env();
+    let result = success_result(
+        invoke_with_env(
+            "quota.probe",
+            quota_base_params(),
+            &[("HOME", home.path_str()), ("PATH", path.as_str())],
+        ),
+        "quota.schema.json#/$defs/QuotaProbeResponse",
+        "quota.schema.json#/$defs/QuotaProbeResult",
+    );
+    assert_available_probe_result(&result, &raw_windows);
+    curl.assert_native_invocation();
+}
+
+#[test]
 fn contract_quota_probe_refreshes_native_auth_on_401_then_retries() {
     let raw_windows = parse_chatgpt_usage_windows(CHATGPT_USAGE_WINDOWS_RAW)
         .expect("captured chatgpt-usage fixture should parse");
@@ -276,8 +297,27 @@ fn contract_quota_refresh_auth() {
 #[test]
 #[ignore]
 fn integration_quota_probe_live() {
-    let output = invoke_with_host_and_env("quota.probe", quota_base_params(), json!({}), &[]);
+    let path = std::env::var("PATH").expect("live PATH");
+    let home = std::env::var("HOME").expect("live HOME");
+    let output = invoke_with_host_and_env(
+        "quota.probe",
+        quota_base_params(),
+        json!({}),
+        &[("PATH", path.as_str()), ("HOME", home.as_str())],
+    );
+    assert!(
+        output.status.success(),
+        "live quota provider process failed"
+    );
     let response = json_stdout(&output);
     assert_quota_probe_response(&response);
     assert_live_probe_result(&response["result"]);
+    assert_eq!(response["result"]["available"], true, "{response}");
+    assert!(
+        !response["result"]["windows"]
+            .as_array()
+            .expect("live quota windows")
+            .is_empty(),
+        "{response}"
+    );
 }

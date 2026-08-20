@@ -2,7 +2,7 @@
 
 use crate::account::{AccountProfile, ACCOUNTS};
 use crate::envelope::{ProviderFailure, CONTRACT};
-use crate::models::{alias_names, DEFAULT_MODEL_ALIAS};
+use crate::models::{ModelAlias, DEFAULT_MODEL_ALIAS, MODEL_ALIASES};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -31,7 +31,7 @@ pub fn validate_schema_id(request_id: &str, schema_id: &str) -> Result<(), Provi
 pub fn describe_result() -> Value {
     json!({
         "provider_id": "opencode",
-        "display_name": "OpenCode Codex Hybrid",
+        "display_name": "OpenCode",
         "contract_versions": [CONTRACT],
         "preferred_contract": CONTRACT,
         "capabilities": {
@@ -51,10 +51,10 @@ pub fn describe_result() -> Value {
         "settings_schema_id": SETTINGS_SCHEMA_ID,
         "concurrency": {
             "safe_for_parallel_invocation": true,
-            "state_locking": "atomic_file_writes_and_provider_cli_owned_state",
+            "state_locking": "interprocess_locked_atomic_file_transactions",
             "settings_version_tokens": true,
             "stdout_protocol_only": true,
-            "notes": "This provider is one-shot and daemonless; auth and quota attribution are owned by paired codex auth paths.",
+            "notes": "This provider is one-shot and daemonless; each account's native OpenCode auth path owns quota probing and refresh attribution.",
         },
     })
 }
@@ -63,66 +63,30 @@ pub fn opencode_settings_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": SETTINGS_SCHEMA_URI,
-        "title": "OpenCode Hybrid Provider Settings",
+        "title": "OpenCode Provider Settings",
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "id": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Stable provider settings identifier."
+            "provider": {
+                "const": "opencode",
+                "default": "opencode"
             },
-            "display_name": {
+            "profile": {
                 "type": "string",
-                "minLength": 1
+                "enum": account_values(account_wrapper),
+                "default": default_account_value(account_wrapper)
             },
-            "account": {
+            "wrapper": {
                 "type": "string",
                 "enum": account_values(account_wrapper),
                 "default": default_account_value(account_wrapper),
-                "description": "Pinned OpenCode wrapper profile; quota and auth are attributed through the paired codex auth path."
-            },
-            "opencode_wrapper": {
-                "type": "string",
-                "enum": account_values(account_wrapper),
-                "description": "Resolved wrapper command for the selected account."
-            },
-            "opencode_index": {
-                "type": "integer",
-                "minimum": account_index_min(),
-                "maximum": account_index_max(),
-                "description": "Resolved one-based wrapper index for the selected account."
-            },
-            "codex_auth_path": {
-                "type": "string",
-                "enum": account_values(codex_auth_path),
-                "description": "Paired codex auth path used for quota attribution."
-            },
-            "codex_account_tag": {
-                "type": "string",
-                "enum": account_values(codex_account_tag),
-                "description": "Human-readable tag for the paired codex account."
-            },
-            "codex_account_hash": {
-                "type": "string",
-                "enum": account_values(codex_account_hash),
-                "description": "Stable short fingerprint for the paired codex account."
+                "description": "Canonical account wrapper consumed by policy, launch, session, rotation, and quota."
             },
             "model": {
-                "type": "string",
-                "enum": alias_names(),
-                "default": DEFAULT_MODEL_ALIAS,
-                "description": "Provider-owned alias mapped to an exact OpenCode model and reasoning-effort variant."
-            },
-            "working_directory": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Launch working directory."
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["interactive", "non_interactive"],
-                "default": "non_interactive"
+                "type": "object",
+                "oneOf": model_schema_variants(),
+                "default": default_model_schema_value(),
+                "description": "One exact provider-owned alias, OpenCode model, and effort tuple."
             },
             "launch": {
                 "type": "object",
@@ -131,22 +95,28 @@ pub fn opencode_settings_schema() -> Value {
                     "dangerously_skip_permissions": { "type": "boolean", "default": true },
                     "format": { "type": "string", "enum": ["json"], "default": "json" },
                     "preserve_pure_wrapper": { "type": "boolean", "default": true }
-                }
+                },
+                "required": ["dangerously_skip_permissions", "format"]
             },
             "quota": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "source": { "type": "string", "enum": ["codex_auth"], "default": "codex_auth" },
-                    "auth_path": { "type": "string", "enum": account_values(codex_auth_path) }
-                }
+                    "source": { "const": "opencode_auth", "default": "opencode_auth" },
+                    "auth_path": { "type": "string", "enum": account_values(quota_auth_path) },
+                    "probe": { "const": "native_chatgpt_usage", "default": "native_chatgpt_usage" }
+                },
+                "required": ["source", "auth_path", "probe"]
             },
             "extra_env": {
                 "type": "object",
                 "additionalProperties": { "type": "string" },
                 "default": {}
-            }
-        }
+            },
+            "working_directory": { "type": "string", "minLength": 1 },
+            "mode": { "type": "string", "enum": ["interactive", "non_interactive"], "default": "non_interactive" }
+        },
+        "required": ["provider", "wrapper", "model", "quota", "launch"]
     })
 }
 
@@ -158,36 +128,41 @@ fn account_wrapper(account: &AccountProfile) -> &'static str {
     account.opencode_wrapper
 }
 
-fn codex_auth_path(account: &AccountProfile) -> &'static str {
-    account.codex_auth_path
+fn quota_auth_path(account: &AccountProfile) -> &'static str {
+    account.quota_auth_path()
 }
 
-fn codex_account_tag(account: &AccountProfile) -> &'static str {
-    account.codex_account_tag
+fn model_schema_variants() -> Vec<Value> {
+    MODEL_ALIASES.iter().map(model_schema_variant).collect()
 }
 
-fn codex_account_hash(account: &AccountProfile) -> &'static str {
-    account.codex_account_hash
+fn model_schema_variant(model: &ModelAlias) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "name": { "const": model.name },
+            "provider_model": { "const": model.provider_model },
+            "variant": { "const": model.effort }
+        },
+        "required": ["name", "provider_model", "variant"]
+    })
+}
+
+fn default_model_schema_value() -> Value {
+    let model = MODEL_ALIASES
+        .iter()
+        .find(|model| model.name == DEFAULT_MODEL_ALIAS)
+        .expect("default model alias must exist");
+    json!({
+        "name": model.name,
+        "provider_model": model.provider_model,
+        "variant": model.effort,
+    })
 }
 
 fn default_account_value(field: fn(&AccountProfile) -> &'static str) -> &'static str {
     field(&ACCOUNTS[0])
-}
-
-fn account_index_min() -> u8 {
-    ACCOUNTS
-        .iter()
-        .map(|account| account.opencode_index)
-        .min()
-        .expect("account profile constant is non-empty")
-}
-
-fn account_index_max() -> u8 {
-    ACCOUNTS
-        .iter()
-        .map(|account| account.opencode_index)
-        .max()
-        .expect("account profile constant is non-empty")
 }
 
 fn parse_schema_params(params: Value, request_id: &str) -> Result<SchemaParams, ProviderFailure> {
@@ -208,12 +183,12 @@ fn settings_schema_ui() -> Value {
             {
                 "id": "launch",
                 "title": "Launch",
-                "fields": ["account", "model", "working_directory"]
+                "fields": ["wrapper", "model", "working_directory"]
             },
             {
                 "id": "metadata",
                 "title": "Metadata",
-                "fields": ["id", "display_name", "extra_env"]
+                "fields": ["profile", "quota", "extra_env"]
             }
         ]
     })

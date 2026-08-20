@@ -8,6 +8,7 @@
 //!       - per-capability handler invocation
 //!       - request/response envelope decode-encode
 
+use crate::activity::ActivityContext;
 use crate::discovery;
 use crate::encoding::canonical_json_bytes;
 use crate::envelope::{
@@ -72,7 +73,7 @@ pub fn handle_decoded_invocation(
         "launch" => Err(launch_requires_streaming_writer_failure(request.request_id)),
         "policy.evaluate" => Ok(success_response(
             &request.request_id,
-            policy::evaluate_params(request.params, &request.request_id)?,
+            policy::evaluate_params(&request.host, request.params, &request.request_id)?,
         )),
         "terminal.classify" => Ok(success_response(
             &request.request_id,
@@ -96,11 +97,21 @@ pub fn handle_decoded_invocation(
         }
         "rotation.assess" => Ok(success_response(
             &request.request_id,
-            rotation::assess_params(request.params, &request.request_id)?,
+            rotation::assess_params(
+                &request.host,
+                request.params,
+                &request.request_id,
+                request.provider_instance_id.as_deref().unwrap_or(""),
+            )?,
         )),
         "rotation.materialize" => Ok(success_response(
             &request.request_id,
-            rotation::materialize_params(&request.host, request.params, &request.request_id)?,
+            rotation::materialize_params(
+                &request.host,
+                request.params,
+                &request.request_id,
+                request.provider_instance_id.as_deref().unwrap_or(""),
+            )?,
         )),
         "migration.plan" => Ok(success_response(
             &request.request_id,
@@ -121,10 +132,32 @@ fn write_invocation_result<W: Write>(
 ) -> Result<i32, ProviderFailure> {
     let request = decode_request(stdin)?;
     let subcommand = subcommand_from_args(args, &request.request_id)?;
+    let activity = ActivityContext::from_request(&request, subcommand);
+    activity.started()?;
     if subcommand == "launch" {
-        return launch::stream(&request.request_id, &request.host, request.params, writer);
+        let result = launch::stream(&request.request_id, &request.host, request.params, writer);
+        match &result {
+            Ok(exit_code) => {
+                let _ = activity.succeeded(*exit_code);
+            }
+            Err(failure) => {
+                let _ = activity.failed(failure);
+            }
+        }
+        return result;
     }
-    let response = handle_decoded_invocation(request, subcommand)?;
+    let response = match handle_decoded_invocation(request, subcommand) {
+        Ok(response) => {
+            if let Err(error) = activity.succeeded(0) {
+                eprintln!("provider activity completion evidence warning: {error:?}");
+            }
+            response
+        }
+        Err(failure) => {
+            let _ = activity.failed(&failure);
+            return Err(failure);
+        }
+    };
     writer
         .write_all(&canonical_json_bytes(&response))
         .map_err(stdout_write_failure)?;

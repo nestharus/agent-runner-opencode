@@ -475,6 +475,21 @@ pub fn assert_live_launch_output(output: &std::process::Output) {
     assert_status_derived_terminal_signal(final_event);
     let diagnostics = output_stderr_stdout_diagnostics(output);
     assert_live_provider_exit_code(output, final_event, &diagnostics);
+    assert_output_success_with_diagnostics(output, "live launch", &diagnostics);
+    assert_eq!(
+        final_event["status"],
+        json!({ "kind": "exited", "code": 0 })
+    );
+    assert_eq!(final_event["terminal_signal"]["kind"], "clean_exit");
+    assert!(events.iter().any(|event| {
+        event["kind"] == "marker"
+            && event["name"] == "oulipoly.launch_route"
+            && event["value"].to_string().contains("openai/gpt-5.6-luna")
+            && event["value"].to_string().contains("low")
+    }));
+    assert!(events.iter().any(|event| {
+        event["kind"] == "marker" && event["name"] == "oulipoly.provider_session"
+    }));
 }
 
 pub fn assert_live_provider_exit_code(
@@ -800,6 +815,13 @@ pub fn assert_policy_rejects_invalid_model(response: &Value) {
     let result = policy_result(response);
     assert_policy_rejected(result, "inconsistent model identity must be rejected");
     assert_policy_diagnostic(policy_diagnostics(result), "invalid_model", "provider args");
+}
+
+pub fn assert_policy_rejected_with_code(response: &Value, code: &str) {
+    assert_policy_response_shape(response);
+    let result = policy_result(response);
+    assert_policy_rejected(result, "policy request must be rejected");
+    assert_policy_diagnostic(policy_diagnostics(result), code, "account");
 }
 
 pub fn assert_policy_accepted(result: &Value) {

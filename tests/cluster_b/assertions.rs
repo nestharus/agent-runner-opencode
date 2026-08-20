@@ -245,6 +245,22 @@ pub fn assert_canonical_export_result(result: &Value, sha_message: &str) {
     let decoded = canonical_result_decoded_bytes(result);
     assert_canonical_export_sha(result, &decoded, sha_message);
     assert_canonical_export_turn_count(result, &decoded);
+    assert_canonical_export_model_identity(&decoded);
+}
+
+pub fn assert_canonical_export_model_identity(decoded: &[u8]) {
+    let text = std::str::from_utf8(decoded).expect("canonical export UTF-8");
+    let records = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("canonical record"))
+        .collect::<Vec<_>>();
+    assert!(!records.is_empty());
+    for record in records {
+        assert_eq!(record["metadata"]["provider_id"], "openai");
+        assert_eq!(record["metadata"]["model_id"], "gpt-5.5");
+        assert_eq!(record["metadata"]["variant"], "low");
+    }
 }
 
 pub fn assert_canonical_export_format(result: &Value) {
@@ -332,9 +348,16 @@ pub fn assert_limited_enumerate_result(result: &Value, limit: usize) {
     assert_eq!(sessions.len(), limit);
     assert_eq!(sessions[0]["provider_session_id"], "ses_limit_one");
     assert_eq!(sessions[1]["provider_session_id"], "ses_limit_two");
+    assert_eq!(result["complete"], false);
+    assert!(
+        result["next_cursor"]
+            .as_str()
+            .is_some_and(|cursor| cursor.starts_with("v1:2:")),
+        "truncated enumeration must return an opaque continuation cursor: {result}"
+    );
 }
 
-pub fn assert_session_list_limit_forwarded(log_path: &Path, limit: u64) {
+pub fn assert_session_list_is_exhaustive(log_path: &Path) {
     let log = fs::read_to_string(log_path).expect("read fake session list wrapper log");
     assert!(
         log.contains("arg=session"),
@@ -349,9 +372,17 @@ pub fn assert_session_list_limit_forwarded(log_path: &Path, limit: u64) {
         "session list wrapper should receive JSON format args: {log}"
     );
     assert!(
-        log.contains("arg=--max-count") && log.contains(&format!("arg={limit}")),
-        "session list wrapper should receive max-count limit {limit}: {log}"
+        !log.contains("arg=--max-count"),
+        "provider pagination must fetch the complete native population before issuing a cursor: {log}"
     );
+}
+
+pub fn assert_second_enumerate_page(result: &Value) {
+    let sessions = enumerate_sessions(result);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["provider_session_id"], "ses_limit_three");
+    assert_eq!(result["complete"], true);
+    assert!(result["next_cursor"].is_null());
 }
 
 pub fn assert_enumerate_error_code(response: &Value, code: &str) {

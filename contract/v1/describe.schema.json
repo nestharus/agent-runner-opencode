@@ -40,7 +40,6 @@
         "policy",
         "quota",
         "session",
-        "session_enumerate",
         "terminal",
         "rotation",
         "discovery",

@@ -1,8 +1,9 @@
 //! Declared roles: validator, mapper, formatter, parser, filter, predicate
 
-use crate::account::profile_for_settings_id;
-use crate::envelope::ProviderFailure;
+use crate::account::profile_for_wrapper_command;
+use crate::envelope::{HostContext, ProviderFailure};
 use crate::models::{model_alias, provider_args_match, ModelAlias};
+use crate::settings::{resolve_runtime_settings, RuntimeSettings};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -45,20 +46,29 @@ struct PolicyLaunchParams {
     stdin: Option<String>,
 }
 
-pub fn evaluate_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn evaluate_params(
+    host: &HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let params = parse_policy_params(params, request_id)?;
-    evaluate(params, request_id)
+    evaluate(host, params, request_id)
 }
 
-pub fn evaluate(params: PolicyEvaluateParams, request_id: &str) -> Result<Value, ProviderFailure> {
-    policy_account(&params.settings_id, request_id)?;
+pub fn evaluate(
+    host: &HostContext,
+    params: PolicyEvaluateParams,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
+    let runtime = resolve_runtime_settings(host, &params.settings_id, request_id)?;
     let model = resolved_model(&params);
-    let diagnostics = diagnostics_for_policy(&params, model);
-    Ok(policy_result(&params, model, diagnostics))
+    let diagnostics = diagnostics_for_policy(&params, &runtime, model);
+    Ok(policy_result(&params, &runtime, model, diagnostics))
 }
 
 fn policy_result(
     params: &PolicyEvaluateParams,
+    runtime: &RuntimeSettings,
     model: Option<&ModelAlias>,
     diagnostics: Vec<Value>,
 ) -> Value {
@@ -70,24 +80,8 @@ fn policy_result(
         "stdin": params.launch.stdin.clone(),
         "prompt": params.model.inputs.prompt.clone(),
         "diagnostics": diagnostics,
-        "markers": policy_markers(configured_launch_command(params), params),
+        "markers": policy_markers(configured_launch_command(params), params, runtime, model),
     })
-}
-
-fn policy_account(
-    settings_id: &str,
-    request_id: &str,
-) -> Result<&'static crate::account::AccountProfile, ProviderFailure> {
-    profile_for_settings_id(settings_id)
-        .ok_or_else(|| unknown_settings_id_failure(request_id, settings_id))
-}
-
-fn unknown_settings_id_failure(request_id: &str, settings_id: &str) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "unknown_settings_id",
-        format!("unknown opencode settings_id: {settings_id}"),
-    )
 }
 
 fn policy_accepted(diagnostics: &[Value]) -> bool {
@@ -109,16 +103,7 @@ fn effective_argv(params: &PolicyEvaluateParams, model: Option<&ModelAlias>) -> 
         return params.launch.argv.clone().unwrap_or_default();
     };
     let mut argv = prefix.to_vec();
-    argv.extend([
-        "run".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
-        "--dangerously-skip-permissions".to_string(),
-        "-m".to_string(),
-        model.provider_model.to_string(),
-        "--variant".to_string(),
-        model.effort.to_string(),
-    ]);
+    argv.extend(model.policy_effective_args());
     argv.extend(policy_launch_args(params, Some(model)));
     argv
 }
@@ -152,10 +137,16 @@ fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, S
     input.cloned().unwrap_or_default()
 }
 
-fn diagnostics_for_policy(params: &PolicyEvaluateParams, model: Option<&ModelAlias>) -> Vec<Value> {
-    let mut diagnostics = launch_command_diagnostics(params);
+fn diagnostics_for_policy(
+    params: &PolicyEvaluateParams,
+    runtime: &RuntimeSettings,
+    model: Option<&ModelAlias>,
+) -> Vec<Value> {
+    let mut diagnostics = launch_command_diagnostics(params, runtime);
     if model.is_none() {
         diagnostics.push(invalid_model_diagnostic(params));
+    } else if runtime.model.is_some() && runtime.model != model {
+        diagnostics.push(settings_model_mismatch_diagnostic(runtime, model));
     }
     diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(
         params, model,
@@ -174,16 +165,45 @@ fn invalid_model_diagnostic(params: &PolicyEvaluateParams) -> Value {
     )
 }
 
-fn launch_command_diagnostics(params: &PolicyEvaluateParams) -> Vec<Value> {
-    if configured_launch_command(params).is_some() {
-        Vec::new()
-    } else {
-        vec![diagnostic(
+fn launch_command_diagnostics(
+    params: &PolicyEvaluateParams,
+    runtime: &RuntimeSettings,
+) -> Vec<Value> {
+    let Some(command) = configured_launch_command(params) else {
+        return vec![diagnostic(
             "error",
             "invalid_command",
             "launch argv must begin with a configured OpenCode command".to_string(),
-        )]
+        )];
+    };
+    if profile_for_wrapper_command(command)
+        .is_some_and(|account| account.opencode_wrapper == runtime.account.opencode_wrapper)
+    {
+        return Vec::new();
     }
+    vec![diagnostic(
+        "error",
+        "settings_command_mismatch",
+        format!(
+            "launch command must resolve to account {} selected by settings_id {}",
+            runtime.account.opencode_wrapper, runtime.settings_id
+        ),
+    )]
+}
+
+fn settings_model_mismatch_diagnostic(
+    runtime: &RuntimeSettings,
+    requested: Option<&ModelAlias>,
+) -> Value {
+    diagnostic(
+        "error",
+        "settings_model_mismatch",
+        format!(
+            "model {} does not match the model stored by settings_id {}",
+            requested.map(|model| model.name).unwrap_or("<invalid>"),
+            runtime.settings_id
+        ),
+    )
 }
 
 fn forbidden_argv_diagnostics(input: &[String]) -> Vec<Value> {
@@ -233,27 +253,11 @@ fn strip_intrinsic_launch_prefix<'a>(
 }
 
 fn host_candidate_args(model: &ModelAlias) -> Vec<String> {
-    vec![
-        "run".to_string(),
-        "--dangerously-skip-permissions".to_string(),
-        "-m".to_string(),
-        model.provider_model.to_string(),
-        "--variant".to_string(),
-        model.effort.to_string(),
-    ]
+    model.host_candidate_args()
 }
 
 fn policy_effective_args(model: &ModelAlias) -> Vec<String> {
-    vec![
-        "run".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
-        "--dangerously-skip-permissions".to_string(),
-        "-m".to_string(),
-        model.provider_model.to_string(),
-        "--variant".to_string(),
-        model.effort.to_string(),
-    ]
+    model.policy_effective_args()
 }
 
 fn is_forbidden_launch_arg(arg: &str) -> bool {
@@ -283,10 +287,21 @@ fn is_error_diagnostic(diagnostic: &Value) -> bool {
     diagnostic.get("severity").and_then(Value::as_str) == Some("error")
 }
 
-fn policy_markers(command: Option<&str>, params: &PolicyEvaluateParams) -> Vec<Value> {
+fn policy_markers(
+    command: Option<&str>,
+    params: &PolicyEvaluateParams,
+    runtime: &RuntimeSettings,
+    model: Option<&ModelAlias>,
+) -> Vec<Value> {
     vec![
         json!({ "name": "opencode.command", "value": command.unwrap_or("") }),
         json!({ "name": "opencode.mode", "value": params.mode }),
+        json!({ "name": "opencode.account", "value": runtime.account.opencode_wrapper }),
+        json!({ "name": "opencode.account_hash", "value": runtime.account.account_hash }),
+        json!({ "name": "opencode.model_alias", "value": model.map(|model| model.name).unwrap_or("") }),
+        json!({ "name": "opencode.provider_model", "value": model.map(|model| model.provider_model).unwrap_or("") }),
+        json!({ "name": "opencode.effort", "value": model.map(|model| model.effort).unwrap_or("") }),
+        json!({ "name": "opencode.attempted_provider_args", "value": params.model.provider_args }),
     ]
 }
 

@@ -31,10 +31,10 @@ pub fn detect_params(
     let data_root = string_param(&params, "data_root").or(host.data_root.as_deref());
     let profile_root = string_param(&params, "profile_root");
     let opencode = executable_evidence("opencode");
-    let chatgpt_usage = executable_evidence("chatgpt-usage");
+    let curl = executable_evidence("curl");
     let profiles = profile_evidence(data_root, profile_root);
-    let installed = setup_installed(&opencode, &chatgpt_usage, &profiles);
-    Ok(detect_result(opencode, chatgpt_usage, profiles, installed))
+    let installed = setup_installed(&opencode, &curl, &profiles);
+    Ok(detect_result(opencode, curl, profiles, installed))
 }
 
 pub fn install_plan_params(params: Value, _request_id: &str) -> Result<Value, ProviderFailure> {
@@ -220,7 +220,7 @@ fn profile_evidence(data_root: Option<&str>, profile_root: Option<&str>) -> Vec<
 
 fn auth_summary() -> String {
     let present = auth_entries().join(", ");
-    format!("codex auth metadata only; {present}; quota command chatgpt-usage")
+    format!("OpenCode auth metadata only; {present}; quota probe native_chatgpt_usage")
 }
 
 fn setup_warnings(installed: bool) -> Vec<Value> {
@@ -330,8 +330,8 @@ fn unknown_setup_subcommand_failure(request_id: String, unknown: &str) -> Provid
     )
 }
 
-fn setup_installed(opencode: &Value, chatgpt_usage: &Value, profiles: &[Value]) -> bool {
-    evidence_present(opencode) && evidence_present(chatgpt_usage) && any_wrapper_present(profiles)
+fn setup_installed(opencode: &Value, curl: &Value, profiles: &[Value]) -> bool {
+    evidence_present(opencode) && evidence_present(curl) && any_wrapper_present(profiles)
 }
 
 fn evidence_present(evidence: &Value) -> bool {
@@ -347,17 +347,12 @@ fn any_wrapper_present(profiles: &[Value]) -> bool {
         .any(|profile| profile.get("wrapper_present").and_then(Value::as_bool) == Some(true))
 }
 
-fn detect_result(
-    opencode: Value,
-    chatgpt_usage: Value,
-    profiles: Vec<Value>,
-    installed: bool,
-) -> Value {
+fn detect_result(opencode: Value, curl: Value, profiles: Vec<Value>, installed: bool) -> Value {
     json!({
         "installed": installed,
         "binary": {
             "opencode": opencode,
-            "chatgpt-usage": chatgpt_usage,
+            "curl": curl,
         },
         "auth": auth_summary(),
         "profiles": profiles,
@@ -369,7 +364,7 @@ fn install_plan_result(target: &str) -> Value {
     json!({
         "steps": [
             {"kind": "verify_tool", "target": target, "command": "opencode --version"},
-            {"kind": "verify_tool", "target": target, "command": "chatgpt-usage <codex-auth-path>"},
+            {"kind": "verify_tool", "target": target, "command": "curl --version"},
             {"kind": "verify_wrappers", "target": target, "wrappers": wrapper_names()},
             {"kind": "prepare_provider_settings", "schema_id": "opencode.settings/v1"}
         ]
@@ -487,27 +482,27 @@ fn profile_json(
 
 struct ProfileProbe {
     wrapper_path: Option<PathBuf>,
-    codex_auth_present: bool,
+    opencode_auth_present: bool,
 }
 
 fn profile_probe(account: &crate::account::AccountProfile) -> ProfileProbe {
     profile_probe_from_parts(
         find_on_path(account.opencode_wrapper),
-        codex_auth_file_present(account.codex_auth_path),
+        opencode_auth_file_present(account.opencode_auth_path),
     )
 }
 
 fn profile_probe_from_parts(
     wrapper_path: Option<PathBuf>,
-    codex_auth_present: bool,
+    opencode_auth_present: bool,
 ) -> ProfileProbe {
     ProfileProbe {
         wrapper_path,
-        codex_auth_present,
+        opencode_auth_present,
     }
 }
 
-fn codex_auth_file_present(path: &str) -> bool {
+fn opencode_auth_file_present(path: &str) -> bool {
     path_is_file(&expanded_auth_path(path))
 }
 
@@ -530,11 +525,11 @@ fn profile_evidence_json(
         "wrapper": account.opencode_wrapper,
         "wrapper_present": probe.wrapper_path.is_some(),
         "wrapper_path": probe.wrapper_path.map(|path| path.to_string_lossy().into_owned()),
-        "codex_auth_path": account.codex_auth_path,
-        "codex_auth_present": probe.codex_auth_present,
+        "opencode_auth_path": account.opencode_auth_path,
+        "opencode_auth_present": probe.opencode_auth_present,
         "data_root": data_root,
         "profile_root": profile_root,
-        "quota_probe": "chatgpt-usage",
+        "quota_probe": account.quota_probe_kind(),
     })
 }
 
@@ -546,13 +541,13 @@ fn auth_entry(account: &crate::account::AccountProfile) -> String {
     format!(
         "{}:{}:{}",
         account.opencode_wrapper,
-        auth_state(account.codex_auth_path),
-        account.codex_auth_path
+        auth_state(account.opencode_auth_path),
+        account.opencode_auth_path
     )
 }
 
 fn auth_state(path: &str) -> &'static str {
-    auth_state_label(codex_auth_file_present(path))
+    auth_state_label(opencode_auth_file_present(path))
 }
 
 fn auth_state_label(present: bool) -> &'static str {

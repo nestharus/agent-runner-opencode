@@ -11,7 +11,7 @@ pub const SETUP_AUTH_SENTINEL: &str = "SETUP_AUTH_SENTINEL_DO_NOT_LEAK";
 
 pub const OPENCODE_VERSION_SENTINEL: &str = "opencode 0.0.0-contract";
 
-pub const CHATGPT_USAGE_READY_SENTINEL: &str = "contract_chatgpt_usage_ready";
+pub const CURL_VERSION_SENTINEL: &str = "curl 0.0.0-contract";
 
 pub const ROTATION_SOURCE_SESSION: &str = "ses_source_contract_d";
 
@@ -175,6 +175,10 @@ impl RotationOpencodeFixture {
             .parse()
             .expect("recorded import count")
     }
+
+    pub fn import_was_attempted(&self) -> bool {
+        self.import_record.exists() || self.import_count_record.exists()
+    }
 }
 
 impl Drop for RotationOpencodeFixture {
@@ -330,9 +334,9 @@ impl HomeFixture {
         &self.path_string
     }
 
-    pub fn write_all_codex_auths(&self) {
-        for relative in codex_auth_relatives() {
-            write_codex_auth(&self.path.join(relative));
+    pub fn write_all_opencode_auths(&self) {
+        for relative in opencode_auth_relatives() {
+            write_opencode_auth(&self.path.join(relative));
         }
     }
 }
@@ -351,25 +355,23 @@ fn create_home_dir(path: &Path) {
     fs::create_dir_all(path).expect("create temp HOME");
 }
 
-pub fn codex_auth_relatives() -> [&'static str; 5] {
+pub fn opencode_auth_relatives() -> [&'static str; 5] {
     [
-        ".codex/auth.json",
-        ".codex5/auth.json",
-        ".codex2/auth.json",
-        ".codex3/auth.json",
-        ".codex4/auth.json",
+        ".local/share/opencode/auth.json",
+        ".opencode2/opencode/auth.json",
+        ".opencode3/opencode/auth.json",
+        ".opencode4/opencode/auth.json",
+        ".opencode5/opencode/auth.json",
     ]
 }
 
-pub fn write_codex_auth(path: &Path) {
+pub fn write_opencode_auth(path: &Path) {
     fs::create_dir_all(path.parent().expect("auth parent")).expect("create auth parent");
-    fs::write(path, codex_auth_fixture()).expect("write auth fixture");
+    fs::write(path, opencode_auth_fixture()).expect("write auth fixture");
 }
 
-pub fn codex_auth_fixture() -> String {
-    format!(
-        "{{\"tokens\":{{\"access_token\":\"{SETUP_AUTH_SENTINEL}\",\"account_id\":\"acct\"}}}}\n"
-    )
+pub fn opencode_auth_fixture() -> String {
+    format!("{{\"openai\":{{\"access\":\"{SETUP_AUTH_SENTINEL}\",\"accountId\":\"acct\"}}}}\n")
 }
 
 impl Drop for HomeFixture {
@@ -411,7 +413,7 @@ fn create_fake_toolchain_dir(dir: &Path) {
 
 pub fn write_fake_toolchain(dir: &Path) {
     write_executable(&dir.join("opencode"), fake_opencode_binary_script());
-    write_executable(&dir.join("chatgpt-usage"), fake_chatgpt_usage_script());
+    write_executable(&dir.join("curl"), fake_curl_binary_script());
     for wrapper in opencode_wrappers() {
         write_executable(&dir.join(wrapper), fake_wrapper_script());
     }
@@ -421,8 +423,8 @@ pub fn fake_opencode_binary_script() -> &'static str {
     "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'opencode 0.0.0-contract\\n'; exit 0; fi\nprintf 'fake opencode\\n'\nexit 0\n"
 }
 
-pub fn fake_chatgpt_usage_script() -> &'static str {
-    "#!/bin/sh\nprintf '{\"contract_chatgpt_usage_ready\":true,\"windows\":[]}\\n'\nexit 0\n"
+pub fn fake_curl_binary_script() -> &'static str {
+    "#!/bin/sh\nprintf 'curl 0.0.0-contract\\n'\nexit 0\n"
 }
 
 pub fn opencode_wrappers() -> [&'static str; 5] {

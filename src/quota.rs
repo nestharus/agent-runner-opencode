@@ -7,10 +7,11 @@
 //!       - chatgpt-usage rolling windows to QuotaProbeWindow
 //!       - opencode CLI-owned auth refresh boundary to QuotaRefreshAuthResult
 
-use crate::account::{profile_for_settings_id, AccountProfile};
-use crate::codex::{self, ChatgptUsageWindow};
+use crate::account::AccountProfile;
 use crate::encoding::{bounded_text, now_unix_ms};
-use crate::envelope::{ProviderFailure, RequestEnvelope};
+use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
+use crate::quota_adapter::{self, ChatgptUsageWindow};
+use crate::settings::resolve_runtime_settings;
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -32,32 +33,47 @@ struct QuotaRefreshAuthParams {
 
 pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
     let RequestEnvelope {
-        params, request_id, ..
+        host,
+        params,
+        request_id,
+        ..
     } = request;
     match subcommand {
-        "quota.source" => source_params(params, &request_id),
-        "quota.probe" => probe_params(params, &request_id),
-        "quota.refresh_auth" => refresh_auth_params(params, &request_id),
+        "quota.source" => source_params(&host, params, &request_id),
+        "quota.probe" => probe_params(&host, params, &request_id),
+        "quota.refresh_auth" => refresh_auth_params(&host, params, &request_id),
         unknown => Err(unknown_quota_subcommand_failure(request_id, unknown)),
     }
 }
 
-pub fn source_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn source_params(
+    host: &HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let params = parse_base_params(params, request_id)?;
-    let account = account_for_settings_id(&params.settings_id, request_id)?;
+    let account = account_for_settings_id(host, &params.settings_id, request_id)?;
     let auth_path = resolved_auth_path(account);
     Ok(source_result(account, &auth_path))
 }
 
-pub fn probe_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn probe_params(
+    host: &HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let params = parse_base_params(params, request_id)?;
-    let account = account_for_settings_id(&params.settings_id, request_id)?;
+    let account = account_for_settings_id(host, &params.settings_id, request_id)?;
     probe_account(account, request_id)
 }
 
-pub fn refresh_auth_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn refresh_auth_params(
+    host: &HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let params = parse_refresh_params(params, request_id)?;
-    let account = account_for_settings_id(&params.settings_id, request_id)?;
+    let account = account_for_settings_id(host, &params.settings_id, request_id)?;
     let checked_at_unix_ms = now_unix_ms();
     let refresh = run_account_auth_refresh(account);
     let refreshed = refresh_succeeded(&refresh);
@@ -178,7 +194,8 @@ fn run_probe_command(
     auth_path: &Path,
     request_id: &str,
 ) -> Result<crate::shell::ShellOutput, ProviderFailure> {
-    codex::run_chatgpt_usage(auth_path).map_err(|err| quota_probe_spawn_failure(request_id, err))
+    quota_adapter::run_chatgpt_usage(auth_path)
+        .map_err(|err| quota_probe_spawn_failure(request_id, err))
 }
 
 fn probe_output_result(output: &crate::shell::ShellOutput) -> Value {
@@ -241,15 +258,15 @@ fn parse_refresh_params(
 }
 
 fn account_for_settings_id(
+    host: &HostContext,
     settings_id: &str,
     request_id: &str,
 ) -> Result<&'static AccountProfile, ProviderFailure> {
-    profile_for_settings_id(settings_id)
-        .ok_or_else(|| unknown_settings_id_failure(request_id, settings_id))
+    resolve_runtime_settings(host, settings_id, request_id).map(|settings| settings.account)
 }
 
 fn resolved_auth_path(account: &AccountProfile) -> PathBuf {
-    expand_tilde(account.opencode_auth_path)
+    expand_tilde(account.quota_auth_path())
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -289,7 +306,8 @@ fn has_read_permission(_metadata: &fs::Metadata) -> bool {
 
 fn source_id(account: &AccountProfile, auth_path: &Path) -> String {
     format!(
-        "opencode-auth:{}:{}:{}",
+        "{}:{}:{}:{}",
+        account.quota_source_kind(),
         account.opencode_wrapper,
         account.opencode_index,
         auth_path.to_string_lossy()
@@ -367,7 +385,7 @@ fn quota_probe_spawn_failure(request_id: &str, err: std::io::Error) -> ProviderF
 }
 
 fn parse_probe_windows(stdout: &[u8]) -> Result<Vec<ChatgptUsageWindow>, String> {
-    codex::parse_chatgpt_usage_windows(stdout)
+    quota_adapter::parse_chatgpt_usage_windows(stdout)
 }
 
 fn available_probe_result(windows: &[ChatgptUsageWindow]) -> Value {
@@ -406,14 +424,6 @@ fn invalid_quota_refresh_params_failure(
         request_id,
         "invalid_quota_refresh_auth_params",
         format!("quota.refresh_auth params are invalid: {err}"),
-    )
-}
-
-fn unknown_settings_id_failure(request_id: &str, settings_id: &str) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "unknown_settings_id",
-        format!("unknown opencode settings_id: {settings_id}"),
     )
 }
 
