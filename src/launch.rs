@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 #[cfg(unix)]
@@ -60,6 +62,10 @@ const RESUME_COMPLETION_UNRESOLVED_MARKER: &str = "oulipoly.resume_completion_un
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
+#[cfg(unix)]
+const LAUNCH_EXEC_GATE_ARG: &str = "__launch_exec_gate";
+#[cfg(unix)]
+const LAUNCH_EXEC_GATE_FD_ENV: &str = "AGENT_RUNNER_OPENCODE_LAUNCH_GATE_FD";
 pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -94,6 +100,11 @@ enum DrainMessage {
     StdoutDone,
     StderrDone,
     ReadError { stdout: bool, message: String },
+}
+
+struct LaunchExecGate {
+    #[cfg(unix)]
+    writer: UnixStream,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -296,7 +307,7 @@ pub(crate) fn stream<W: Write>(
     if let Some(resume_launch_request) = resume_launch_request {
         state.attach_resume_launch_request(resume_launch_request);
     }
-    let child = match spawn_child(
+    let (child, launch_exec_gate) = match spawn_child(
         &effective.argv,
         &params.working_directory,
         &effective.env,
@@ -327,6 +338,11 @@ pub(crate) fn stream<W: Write>(
     }
     if let Some(launch_request) = state.resume_launch_request.as_mut() {
         launch_request.observe_actor(actor_process_group_id)?;
+    }
+    if let Some(launch_exec_gate) = launch_exec_gate {
+        launch_exec_gate.release().map_err(|error| {
+            spawn_failure(request_id, "release durably registered launch actor", error)
+        })?;
     }
     stream_child(custody.child_mut(), &mut state, writer).map(|exit_code| LaunchOutcome {
         exit_code,
@@ -742,13 +758,26 @@ fn spawn_child(
     working_directory: &str,
     env: &BTreeMap<String, String>,
     stdin: Stdio,
-) -> std::io::Result<Child> {
-    let mut command = child_command(argv, working_directory, stdin);
+) -> std::io::Result<(Child, Option<LaunchExecGate>)> {
+    let (mut command, launch_exec_gate) = child_command(argv, working_directory, stdin)?;
     command.env_clear();
     let child_env = child_env(env);
     command.envs(child_env.iter());
     configure_process_group(&mut command);
-    command.spawn()
+    command
+        .env(
+            LAUNCH_EXEC_GATE_FD_ENV,
+            launch_exec_gate.1.as_raw_fd().to_string(),
+        )
+        .spawn()
+        .map(|child| {
+            (
+                child,
+                Some(LaunchExecGate {
+                    writer: launch_exec_gate.0,
+                }),
+            )
+        })
 }
 
 #[cfg(not(unix))]
@@ -757,7 +786,7 @@ fn spawn_child(
     _working_directory: &str,
     _env: &BTreeMap<String, String>,
     _stdin: Stdio,
-) -> std::io::Result<Child> {
+) -> std::io::Result<(Child, Option<LaunchExecGate>)> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "native launch requires Unix process-group custody",
@@ -765,15 +794,77 @@ fn spawn_child(
 }
 
 #[cfg(unix)]
-fn child_command(argv: &[String], working_directory: &str, stdin: Stdio) -> Command {
-    let mut command = Command::new(&argv[0]);
+fn child_command(
+    argv: &[String],
+    working_directory: &str,
+    stdin: Stdio,
+) -> std::io::Result<(Command, (UnixStream, UnixStream))> {
+    use std::os::unix::process::CommandExt;
+
+    let gate_program = launch_exec_gate_program()?;
+    let launch_exec_gate = UnixStream::pair()?;
+    let inherited_gate_fd = launch_exec_gate.1.as_raw_fd();
+    let inherited_gate = launch_exec_gate.1.try_clone()?;
+    let mut command = Command::new(gate_program);
     command
-        .args(&argv[1..])
+        .arg(LAUNCH_EXEC_GATE_ARG)
+        .args(argv)
         .current_dir(working_directory)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(stdin);
-    command
+    unsafe {
+        command.pre_exec(move || {
+            let _keep_gate_open = &inherited_gate;
+            let flags = libc::fcntl(inherited_gate_fd, libc::F_GETFD);
+            if flags == -1
+                || libc::fcntl(inherited_gate_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok((command, launch_exec_gate))
+}
+
+#[cfg(unix)]
+fn launch_exec_gate_program() -> std::io::Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    let binary_name = "agent-runner-opencode";
+    if current.file_name().and_then(|name| name.to_str()) == Some(binary_name) {
+        return Ok(current);
+    }
+    let Some(parent) = current.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "provider executable has no containing directory",
+        ));
+    };
+    let candidate = if parent.file_name().and_then(|name| name.to_str()) == Some("deps") {
+        parent.parent().unwrap_or(parent).join(binary_name)
+    } else {
+        parent.join(binary_name)
+    };
+    candidate.is_file().then_some(candidate).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "could not locate the provider launch-gate executable",
+        )
+    })
+}
+
+impl LaunchExecGate {
+    #[cfg(unix)]
+    fn release(mut self) -> std::io::Result<()> {
+        self.writer.write_all(&[1])?;
+        self.writer.flush()
+    }
+
+    #[cfg(not(unix))]
+    fn release(self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn prepared_child_stdin(stdin: Option<&[u8]>) -> std::io::Result<Stdio> {
@@ -1384,12 +1475,11 @@ fn require_prior_actor_terminal(
     binding_sha256: &str,
 ) -> Result<(), ProviderFailure> {
     let Some(process_group_id) = process_group_id else {
-        return Err(launch_actor_reconciliation_required(
-            request_id,
-            binding_sha256,
-            None,
-            "the provider stopped before durably publishing the admitted native actor",
-        ));
+        // The exec gate cannot release the native command until actor
+        // publication succeeds. Losing the provider before publication closes
+        // the gate pipe, so an actor-less prepared record has admitted no
+        // native effect and may proceed to authoritative native recovery.
+        return Ok(());
     };
     if launch_process_group_is_live(process_group_id) {
         return Err(launch_actor_reconciliation_required(

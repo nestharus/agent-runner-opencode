@@ -6,7 +6,10 @@ mod support;
 use cluster_a::*;
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::{
+    os::fd::AsRawFd,
+    os::unix::{net::UnixStream, process::CommandExt},
+};
 use support::{invoke_validated, invoke_with_env, invoke_with_host_and_env, json_stdout};
 
 #[cfg(unix)]
@@ -48,6 +51,53 @@ impl std::io::Write for FailAfterFirstLaunchEvent {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn contract_launch_exec_gate_prevents_unpublished_native_effect() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_script().to_string());
+    let (gate_writer, inherited_gate) = UnixStream::pair().expect("create launch exec gate");
+    let inherited_gate_fd = inherited_gate.as_raw_fd();
+    let inherited_gate_guard = inherited_gate
+        .try_clone()
+        .expect("clone inherited launch gate");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_agent-runner-opencode"));
+    command
+        .arg("__launch_exec_gate")
+        .arg(fake_wrapper_path(fake_wrapper.dir()))
+        .arg("run")
+        .env_clear()
+        .env(
+            "AGENT_RUNNER_OPENCODE_LAUNCH_GATE_FD",
+            inherited_gate_fd.to_string(),
+        )
+        .env("AGENT_RUNNER_OPENCODE_WRAPPER_LOG", fake_wrapper.log_path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            let _keep_gate_open = &inherited_gate_guard;
+            let flags = libc::fcntl(inherited_gate_fd, libc::F_GETFD);
+            if flags == -1
+                || libc::fcntl(inherited_gate_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn launch exec gate");
+    drop(inherited_gate);
+    drop(gate_writer);
+
+    let status = child.wait().expect("wait for closed launch exec gate");
+    assert_eq!(status.code(), Some(126));
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "closing an unpublished actor gate must prevent the native command effect"
+    );
 }
 
 #[test]
@@ -332,23 +382,6 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
         "prepared_at_unix_ms": prepared_at_unix_ms,
         "observed_at_unix_ms": null
     });
-    fs::write(
-        &state_path,
-        serde_json::to_vec(&prepared_state).expect("serialize prepared launch state"),
-    )
-    .expect("write prepared launch state");
-
-    let unpublished = json_stdout(&support::invoke_with_request("launch", request.clone()));
-    assert_eq!(
-        unpublished["error"]["code"],
-        "launch_actor_reconciliation_required"
-    );
-    assert!(unpublished["error"]["details"]["process_group_id"].is_null());
-    assert!(
-        !fake_wrapper.log_path().exists(),
-        "an ambiguously unpublished actor must prevent a second native spawn"
-    );
-
     let mut prior_actor_command = std::process::Command::new("/bin/sleep");
     prior_actor_command.arg("30");
     unsafe {
@@ -386,12 +419,19 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
     prior_actor.kill().expect("terminate prior launch actor");
     prior_actor.wait().expect("reap prior launch actor");
 
+    prepared_state["actor_process_group_id"] = serde_json::Value::Null;
+    fs::write(
+        &state_path,
+        serde_json::to_vec(&prepared_state).expect("serialize unpublished-actor launch state"),
+    )
+    .expect("write unpublished-actor launch state");
+
     let replay = support::invoke_with_request("launch", request);
     assert_output_success(&replay, "recovered prepared launch");
     assert_eq!(
         fs::read_to_string(fake_wrapper.log_path()).expect("read recovered launch count"),
         "1\n",
-        "an exhaustive empty session list should readmit exactly one launch"
+        "the exec-gated unpublished actor and exhaustive empty session list should readmit exactly one launch"
     );
 }
 
