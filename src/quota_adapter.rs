@@ -7,17 +7,23 @@
 //!       - source-specific transport and protocol failures to QuotaObservationFailure
 
 use crate::child_custody::ChildCustody;
+use crate::durable_fs;
 use crate::quota_observer::QuotaObserverContext;
 use crate::shell::ShellOutput;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
-use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const HTTP_STATUS_MARKER: &str = "__oulipoly_http_status__:";
+const MAX_ACCESS_TOKEN_BYTES: usize = 32 * 1024;
+const MAX_ACCOUNT_ID_BYTES: usize = 1024;
+const MAX_WHAM_STDOUT_BYTES: usize = 512 * 1024;
+const MAX_WHAM_STDERR_BYTES: usize = 64 * 1024;
+const WHAM_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaObservationSource {
@@ -151,7 +157,8 @@ struct AuthTokens {
 }
 
 fn read_auth_tokens(path: &Path) -> Result<AuthTokens, String> {
-    let raw = fs::read(path).map_err(|err| format!("failed to read OpenCode auth file: {err}"))?;
+    let raw = durable_fs::read_file_bounded(path, durable_fs::MAX_AUTH_FILE_BYTES)
+        .map_err(|err| format!("failed to read bounded OpenCode auth file: {err}"))?;
     let parsed: Value = serde_json::from_slice(&raw)
         .map_err(|err| format!("OpenCode auth file must be JSON: {err}"))?;
     let access_token = parsed
@@ -166,6 +173,11 @@ fn read_auth_tokens(path: &Path) -> Result<AuthTokens, String> {
         .ok_or_else(missing_auth_tokens_error)?;
     validate_curl_header_value("access token", &access_token)?;
     validate_curl_header_value("account id", &account_id)?;
+    if access_token.len() > MAX_ACCESS_TOKEN_BYTES || account_id.len() > MAX_ACCOUNT_ID_BYTES {
+        return Err(
+            "OpenCode auth token identity exceeds the supported bounded WHAM request".into(),
+        );
+    }
     Ok(AuthTokens {
         access_token,
         account_id,
@@ -228,7 +240,19 @@ fn run_curl_usage(
         .as_mut()
         .expect("curl stdin is piped")
         .write_all(curl_usage_config(tokens).as_bytes())?;
-    let output = custody.wait_with_output()?;
+    let output = custody
+        .wait_with_bounded_output_timeout(
+            WHAM_TIMEOUT,
+            MAX_WHAM_STDOUT_BYTES,
+            MAX_WHAM_STDERR_BYTES,
+        )?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "WHAM curl timed out"))?;
+    if output.stdout.len() > MAX_WHAM_STDOUT_BYTES || output.stderr.len() > MAX_WHAM_STDERR_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WHAM curl output exceeds the supported bounded response",
+        ));
+    }
     Ok(ShellOutput {
         stdout: output.stdout,
         stderr: output.stderr,

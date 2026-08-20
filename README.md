@@ -142,6 +142,13 @@ Exact refresh retries inspect this immutable request record before resolving
 live settings. Deleting or updating the former settings record therefore cannot
 hide either a committed result or an admitted-effect reconciliation handoff;
 prepared work continues from its stored canonical account and auth-source path.
+Quota refresh custody is capped at 64 active/replay request records. Committed
+results have a 24-hour retention window and are retired under a fixed capacity
+lock; prepared, effect-admitted, and reconciliation-required records are never
+aged out. Each record is capped at 256 KiB. The selected auth file is read
+through a 1 MiB bound, access tokens and account IDs have explicit field bounds,
+and WHAM `curl` capture is limited to 512 KiB stdout, 64 KiB stderr, and 20
+seconds.
 
 ## Invocation and lifecycle
 
@@ -151,7 +158,11 @@ The one-shot invocation form is:
 agent-runner-opencode <subcommand>
 ```
 
-Each invocation reads one JSON envelope from stdin. Non-launch commands write
+Each invocation reads one JSON envelope from stdin. Input is capped at 4 MiB
+before JSON parsing; the process reads at most one byte beyond that limit to
+classify an oversize request. Request/provider IDs, host labels and paths, and
+the host environment have field, entry-count, and 256 KiB aggregate environment
+bounds. Non-launch commands write
 one JSON response. `launch` writes NDJSON events ending in an `exit` event.
 Launch children run in a provider-owned process group, while export and quota
 helpers remain direct children. One custody boundary is installed immediately
@@ -177,8 +188,11 @@ before the gate can execute the native command. Provider loss or publication
 failure closes an unreleased gate without admitting a native effect. Recovery
 refuses readmission while a published actor is live; once that actor is
 terminal (or a prepared record proves no actor was ever published), recovery
-binds a matching session when present and readmits the request only after an
-exhaustive same-context list proves no effect.
+binds a matching session when present and readmits the request only after a
+same-context list bounded to 257 native rows proves no effect. Recovery admits
+at most 256 sessions, examines at most eight plausible candidates, captures at
+most 2 MiB of list output, and shares one five-second/host-deadline budget across
+listing and candidate exports.
 Non-Unix builds do not admit native launch because they cannot provide this
 process-group custody contract.
 Reusing the request ID with different launch inputs is rejected as a conflict.
@@ -188,25 +202,28 @@ identity and any durable session, terminal, or resume observation before
 consulting mutable live settings. Current settings admission occurs only when
 there is no prior operation or authoritative recovery proved that it had no
 native effect.
+Launch custody is capped at 64 active/replay request records, each no larger
+than 256 KiB. Terminal records are retained for 24 hours and retired under a
+fixed capacity lock; prepared, submission-observed, and unresolved records are
+never aged out because they may still own an effect. Admission fails explicitly
+at the cap until those obligations are reconciled or terminal replay expires.
 
-For resumed sessions, model switching is allowed per turn. Delivery and
-completion are credited only when bounded native export observes the submitted
-payload and a completed assistant message for the requested session, provider
-model, and variant. A bare native `step_finish` is not completion authority.
+For resumed sessions, model switching is allowed per turn. During the normal
+launch, matching bounded `opencode run --format json` `step_start` and successful
+`step_finish(reason=stop)` events establish submission and completion without
+re-exporting and reparsing the growing transcript. A bare terminal process
+status is not completion authority.
 Before spawning a resumed turn, launch durably binds the request ID to its
 session, route, payload digest, delivery nonce, observation timestamp, and
-original export-command context. Post-spawn events remain withheld until a
-terminal export result is durable. If event delivery then fails, an exact retry
-uses that same context to inspect the bound session and refuses to resubmit a
-turn whose user message is already present; readmission requires authoritative
-evidence that the prior invocation had no effect. New-session and resumed-turn
-records carry distinct operation kinds, so a request ID cannot cross those
-lifecycle domains.
-The named resume-observation boundary owns this transcript traversal and
-returns either evidence-backed completion or explicit uncertainty; launch only
-orchestrates its probes alongside process supervision and projects the result
-to contract markers. If export proves the resumed user turn was submitted but
-cannot prove a completed assistant response, launch emits an unresolved
+original recovery-command context. Post-spawn run events remain withheld until
+the corresponding observation is durable. Recovery of a prepared or legacy
+terminal record may perform one bounded 750 ms export in that original context.
+If it cannot prove safe readmission, the record becomes durable `unresolved`;
+exact retries return the same reconciliation handoff without polling the
+transcript again. New-session and resumed-turn records carry distinct operation
+kinds, so a request ID cannot cross those lifecycle domains. If run evidence
+proves submission but cannot prove a completed assistant response, launch emits
+an unresolved
 completion marker and returns a non-clean unknown terminal result so the caller
 must reconcile the named provider session before retrying the turn.
 If a lingering OpenCode process is terminated after response confirmation,
@@ -242,6 +259,13 @@ host working directory because neither path uses it. The directory is required
 only before a new native import, so removing or renaming it cannot strand a
 completed materialization.
 
+`session.enumerate` materializes one bounded, private pagination snapshot on
+the first page instead of relisting the complete native population for every
+cursor. Page size and admitted population are each capped at 256, list capture
+at 2 MiB, each row at 64 KiB, and each snapshot at 4 MiB. At most 32 snapshots
+are retained for 15 minutes; continuation cursors read only the requested rows.
+An above-bound native population fails explicitly.
+
 ## State, evidence, and authority
 
 Settings are stored under `host.config_root/agent-runner-opencode` using an
@@ -262,10 +286,11 @@ an intermediate schema-zero recovery transaction can exceed the encoded bound,
 no admitted predecessor/recovery store may exceed 16 MiB or 4,096 records, and
 each admitted recovery mutation must reduce record count or encoded size.
 Settings lock admission is bounded by the earlier of the host deadline and five
-seconds. Migration
-artifacts are content-addressed, atomically published, confined to
-provider-owned roots, and retain hashes for the complete legacy input plus its
-provider/model records.
+seconds. Migration artifacts are content-addressed, atomically published,
+confined to one of the two exact provider-owned roots, and retain hashes for the
+complete legacy input plus its provider/model records. Each summary is capped
+at 4 MiB; a fixed five-second/host-deadline capacity lock enforces at most 256
+summaries with a 30-day retention window.
 `src/settings_definition.rs` is the sole owner of both the published
 `opencode.settings/v1` JSON schema and its executable domain validation;
 `schema` projects that definition and `settings` owns record lifecycle.
@@ -283,9 +308,12 @@ operation records, materialization receipts, and decision receipts live under
 the adjacent `provider-state/opencode/rotation` tree.
 Activity recording never waits for its global lock: contention or evidence I/O
 failure produces a warning and capability dispatch continues. Each event is at
-most 64 KiB and the retained ledger is capped at 4,096 events and 8 MiB. When a
-bound is reached, the recorder keeps the newest contiguous hash-chain tail; its
-first sequence and predecessor digest expose the retention boundary.
+most 64 KiB. A small atomic head validates only the committed tail before each
+append; two alternating append-only segments provide constant-space rotation
+at 4,096 events or 8 MiB without rereading and rewriting the full history on
+every invocation. The head's first sequence and predecessor digest expose the
+retention boundary. Activity-target deduplication uses a hash set, so a settings
+list does not perform quadratic scans as identities accumulate.
 
 Settings, migration, activity, and rotation all pass every provider-owned
 filesystem target through the same lexical and canonical confinement guard
@@ -375,10 +403,18 @@ contended account lock cannot extend ownership of the global rotation lane.
 Each
 phase checks the remaining absolute budget, native children are terminated and
 reaped at expiry, artifacts are read back through the same 16 MiB bound, and
-provider-owned rotation state records are capped at 1 MiB. An expired operation
+provider-owned rotation state records are capped at 1 MiB. Every deadline path
 releases the lock while retaining any prepared/imported record needed for
 identity-safe reconciliation. Unrelated rotation actors can therefore regain
 the shared capability without terminating the provider manually.
+Authorizations are capped at 64 records, while unresolved operations and
+materialization receipts share one 64-record lifecycle cap so every admitted
+operation has capacity to become its replay receipt. Authorizations expire after ten minutes;
+completed materializations replay for 24 hours, after which unreferenced source
+and decision artifacts are retired. A durable receipt replaces its completed
+operation record, while prepared/imported operations remain until safely
+finalized. Artifact and decision collections are capped at 128 records, so
+crash-orphaned publications cannot grow without bound.
 
 Activity evidence is operational and explicitly best-effort. A directory,
 lock, write, or chain-validation failure is emitted as a stderr warning but

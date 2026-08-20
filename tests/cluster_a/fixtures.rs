@@ -676,10 +676,10 @@ exit 0\n"
 pub fn fake_wrapper_completed_export_then_hang_script() -> String {
     "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
-	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]},{\"info\":{\"id\":\"msg-assistant\",\"role\":\"assistant\",\"sessionID\":\"ses_resume_contract\",\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\",\"time\":{\"created\":4102444800001,\"completed\":4102444800002}},\"parts\":[{\"type\":\"text\",\"text\":\"done\"}]}]}'\n\
-  exit 0\n\
+  printf '%s\\n' 'unexpected full transcript export' > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
+  exit 70\n\
 fi\n\
-/bin/sleep 5\n\
+/bin/sleep 1\n\
 exit 9\n"
         .to_string()
 }
@@ -742,7 +742,7 @@ pub fn short_deadline_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
         .as_millis() as u64
-        + 250
+        + 1_500
 }
 
 pub fn string_array(value: &Value, label: &str) -> Vec<String> {

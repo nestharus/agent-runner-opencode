@@ -12,6 +12,7 @@ use std::io::{Error, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 pub(crate) const MAX_BOUND_EXECUTABLE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn create_directories(path: &Path) -> std::io::Result<()> {
     create_directory_chain(path, false)
@@ -19,15 +20,6 @@ pub(crate) fn create_directories(path: &Path) -> std::io::Result<()> {
 
 pub(crate) fn create_private_directories(path: &Path) -> std::io::Result<()> {
     create_directory_chain(path, true)
-}
-
-pub(crate) fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    let bytes = fs::read(path)?;
-    sync_directory(
-        path.parent()
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "file has no parent directory"))?,
-    )?;
-    Ok(bytes)
 }
 
 pub(crate) fn is_executable_file(path: &Path) -> std::io::Result<bool> {

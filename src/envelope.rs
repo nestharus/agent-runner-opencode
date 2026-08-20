@@ -5,6 +5,15 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub const CONTRACT: &str = "oulipoly.provider/v1";
+pub const MAX_REQUEST_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_REQUEST_ID_BYTES: usize = 256;
+pub const MAX_PROVIDER_INSTANCE_ID_BYTES: usize = 256;
+pub const MAX_HOST_LABEL_BYTES: usize = 256;
+pub const MAX_HOST_PATH_BYTES: usize = 64 * 1024;
+pub const MAX_HOST_ENV_ENTRIES: usize = 128;
+pub const MAX_HOST_ENV_KEY_BYTES: usize = 256;
+pub const MAX_HOST_ENV_VALUE_BYTES: usize = 64 * 1024;
+pub const MAX_HOST_ENV_BYTES: usize = 256 * 1024;
 
 pub const CATEGORY_UNSUPPORTED: &str = "unsupported";
 pub const CATEGORY_INVALID_REQUEST: &str = "invalid_request";

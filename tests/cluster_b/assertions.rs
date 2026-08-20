@@ -262,12 +262,12 @@ pub fn assert_limited_enumerate_result(result: &Value, limit: usize) {
     assert!(
         result["next_cursor"]
             .as_str()
-            .is_some_and(|cursor| cursor.starts_with("v1:2:")),
+            .is_some_and(|cursor| cursor.starts_with("v2:")),
         "truncated enumeration must return an opaque continuation cursor: {result}"
     );
 }
 
-pub fn assert_session_list_is_exhaustive(log_path: &Path) {
+pub fn assert_session_list_uses_bounded_snapshot(log_path: &Path) {
     let log = fs::read_to_string(log_path).expect("read fake session list wrapper log");
     assert!(
         log.contains("arg=session"),
@@ -279,8 +279,12 @@ pub fn assert_session_list_is_exhaustive(log_path: &Path) {
         "missing JSON format args: {log}"
     );
     assert!(
-        !log.contains("arg=--max-count"),
-        "provider pagination must fetch the complete native population before issuing a cursor: {log}"
+        log.contains("arg=--max-count"),
+        "missing native row bound: {log}"
+    );
+    assert!(
+        log.contains("arg=257"),
+        "provider pagination must request one sentinel row above its 256-session snapshot bound: {log}"
     );
 }
 

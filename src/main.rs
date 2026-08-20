@@ -64,7 +64,10 @@ fn run_launch_exec_gate(_args: &[String]) -> i32 {
 
 fn read_stdin_or_exit() -> Vec<u8> {
     let mut stdin = Vec::new();
-    if let Err(err) = std::io::stdin().read_to_end(&mut stdin) {
+    if let Err(err) = std::io::stdin()
+        .take(agent_runner_opencode::envelope::MAX_REQUEST_ENVELOPE_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut stdin)
+    {
         exit_stdin_read_failure(&stdin_read_failure_message(&err));
     }
     stdin

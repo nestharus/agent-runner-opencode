@@ -12,6 +12,7 @@ use crate::path_guard;
 use crate::runtime_selection::resolve_runtime_selection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -19,10 +20,23 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTHORIZATION_TTL: Duration = Duration::from_secs(10 * 60);
+const ROTATION_REPLAY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const ROTATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ROTATION_ARTIFACT_BYTES: usize = opencode::MAX_EXPORT_OUTPUT_BYTES;
 const MAX_ROTATION_STATE_BYTES: usize = 1024 * 1024;
+const MAX_ROTATION_LIVE_RECORDS: usize = 64;
+const MAX_ROTATION_ARTIFACT_RECORDS: usize = MAX_ROTATION_LIVE_RECORDS * 2;
+const MAX_ROTATION_COMPATIBILITY_RECORDS: usize = 4096;
 const ROTATION_STATE_DIR: &str = "provider-state/opencode/rotation";
+
+#[derive(Default)]
+struct RotationCapacity {
+    authorizations: usize,
+    materializations: usize,
+    operations: usize,
+    artifacts: usize,
+    decisions: usize,
+}
 
 struct RotationBudget {
     started: Instant,
@@ -70,6 +84,16 @@ pub fn assess_params(
         && binding.source_account.opencode_wrapper != binding.target_account.opencode_wrapper;
     let _lock = acquire_rotation_lock(host, &budget, request_id)?;
     budget.checkpoint(request_id)?;
+    let capacity = maintain_rotation_capacity(host, &binding, &budget, request_id)?;
+    if allowed
+        && !authorization_path(host, &binding, request_id)?.exists()
+        && capacity.authorizations >= MAX_ROTATION_LIVE_RECORDS
+    {
+        return Err(rotation_state_capacity_exceeded(
+            request_id,
+            "authorizations",
+        ));
+    }
     let authorization = persist_assessment_decision(host, &binding, allowed, request_id)?;
     budget.checkpoint(request_id)?;
     Ok(assess_result(
@@ -91,6 +115,36 @@ pub fn materialize_params(
     let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
     let _lock = acquire_rotation_lock(host, &budget, request_id)?;
     budget.checkpoint(request_id)?;
+    let capacity = maintain_rotation_capacity(host, &binding, &budget, request_id)?;
+    let receipt_exists = materialization_receipt_path(host, &binding, request_id)?.exists();
+    let operation_exists = rotation_operation_path(host, &binding, request_id)?.exists();
+    if !receipt_exists && capacity.materializations >= MAX_ROTATION_LIVE_RECORDS {
+        return Err(rotation_state_capacity_exceeded(
+            request_id,
+            "materialization receipts",
+        ));
+    }
+    if !receipt_exists
+        && !operation_exists
+        && capacity
+            .materializations
+            .saturating_add(capacity.operations)
+            >= MAX_ROTATION_LIVE_RECORDS
+    {
+        return Err(rotation_state_capacity_exceeded(
+            request_id,
+            "operations and materialization receipts",
+        ));
+    }
+    if !receipt_exists
+        && (capacity.artifacts >= MAX_ROTATION_ARTIFACT_RECORDS
+            || capacity.decisions >= MAX_ROTATION_ARTIFACT_RECORDS)
+    {
+        return Err(rotation_state_capacity_exceeded(
+            request_id,
+            "artifacts or decisions",
+        ));
+    }
     if let Some(result) = read_materialization_receipt(host, &binding, request_id)? {
         budget.checkpoint(request_id)?;
         return Ok(result);
@@ -550,6 +604,224 @@ fn acquire_rotation_lock(
     Ok(lock)
 }
 
+fn maintain_rotation_capacity(
+    host: &HostContext,
+    binding: &RotationBinding,
+    budget: &RotationBudget,
+    request_id: &str,
+) -> Result<RotationCapacity, ProviderFailure> {
+    let root = rotation_state_root(host, request_id)?;
+    let current_digest = binding_digest(binding);
+    let mut capacity = RotationCapacity::default();
+
+    for path in rotation_collection_paths(&root, "authorizations", request_id)? {
+        budget.checkpoint(request_id)?;
+        if path.file_stem().and_then(|stem| stem.to_str()) != Some(current_digest.as_str())
+            && rotation_record_expired(&path, AUTHORIZATION_TTL)
+        {
+            remove_rotation_record(&path, request_id)?;
+        } else {
+            capacity.authorizations += 1;
+        }
+    }
+
+    for path in rotation_collection_paths(&root, "materializations", request_id)? {
+        budget.checkpoint(request_id)?;
+        if path.file_stem().and_then(|stem| stem.to_str()) != Some(current_digest.as_str())
+            && rotation_record_expired(&path, ROTATION_REPLAY_RETENTION)
+        {
+            remove_rotation_record(&path, request_id)?;
+        } else {
+            capacity.materializations += 1;
+        }
+    }
+
+    let materialization_root = root.join("materializations");
+    for path in rotation_collection_paths(&root, "operations", request_id)? {
+        budget.checkpoint(request_id)?;
+        let successor = path
+            .file_name()
+            .map(|name| materialization_root.join(name))
+            .is_some_and(|receipt| receipt.is_file());
+        if successor {
+            remove_rotation_record(&path, request_id)?;
+        } else {
+            capacity.operations += 1;
+        }
+    }
+
+    let references = rotation_live_artifact_references(host, &root, budget, request_id)?;
+    let artifact_root = confined_rotation_state_target(
+        host,
+        &rotation_data_root(host, request_id)?
+            .join("provider-artifacts")
+            .join("opencode")
+            .join("rotation"),
+        request_id,
+    )?;
+    capacity.artifacts =
+        maintain_rotation_artifact_collection(&artifact_root, &references, budget, request_id)?;
+    capacity.decisions = maintain_rotation_artifact_collection(
+        &root.join("decisions"),
+        &references,
+        budget,
+        request_id,
+    )?;
+
+    for (name, observed) in [
+        ("authorizations", capacity.authorizations),
+        ("materialization receipts", capacity.materializations),
+        ("operations", capacity.operations),
+    ] {
+        if observed > MAX_ROTATION_LIVE_RECORDS {
+            return Err(rotation_state_capacity_exceeded(request_id, name));
+        }
+    }
+    for (name, observed) in [
+        ("artifacts", capacity.artifacts),
+        ("decisions", capacity.decisions),
+    ] {
+        if observed > MAX_ROTATION_ARTIFACT_RECORDS {
+            return Err(rotation_state_capacity_exceeded(request_id, name));
+        }
+    }
+    Ok(capacity)
+}
+
+fn rotation_collection_paths(
+    root: &Path,
+    relative: &str,
+    request_id: &str,
+) -> Result<Vec<PathBuf>, ProviderFailure> {
+    let directory = root.join(relative);
+    rotation_directory_paths(&directory, relative, request_id)
+}
+
+fn rotation_directory_paths(
+    directory: &Path,
+    collection_name: &str,
+    request_id: &str,
+) -> Result<Vec<PathBuf>, ProviderFailure> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(rotation_state_failure(request_id, error)),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| rotation_state_failure(request_id, error))?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .map_err(|error| rotation_state_failure(request_id, error))?
+            .is_file()
+        {
+            return Err(rotation_state_failure(
+                request_id,
+                format!(
+                    "rotation collection entry is not a file: {}",
+                    path.display()
+                ),
+            ));
+        }
+        paths.push(path);
+        if paths.len() > MAX_ROTATION_COMPATIBILITY_RECORDS {
+            return Err(rotation_state_capacity_exceeded(
+                request_id,
+                collection_name,
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+fn rotation_record_expired(path: &Path, retention: Duration) -> bool {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= retention)
+}
+
+fn remove_rotation_record(path: &Path, request_id: &str) -> Result<(), ProviderFailure> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(rotation_state_failure(request_id, error)),
+    }
+    durable_fs::sync_directory(
+        path.parent()
+            .expect("rotation record always has a parent directory"),
+    )
+    .map_err(|error| rotation_state_failure(request_id, error))
+}
+
+fn rotation_live_artifact_references(
+    host: &HostContext,
+    root: &Path,
+    budget: &RotationBudget,
+    request_id: &str,
+) -> Result<HashSet<PathBuf>, ProviderFailure> {
+    let mut references = HashSet::new();
+    for path in rotation_collection_paths(root, "operations", request_id)? {
+        budget.checkpoint(request_id)?;
+        let bytes = durable_fs::read_file_bounded(&path, MAX_ROTATION_STATE_BYTES)
+            .map_err(|error| rotation_state_failure(request_id, error))?;
+        let operation: RotationOperation = serde_json::from_slice(&bytes)
+            .map_err(|error| rotation_operation_invalid(request_id, error))?;
+        references.insert(confined_rotation_state_target(
+            host,
+            Path::new(&operation.artifact_path),
+            request_id,
+        )?);
+    }
+    for path in rotation_collection_paths(root, "materializations", request_id)? {
+        budget.checkpoint(request_id)?;
+        let bytes = durable_fs::read_file_bounded(&path, MAX_ROTATION_STATE_BYTES)
+            .map_err(|error| rotation_state_failure(request_id, error))?;
+        let receipt: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| rotation_state_failure(request_id, error))?;
+        if let Some(artifacts) = receipt
+            .pointer("/result/artifacts")
+            .and_then(Value::as_array)
+        {
+            for artifact in artifacts {
+                if let Some(path) = artifact.get("path").and_then(Value::as_str) {
+                    references.insert(confined_rotation_state_target(
+                        host,
+                        Path::new(path),
+                        request_id,
+                    )?);
+                }
+            }
+        }
+    }
+    Ok(references)
+}
+
+fn maintain_rotation_artifact_collection(
+    directory: &Path,
+    references: &HashSet<PathBuf>,
+    budget: &RotationBudget,
+    request_id: &str,
+) -> Result<usize, ProviderFailure> {
+    let paths = rotation_directory_paths(directory, "artifacts", request_id)?;
+    let mut retained = 0_usize;
+    for path in paths {
+        budget.checkpoint(request_id)?;
+        if !references.contains(&path) && rotation_record_expired(&path, ROTATION_REPLAY_RETENTION)
+        {
+            remove_rotation_record(&path, request_id)?;
+        } else {
+            retained += 1;
+        }
+    }
+    Ok(retained)
+}
+
 fn authorization_path(
     host: &HostContext,
     binding: &RotationBinding,
@@ -864,6 +1136,12 @@ fn finalize_rotation_operation(
         &operation.materialization_request_id,
         request_id,
     )?;
+    budget.checkpoint(request_id)?;
+    remove_rotation_record(
+        &rotation_operation_path(host, binding, request_id)?,
+        request_id,
+    )?;
+    remove_rotation_record(&authorization_path(host, binding, request_id)?, request_id)?;
     budget.checkpoint(request_id)?;
     Ok(result)
 }
@@ -1320,6 +1598,16 @@ fn rotation_state_failure(request_id: &str, error: impl std::fmt::Display) -> Pr
         request_id,
         "rotation_state_failed",
         format!("failed to maintain provider-owned rotation state: {error}"),
+    )
+}
+
+fn rotation_state_capacity_exceeded(request_id: &str, collection: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "rotation_state_capacity_exceeded",
+        format!(
+            "provider-owned rotation {collection} reached its supported bounded custody; reconcile incomplete rotations or wait for the 24-hour replay window to expire"
+        ),
     )
 }
 

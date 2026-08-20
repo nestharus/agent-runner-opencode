@@ -19,23 +19,41 @@
 //!       - opencode unsupported transcript import to SessionReplaceResult boundary
 
 use crate::activity::ActivityTargets;
-use crate::encoding::{encode_base64, sha256_hex};
+use crate::durable_fs;
+use crate::encoding::{encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
 use crate::native_runtime::{self, NativeRuntimeContext};
 use crate::opencode::{
     self, OpencodeExport, OpencodeExportError, OpencodeMessage, OpencodeSessionListError,
 };
+use crate::operation_bounds;
+use crate::path_guard;
 use crate::runtime_selection::{append_resolved_activity_targets, resolve_runtime_selection};
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const CANONICAL_FORMAT: &str = "oulipoly.canonical_transcript/v1";
 const NATIVE_FORMAT_ID: &str = "opencode.export/native-json";
 const SOURCE_KIND: &str = "opencode.export";
 const USER_OBSERVATION_PROJECTION: &str = "user_observation";
 const MAX_OBSERVATION_BODY_TAIL: usize = 16;
+const SESSION_ENUMERATION_SNAPSHOT_DIR: &str =
+    "provider-state/opencode/session-enumeration-snapshots";
+const SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const SESSION_ENUMERATION_SNAPSHOT_TTL_MS: u64 = 15 * 60 * 1_000;
+const SESSION_ENUMERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ENUMERATED_SESSIONS: usize = 256;
+const MAX_ENUMERATION_PAGE_SIZE: usize = 256;
+const MAX_ENUMERATION_SNAPSHOTS: usize = 32;
+const MAX_ENUMERATION_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ENUMERATION_ENTRY_BYTES: usize = 64 * 1024;
+const MAX_ENUMERATION_MANIFEST_BYTES: usize = 16 * 1024;
+const MAX_ENUMERATION_WARNINGS: usize = 32;
 
 #[derive(Deserialize)]
 struct SessionParams {
@@ -87,6 +105,16 @@ struct SessionEnumerateParams {
     include_cwd: Option<bool>,
     include_turn_count: Option<bool>,
     since_unix_ms: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct EnumerationSnapshotManifest {
+    schema_version: u32,
+    snapshot_id: String,
+    identity_sha256: String,
+    total_sessions: usize,
+    created_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
 }
 
 struct CapturedSession {
@@ -360,8 +388,12 @@ pub fn enumerate_params(
 ) -> Result<Value, ProviderFailure> {
     let params = parse_enumerate_params(params, request_id)?;
     validate_enumerate_params(&params, request_id)?;
+    if let Some(cursor) = params.cursor.as_deref() {
+        return load_enumeration_snapshot_page(host, &params, cursor, request_id)
+            .map(enumerate_result);
+    }
     let native = enumerate_native(host, &params.settings_id, request_id)?;
-    let page = enumerate_sessions(native, &params, request_id)?;
+    let page = enumerate_sessions(host, native, &params, request_id)?;
     Ok(enumerate_result(page))
 }
 
@@ -413,7 +445,7 @@ fn validate_enumerate_params(
     params: &SessionEnumerateParams,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    if params.limit == Some(0) {
+    if !matches!(params.limit, None | Some(1..=MAX_ENUMERATION_PAGE_SIZE)) {
         return Err(invalid_session_enumerate_limit_failure(request_id));
     }
     Ok(())
@@ -476,7 +508,19 @@ fn enumerate_native(
     request_id: &str,
 ) -> Result<Vec<Value>, ProviderFailure> {
     let runtime = session_runtime(host, settings_id, request_id)?;
-    opencode::session_list(None, &runtime).map_err(|err| session_list_failure(request_id, err))
+    let timeout =
+        operation_bounds::remaining_timeout(host.deadline_unix_ms, Duration::from_secs(20))
+            .ok_or_else(|| session_list_timeout_failure(request_id))?;
+    let sessions = opencode::session_list_with_timeout(
+        Some(MAX_ENUMERATED_SESSIONS.saturating_add(1)),
+        &runtime,
+        timeout,
+    )
+    .map_err(|err| session_list_failure(request_id, err))?;
+    if sessions.len() > MAX_ENUMERATED_SESSIONS {
+        return Err(session_population_capacity_failure(request_id));
+    }
+    Ok(sessions)
 }
 
 struct EnumeratePage {
@@ -487,6 +531,7 @@ struct EnumeratePage {
 }
 
 fn enumerate_sessions(
+    host: &crate::envelope::HostContext,
     native: Vec<Value>,
     params: &SessionEnumerateParams,
     request_id: &str,
@@ -500,7 +545,7 @@ fn enumerate_sessions(
             sessions.push(session);
         }
     }
-    paginate_sessions(sessions, params, warnings, request_id)
+    paginate_sessions(host, sessions, params, warnings, request_id)
 }
 
 fn enumerate_session_entry(
@@ -540,64 +585,370 @@ fn enumerate_session_entry(
 }
 
 fn paginate_sessions(
+    host: &crate::envelope::HostContext,
     sessions: Vec<Value>,
     params: &SessionEnumerateParams,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
     request_id: &str,
 ) -> Result<EnumeratePage, ProviderFailure> {
-    let identity = enumeration_identity(&sessions);
-    let offset = cursor_offset(params.cursor.as_deref(), &identity, request_id)?;
-    if offset > sessions.len() {
-        return Err(invalid_session_enumerate_cursor_failure(
-            request_id,
-            "cursor offset exceeds the current result population",
+    if warnings.len() > MAX_ENUMERATION_WARNINGS {
+        let omitted = warnings.len() - MAX_ENUMERATION_WARNINGS;
+        warnings.truncate(MAX_ENUMERATION_WARNINGS);
+        warnings.push(format!(
+            "{omitted} additional session enumeration warnings were omitted"
         ));
     }
-    let limit = params
-        .limit
-        .unwrap_or(sessions.len().saturating_sub(offset));
-    let end = offset.saturating_add(limit).min(sessions.len());
+    let limit = params.limit.unwrap_or(MAX_ENUMERATION_PAGE_SIZE);
+    let end = limit.min(sessions.len());
     let complete = end == sessions.len();
-    let next_cursor = (!complete).then(|| format!("v1:{end}:{identity}"));
+    let next_cursor = if complete {
+        None
+    } else {
+        let identity_sha256 = enumeration_request_identity(params);
+        let snapshot_id =
+            persist_enumeration_snapshot(host, &identity_sha256, &sessions, request_id)?;
+        Some(enumeration_cursor(
+            &snapshot_id,
+            end,
+            sessions.len(),
+            &identity_sha256,
+        ))
+    };
     Ok(EnumeratePage {
-        sessions: sessions
-            .into_iter()
-            .skip(offset)
-            .take(end - offset)
-            .collect(),
+        sessions: sessions.into_iter().take(end).collect(),
         warnings,
         complete,
         next_cursor,
     })
 }
 
-fn enumeration_identity(sessions: &[Value]) -> String {
-    let ids = sessions
-        .iter()
-        .filter_map(|session| session["provider_session_id"].as_str())
-        .collect::<Vec<_>>()
-        .join("\0");
-    sha256_hex(ids.as_bytes())
+fn enumeration_request_identity(params: &SessionEnumerateParams) -> String {
+    sha256_hex(
+        json!({
+            "settings_id": params.settings_id,
+            "include_cwd": params.include_cwd.unwrap_or(true),
+            "include_turn_count": params.include_turn_count.unwrap_or(true),
+            "since_unix_ms": params.since_unix_ms,
+        })
+        .to_string()
+        .as_bytes(),
+    )
 }
 
-fn cursor_offset(
-    cursor: Option<&str>,
-    identity: &str,
+fn persist_enumeration_snapshot(
+    host: &crate::envelope::HostContext,
+    identity_sha256: &str,
+    sessions: &[Value],
     request_id: &str,
-) -> Result<usize, ProviderFailure> {
-    let Some(cursor) = cursor else {
-        return Ok(0);
-    };
-    let fields = cursor.split(':').collect::<Vec<_>>();
-    if fields.len() != 3 || fields[0] != "v1" || fields[2] != identity {
-        return Err(invalid_session_enumerate_cursor_failure(
+) -> Result<String, ProviderFailure> {
+    let mut encoded_rows = Vec::with_capacity(sessions.len());
+    let mut encoded_bytes = 0_usize;
+    for session in sessions {
+        let bytes = serde_json::to_vec(session)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+        if bytes.len() > MAX_ENUMERATION_ENTRY_BYTES {
+            return Err(session_snapshot_capacity_failure(
+                request_id,
+                "one projected session row exceeds its supported encoded-size bound",
+            ));
+        }
+        encoded_bytes = encoded_bytes.saturating_add(bytes.len());
+        if encoded_bytes > MAX_ENUMERATION_SNAPSHOT_BYTES {
+            return Err(session_snapshot_capacity_failure(
+                request_id,
+                "the projected session snapshot exceeds its supported encoded-size bound",
+            ));
+        }
+        encoded_rows.push(bytes);
+    }
+    let snapshot_id = sha256_hex(
+        [identity_sha256.as_bytes(), &[0], &encoded_rows.concat()]
+            .concat()
+            .as_slice(),
+    );
+    let root = enumeration_snapshot_root(host, request_id)?;
+    let _lock = acquire_enumeration_snapshot_lock(host, &root, request_id)?;
+    let retained = prune_enumeration_snapshots(host, &root, request_id)?;
+    let snapshot_root =
+        confined_enumeration_snapshot_target(host, &root.join(&snapshot_id), request_id)?;
+    if snapshot_manifest(&snapshot_root, request_id).is_ok_and(|manifest| {
+        manifest.snapshot_id == snapshot_id
+            && manifest.identity_sha256 == identity_sha256
+            && manifest.total_sessions == sessions.len()
+            && manifest.expires_at_unix_ms >= now_unix_ms()
+    }) {
+        return Ok(snapshot_id);
+    }
+    if snapshot_root.exists() {
+        fs::remove_dir_all(&snapshot_root)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+        durable_fs::sync_directory(&root)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+    } else if retained >= MAX_ENUMERATION_SNAPSHOTS {
+        return Err(session_snapshot_capacity_failure(
             request_id,
-            "cursor is malformed or the session population changed",
+            "the active session enumeration snapshot limit is reached; retry after an earlier cursor expires",
         ));
     }
-    fields[1].parse::<usize>().map_err(|_| {
-        invalid_session_enumerate_cursor_failure(request_id, "cursor offset is not an integer")
+    durable_fs::create_private_directories(&snapshot_root)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    for (index, bytes) in encoded_rows.iter().enumerate() {
+        write_enumeration_snapshot_file(&snapshot_root.join(format!("{index:04}.json")), bytes)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+    }
+    let created_at_unix_ms = now_unix_ms();
+    let manifest = EnumerationSnapshotManifest {
+        schema_version: SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: snapshot_id.clone(),
+        identity_sha256: identity_sha256.to_string(),
+        total_sessions: sessions.len(),
+        created_at_unix_ms,
+        expires_at_unix_ms: created_at_unix_ms.saturating_add(SESSION_ENUMERATION_SNAPSHOT_TTL_MS),
+    };
+    let bytes = serde_json::to_vec(&manifest)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    write_enumeration_snapshot_file(&snapshot_root.join("manifest.json"), &bytes)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    Ok(snapshot_id)
+}
+
+fn load_enumeration_snapshot_page(
+    host: &crate::envelope::HostContext,
+    params: &SessionEnumerateParams,
+    cursor: &str,
+    request_id: &str,
+) -> Result<EnumeratePage, ProviderFailure> {
+    let (snapshot_id, start, total, cursor_identity) =
+        parse_enumeration_cursor(cursor, request_id)?;
+    let expected_identity = enumeration_request_identity(params);
+    if cursor_identity != expected_identity {
+        return Err(invalid_session_enumerate_cursor_failure(
+            request_id,
+            "cursor does not match the requested settings and filters",
+        ));
+    }
+    let root = enumeration_snapshot_root(host, request_id)?;
+    let _lock = acquire_enumeration_snapshot_lock(host, &root, request_id)?;
+    let snapshot_root =
+        confined_enumeration_snapshot_target(host, &root.join(&snapshot_id), request_id)?;
+    let manifest = snapshot_manifest(&snapshot_root, request_id).map_err(|_| {
+        invalid_session_enumerate_cursor_failure(request_id, "snapshot is missing or invalid")
+    })?;
+    if manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
+        || manifest.snapshot_id != snapshot_id
+        || manifest.identity_sha256 != expected_identity
+        || manifest.total_sessions != total
+        || manifest.expires_at_unix_ms < now_unix_ms()
+        || start >= total
+    {
+        return Err(invalid_session_enumerate_cursor_failure(
+            request_id,
+            "snapshot identity, lifetime, or offset is invalid",
+        ));
+    }
+    let end = start
+        .saturating_add(params.limit.unwrap_or(MAX_ENUMERATION_PAGE_SIZE))
+        .min(total);
+    let mut sessions = Vec::with_capacity(end - start);
+    for index in start..end {
+        let path = confined_enumeration_snapshot_target(
+            host,
+            &snapshot_root.join(format!("{index:04}.json")),
+            request_id,
+        )?;
+        let bytes = durable_fs::read_file_bounded(&path, MAX_ENUMERATION_ENTRY_BYTES)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+        sessions.push(
+            serde_json::from_slice(&bytes)
+                .map_err(|error| session_snapshot_failure(request_id, error))?,
+        );
+    }
+    let complete = end == total;
+    Ok(EnumeratePage {
+        sessions,
+        warnings: Vec::new(),
+        complete,
+        next_cursor: (!complete)
+            .then(|| enumeration_cursor(&snapshot_id, end, total, &expected_identity)),
     })
+}
+
+fn enumeration_cursor(
+    snapshot_id: &str,
+    offset: usize,
+    total: usize,
+    identity_sha256: &str,
+) -> String {
+    format!("v2:{snapshot_id}:{offset}:{total}:{identity_sha256}")
+}
+
+fn parse_enumeration_cursor(
+    cursor: &str,
+    request_id: &str,
+) -> Result<(String, usize, usize, String), ProviderFailure> {
+    let fields = cursor.split(':').collect::<Vec<_>>();
+    if fields.len() != 5
+        || fields[0] != "v2"
+        || !is_sha256_hex(fields[1])
+        || !is_sha256_hex(fields[4])
+    {
+        return Err(invalid_session_enumerate_cursor_failure(
+            request_id,
+            "cursor is malformed",
+        ));
+    }
+    let offset = fields[2].parse::<usize>().map_err(|_| {
+        invalid_session_enumerate_cursor_failure(request_id, "cursor offset is not an integer")
+    })?;
+    let total = fields[3].parse::<usize>().map_err(|_| {
+        invalid_session_enumerate_cursor_failure(request_id, "cursor total is not an integer")
+    })?;
+    if total > MAX_ENUMERATED_SESSIONS || offset >= total {
+        return Err(invalid_session_enumerate_cursor_failure(
+            request_id,
+            "cursor range is outside the supported session population",
+        ));
+    }
+    Ok((fields[1].to_string(), offset, total, fields[4].to_string()))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn enumeration_snapshot_root(
+    host: &crate::envelope::HostContext,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let data_root = host
+        .data_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(Path::new)
+        .ok_or_else(|| session_snapshot_data_root_failure(request_id))?;
+    confined_enumeration_snapshot_target(
+        host,
+        &data_root.join(SESSION_ENUMERATION_SNAPSHOT_DIR),
+        request_id,
+    )
+}
+
+fn confined_enumeration_snapshot_target(
+    host: &crate::envelope::HostContext,
+    target: &Path,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let data_root = host
+        .data_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(Path::new)
+        .ok_or_else(|| session_snapshot_data_root_failure(request_id))?;
+    path_guard::confined_target(data_root, target)
+        .map_err(|error| session_snapshot_failure(request_id, error))
+}
+
+fn acquire_enumeration_snapshot_lock(
+    host: &crate::envelope::HostContext,
+    root: &Path,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    durable_fs::create_private_directories(root)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    let lock_path =
+        confined_enumeration_snapshot_target(host, &root.join(".snapshots.lock"), request_id)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    let timeout = operation_bounds::remaining_timeout(
+        host.deadline_unix_ms,
+        SESSION_ENUMERATION_LOCK_TIMEOUT,
+    )
+    .ok_or_else(|| session_snapshot_lock_timeout_failure(request_id))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| session_snapshot_failure(request_id, error))?
+    {
+        return Err(session_snapshot_lock_timeout_failure(request_id));
+    }
+    Ok(lock)
+}
+
+fn prune_enumeration_snapshots(
+    host: &crate::envelope::HostContext,
+    root: &Path,
+    request_id: &str,
+) -> Result<usize, ProviderFailure> {
+    let mut retained = 0_usize;
+    let mut visited = 0_usize;
+    for entry in fs::read_dir(root).map_err(|error| session_snapshot_failure(request_id, error))? {
+        let entry = entry.map_err(|error| session_snapshot_failure(request_id, error))?;
+        if !entry
+            .file_type()
+            .map_err(|error| session_snapshot_failure(request_id, error))?
+            .is_dir()
+        {
+            continue;
+        }
+        visited += 1;
+        if visited > MAX_ENUMERATION_SNAPSHOTS.saturating_add(1) {
+            return Err(session_snapshot_capacity_failure(
+                request_id,
+                "the snapshot directory exceeds its supported entry bound",
+            ));
+        }
+        let path = confined_enumeration_snapshot_target(host, &entry.path(), request_id)?;
+        let expired_or_partial = snapshot_manifest(&path, request_id)
+            .map(|manifest| manifest.expires_at_unix_ms < now_unix_ms())
+            .unwrap_or(true);
+        if expired_or_partial {
+            fs::remove_dir_all(&path)
+                .map_err(|error| session_snapshot_failure(request_id, error))?;
+            durable_fs::sync_directory(root)
+                .map_err(|error| session_snapshot_failure(request_id, error))?;
+        } else {
+            retained += 1;
+        }
+    }
+    Ok(retained)
+}
+
+fn snapshot_manifest(
+    snapshot_root: &Path,
+    request_id: &str,
+) -> Result<EnumerationSnapshotManifest, ProviderFailure> {
+    let bytes = durable_fs::read_file_bounded(
+        &snapshot_root.join("manifest.json"),
+        MAX_ENUMERATION_MANIFEST_BYTES,
+    )
+    .map_err(|error| session_snapshot_failure(request_id, error))?;
+    serde_json::from_slice(&bytes).map_err(|error| session_snapshot_failure(request_id, error))
+}
+
+fn write_enumeration_snapshot_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("snapshot path has no parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    set_private_snapshot_file(path)?;
+    durable_fs::sync_directory(parent)
+}
+
+#[cfg(unix)]
+fn set_private_snapshot_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_snapshot_file(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn required_enumerated_session_id(
@@ -786,6 +1137,17 @@ fn session_list_failure(request_id: &str, err: OpencodeSessionListError) -> Prov
         OpencodeSessionListError::InvalidJson(message) => {
             invalid_opencode_session_list_failure(request_id, message)
         }
+        OpencodeSessionListError::OutputTooLarge {
+            stream,
+            maximum_bytes,
+        } => ProviderFailure::invalid_request(
+            request_id,
+            "opencode_session_list_capacity_exceeded",
+            format!(
+                "opencode session list {stream} exceeds the supported {maximum_bytes}-byte bound"
+            ),
+        ),
+        OpencodeSessionListError::TimedOut => session_list_timeout_failure(request_id),
     }
 }
 
@@ -1175,7 +1537,7 @@ fn invalid_session_enumerate_limit_failure(request_id: &str) -> ProviderFailure 
     ProviderFailure::invalid_request(
         request_id,
         "invalid_session_enumerate_params",
-        "session.enumerate limit must be greater than or equal to 1",
+        format!("session.enumerate limit must be between 1 and {MAX_ENUMERATION_PAGE_SIZE}"),
     )
 }
 
@@ -1318,6 +1680,59 @@ fn invalid_opencode_session_list_row_failure(request_id: &str, index: usize) -> 
         request_id,
         "invalid_opencode_session_list",
         format!("opencode session list row {index} is missing a non-empty id"),
+    )
+}
+
+fn session_list_timeout_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "opencode_session_list_timeout",
+        "opencode session list did not complete within the supported operation deadline",
+    )
+}
+
+fn session_population_capacity_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "opencode_session_population_capacity_exceeded",
+        format!(
+            "opencode session population exceeds the supported {MAX_ENUMERATED_SESSIONS}-session snapshot bound"
+        ),
+    )
+}
+
+fn session_snapshot_data_root_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "session_enumeration_data_root_missing",
+        "paginated session enumeration requires host.data_root for its bounded continuation snapshot",
+    )
+}
+
+fn session_snapshot_failure(request_id: &str, error: impl std::fmt::Display) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "session_enumeration_snapshot_failed",
+        format!("bounded session enumeration snapshot failed: {error}"),
+    )
+}
+
+fn session_snapshot_capacity_failure(
+    request_id: &str,
+    message: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "session_enumeration_snapshot_capacity_exceeded",
+        message.to_string(),
+    )
+}
+
+fn session_snapshot_lock_timeout_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "session_enumeration_snapshot_lock_timeout",
+        "session enumeration snapshot lock could not be acquired before the operation deadline",
     )
 }
 

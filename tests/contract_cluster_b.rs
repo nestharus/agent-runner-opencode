@@ -131,13 +131,14 @@ fn contract_session_enumerate_honors_limit() {
     let result = enumerate_result(session_enumerate_limit_params(2), &path);
 
     assert_limited_enumerate_result(&result, 2);
-    assert_session_list_is_exhaustive(fake_opencode.log_path());
+    assert_session_list_uses_bounded_snapshot(fake_opencode.log_path());
 
     let cursor = result["next_cursor"]
         .as_str()
         .expect("truncated page cursor");
     let second = enumerate_result(session_enumerate_cursor_params(2, cursor), &path);
     assert_second_enumerate_page(&second);
+    assert_session_list_uses_bounded_snapshot(fake_opencode.log_path());
 }
 
 #[test]

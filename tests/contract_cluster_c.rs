@@ -396,6 +396,54 @@ fn contract_quota_observer_rejects_curl_config_injection_before_spawn() {
 }
 
 #[test]
+fn contract_quota_observer_rejects_oversized_auth_before_spawn() {
+    let home = HomeFixture::new("agent-runner-opencode-quota-oversized-auth-home");
+    home.write_paired_auth(&vec![b'x'; 1024 * 1024 + 1]);
+    let curl = FakeNativeCurl::new();
+    let path = curl.path_env();
+    let result = success_result(
+        invoke_with_env(
+            "quota.probe",
+            quota_base_params(),
+            &[("HOME", home.path_str()), ("PATH", path.as_str())],
+        ),
+        "quota.schema.json#/$defs/QuotaProbeResponse",
+        "quota.schema.json#/$defs/QuotaProbeResult",
+    );
+    assert_eq!(result["available"], false);
+    assert!(result["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("1048576-byte bound")));
+    assert!(
+        !curl.invocation_path.exists(),
+        "oversized auth must fail before quota transport"
+    );
+}
+
+#[test]
+fn contract_quota_observer_bounds_oversized_wham_output() {
+    let home = HomeFixture::new("agent-runner-opencode-quota-oversized-wham-home");
+    home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
+    let body = "x".repeat(512 * 1024 + 1);
+    let curl = FakeNativeCurl::with_response(200, &body);
+    let path = curl.path_env();
+    let result = success_result(
+        invoke_with_env(
+            "quota.probe",
+            quota_base_params(),
+            &[("HOME", home.path_str()), ("PATH", path.as_str())],
+        ),
+        "quota.schema.json#/$defs/QuotaProbeResponse",
+        "quota.schema.json#/$defs/QuotaProbeResult",
+    );
+    assert_eq!(result["available"], false);
+    assert!(result["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("bounded response")));
+    curl.assert_native_invocation();
+}
+
+#[test]
 fn contract_native_quota_failure_names_wham_boundary() {
     let home = HomeFixture::new("agent-runner-opencode-native-quota-failure-home");
     home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());

@@ -13,6 +13,9 @@ use crate::discovery;
 use crate::encoding::canonical_json_bytes;
 use crate::envelope::{
     failure_response, success_response, ProviderFailure, RequestEnvelope, CONTRACT,
+    MAX_HOST_ENV_BYTES, MAX_HOST_ENV_ENTRIES, MAX_HOST_ENV_KEY_BYTES, MAX_HOST_ENV_VALUE_BYTES,
+    MAX_HOST_LABEL_BYTES, MAX_HOST_PATH_BYTES, MAX_PROVIDER_INSTANCE_ID_BYTES,
+    MAX_REQUEST_ENVELOPE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 use crate::schema::{describe_result, schema_result_params};
 use crate::{launch, migration, policy, quota, rotation, session, settings, setup, terminal};
@@ -311,6 +314,9 @@ pub fn subcommand_from_args<'a>(
 }
 
 pub fn decode_request(stdin: &[u8]) -> Result<RequestEnvelope, ProviderFailure> {
+    if stdin.len() > MAX_REQUEST_ENVELOPE_BYTES {
+        return Err(request_envelope_capacity_exceeded());
+    }
     let raw = parse_raw_request(stdin).map_err(invalid_json_failure)?;
     let request_id = fallback_request_id(request_id_from_raw(&raw));
     validate_params_present(&raw, &request_id)?;
@@ -458,10 +464,52 @@ fn validate_request_envelope(request: RequestEnvelope) -> Result<RequestEnvelope
     if request.request_id.trim().is_empty() {
         return Err(invalid_request_id_failure());
     }
-    if request.host.app.trim().is_empty() {
+    if request.request_id.len() > MAX_REQUEST_ID_BYTES
+        || request
+            .provider_instance_id
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_PROVIDER_INSTANCE_ID_BYTES)
+    {
+        return Err(request_envelope_capacity_exceeded());
+    }
+    if request.host.app.trim().is_empty()
+        || request.host.app.len() > MAX_HOST_LABEL_BYTES
+        || request
+            .host
+            .app_version
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_HOST_LABEL_BYTES)
+        || request
+            .host
+            .platform
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_HOST_LABEL_BYTES)
+        || [
+            request.host.working_directory.as_ref(),
+            request.host.config_root.as_ref(),
+            request.host.data_root.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value.len() > MAX_HOST_PATH_BYTES)
+        || !host_env_within_bounds(request.host.env.as_ref())
+    {
         return Err(invalid_host_failure(request.request_id));
     }
     Ok(request)
+}
+
+fn host_env_within_bounds(env: Option<&std::collections::BTreeMap<String, String>>) -> bool {
+    let Some(env) = env else {
+        return true;
+    };
+    env.len() <= MAX_HOST_ENV_ENTRIES
+        && env.iter().all(|(key, value)| {
+            key.len() <= MAX_HOST_ENV_KEY_BYTES && value.len() <= MAX_HOST_ENV_VALUE_BYTES
+        })
+        && env.iter().fold(0_usize, |total, (key, value)| {
+            total.saturating_add(key.len()).saturating_add(value.len())
+        }) <= MAX_HOST_ENV_BYTES
 }
 
 fn unknown_subcommand_failure(request_id: String, subcommand: &str) -> ProviderFailure {
@@ -551,10 +599,48 @@ fn invalid_host_failure(request_id: String) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
         "invalid_host",
-        "host.app must be a non-empty string",
+        "host identity, path, or environment exceeds the supported bounded envelope",
+    )
+}
+
+fn request_envelope_capacity_exceeded() -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        "unknown",
+        "request_envelope_capacity_exceeded",
+        format!("request envelope exceeds the supported {MAX_REQUEST_ENVELOPE_BYTES}-byte bound"),
     )
 }
 
 fn report_stdout_write_failure(err: std::io::Error) {
     eprintln!("failed to write stdout: {err}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_decode_rejects_input_above_the_process_bound_before_parsing() {
+        let bytes = vec![b' '; MAX_REQUEST_ENVELOPE_BYTES + 1];
+        let failure = decode_request(&bytes).expect_err("oversized envelope must fail");
+        assert_eq!(failure.code, "request_envelope_capacity_exceeded");
+    }
+
+    #[test]
+    fn request_decode_rejects_host_environment_above_the_entry_bound() {
+        let env = (0..=MAX_HOST_ENV_ENTRIES)
+            .map(|index| (format!("KEY_{index}"), json!("value")))
+            .collect::<serde_json::Map<_, _>>();
+        let bytes = serde_json::to_vec(&json!({
+            "contract": CONTRACT,
+            "request_id": "request-bounded-env",
+            "provider_instance_id": "opencode-primary",
+            "host": {"app": "agent-runner", "env": env},
+            "params": {},
+        }))
+        .expect("serialize request fixture");
+        let failure = decode_request(&bytes).expect_err("oversized host env must fail");
+        assert_eq!(failure.code, "invalid_host");
+    }
 }

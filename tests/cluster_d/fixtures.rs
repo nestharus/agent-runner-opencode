@@ -125,6 +125,7 @@ pub struct RotationOpencodeFixture {
     import_record: PathBuf,
     import_cwd_record: PathBuf,
     import_count_record: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
     finalization_fault_marker: Option<PathBuf>,
 }
 
@@ -133,10 +134,12 @@ impl RotationOpencodeFixture {
         Self::configured(false, None, false, 0)
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn with_post_import_finalization_fault() -> Self {
         Self::configured(true, None, false, 0)
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn with_post_import_finalization_fault_and_target_id(target_session_id: &str) -> Self {
         Self::configured(true, Some(target_session_id), false, 0)
     }
@@ -222,6 +225,7 @@ impl RotationOpencodeFixture {
         self.import_record.exists() || self.import_count_record.exists()
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn restore_operation_state_writes(&self, data_root: &Path) {
         let operation_root = data_root.join("provider-state/opencode/rotation/operations");
         fs::remove_file(&operation_root).expect("remove blocked operation-state path");
@@ -585,10 +589,12 @@ pub fn write_executable_write_error(path: &Path, err: &std::io::Error) -> String
     format!("write {}: {err}", path.display())
 }
 
+#[cfg(unix)]
 pub fn write_executable_metadata_error(path: &Path, err: &std::io::Error) -> String {
     format!("metadata {}: {err}", path.display())
 }
 
+#[cfg(unix)]
 pub fn write_executable_chmod_error(path: &Path, err: &std::io::Error) -> String {
     format!("chmod {}: {err}", path.display())
 }

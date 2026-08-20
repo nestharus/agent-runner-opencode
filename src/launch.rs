@@ -17,20 +17,22 @@ use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, s
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 use crate::native_runtime;
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
+use crate::operation_bounds;
 use crate::path_guard;
 use crate::policy;
 use crate::resume_observation::{
     self, DurableResumeObservationRequest, ResumeObservation, ResumeObservationRequest,
 };
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -40,13 +42,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);
 const COMPLETED_RESUME_GRACE: Duration = Duration::from_millis(500);
-const RESUME_COMPLETION_PROBE_DELAY: Duration = Duration::from_secs(1);
-const RESUME_COMPLETION_PROBE_INTERVAL: Duration = Duration::from_millis(500);
-const MAX_RESUME_COMPLETION_PROBES: usize = 3;
 const DRAIN_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 const DRAIN_CHANNEL_CAPACITY: usize = 32;
 const TERMINAL_CAPTURE_LIMIT: usize = 1024 * 1024;
 const DEFERRED_EVENT_LIMIT: usize = 1024 * 1024;
+const LAUNCH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_LAUNCH_RECOVERY_SESSIONS: usize = 256;
+const MAX_LAUNCH_RECOVERY_CANDIDATES: usize = 8;
 const OPENCODE_SESSION_FLAG: &str = "--session";
 const OPENCODE_RUN_ARG: &str = "run";
 const POLICY_MANAGED_FLAGS_WITH_VALUE: &[&str] = &["--format", "-m", "--variant"];
@@ -57,6 +59,10 @@ const RESUME_COMPLETION_UNRESOLVED_MARKER: &str = "oulipoly.resume_completion_un
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
+const LAUNCH_REQUEST_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const LAUNCH_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_LAUNCH_REQUEST_RECORDS: usize = 64;
+const MAX_LAUNCH_STATE_BYTES: usize = 256 * 1024;
 #[cfg(unix)]
 const LAUNCH_EXEC_GATE_ARG: &str = "__launch_exec_gate";
 #[cfg(unix)]
@@ -190,7 +196,6 @@ enum ResumeLaunchRequestPhase {
 struct ResumeLaunchRequestGuard {
     state_path: PathBuf,
     state: ResumeLaunchRequestState,
-    declared_env: BTreeMap<String, String>,
     _lock: fs::File,
 }
 
@@ -473,15 +478,8 @@ fn effective_launch(
     }
     let stdin = stdin.map(String::into_bytes);
     let argv = resume_argv(params, argv, stdin.as_deref(), request_id)?;
-    let resume_observation_request = resume_observation_request(
-        params,
-        stdin.as_deref(),
-        &argv,
-        host.deadline_unix_ms,
-        &route,
-        &native_runtime,
-        &env,
-    );
+    let resume_observation_request =
+        resume_observation_request(params, stdin.as_deref(), &argv, &route);
     let mut activity_targets = ActivityTargets::default();
     policy::append_route_activity_targets(&mut activity_targets, &route);
     let argv = split_oversized_prompt_argv(argv, request_id)?;
@@ -562,10 +560,7 @@ fn resume_observation_request(
     params: &LaunchParams,
     stdin: Option<&[u8]>,
     argv: &[String],
-    deadline_unix_ms: Option<u64>,
     route: &policy::PolicyRouteIdentity,
-    native_runtime: &native_runtime::NativeRuntimeContext,
-    declared_env: &BTreeMap<String, String>,
 ) -> Option<ResumeObservationRequest> {
     let session_id = known_provider_session_id(params)?;
     let prompt = submitted_resume_payload(argv, stdin)?;
@@ -574,13 +569,9 @@ fn resume_observation_request(
         session_id.to_string(),
         prompt,
         now_unix_ms(),
-        deadline_unix_ms,
         route.provider_id.clone(),
         route.model_id.clone(),
         route.effort.to_string(),
-        native_runtime.program().to_string(),
-        params.working_directory.clone(),
-        native_runtime.execution_environment(declared_env),
     ))
 }
 
@@ -1002,7 +993,6 @@ fn run_supervision_loop<W: Write>(
     while !state.is_complete() {
         capture_child_exit(child, state)?;
         enforce_deadline(child, state)?;
-        state.probe_completed_resume();
         complete_terminal_resume(child, state);
         close_lingering_process_group(child, state);
         match receiver.recv_timeout(state.wait_duration()) {
@@ -1087,17 +1077,20 @@ fn reconcile_existing_launch_request(
     let key = sha256_hex(request_id.as_bytes());
     let state_path =
         confined_launch_state_target(host, &root.join(format!("{key}.json")), request_id)?;
-    let lock_path =
-        confined_launch_state_target(host, &root.join(format!("{key}.lock")), request_id)?;
-    let lock = open_launch_state_lock(&lock_path)
-        .map_err(|error| launch_state_failure(request_id, error))?;
-    lock.lock_exclusive()
-        .map_err(|error| launch_state_failure(request_id, error))?;
-    let bytes = match durable_fs::read_file(&state_path) {
-        Ok(bytes) => bytes,
+    match fs::metadata(&state_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(launch_state_failure(
+                request_id,
+                "launch state is not a file",
+            ))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(launch_state_failure(request_id, error)),
-    };
+    }
+    let _lock = acquire_launch_request_lock(host, &root, &state_path, false, request_id)?;
+    let bytes = durable_fs::read_file_bounded(&state_path, MAX_LAUNCH_STATE_BYTES)
+        .map_err(|error| launch_state_failure(request_id, error))?;
     let expected_kind = if new_session {
         LaunchOperationKind::NewSession
     } else {
@@ -1129,7 +1122,7 @@ fn reconcile_existing_launch_request(
                     request_id,
                     &state.binding_sha256,
                 )?;
-                match recover_prepared_launch(&state, declared_env, request_id)? {
+                match recover_prepared_launch(host, &state, declared_env, request_id)? {
                     PreparedLaunchRecovery::NoEffectObserved => {
                         remove_launch_request_state(&state_path, request_id)?;
                     }
@@ -1167,8 +1160,10 @@ fn reconcile_existing_launch_request(
         | ResumeLaunchRequestPhase::CompletionObserved => {
             Err(resume_launch_reconciliation_required(request_id, &state))
         }
+        ResumeLaunchRequestPhase::Unresolved => {
+            Err(resume_launch_recovery_unavailable(request_id, &state))
+        }
         ResumeLaunchRequestPhase::Prepared
-        | ResumeLaunchRequestPhase::Unresolved
         | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
             validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
             if state.phase == ResumeLaunchRequestPhase::Prepared {
@@ -1216,13 +1211,8 @@ impl LaunchRequestGuard {
         let key = sha256_hex(request_id.as_bytes());
         let state_path =
             confined_launch_state_target(host, &root.join(format!("{key}.json")), request_id)?;
-        let lock_path =
-            confined_launch_state_target(host, &root.join(format!("{key}.lock")), request_id)?;
-        let lock = open_launch_state_lock(&lock_path)
-            .map_err(|error| launch_state_failure(request_id, error))?;
-        lock.lock_exclusive()
-            .map_err(|error| launch_state_failure(request_id, error))?;
-        match durable_fs::read_file(&state_path) {
+        let lock = acquire_launch_request_lock(host, &root, &state_path, true, request_id)?;
+        match durable_fs::read_file_bounded(&state_path, MAX_LAUNCH_STATE_BYTES) {
             Ok(bytes) => {
                 validate_launch_operation_kind(
                     &bytes,
@@ -1248,7 +1238,12 @@ impl LaunchRequestGuard {
                             request_id,
                             &state.binding_sha256,
                         )?;
-                        match recover_prepared_launch(&state, &recovery.declared_env, request_id)? {
+                        match recover_prepared_launch(
+                            host,
+                            &state,
+                            &recovery.declared_env,
+                            request_id,
+                        )? {
                             PreparedLaunchRecovery::NoEffectObserved => {
                                 remove_launch_request_state(&state_path, request_id)?;
                             }
@@ -1350,7 +1345,11 @@ impl LaunchRequestGuard {
     }
 
     fn abandon_before_spawn(self) -> Result<(), ProviderFailure> {
-        remove_launch_request_state(&self.state_path, &self.state.request_id)
+        let state_path = self.state_path.clone();
+        let request_id = self.state.request_id.clone();
+        remove_launch_request_state(&state_path, &request_id)?;
+        drop(self);
+        retire_orphan_launch_request_lock(&state_path, &request_id)
     }
 }
 
@@ -1369,13 +1368,8 @@ impl ResumeLaunchRequestGuard {
         let key = sha256_hex(request_id.as_bytes());
         let state_path =
             confined_launch_state_target(host, &root.join(format!("{key}.json")), request_id)?;
-        let lock_path =
-            confined_launch_state_target(host, &root.join(format!("{key}.lock")), request_id)?;
-        let lock = open_launch_state_lock(&lock_path)
-            .map_err(|error| launch_state_failure(request_id, error))?;
-        lock.lock_exclusive()
-            .map_err(|error| launch_state_failure(request_id, error))?;
-        match durable_fs::read_file(&state_path) {
+        let lock = acquire_launch_request_lock(host, &root, &state_path, true, request_id)?;
+        match durable_fs::read_file_bounded(&state_path, MAX_LAUNCH_STATE_BYTES) {
             Ok(bytes) => {
                 validate_launch_operation_kind(
                     &bytes,
@@ -1399,8 +1393,10 @@ impl ResumeLaunchRequestGuard {
                     | ResumeLaunchRequestPhase::CompletionObserved => {
                         return Err(resume_launch_reconciliation_required(request_id, &state));
                     }
+                    ResumeLaunchRequestPhase::Unresolved => {
+                        return Err(resume_launch_recovery_unavailable(request_id, &state));
+                    }
                     ResumeLaunchRequestPhase::Prepared
-                    | ResumeLaunchRequestPhase::Unresolved
                     | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
                         if state.phase == ResumeLaunchRequestPhase::Prepared {
                             require_prior_actor_terminal(
@@ -1455,17 +1451,8 @@ impl ResumeLaunchRequestGuard {
         Ok(Self {
             state_path,
             state,
-            declared_env: recovery.declared_env,
             _lock: lock,
         })
-    }
-
-    fn observe(&self) -> ResumeObservation {
-        observe_durable_resume(
-            &self.state.observation,
-            &self.state.recovery,
-            &self.declared_env,
-        )
     }
 
     fn observe_actor(&mut self, process_group_id: u32) -> Result<(), ProviderFailure> {
@@ -1508,20 +1495,60 @@ impl ResumeLaunchRequestGuard {
     }
 
     fn abandon_before_spawn(self) -> Result<(), ProviderFailure> {
-        remove_launch_request_state(&self.state_path, &self.state.request_id)
+        let state_path = self.state_path.clone();
+        let request_id = self.state.request_id.clone();
+        remove_launch_request_state(&state_path, &request_id)?;
+        drop(self);
+        retire_orphan_launch_request_lock(&state_path, &request_id)
     }
 }
 
 fn remove_launch_request_state(path: &Path, request_id: &str) -> Result<(), ProviderFailure> {
+    let root = path
+        .parent()
+        .expect("launch state path always has a parent");
     match fs::remove_file(path) {
-        Ok(()) => durable_fs::sync_directory(
-            path.parent()
-                .expect("launch state path always has a parent"),
-        )
-        .map_err(|error| launch_state_failure(request_id, error)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(launch_state_failure(request_id, error)),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(launch_state_failure(request_id, error)),
     }
+    durable_fs::sync_directory(root).map_err(|error| launch_state_failure(request_id, error))
+}
+
+fn retire_orphan_launch_request_lock(
+    state_path: &Path,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let root = state_path
+        .parent()
+        .expect("launch state path always has a parent");
+    let capacity = open_launch_state_lock(&root.join(".capacity.lock"))
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    if !operation_bounds::lock_exclusive_for(&capacity, LAUNCH_STATE_LOCK_TIMEOUT)
+        .map_err(|error| launch_state_failure(request_id, error))?
+    {
+        return Err(launch_state_lock_timeout(request_id));
+    }
+    if state_path.exists() {
+        return Ok(());
+    }
+    let lock_path = state_path.with_extension("lock");
+    let lock = open_launch_state_lock(&lock_path)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        Err(error) => return Err(launch_state_failure(request_id, error)),
+    }
+    if state_path.exists() {
+        return Ok(());
+    }
+    match fs::remove_file(&lock_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(launch_state_failure(request_id, error)),
+    }
+    durable_fs::sync_directory(root).map_err(|error| launch_state_failure(request_id, error))
 }
 
 fn launch_request_binding_sha256(
@@ -1693,29 +1720,29 @@ fn resolve_launch_program(
 }
 
 fn recover_prepared_launch(
+    host: &HostContext,
     state: &LaunchRequestState,
     declared_env: &BTreeMap<String, String>,
     request_id: &str,
 ) -> Result<PreparedLaunchRecovery, ProviderFailure> {
-    let output = launch_recovery_command(
-        state,
-        declared_env,
-        &["session", "list", "--format", "json"],
+    let started = Instant::now();
+    let env = launch_recovery_environment(state, declared_env);
+    let sessions = opencode::session_list_with_launch_context(
+        &state.recovery.program,
+        &state.recovery.working_directory,
+        &env,
+        Some(MAX_LAUNCH_RECOVERY_SESSIONS.saturating_add(1)),
+        launch_recovery_remaining(host, started, request_id)?,
     )
-    .output()
-    .map_err(|error| launch_recovery_unavailable(request_id, error))?;
-    if !output.status.success() {
+    .map_err(|error| launch_recovery_unavailable(request_id, format!("{error:?}")))?;
+    if sessions.len() > MAX_LAUNCH_RECOVERY_SESSIONS {
         return Err(launch_recovery_unavailable(
             request_id,
             format!(
-                "session list exited {:?}: {}",
-                output.status.code(),
-                bounded_text(&String::from_utf8_lossy(&output.stderr), 500)
+                "session population exceeds the supported {MAX_LAUNCH_RECOVERY_SESSIONS}-session recovery bound"
             ),
         ));
     }
-    let sessions = opencode::parse_session_list_stdout(&output.stdout)
-        .map_err(|error| launch_recovery_unavailable(request_id, format!("{error:?}")))?;
     let mut candidates = sessions
         .iter()
         .filter(|entry| launch_recovery_session_is_plausible(entry, state))
@@ -1726,17 +1753,19 @@ fn recover_prepared_launch(
     if candidates.is_empty() {
         return Ok(PreparedLaunchRecovery::NoEffectObserved);
     }
+    if candidates.len() > MAX_LAUNCH_RECOVERY_CANDIDATES {
+        return Ok(PreparedLaunchRecovery::Ambiguous(candidates));
+    }
     let Some(prompt_sha256) = state.prompt_sha256.as_deref() else {
         return Ok(PreparedLaunchRecovery::Ambiguous(candidates));
     };
-    let mut matched = candidates
-        .iter()
-        .filter(|session_id| {
-            recovered_session_matches_request(state, declared_env, session_id, prompt_sha256)
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut matched = Vec::new();
+    for session_id in &candidates {
+        if recovered_session_matches_request(host, started, state, &env, session_id, prompt_sha256)?
+        {
+            matched.push(session_id.clone());
+        }
+    }
     matched.sort();
     matched.dedup();
     match matched.as_slice() {
@@ -1746,20 +1775,24 @@ fn recover_prepared_launch(
     }
 }
 
-fn launch_recovery_command(
+fn launch_recovery_environment(
     state: &LaunchRequestState,
     declared_env: &BTreeMap<String, String>,
-    args: &[&str],
-) -> Command {
-    let mut command = Command::new(&state.recovery.program);
+) -> BTreeMap<String, String> {
     let mut env = state.recovery.passthrough_env.clone();
     env.extend(declared_env.clone());
-    command
-        .args(args)
-        .current_dir(&state.recovery.working_directory)
-        .env_clear()
-        .envs(env);
-    command
+    env
+}
+
+fn launch_recovery_remaining(
+    host: &HostContext,
+    started: Instant,
+    request_id: &str,
+) -> Result<Duration, ProviderFailure> {
+    let remaining = LAUNCH_RECOVERY_TIMEOUT.saturating_sub(started.elapsed());
+    operation_bounds::remaining_timeout(host.deadline_unix_ms, remaining)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| launch_recovery_unavailable(request_id, "recovery deadline was reached"))
 }
 
 fn launch_recovery_session_is_plausible(entry: &Value, state: &LaunchRequestState) -> bool {
@@ -1799,19 +1832,21 @@ fn launch_recovery_integer(entry: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 fn recovered_session_matches_request(
+    host: &HostContext,
+    started: Instant,
     state: &LaunchRequestState,
-    declared_env: &BTreeMap<String, String>,
+    env: &BTreeMap<String, String>,
     session_id: &str,
     prompt_sha256: &str,
 ) -> Result<bool, ProviderFailure> {
-    let output = launch_recovery_command(state, declared_env, &["export", session_id])
-        .output()
-        .map_err(|error| launch_recovery_unavailable(&state.request_id, error))?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    let export = opencode::parse_export_stdout(&output.stdout)
-        .map_err(|error| launch_recovery_unavailable(&state.request_id, format!("{error:?}")))?;
+    let export = opencode::export_with_launch_context(
+        session_id,
+        &state.recovery.program,
+        &state.recovery.working_directory,
+        env,
+        launch_recovery_remaining(host, started, &state.request_id)?,
+    )
+    .map_err(|error| launch_recovery_unavailable(&state.request_id, format!("{error:?}")))?;
     if export.info.id != session_id {
         return Ok(false);
     }
@@ -1867,6 +1902,166 @@ fn confined_launch_state_target(
         .map_err(|error| launch_state_failure(request_id, error))
 }
 
+fn acquire_launch_request_lock(
+    host: &HostContext,
+    root: &Path,
+    state_path: &Path,
+    admit_new: bool,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    let capacity = acquire_launch_capacity_lock(root, host, request_id)?;
+    let lock_path = state_path.with_extension("lock");
+    let existing_lock = lock_path.exists();
+    let retained = maintain_launch_request_capacity(root, &lock_path, request_id)?;
+    if admit_new && !existing_lock && retained >= MAX_LAUNCH_REQUEST_RECORDS {
+        return Err(launch_state_capacity_exceeded(request_id));
+    }
+    let lock = open_launch_state_lock(&lock_path)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    drop(capacity);
+    let timeout =
+        operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
+            .ok_or_else(|| launch_state_lock_timeout(request_id))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| launch_state_failure(request_id, error))?
+    {
+        return Err(launch_state_lock_timeout(request_id));
+    }
+    Ok(lock)
+}
+
+fn acquire_launch_capacity_lock(
+    root: &Path,
+    host: &HostContext,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    durable_fs::create_private_directories(root)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    let path = root.join(".capacity.lock");
+    let lock =
+        open_launch_state_lock(&path).map_err(|error| launch_state_failure(request_id, error))?;
+    let timeout =
+        operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
+            .ok_or_else(|| launch_state_lock_timeout(request_id))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| launch_state_failure(request_id, error))?
+    {
+        return Err(launch_state_lock_timeout(request_id));
+    }
+    Ok(lock)
+}
+
+fn maintain_launch_request_capacity(
+    root: &Path,
+    current_lock_path: &Path,
+    request_id: &str,
+) -> Result<usize, ProviderFailure> {
+    let mut retained = 0_usize;
+    let mut visited = 0_usize;
+    for entry in fs::read_dir(root).map_err(|error| launch_state_failure(request_id, error))? {
+        let entry = entry.map_err(|error| launch_state_failure(request_id, error))?;
+        let path = entry.path();
+        if path == current_lock_path
+            || path.file_name().and_then(|name| name.to_str()) == Some(".capacity.lock")
+            || path.extension().and_then(|extension| extension.to_str()) != Some("lock")
+        {
+            continue;
+        }
+        visited += 1;
+        if visited > MAX_LAUNCH_REQUEST_RECORDS.saturating_add(1) {
+            return Err(launch_state_capacity_exceeded(request_id));
+        }
+        let state_path = path.with_extension("json");
+        if launch_request_record_expired(&path, &state_path, request_id)?
+            && remove_expired_launch_record(&path, &state_path, request_id)?
+        {
+            continue;
+        }
+        retained += 1;
+    }
+    if current_lock_path.exists() {
+        retained += 1;
+    }
+    Ok(retained)
+}
+
+fn launch_request_record_expired(
+    lock_path: &Path,
+    state_path: &Path,
+    request_id: &str,
+) -> Result<bool, ProviderFailure> {
+    let state_metadata = match fs::metadata(state_path) {
+        Ok(metadata) if metadata.is_file() => Some(metadata),
+        Ok(_) => {
+            return Err(launch_state_failure(
+                request_id,
+                "launch state is not a file",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(launch_state_failure(request_id, error)),
+    };
+    let modified = match state_metadata.as_ref() {
+        Some(metadata) => metadata.modified().ok(),
+        None => fs::metadata(lock_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok()),
+    };
+    let old_enough = modified
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= LAUNCH_REQUEST_RETENTION);
+    if !old_enough {
+        return Ok(false);
+    }
+    let Some(_) = state_metadata else {
+        return Ok(true);
+    };
+    let bytes = durable_fs::read_file_bounded(state_path, MAX_LAUNCH_STATE_BYTES)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    let state: Value =
+        serde_json::from_slice(&bytes).map_err(|error| launch_state_invalid(request_id, error))?;
+    Ok(matches!(
+        state.get("phase").and_then(Value::as_str),
+        Some(
+            "session_observed"
+                | "terminal_without_session"
+                | "completion_observed"
+                | "terminal_without_submission"
+        )
+    ))
+}
+
+fn remove_expired_launch_record(
+    lock_path: &Path,
+    state_path: &Path,
+    request_id: &str,
+) -> Result<bool, ProviderFailure> {
+    let lock = open_launch_state_lock(lock_path)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(error) => return Err(launch_state_failure(request_id, error)),
+    }
+    match fs::remove_file(state_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(launch_state_failure(request_id, error)),
+    }
+    match fs::remove_file(lock_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(launch_state_failure(request_id, error)),
+    }
+    durable_fs::sync_directory(
+        state_path
+            .parent()
+            .expect("launch request state always has a parent"),
+    )
+    .map_err(|error| launch_state_failure(request_id, error))?;
+    Ok(true)
+}
+
 fn open_launch_state_lock(path: &Path) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -1890,6 +2085,9 @@ fn write_launch_request_state<T: Serialize>(
         .map_err(|error| launch_state_failure(request_id, error))?;
     let bytes =
         serde_json::to_vec(state).map_err(|error| launch_state_invalid(request_id, error))?;
+    if bytes.len() > MAX_LAUNCH_STATE_BYTES {
+        return Err(launch_state_capacity_exceeded(request_id));
+    }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| launch_state_failure(request_id, error))?;
     temporary
@@ -2035,6 +2233,24 @@ fn launch_state_invalid(request_id: &str, error: impl std::fmt::Display) -> Prov
         request_id,
         "launch_state_invalid",
         format!("durable launch request state is invalid: {error}"),
+    )
+}
+
+fn launch_state_capacity_exceeded(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "launch_state_capacity_exceeded",
+        format!(
+            "durable launch custody has reached its supported {MAX_LAUNCH_REQUEST_RECORDS}-request active/replay bound; reconcile unresolved requests or wait for the 24-hour terminal replay window to expire"
+        ),
+    )
+}
+
+fn launch_state_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "launch_state_lock_timeout",
+        "durable launch state lock could not be acquired before the operation deadline",
     )
 }
 
@@ -2206,8 +2422,7 @@ struct LaunchState {
     parser: EventParser,
     last_opencode_event: Option<OpencodeEventMetadata>,
     completed_resume_at: Option<Instant>,
-    next_resume_completion_probe: Option<Instant>,
-    resume_completion_probes: usize,
+    stream_resume_observation: Option<ResumeObservation>,
     unresolved_resume_completion: Option<Value>,
     session_id: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
@@ -2229,9 +2444,6 @@ impl LaunchState {
         route_evidence: Value,
         launch_request: Option<LaunchRequestGuard>,
     ) -> Self {
-        let next_resume_completion_probe = resume_observation_request
-            .as_ref()
-            .map(|_| Instant::now() + RESUME_COMPLETION_PROBE_DELAY);
         Self {
             request_id: request_id.to_string(),
             seq: 1,
@@ -2248,8 +2460,7 @@ impl LaunchState {
             parser: EventParser::default(),
             last_opencode_event: None,
             completed_resume_at: None,
-            next_resume_completion_probe,
-            resume_completion_probes: 0,
+            stream_resume_observation: None,
             unresolved_resume_completion: None,
             session_id: None,
             resume_observation_request,
@@ -2469,6 +2680,25 @@ impl LaunchState {
     }
 
     fn record_opencode_events(&mut self, events: &[OpencodeEventMetadata]) {
+        if let Some(request) = self.resume_observation_request.as_ref() {
+            for event in events {
+                if let Some(observation) = resume_observation::observe_stream_event(request, event)
+                {
+                    let completion_observed = observation.completion_observed();
+                    if completion_observed
+                        || !self
+                            .stream_resume_observation
+                            .as_ref()
+                            .is_some_and(ResumeObservation::completion_observed)
+                    {
+                        self.stream_resume_observation = Some(observation);
+                    }
+                    if completion_observed {
+                        self.completed_resume_at.get_or_insert_with(Instant::now);
+                    }
+                }
+            }
+        }
         if let Some(event) = events.last() {
             self.last_opencode_event = Some(event.clone());
         }
@@ -2486,40 +2716,6 @@ impl LaunchState {
     fn completed_resume_grace_elapsed(&self) -> bool {
         self.completed_resume_at
             .is_some_and(|completed_at| completed_at.elapsed() >= COMPLETED_RESUME_GRACE)
-    }
-
-    fn probe_completed_resume(&mut self) {
-        let Some(next_probe) = self.next_resume_completion_probe else {
-            return;
-        };
-        if self.completed_resume_at.is_some()
-            || self.resume_completion_probes >= MAX_RESUME_COMPLETION_PROBES
-            || Instant::now() < next_probe
-        {
-            return;
-        }
-        self.next_resume_completion_probe = Some(Instant::now() + RESUME_COMPLETION_PROBE_INTERVAL);
-        self.probe_completed_resume_now();
-    }
-
-    fn probe_completed_resume_now(&mut self) {
-        if self.completed_resume_at.is_some()
-            || self.resume_completion_probes >= MAX_RESUME_COMPLETION_PROBES
-        {
-            return;
-        }
-        self.resume_completion_probes += 1;
-        let Some(request) = self.resume_observation_request.as_ref() else {
-            return;
-        };
-        let observation = self
-            .resume_launch_request
-            .as_ref()
-            .map(ResumeLaunchRequestGuard::observe)
-            .unwrap_or_else(|| resume_observation::observe(request));
-        if observation.completion_observed() {
-            self.completed_resume_at = Some(Instant::now());
-        }
     }
 
     fn marker<W: Write>(&mut self, name: String, writer: &mut W) -> Result<(), ProviderFailure> {
@@ -2549,19 +2745,14 @@ impl LaunchState {
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
         self.capture_session_from_parser_tail(writer)?;
         self.admit_terminal_without_session(writer)?;
-        let final_resume_observation = self
-            .resume_launch_request
-            .as_ref()
-            .map(ResumeLaunchRequestGuard::observe)
-            .or_else(|| {
-                self.resume_observation_request
-                    .as_ref()
-                    .map(resume_observation::observe)
-            });
-        let completion_observed = self.completed_resume_at.is_some()
-            || final_resume_observation
+        let final_resume_observation = self.stream_resume_observation.clone().or_else(|| {
+            self.resume_observation_request
                 .as_ref()
-                .is_some_and(|observation| observation.completion_observed());
+                .map(|_| resume_observation::unconfirmed_observation())
+        });
+        let completion_observed = final_resume_observation
+            .as_ref()
+            .is_some_and(|observation| observation.completion_observed());
         let submitted_user_turn = final_resume_observation
             .as_ref()
             .and_then(|observation| observation.submitted_user_turn.as_ref());

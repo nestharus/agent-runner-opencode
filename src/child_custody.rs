@@ -27,25 +27,6 @@ impl ChildCustody {
         self.child.as_mut().expect("child custody is active")
     }
 
-    pub(crate) fn wait_with_output(mut self) -> io::Result<Output> {
-        self.child_mut().stdin.take();
-        let stdout = self.child_mut().stdout.take().map(spawn_drain);
-        let stderr = self.child_mut().stderr.take().map(spawn_drain);
-        let status = self.child_mut().wait();
-        if status.is_err() {
-            self.cleanup_now();
-        }
-        let stdout = join_drain(stdout)?;
-        let stderr = join_drain(stderr)?;
-        let status = status?;
-        self.child.take();
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
-        })
-    }
-
     pub(crate) fn wait_with_output_timeout(
         mut self,
         timeout: Duration,

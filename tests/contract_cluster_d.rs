@@ -2432,7 +2432,10 @@ fn contract_migration_parallel_retries_converge_on_one_content_addressed_artifac
     let files = fs::read_dir(live.provider_artifact_root())
         .expect("artifact directory")
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+        })
         .count();
     assert_eq!(files, 1);
 }

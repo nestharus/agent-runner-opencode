@@ -531,7 +531,7 @@ pub fn assert_oversized_resume_prompt(
     wrapper_log_path: &Path,
     prompt: &str,
 ) {
-    assert_output_success(output, "launch oversized resume prompt");
+    assert_eq!(output.status.code(), Some(1));
     let argv = wrapper_nul_log_args(wrapper_log_path);
     let session = argv_arg_index_owned(&argv, OPENCODE_SESSION_FLAG_FOR_TEST);
     let boundary = argv_arg_index_owned(&argv, "--");
@@ -550,7 +550,9 @@ pub fn assert_oversized_resume_prompt(
         marker["value"]["prompt_sha256"],
         sha256_hex(prompt.as_bytes())
     );
-    assert_eq!(marker["value"]["message_id"], "msg-user");
+    assert!(marker["value"]["event_timestamp_unix_ms"].is_u64());
+    assert_eq!(marker["value"]["source"], "opencode.run.format_json");
+    assert_unresolved_resume_completion(output, &events);
 }
 
 pub fn assert_oversized_prompt_rejected(output: &std::process::Output, wrapper_log_path: &Path) {
@@ -604,13 +606,6 @@ pub fn assert_argv_session_before_notification_payload(argv: &[&str]) {
 pub fn assert_submitted_user_turn_marker(events: &[Value]) {
     let marker = expected_submitted_user_turn_marker(events);
     assert_submitted_user_turn_marker_value(marker);
-}
-
-pub fn assert_no_submitted_user_turn_marker(events: &[Value]) {
-    assert!(
-        submitted_user_turn_marker(events).is_none(),
-        "unconfirmed resume must not emit a submitted user turn marker; events={events:?}"
-    );
 }
 
 pub fn assert_produced_assistant_response_marker(events: &[Value]) {
@@ -699,11 +694,14 @@ pub fn assert_submitted_user_turn_prompt_hash(marker: &Value) {
 }
 
 pub fn assert_submitted_user_turn_source(marker: &Value) {
-    assert_eq!(marker["value"]["source"].as_str(), Some("opencode.export"));
+    assert_eq!(
+        marker["value"]["source"].as_str(),
+        Some("opencode.run.format_json")
+    );
 }
 
 pub fn assert_submitted_user_turn_message_id(marker: &Value) {
-    assert_eq!(marker["value"]["message_id"].as_str(), Some("msg-user"));
+    assert!(marker["value"]["event_timestamp_unix_ms"].is_u64());
 }
 
 pub fn assert_submitted_user_turn_delivery_nonce(marker: &Value) {

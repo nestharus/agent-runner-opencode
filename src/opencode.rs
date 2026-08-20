@@ -10,12 +10,12 @@
 //!       - opencode auth list status plus observed credential-file effect
 
 use crate::child_custody::ChildCustody;
+use crate::durable_fs;
 use crate::native_runtime::NativeRuntimeContext;
 use crate::shell::ShellOutput;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs;
 #[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -23,7 +23,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub const MAX_EXPORT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_SESSION_LIST_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_NATIVE_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Default)]
 pub struct EventParser {
@@ -165,8 +167,16 @@ pub enum OpencodeExportError {
 #[derive(Debug)]
 pub enum OpencodeSessionListError {
     Spawn(String),
-    Failed { status: Option<i32>, stderr: String },
+    Failed {
+        status: Option<i32>,
+        stderr: String,
+    },
     InvalidJson(String),
+    OutputTooLarge {
+        stream: &'static str,
+        maximum_bytes: usize,
+    },
+    TimedOut,
 }
 
 #[derive(Debug)]
@@ -346,6 +356,34 @@ pub fn session_list(
     runtime: &NativeRuntimeContext,
 ) -> Result<Vec<Value>, OpencodeSessionListError> {
     let mut command = runtime.command();
+    configure_session_list_command(&mut command, limit);
+    run_session_list_command(command, SESSION_LIST_TIMEOUT)
+}
+
+pub fn session_list_with_timeout(
+    limit: Option<usize>,
+    runtime: &NativeRuntimeContext,
+    timeout: Duration,
+) -> Result<Vec<Value>, OpencodeSessionListError> {
+    let mut command = runtime.command();
+    configure_session_list_command(&mut command, limit);
+    run_session_list_command(command, timeout)
+}
+
+pub fn session_list_with_launch_context(
+    program: &str,
+    working_directory: &str,
+    env: &BTreeMap<String, String>,
+    limit: Option<usize>,
+    timeout: Duration,
+) -> Result<Vec<Value>, OpencodeSessionListError> {
+    let mut command = Command::new(program);
+    command.current_dir(working_directory).env_clear().envs(env);
+    configure_session_list_command(&mut command, limit);
+    run_session_list_command(command, timeout)
+}
+
+fn configure_session_list_command(command: &mut Command, limit: Option<usize>) {
     command
         .arg("session")
         .arg("list")
@@ -354,7 +392,23 @@ pub fn session_list(
     if let Some(limit) = limit {
         command.arg("--max-count").arg(limit.to_string());
     }
-    let output = command.output().map_err(session_list_spawn_error)?;
+}
+
+fn run_session_list_command(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<Vec<Value>, OpencodeSessionListError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().map_err(session_list_spawn_error)?;
+    let output = ChildCustody::new(child)
+        .wait_with_bounded_output_timeout(
+            timeout,
+            MAX_SESSION_LIST_OUTPUT_BYTES,
+            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+        )
+        .map_err(session_list_spawn_error)?
+        .ok_or(OpencodeSessionListError::TimedOut)?;
+    validate_bounded_session_list_output(&output)?;
     validate_session_list_status(&output)?;
     parse_session_list_stdout(&output.stdout)
 }
@@ -391,7 +445,7 @@ pub fn observe_auth_list(
     auth_path: &Path,
     timeout: Duration,
 ) -> std::io::Result<OpencodeAuthObservation> {
-    let before = credential_snapshot(auth_path);
+    let before = credential_snapshot(auth_path)?;
     let mut command = runtime.command();
     command
         .arg("auth")
@@ -419,7 +473,7 @@ pub fn observe_auth_list(
             ),
         ));
     }
-    let after = credential_snapshot(auth_path);
+    let after = credential_snapshot(auth_path)?;
     Ok(OpencodeAuthObservation {
         output: ShellOutput {
             stdout: output.stdout,
@@ -430,8 +484,12 @@ pub fn observe_auth_list(
     })
 }
 
-fn credential_snapshot(path: &Path) -> Option<Vec<u8>> {
-    fs::read(path).ok()
+fn credential_snapshot(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match durable_fs::read_file_bounded(path, durable_fs::MAX_AUTH_FILE_BYTES) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn observed_auth_effect(before: Option<Vec<u8>>, after: Option<Vec<u8>>) -> OpencodeAuthEffect {
@@ -569,6 +627,31 @@ fn validate_session_list_status(
         return Ok(());
     }
     Err(session_list_failed_error(output))
+}
+
+fn validate_bounded_session_list_output(
+    output: &std::process::Output,
+) -> Result<(), OpencodeSessionListError> {
+    for (stream, bytes, maximum_bytes) in [
+        (
+            "stdout",
+            output.stdout.as_slice(),
+            MAX_SESSION_LIST_OUTPUT_BYTES,
+        ),
+        (
+            "stderr",
+            output.stderr.as_slice(),
+            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+        ),
+    ] {
+        if bytes.len() > maximum_bytes {
+            return Err(OpencodeSessionListError::OutputTooLarge {
+                stream,
+                maximum_bytes,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_import_status(output: &std::process::Output) -> Result<(), OpencodeImportError> {

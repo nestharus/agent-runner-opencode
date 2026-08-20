@@ -10,11 +10,13 @@
     },
     "RequestId": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 256
     },
     "ProviderInstanceId": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 256
     },
     "UnixMilliseconds": {
       "type": "integer",
@@ -27,8 +29,13 @@
     "JsonValue": true,
     "StringMap": {
       "type": "object",
+      "maxProperties": 128,
+      "propertyNames": {
+        "maxLength": 256
+      },
       "additionalProperties": {
-        "type": "string"
+        "type": "string",
+        "maxLength": 65536
       }
     },
     "HostContext": {
@@ -36,22 +43,28 @@
       "properties": {
         "app": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 256
         },
         "app_version": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 256
         },
         "platform": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 256
         },
         "working_directory": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 65536
         },
         "config_root": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 65536
         },
         "data_root": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 65536
         },
         "env": {
           "$ref": "#/$defs/StringMap"

@@ -950,7 +950,7 @@ fn contract_launch_resume_forwards_session_and_arg_payload() {
 
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
-    assert_output_success(&output, "launch resume arg payload");
+    assert_eq!(output.status.code(), Some(1));
     assert_resume_arg_payload_wrapper_log(fake_wrapper.log_path());
 }
 
@@ -976,7 +976,7 @@ fn contract_launch_resume_preserves_session_shaped_positional_message() {
 
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
-    assert_output_success(&output, "launch resume session-shaped positional message");
+    assert_eq!(output.status.code(), Some(1));
     let wrapper_log = wrapper_log_text(fake_wrapper.log_path());
     let argv = wrapper_log_args(&wrapper_log);
     let boundary = argv_arg_index(&argv, "--");
@@ -1016,10 +1016,7 @@ fn contract_launch_resume_places_session_before_notification_arg_when_prompt_met
 
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
-    assert_output_success(
-        &output,
-        "launch resume arg payload with mismatched prompt metadata",
-    );
+    assert_eq!(output.status.code(), Some(1));
     assert_session_before_notification_payload(fake_wrapper.log_path());
 }
 
@@ -1033,7 +1030,7 @@ fn contract_launch_resume_forwards_session_and_stdin_payload() {
 
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
-    assert_output_success(&output, "launch resume stdin payload");
+    assert_eq!(output.status.code(), Some(1));
     assert_resume_stdin_payload_wrapper_log(fake_wrapper.log_path());
 }
 
@@ -1056,7 +1053,7 @@ fn contract_launch_resume_returns_non_clean_when_submitted_turn_has_no_completed
 }
 
 #[test]
-fn contract_launch_resume_omits_submitted_user_turn_marker_when_export_lacks_payload() {
+fn contract_launch_resume_uses_run_event_instead_of_export_payload_for_submission() {
     let fake_wrapper = FakeOpencodeWrapper::with_script(
         fake_wrapper_resume_unconfirmed_export_script().to_string(),
     );
@@ -1066,9 +1063,9 @@ fn contract_launch_resume_omits_submitted_user_turn_marker_when_export_lacks_pay
 
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
-    assert_output_success(&output, "launch resume unconfirmed payload");
     let events = launch_events_from_output(&output, "launch resume unconfirmed payload stdout");
-    assert_no_submitted_user_turn_marker(&events);
+    assert_submitted_user_turn_marker(&events);
+    assert_unresolved_resume_completion(&output, &events);
 }
 
 #[test]
@@ -1103,18 +1100,22 @@ fn contract_launch_completed_resume_preserves_completion_across_non_terminal_par
 }
 
 #[test]
-fn contract_launch_completed_export_does_not_wait_for_buffered_native_events() {
+fn contract_launch_resume_does_not_poll_full_export_for_completion() {
     let fake_wrapper =
         FakeOpencodeWrapper::with_script(fake_wrapper_completed_export_then_hang_script());
     let path = prepend_path(fake_wrapper.dir());
     let log_path = fake_wrapper.log_path_str();
     let params = resume_launch_params_with_arg_payload_env(path.as_str(), log_path);
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
-    let events = launch_events_from_output(&output, "completed buffered resume stdout");
-    assert_produced_assistant_response_marker(&events);
+    let events = launch_events_from_output(&output, "unobserved buffered resume stdout");
+    assert_no_produced_assistant_response_marker(&events);
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "normal resume supervision must use bounded run events rather than full transcript export"
+    );
     let final_event = final_launch_event(&events);
-    assert_eq!(final_event["status"]["kind"], "signal_terminated");
-    assert_live_provider_exit_code(&output, final_event, "completed buffered resume");
+    assert_eq!(final_event["status"]["kind"], "exited");
+    assert_live_provider_exit_code(&output, final_event, "unobserved buffered resume");
 }
 
 #[test]

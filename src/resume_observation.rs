@@ -8,8 +8,8 @@
 //!       - native transcript traversal and submitted-turn matching
 //!       - explicit observed-versus-unconfirmed completion results
 
-use crate::encoding::{now_unix_ms, sha256_hex};
-use crate::opencode::{self, OpencodeExport, OpencodeMessage};
+use crate::encoding::sha256_hex;
+use crate::opencode::{self, OpencodeEventMetadata, OpencodeExport, OpencodeMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -18,6 +18,7 @@ use std::time::Duration;
 const RESUME_MESSAGE_CLOCK_TOLERANCE_MS: u64 = 5_000;
 const RESUME_EXPORT_TIMEOUT: Duration = Duration::from_millis(750);
 const SUBMITTED_USER_TURN_SOURCE: &str = "opencode.export";
+const STREAM_SUBMITTED_USER_TURN_SOURCE: &str = "opencode.run.format_json";
 const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_NONCE_SUFFIX: char = ']';
 
@@ -28,11 +29,7 @@ pub struct ResumeObservationRequest {
     payload: String,
     delivery_nonce: Option<String>,
     started_at_unix_ms: u64,
-    deadline_unix_ms: Option<u64>,
     route: RouteIdentity,
-    program: String,
-    working_directory: String,
-    env: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -42,15 +39,10 @@ struct RouteIdentity {
     variant: String,
 }
 
-enum ResumePayloadEvidence<'a> {
-    Plaintext(&'a str),
-    Sha256(&'a str),
-}
-
 struct ResumeMatchIdentity<'a> {
     session_id: &'a str,
     prompt_sha256: String,
-    payload: ResumePayloadEvidence<'a>,
+    payload_sha256: &'a str,
     delivery_nonce: Option<&'a str>,
     started_at_unix_ms: u64,
     provider_id: &'a str,
@@ -58,6 +50,7 @@ struct ResumeMatchIdentity<'a> {
     variant: &'a str,
 }
 
+#[derive(Clone)]
 pub struct ResumeObservation {
     pub available: bool,
     pub submitted_user_turn: Option<Value>,
@@ -83,19 +76,14 @@ pub enum ResumeCompletion {
 }
 
 impl ResumeObservationRequest {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         account_wrapper: String,
         session_id: String,
         payload: String,
         started_at_unix_ms: u64,
-        deadline_unix_ms: Option<u64>,
         provider_id: String,
         model_id: String,
         variant: String,
-        program: String,
-        working_directory: String,
-        env: BTreeMap<String, String>,
     ) -> Self {
         let delivery_nonce = delivery_nonce_from_payload(&payload);
         Self {
@@ -104,15 +92,11 @@ impl ResumeObservationRequest {
             payload,
             delivery_nonce,
             started_at_unix_ms,
-            deadline_unix_ms,
             route: RouteIdentity {
                 provider_id,
                 model_id,
                 variant,
             },
-            program,
-            working_directory,
-            env,
         }
     }
 
@@ -128,19 +112,6 @@ impl ResumeObservationRequest {
             variant: self.route.variant.clone(),
         }
     }
-
-    fn match_identity(&self) -> ResumeMatchIdentity<'_> {
-        ResumeMatchIdentity {
-            session_id: &self.session_id,
-            prompt_sha256: sha256_hex(self.payload.as_bytes()),
-            payload: ResumePayloadEvidence::Plaintext(&self.payload),
-            delivery_nonce: self.delivery_nonce.as_deref(),
-            started_at_unix_ms: self.started_at_unix_ms,
-            provider_id: &self.route.provider_id,
-            model_id: &self.route.model_id,
-            variant: &self.route.variant,
-        }
-    }
 }
 
 impl DurableResumeObservationRequest {
@@ -148,7 +119,7 @@ impl DurableResumeObservationRequest {
         ResumeMatchIdentity {
             session_id: &self.session_id,
             prompt_sha256: self.payload_sha256.clone(),
-            payload: ResumePayloadEvidence::Sha256(&self.payload_sha256),
+            payload_sha256: &self.payload_sha256,
             delivery_nonce: self.delivery_nonce.as_deref(),
             started_at_unix_ms: self.started_at_unix_ms,
             provider_id: &self.provider_id,
@@ -164,17 +135,37 @@ impl ResumeObservation {
     }
 }
 
-pub fn observe(request: &ResumeObservationRequest) -> ResumeObservation {
-    let Some(native) = export_for_observation(request) else {
-        return unconfirmed_observation();
-    };
-    if !export_session_matches_request(&native, request) {
-        return unconfirmed_observation();
+pub fn observe_stream_event(
+    request: &ResumeObservationRequest,
+    event: &OpencodeEventMetadata,
+) -> Option<ResumeObservation> {
+    let completion_observed = opencode::is_successful_terminal_event(event);
+    if event.session_id.as_deref() != Some(request.session_id.as_str())
+        || (event.event_type != "step_start" && !completion_observed)
+    {
+        return None;
     }
-    observation_from_export(&native, &request.match_identity())
+    let mut marker = json!({
+        "provider_session_id": request.session_id,
+        "prompt_sha256": sha256_hex(request.payload.as_bytes()),
+        "source": STREAM_SUBMITTED_USER_TURN_SOURCE,
+        "event_timestamp_unix_ms": event.timestamp,
+    });
+    if let Some(delivery_nonce) = request.delivery_nonce.as_deref() {
+        marker["delivery_nonce"] = json!(delivery_nonce);
+    }
+    Some(ResumeObservation {
+        available: true,
+        submitted_user_turn: Some(marker),
+        completion: if completion_observed {
+            ResumeCompletion::Observed
+        } else {
+            ResumeCompletion::Unconfirmed
+        },
+    })
 }
 
-fn unconfirmed_observation() -> ResumeObservation {
+pub fn unconfirmed_observation() -> ResumeObservation {
     ResumeObservation {
         available: false,
         submitted_user_turn: None,
@@ -261,7 +252,7 @@ fn submitted_user_message(message: &OpencodeMessage, identity: &ResumeMatchIdent
             message.parts.iter().any(|part| {
                 part.get("text")
                     .and_then(Value::as_str)
-                    .is_some_and(|text| payload_matches(text, &identity.payload))
+                    .is_some_and(|text| text_sha256_matches(text, identity.payload_sha256))
             })
         }
 }
@@ -287,13 +278,6 @@ fn message_model_matches(message: &OpencodeMessage, identity: &ResumeMatchIdenti
         && variant == Some(identity.variant)
 }
 
-fn payload_matches(text: &str, payload: &ResumePayloadEvidence<'_>) -> bool {
-    match payload {
-        ResumePayloadEvidence::Plaintext(payload) => text_matches_payload(text, payload),
-        ResumePayloadEvidence::Sha256(expected) => text_sha256_matches(text, expected),
-    }
-}
-
 fn text_sha256_matches(text: &str, expected: &str) -> bool {
     sha256_hex(text.as_bytes()) == expected
         || text
@@ -302,43 +286,6 @@ fn text_sha256_matches(text: &str, expected: &str) -> bool {
             .is_some_and(|unquoted| sha256_hex(unquoted.as_bytes()) == expected)
         || serde_json::from_str::<String>(text)
             .is_ok_and(|decoded| sha256_hex(decoded.as_bytes()) == expected)
-}
-
-fn export_for_observation(request: &ResumeObservationRequest) -> Option<OpencodeExport> {
-    let timeout = remaining_export_timeout(request)?;
-    opencode::export_with_launch_context(
-        &request.session_id,
-        &request.program,
-        &request.working_directory,
-        &request.env,
-        timeout,
-    )
-    .ok()
-}
-
-fn remaining_export_timeout(request: &ResumeObservationRequest) -> Option<Duration> {
-    let Some(deadline) = request.deadline_unix_ms else {
-        return Some(RESUME_EXPORT_TIMEOUT);
-    };
-    let remaining_ms = deadline.saturating_sub(now_unix_ms());
-    (remaining_ms > 0)
-        .then(|| Duration::from_millis(remaining_ms.min(RESUME_EXPORT_TIMEOUT.as_millis() as u64)))
-}
-
-fn export_session_matches_request(
-    native: &OpencodeExport,
-    request: &ResumeObservationRequest,
-) -> bool {
-    native.info.id.as_str() == request.session_id.as_str()
-}
-
-fn text_matches_payload(text: &str, payload: &str) -> bool {
-    text == payload
-        || text
-            .strip_prefix('"')
-            .and_then(|quoted| quoted.strip_suffix('"'))
-            .is_some_and(|unquoted| unquoted == payload)
-        || serde_json::from_str::<String>(text).is_ok_and(|decoded| decoded.as_str() == payload)
 }
 
 fn message_contains_delivery_nonce(message: &OpencodeMessage, delivery_nonce: &str) -> bool {
@@ -378,7 +325,7 @@ fn delivery_marker(delivery_nonce: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{text_matches_payload, text_sha256_matches};
+    use super::text_sha256_matches;
     use crate::encoding::sha256_hex;
 
     #[test]
@@ -386,7 +333,10 @@ mod tests {
         let payload = "Print exactly LIVE_ROTATION_OK and nothing else.\n";
         let native = format!("\"{payload}\"");
 
-        assert!(text_matches_payload(&native, payload));
+        assert!(text_sha256_matches(
+            &native,
+            &sha256_hex(payload.as_bytes())
+        ));
     }
 
     #[test]

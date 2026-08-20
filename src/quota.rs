@@ -32,6 +32,9 @@ use std::time::Duration;
 const QUOTA_REFRESH_STATE_DIR: &str = "provider-state/opencode/quota/auth-refresh";
 const QUOTA_REFRESH_SCHEMA_VERSION: u32 = 1;
 const QUOTA_REFRESH_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
+const QUOTA_REFRESH_REPLAY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_QUOTA_REFRESH_REQUEST_RECORDS: usize = 64;
+const MAX_QUOTA_REFRESH_STATE_BYTES: usize = 256 * 1024;
 
 #[derive(Deserialize)]
 struct QuotaBaseParams {
@@ -432,7 +435,25 @@ fn acquire_quota_refresh_request_lock(
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
     let name = sha256_hex(request_id.as_bytes());
-    acquire_quota_refresh_lock(host, &format!("locks/requests/{name}.lock"), request_id)
+    let root = quota_refresh_state_root(host, request_id)?;
+    let lock_root = confined_quota_refresh_target(host, &root.join("locks/requests"), request_id)?;
+    durable_fs::create_private_directories(&lock_root)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    let capacity = open_quota_refresh_lock_file(&lock_root.join(".capacity.lock"))
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    lock_quota_refresh_file(host, &capacity, request_id)?;
+    let lock_path = lock_root.join(format!("{name}.lock"));
+    let existing = lock_path.exists();
+    let retained =
+        maintain_quota_refresh_capacity(host, &root, &lock_root, &lock_path, request_id)?;
+    if !existing && retained >= MAX_QUOTA_REFRESH_REQUEST_RECORDS {
+        return Err(quota_refresh_state_capacity_exceeded(request_id));
+    }
+    let lock = open_quota_refresh_lock_file(&lock_path)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    drop(capacity);
+    lock_quota_refresh_file(host, &lock, request_id)?;
+    Ok(lock)
 }
 
 fn acquire_quota_refresh_account_lock(
@@ -465,20 +486,157 @@ fn acquire_quota_refresh_lock(
         .expect("quota refresh lock always has a parent");
     durable_fs::create_private_directories(parent)
         .map_err(|error| quota_refresh_state_failure(request_id, error))?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
+    let lock = open_quota_refresh_lock_file(&path)
         .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    lock_quota_refresh_file(host, &lock, request_id)?;
+    Ok(lock)
+}
+
+fn open_quota_refresh_lock_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn maintain_quota_refresh_capacity(
+    host: &HostContext,
+    root: &Path,
+    lock_root: &Path,
+    current_lock_path: &Path,
+    request_id: &str,
+) -> Result<usize, ProviderFailure> {
+    let request_root = confined_quota_refresh_target(host, &root.join("requests"), request_id)?;
+    durable_fs::create_private_directories(&request_root)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    let mut retained = 0_usize;
+    let mut visited = 0_usize;
+    for entry in
+        fs::read_dir(lock_root).map_err(|error| quota_refresh_state_failure(request_id, error))?
+    {
+        let entry = entry.map_err(|error| quota_refresh_state_failure(request_id, error))?;
+        let lock_path = entry.path();
+        if lock_path == current_lock_path
+            || lock_path.file_name().and_then(|name| name.to_str()) == Some(".capacity.lock")
+            || lock_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("lock")
+        {
+            continue;
+        }
+        visited += 1;
+        if visited > MAX_QUOTA_REFRESH_REQUEST_RECORDS.saturating_add(1) {
+            return Err(quota_refresh_state_capacity_exceeded(request_id));
+        }
+        let Some(stem) = lock_path.file_stem() else {
+            return Err(quota_refresh_state_failure(
+                request_id,
+                "quota refresh request lock has no file stem",
+            ));
+        };
+        let state_path = request_root.join(stem).with_extension("json");
+        if quota_refresh_record_expired(&lock_path, &state_path, request_id)?
+            && remove_expired_quota_refresh_record(&lock_path, &state_path, request_id)?
+        {
+            continue;
+        }
+        retained += 1;
+    }
+    if current_lock_path.exists() {
+        retained += 1;
+    }
+    Ok(retained)
+}
+
+fn quota_refresh_record_expired(
+    lock_path: &Path,
+    state_path: &Path,
+    request_id: &str,
+) -> Result<bool, ProviderFailure> {
+    let state_metadata = match fs::metadata(state_path) {
+        Ok(metadata) if metadata.is_file() => Some(metadata),
+        Ok(_) => {
+            return Err(quota_refresh_state_failure(
+                request_id,
+                "quota refresh request state is not a file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(quota_refresh_state_failure(request_id, error)),
+    };
+    let modified = match state_metadata.as_ref() {
+        Some(metadata) => metadata.modified().ok(),
+        None => fs::metadata(lock_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok()),
+    };
+    let old_enough = modified
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= QUOTA_REFRESH_REPLAY_RETENTION);
+    if !old_enough {
+        return Ok(false);
+    }
+    let Some(_) = state_metadata else {
+        return Ok(true);
+    };
+    let bytes = durable_fs::read_file_bounded(state_path, MAX_QUOTA_REFRESH_STATE_BYTES)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    let operation: QuotaRefreshOperation = serde_json::from_slice(&bytes)
+        .map_err(|error| quota_refresh_operation_invalid(request_id, error))?;
+    Ok(operation.phase == QuotaRefreshOperationPhase::Committed)
+}
+
+fn remove_expired_quota_refresh_record(
+    lock_path: &Path,
+    state_path: &Path,
+    request_id: &str,
+) -> Result<bool, ProviderFailure> {
+    let lock = open_quota_refresh_lock_file(lock_path)
+        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(error) => return Err(quota_refresh_state_failure(request_id, error)),
+    }
+    for path in [state_path, lock_path] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(quota_refresh_state_failure(request_id, error)),
+        }
+    }
+    durable_fs::sync_directory(
+        state_path
+            .parent()
+            .expect("quota refresh request state always has a parent"),
+    )
+    .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    durable_fs::sync_directory(
+        lock_path
+            .parent()
+            .expect("quota refresh request lock always has a parent"),
+    )
+    .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    Ok(true)
+}
+
+fn lock_quota_refresh_file(
+    host: &HostContext,
+    lock: &fs::File,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
     let timeout = quota_refresh_operation_timeout(host, request_id)?;
-    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+    if !operation_bounds::lock_exclusive_for(lock, timeout)
         .map_err(|error| quota_refresh_state_failure(request_id, error))?
     {
         return Err(quota_refresh_lock_timeout(request_id));
     }
-    Ok(lock)
+    Ok(())
 }
 
 fn quota_refresh_operation_timeout(
@@ -541,7 +699,7 @@ fn read_quota_refresh_operation(
     request_id: &str,
 ) -> Result<Option<QuotaRefreshOperation>, ProviderFailure> {
     let path = quota_refresh_operation_path(host, request_id)?;
-    let bytes = match durable_fs::read_file(&path) {
+    let bytes = match durable_fs::read_file_bounded(&path, MAX_QUOTA_REFRESH_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(quota_refresh_state_failure(request_id, error)),
@@ -601,6 +759,9 @@ fn write_quota_refresh_operation(
         .map_err(|error| quota_refresh_state_failure(request_id, error))?;
     let bytes = serde_json::to_vec_pretty(operation)
         .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    if bytes.len() > MAX_QUOTA_REFRESH_STATE_BYTES {
+        return Err(quota_refresh_state_capacity_exceeded(request_id));
+    }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| quota_refresh_state_failure(request_id, error))?;
     temporary
@@ -676,6 +837,16 @@ fn quota_refresh_lock_timeout(request_id: &str) -> ProviderFailure {
         request_id,
         "quota_refresh_lock_timeout",
         "quota refresh lock could not be acquired before the operation deadline",
+    )
+}
+
+fn quota_refresh_state_capacity_exceeded(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "quota_refresh_state_capacity_exceeded",
+        format!(
+            "durable quota.refresh_auth custody has reached its supported {MAX_QUOTA_REFRESH_REQUEST_RECORDS}-request active/replay bound; reconcile incomplete requests or wait for the 24-hour committed replay window to expire"
+        ),
     )
 }
 

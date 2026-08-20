@@ -9,19 +9,23 @@ use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
 use crate::operation_bounds;
 use crate::path_guard;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const ACTIVITY_DIR: &str = "provider-state/opencode/activity";
 const ACTIVITY_FILE: &str = "operations.jsonl";
+const ACTIVITY_ALTERNATE_FILE: &str = ".operations-alternate.jsonl";
+const ACTIVITY_HEAD_FILE: &str = ".operations-head.json";
 const ACTIVITY_LOCK: &str = ".operations.lock";
 const ACTIVITY_SCHEMA_VERSION: u32 = 2;
 const MAX_ACTIVITY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACTIVITY_EVENTS: usize = 4_096;
 const MAX_ACTIVITY_EVENT_BYTES: usize = 64 * 1024;
+const MAX_ACTIVITY_HEAD_BYTES: usize = 16 * 1024;
 
 pub struct ActivityContext {
     host: HostContextSnapshot,
@@ -41,9 +45,11 @@ pub struct ActivityTargets {
     identities: Vec<ActivityIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempted_provider_args_sha256: Option<String>,
+    #[serde(skip)]
+    seen: HashSet<ActivityIdentity>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Eq, Hash, PartialEq, Serialize)]
 struct ActivityIdentity {
     kind: &'static str,
     value: String,
@@ -51,12 +57,22 @@ struct ActivityIdentity {
     provenance: String,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityIdentityStatus {
     Attempted,
     Resolved,
     Generated,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ActivityLedgerHead {
+    schema_version: u32,
+    active_file: String,
+    sequence: u64,
+    previous_event_sha256: String,
+    committed_bytes: u64,
+    event_count: usize,
 }
 
 impl ActivityContext {
@@ -144,22 +160,18 @@ impl ActivityTargets {
     ) {
         let value = value.into();
         let provenance = provenance.into();
-        if value.trim().is_empty()
-            || self.identities.iter().any(|identity| {
-                identity.kind == kind
-                    && identity.value == value
-                    && identity.status == status
-                    && identity.provenance == provenance
-            })
-        {
+        if value.trim().is_empty() {
             return;
         }
-        self.identities.push(ActivityIdentity {
+        let identity = ActivityIdentity {
             kind,
             value,
             status,
             provenance,
-        });
+        };
+        if self.seen.insert(identity.clone()) {
+            self.identities.push(identity);
+        }
     }
 
     pub fn attempted(
@@ -237,20 +249,10 @@ fn write_activity(
             "activity ledger is busy; best-effort evidence was skipped",
         ));
     }
-    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_ACTIVITY_BYTES as u64) {
-        return Err(invalid_ledger(
-            "activity ledger exceeds its supported retained-size bound; archive or remove it",
-        ));
-    }
-    let existing = match fs::read_to_string(&path) {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error),
-    };
-    let (sequence, previous_event_sha256) = validate_ledger(&existing)?;
+    let mut head = read_or_initialize_activity_head(root, &path)?;
     let mut event = json!({
         "schema_version": ACTIVITY_SCHEMA_VERSION,
-        "sequence": sequence + 1,
+        "sequence": head.sequence + 1,
         "phase": phase,
         "subcommand": context.subcommand,
         "request_id": context.request_id,
@@ -265,7 +267,7 @@ fn write_activity(
         "targets": targets,
         "outcome": outcome,
         "recorded_at_unix_ms": now_unix_ms(),
-        "previous_event_sha256": previous_event_sha256,
+        "previous_event_sha256": head.previous_event_sha256,
     });
     event["event_sha256"] = json!(sha256_hex(event.to_string().as_bytes()));
     let event_line = serde_json::to_string(&event)?;
@@ -274,41 +276,173 @@ fn write_activity(
             "activity event exceeds its supported encoded-size bound",
         ));
     }
-    let retained = retained_activity(&existing, event_line.len() + 1);
-    let mut temporary = tempfile::NamedTempFile::new_in(root)?;
-    temporary.write_all(retained.as_bytes())?;
-    if !retained.is_empty() && !retained.ends_with('\n') {
-        temporary.write_all(b"\n")?;
+    let mut event_bytes = event_line.into_bytes();
+    event_bytes.push(b'\n');
+    let rotate = head.event_count >= MAX_ACTIVITY_EVENTS
+        || head
+            .committed_bytes
+            .saturating_add(event_bytes.len() as u64)
+            > MAX_ACTIVITY_BYTES as u64;
+    if rotate {
+        let next_file = if head.active_file == ACTIVITY_FILE {
+            ACTIVITY_ALTERNATE_FILE
+        } else {
+            ACTIVITY_FILE
+        };
+        let next_path = root.join(next_file);
+        write_activity_file_atomic(&next_path, &event_bytes)?;
+        head.active_file = next_file.to_string();
+        head.event_count = 1;
+        head.committed_bytes = event_bytes.len() as u64;
+    } else {
+        let active_path = activity_file_path(root, &head.active_file)?;
+        let mut active = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active_path)?;
+        active.write_all(&event_bytes)?;
+        active.sync_all()?;
+        set_private_file(&active_path)?;
+        head.event_count += 1;
+        head.committed_bytes = head
+            .committed_bytes
+            .saturating_add(event_bytes.len() as u64);
     }
-    temporary.write_all(event_line.as_bytes())?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(&path).map_err(|error| error.error)?;
-    set_private_file(&path)?;
-    durable_fs::sync_directory(root)
+    head.sequence += 1;
+    head.previous_event_sha256 = event["event_sha256"]
+        .as_str()
+        .expect("activity event digest was just authored")
+        .to_string();
+    write_activity_head(root, &head)
 }
 
-fn retained_activity(existing: &str, new_event_bytes: usize) -> String {
-    let lines = existing
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    let mut retained_bytes = lines.iter().map(|line| line.len() + 1).sum::<usize>();
-    let mut first_retained = 0;
-    while first_retained < lines.len()
-        && (lines.len() - first_retained >= MAX_ACTIVITY_EVENTS
-            || retained_bytes.saturating_add(new_event_bytes) > MAX_ACTIVITY_BYTES)
+fn read_or_initialize_activity_head(
+    root: &Path,
+    legacy_path: &Path,
+) -> std::io::Result<ActivityLedgerHead> {
+    let head_path = root.join(ACTIVITY_HEAD_FILE);
+    let mut head = match durable_fs::read_file_bounded(&head_path, MAX_ACTIVITY_HEAD_BYTES) {
+        Ok(bytes) => serde_json::from_slice::<ActivityLedgerHead>(&bytes)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let existing = match durable_fs::read_file_bounded(legacy_path, MAX_ACTIVITY_BYTES) {
+                Ok(bytes) => String::from_utf8(bytes)
+                    .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?,
+                Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error),
+            };
+            let (sequence, previous_event_sha256, event_count) = validate_ledger(&existing)?;
+            let initialized = ActivityLedgerHead {
+                schema_version: 1,
+                active_file: ACTIVITY_FILE.to_string(),
+                sequence,
+                previous_event_sha256,
+                committed_bytes: existing.len() as u64,
+                event_count,
+            };
+            write_activity_head(root, &initialized)?;
+            initialized
+        }
+        Err(error) => return Err(error),
+    };
+    validate_activity_head(&head)?;
+    repair_activity_tail(root, &mut head)?;
+    Ok(head)
+}
+
+fn validate_activity_head(head: &ActivityLedgerHead) -> std::io::Result<()> {
+    if head.schema_version != 1
+        || !matches!(
+            head.active_file.as_str(),
+            ACTIVITY_FILE | ACTIVITY_ALTERNATE_FILE
+        )
+        || head.event_count > MAX_ACTIVITY_EVENTS
+        || head.committed_bytes > MAX_ACTIVITY_BYTES as u64
+        || (head.event_count == 0
+            && (head.sequence != 0
+                || !head.previous_event_sha256.is_empty()
+                || head.committed_bytes != 0))
     {
-        retained_bytes = retained_bytes.saturating_sub(lines[first_retained].len() + 1);
-        first_retained += 1;
+        return Err(invalid_ledger("activity head is inconsistent"));
     }
-    lines[first_retained..].join("\n")
+    Ok(())
 }
 
-fn validate_ledger(existing: &str) -> std::io::Result<(u64, String)> {
+fn repair_activity_tail(root: &Path, head: &mut ActivityLedgerHead) -> std::io::Result<()> {
+    let path = activity_file_path(root, &head.active_file)?;
+    let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound && head.committed_bytes == 0 => {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    };
+    let actual_bytes = file.metadata()?.len();
+    if actual_bytes < head.committed_bytes {
+        return Err(invalid_ledger(
+            "activity file is shorter than its committed head",
+        ));
+    }
+    if actual_bytes > head.committed_bytes {
+        file.set_len(head.committed_bytes)?;
+        file.sync_all()?;
+        durable_fs::sync_directory(root)?;
+    }
+    if head.event_count == 0 {
+        return Ok(());
+    }
+    validate_activity_tail(&mut file, head)
+}
+
+fn validate_activity_tail(file: &mut fs::File, head: &ActivityLedgerHead) -> std::io::Result<()> {
+    let retained = head.committed_bytes.min(MAX_ACTIVITY_EVENT_BYTES as u64);
+    file.seek(SeekFrom::Start(head.committed_bytes - retained))?;
+    let mut bytes = Vec::with_capacity(retained as usize);
+    file.take(retained).read_to_end(&mut bytes)?;
+    let line = bytes
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| !line.trim_ascii().is_empty())
+        .ok_or_else(|| invalid_ledger("activity file has no committed tail event"))?;
+    let event: Value = serde_json::from_slice(line)
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+    validate_activity_event(&event, head.sequence, &head.previous_event_sha256)
+}
+
+fn activity_file_path(root: &Path, active_file: &str) -> std::io::Result<PathBuf> {
+    if !matches!(active_file, ACTIVITY_FILE | ACTIVITY_ALTERNATE_FILE) {
+        return Err(invalid_ledger("activity head names an unsupported file"));
+    }
+    Ok(root.join(active_file))
+}
+
+fn write_activity_head(root: &Path, head: &ActivityLedgerHead) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(head)?;
+    if bytes.len() > MAX_ACTIVITY_HEAD_BYTES {
+        return Err(invalid_ledger(
+            "activity head exceeds its encoded-size bound",
+        ));
+    }
+    write_activity_file_atomic(&root.join(ACTIVITY_HEAD_FILE), &bytes)
+}
+
+fn write_activity_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("activity path has no parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    set_private_file(path)?;
+    durable_fs::sync_directory(parent)
+}
+
+fn validate_ledger(existing: &str) -> std::io::Result<(u64, String, usize)> {
     let mut sequence = 0;
     let mut prior_hash = String::new();
     let mut first = true;
+    let mut event_count = 0_usize;
     for line in existing.lines() {
         if line.trim().is_empty() {
             continue;
@@ -347,8 +481,32 @@ fn validate_ledger(existing: &str) -> std::io::Result<(u64, String)> {
         }
         sequence = event_sequence;
         prior_hash = recorded_hash.to_string();
+        event_count += 1;
     }
-    Ok((sequence, prior_hash))
+    Ok((sequence, prior_hash, event_count))
+}
+
+fn validate_activity_event(
+    event: &Value,
+    expected_sequence: u64,
+    expected_hash: &str,
+) -> std::io::Result<()> {
+    if event["sequence"].as_u64() != Some(expected_sequence)
+        || event["event_sha256"].as_str() != Some(expected_hash)
+    {
+        return Err(invalid_ledger(
+            "activity tail does not match its committed head",
+        ));
+    }
+    let mut unhashed = event.clone();
+    unhashed
+        .as_object_mut()
+        .ok_or_else(|| invalid_ledger("activity tail is not an object"))?
+        .remove("event_sha256");
+    if sha256_hex(unhashed.to_string().as_bytes()) != expected_hash {
+        return Err(invalid_ledger("activity tail digest does not match"));
+    }
+    Ok(())
 }
 
 fn invalid_ledger(message: &str) -> std::io::Error {
@@ -371,15 +529,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retention_keeps_the_newest_bounded_event_window() {
-        let existing = (0..MAX_ACTIVITY_EVENTS)
-            .map(|index| format!("event-{index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let retained = retained_activity(&existing, 16);
-        let lines = retained.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), MAX_ACTIVITY_EVENTS - 1);
-        assert_eq!(lines.first().copied(), Some("event-1"));
-        assert_eq!(lines.last().copied(), Some("event-4095"));
+    fn activity_target_deduplication_is_constant_time_state() {
+        let mut targets = ActivityTargets::default();
+        targets.attempted("settings_record", "one", "params.id");
+        targets.attempted("settings_record", "one", "params.id");
+        targets.attempted("settings_record", "two", "params.id");
+        assert_eq!(targets.identities.len(), 2);
+        assert_eq!(targets.seen.len(), 2);
     }
 }
