@@ -83,6 +83,7 @@ fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss
                 "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
                 fake_wrapper.log_path_str(),
             ),
+            ("XDG_DATA_HOME", "/tmp/agent-runner-opencode-recovery-xdg"),
         ],
     );
     let mut request = support::validated_request_envelope(
@@ -196,6 +197,7 @@ fn contract_launch_prepared_recovery_proves_no_effect_before_readmission() {
                 "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
                 fake_wrapper.log_path_str(),
             ),
+            ("XDG_DATA_HOME", "/tmp/agent-runner-opencode-recovery-xdg"),
         ],
     );
     let mut request = support::validated_request_envelope(
@@ -229,6 +231,11 @@ fn contract_launch_prepared_recovery_proves_no_effect_before_readmission() {
             .expect("launch prompt")
             .as_bytes(),
     );
+    let declared_env_sha256 = agent_runner_opencode::encoding::sha256_hex(
+        serde_json::to_vec(&request["params"]["env"])
+            .expect("serialize declared launch environment")
+            .as_slice(),
+    );
     let data_root = std::path::PathBuf::from(
         request["host"]["data_root"]
             .as_str()
@@ -247,14 +254,14 @@ fn contract_launch_prepared_recovery_proves_no_effect_before_readmission() {
     fs::write(
         state_path,
         serde_json::to_vec(&serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "request_id": request_id,
             "binding_sha256": binding_sha256,
             "prompt_sha256": prompt_sha256,
             "recovery": {
                 "program": fake_wrapper.dir().join("opencode1").to_string_lossy(),
-                "home": null,
-                "path": path,
+                "passthrough_env": {},
+                "declared_env_sha256": declared_env_sha256,
                 "working_directory": env!("CARGO_MANIFEST_DIR"),
                 "provider_id": "openai",
                 "model_id": "gpt-5.6-sol",

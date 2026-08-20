@@ -472,6 +472,10 @@ pub fn fake_counted_new_session_script(count_path: &Path, session_id: &str) -> S
     format!(
         "#!/bin/sh\n\
 if [ \"$1\" = \"session\" ] && [ \"${{2:-}}\" = \"list\" ]; then\n\
+  if [ \"${{XDG_DATA_HOME-}}\" != \"/tmp/agent-runner-opencode-recovery-xdg\" ]; then\n\
+    printf '%s\\n' 'recovery XDG_DATA_HOME mismatch' >&2\n\
+    exit 65\n\
+  fi\n\
   printf '%s\\n' '[]'\n\
   exit 0\n\
 fi\n\

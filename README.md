@@ -117,9 +117,10 @@ generated provider session ID or a no-session terminal is durable, so an event
 write cannot discard the responsible successor. An exact retry returns an
 observed session or terminal for reconciliation. A request left merely
 prepared by an interrupted provider invocation runs native session discovery,
-binding a matching session when present and readmitting the request only after
-an exhaustive list proves no effect. Reusing the request ID with different
-launch inputs is rejected as a conflict.
+using the original passthrough environment plus the exact request-bound
+declared environment. It binds a matching session when present and readmits
+the request only after an exhaustive same-context list proves no effect.
+Reusing the request ID with different launch inputs is rejected as a conflict.
 
 For resumed sessions, model switching is allowed per turn. Delivery and
 completion are credited only when bounded native export observes the submitted

@@ -107,15 +107,20 @@ struct LaunchRequestState {
     observed_at_unix_ms: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct LaunchRecoveryIdentity {
     program: String,
-    home: Option<String>,
-    path: Option<String>,
+    passthrough_env: BTreeMap<String, String>,
+    declared_env_sha256: String,
     working_directory: String,
     provider_id: String,
     model_id: String,
     effort: String,
+}
+
+struct LaunchRecoveryContext {
+    identity: LaunchRecoveryIdentity,
+    declared_env: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -169,7 +174,7 @@ pub(crate) fn stream<W: Write>(
         .prompt
         .as_deref()
         .map(|prompt| sha256_hex(prompt.as_bytes()));
-    let recovery = launch_recovery_identity(
+    let recovery = launch_recovery_context(
         &effective.argv,
         &params.working_directory,
         &effective.env,
@@ -681,6 +686,13 @@ fn prepared_child_stdin(stdin: Option<&[u8]>) -> std::io::Result<Stdio> {
 }
 
 fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut env = launch_passthrough_env();
+    // Explicitly declared values take precedence over ambient passthrough.
+    env.extend(declared.clone());
+    env
+}
+
+fn launch_passthrough_env() -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     for key in BASE_LAUNCH_ENV_PASSTHROUGH_KEYS
         .iter()
@@ -690,8 +702,6 @@ fn child_env(declared: &BTreeMap<String, String>) -> BTreeMap<String, String> {
             env.insert((*key).to_string(), value);
         }
     }
-    // Explicitly declared values take precedence over ambient passthrough.
-    env.extend(declared.clone());
     env
 }
 
@@ -851,7 +861,7 @@ impl LaunchRequestGuard {
         request_id: &str,
         binding_sha256: String,
         prompt_sha256: Option<String>,
-        recovery: LaunchRecoveryIdentity,
+        recovery: LaunchRecoveryContext,
     ) -> Result<Self, ProviderFailure> {
         let root = launch_state_root(host, request_id)?;
         durable_fs::create_private_directories(&root)
@@ -879,7 +889,8 @@ impl LaunchRequestGuard {
                 }
                 match state.phase {
                     LaunchRequestPhase::Prepared => {
-                        match recover_prepared_launch(&state, request_id)? {
+                        validate_launch_recovery_context(&state, &recovery, request_id)?;
+                        match recover_prepared_launch(&state, &recovery.declared_env, request_id)? {
                             PreparedLaunchRecovery::NoEffectObserved => {
                                 remove_launch_request_state(&state_path, request_id)?;
                             }
@@ -912,11 +923,11 @@ impl LaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = LaunchRequestState {
-            schema_version: 2,
+            schema_version: 3,
             request_id: request_id.to_string(),
             binding_sha256,
             prompt_sha256,
-            recovery,
+            recovery: recovery.identity,
             phase: LaunchRequestPhase::Prepared,
             provider_session_id: None,
             terminal_status: None,
@@ -1000,22 +1011,49 @@ fn launch_request_binding_sha256(
     )
 }
 
-fn launch_recovery_identity(
+fn launch_recovery_context(
     argv: &[String],
     working_directory: &str,
     declared_env: &BTreeMap<String, String>,
     route: &policy::PolicyRouteIdentity,
-) -> LaunchRecoveryIdentity {
-    let env = child_env(declared_env);
-    LaunchRecoveryIdentity {
-        program: resolve_launch_program(&argv[0], working_directory, &env),
-        home: env.get("HOME").cloned(),
-        path: env.get("PATH").cloned(),
-        working_directory: working_directory.to_string(),
-        provider_id: route.provider_id.clone(),
-        model_id: route.model_id.clone(),
-        effort: route.effort.clone(),
+) -> LaunchRecoveryContext {
+    let passthrough_env = launch_passthrough_env();
+    let mut effective_env = passthrough_env.clone();
+    effective_env.extend(declared_env.clone());
+    LaunchRecoveryContext {
+        identity: LaunchRecoveryIdentity {
+            program: resolve_launch_program(&argv[0], working_directory, &effective_env),
+            passthrough_env,
+            declared_env_sha256: launch_environment_sha256(declared_env),
+            working_directory: working_directory.to_string(),
+            provider_id: route.provider_id.clone(),
+            model_id: route.model_id.clone(),
+            effort: route.effort.clone(),
+        },
+        declared_env: declared_env.clone(),
     }
+}
+
+fn launch_environment_sha256(env: &BTreeMap<String, String>) -> String {
+    sha256_hex(
+        serde_json::to_vec(env)
+            .expect("launch environment serialization cannot fail")
+            .as_slice(),
+    )
+}
+
+fn validate_launch_recovery_context(
+    state: &LaunchRequestState,
+    recovery: &LaunchRecoveryContext,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if state.recovery.declared_env_sha256 == launch_environment_sha256(&recovery.declared_env) {
+        return Ok(());
+    }
+    Err(launch_recovery_unavailable(
+        request_id,
+        "the exact retry did not reproduce the declared child environment",
+    ))
 }
 
 fn resolve_launch_program(
@@ -1045,11 +1083,16 @@ fn resolve_launch_program(
 
 fn recover_prepared_launch(
     state: &LaunchRequestState,
+    declared_env: &BTreeMap<String, String>,
     request_id: &str,
 ) -> Result<PreparedLaunchRecovery, ProviderFailure> {
-    let output = launch_recovery_command(state, &["session", "list", "--format", "json"])
-        .output()
-        .map_err(|error| launch_recovery_unavailable(request_id, error))?;
+    let output = launch_recovery_command(
+        state,
+        declared_env,
+        &["session", "list", "--format", "json"],
+    )
+    .output()
+    .map_err(|error| launch_recovery_unavailable(request_id, error))?;
     if !output.status.success() {
         return Err(launch_recovery_unavailable(
             request_id,
@@ -1078,7 +1121,8 @@ fn recover_prepared_launch(
     let mut matched = candidates
         .iter()
         .filter(|session_id| {
-            recovered_session_matches_request(state, session_id, prompt_sha256).unwrap_or(false)
+            recovered_session_matches_request(state, declared_env, session_id, prompt_sha256)
+                .unwrap_or(false)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1091,18 +1135,19 @@ fn recover_prepared_launch(
     }
 }
 
-fn launch_recovery_command(state: &LaunchRequestState, args: &[&str]) -> Command {
+fn launch_recovery_command(
+    state: &LaunchRequestState,
+    declared_env: &BTreeMap<String, String>,
+    args: &[&str],
+) -> Command {
     let mut command = Command::new(&state.recovery.program);
+    let mut env = state.recovery.passthrough_env.clone();
+    env.extend(declared_env.clone());
     command
         .args(args)
         .current_dir(&state.recovery.working_directory)
-        .env_clear();
-    if let Some(home) = state.recovery.home.as_deref() {
-        command.env("HOME", home);
-    }
-    if let Some(path) = state.recovery.path.as_deref() {
-        command.env("PATH", path);
-    }
+        .env_clear()
+        .envs(env);
     command
 }
 
@@ -1144,10 +1189,11 @@ fn launch_recovery_integer(entry: &Value, keys: &[&str]) -> Option<u64> {
 
 fn recovered_session_matches_request(
     state: &LaunchRequestState,
+    declared_env: &BTreeMap<String, String>,
     session_id: &str,
     prompt_sha256: &str,
 ) -> Result<bool, ProviderFailure> {
-    let output = launch_recovery_command(state, &["export", session_id])
+    let output = launch_recovery_command(state, declared_env, &["export", session_id])
         .output()
         .map_err(|error| launch_recovery_unavailable(&state.request_id, error))?;
     if !output.status.success() {
@@ -1272,10 +1318,11 @@ fn validate_launch_request_state(
                 && state.observed_at_unix_ms.is_some()
         }
     };
-    if state.schema_version == 2
+    if state.schema_version == 3
         && state.request_id == request_id
         && !state.binding_sha256.trim().is_empty()
         && !state.recovery.program.trim().is_empty()
+        && !state.recovery.declared_env_sha256.trim().is_empty()
         && !state.recovery.working_directory.trim().is_empty()
         && !state.recovery.provider_id.trim().is_empty()
         && !state.recovery.model_id.trim().is_empty()
