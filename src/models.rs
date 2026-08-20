@@ -1,8 +1,11 @@
 //! Declared roles: accessor, mapper, predicate
 
+use crate::account::{AccountProfile, ACCOUNTS};
+
 pub const SOL_PROVIDER_MODEL: &str = "openai/gpt-5.6-sol";
 pub const LUNA_PROVIDER_MODEL: &str = "openai/gpt-5.6-luna";
 pub const DEFAULT_MODEL_ALIAS: &str = "gpt-high";
+pub const MODEL_ELIGIBILITY_POLICY: &str = "uniform_all_declared_accounts";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelAlias {
@@ -70,6 +73,21 @@ pub fn default_model() -> &'static ModelAlias {
 }
 
 impl ModelAlias {
+    pub fn supports_account(&self, account: &AccountProfile) -> bool {
+        MODEL_ALIASES.iter().any(|declared| declared == self)
+            && ACCOUNTS
+                .iter()
+                .any(|declared| declared.opencode_wrapper == account.opencode_wrapper)
+    }
+
+    pub fn eligible_account_ids(&self) -> Vec<&'static str> {
+        ACCOUNTS
+            .iter()
+            .filter(|account| self.supports_account(account))
+            .map(|account| account.opencode_wrapper)
+            .collect()
+    }
+
     pub fn matches(&self, provider_model: Option<&str>, effort: Option<&str>) -> bool {
         provider_model == Some(self.provider_model) && effort == Some(self.effort)
     }

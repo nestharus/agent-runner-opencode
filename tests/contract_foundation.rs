@@ -332,6 +332,21 @@ fn assert_model_variant(models: &[Value], alias: &str, provider_model: &str, eff
         json!(["-m", provider_model, "--variant", effort]),
         "{alias} provider args"
     );
+    assert_eq!(
+        model["account_eligibility"], "uniform_all_declared_accounts",
+        "{alias} account eligibility policy"
+    );
+    assert_eq!(
+        model["eligible_accounts"],
+        json!([
+            "opencode1",
+            "opencode2",
+            "opencode3",
+            "opencode4",
+            "opencode5"
+        ]),
+        "{alias} eligible accounts"
+    );
 }
 
 fn assert_discovery_accounts_response(response: &Value) {

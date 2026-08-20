@@ -1,7 +1,7 @@
 //! Declared roles: formatter, accessor, mapper
 
 use crate::account::{AccountProfile, ACCOUNTS};
-use crate::models::{ModelAlias, MODEL_ALIASES};
+use crate::models::{ModelAlias, MODEL_ALIASES, MODEL_ELIGIBILITY_POLICY};
 use serde_json::{json, Value};
 
 pub fn models() -> Value {
@@ -27,6 +27,8 @@ fn model_alias_json(model: &ModelAlias) -> Value {
         "name": model.name,
         "provider_model": model.provider_model,
         "provider_args": model.provider_args(),
+        "account_eligibility": MODEL_ELIGIBILITY_POLICY,
+        "eligible_accounts": model.eligible_account_ids(),
     })
 }
 

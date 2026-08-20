@@ -148,10 +148,29 @@ fn diagnostics_for_policy(
     } else if runtime.model.is_some() && runtime.model != model {
         diagnostics.push(settings_model_mismatch_diagnostic(runtime, model));
     }
+    if model.is_some_and(|model| !model.supports_account(runtime.account)) {
+        diagnostics.push(model_account_ineligible_diagnostic(runtime, model));
+    }
     diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(
         params, model,
     )));
     diagnostics
+}
+
+fn model_account_ineligible_diagnostic(
+    runtime: &RuntimeSettings,
+    requested: Option<&ModelAlias>,
+) -> Value {
+    diagnostic(
+        "error",
+        "model_account_ineligible",
+        format!(
+            "model {} is not eligible for account {} selected by settings_id {}",
+            requested.map(|model| model.name).unwrap_or("<invalid>"),
+            runtime.account.opencode_wrapper,
+            runtime.settings_id
+        ),
+    )
 }
 
 fn invalid_model_diagnostic(params: &PolicyEvaluateParams) -> Value {

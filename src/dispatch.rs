@@ -133,15 +133,21 @@ fn write_invocation_result<W: Write>(
     let request = decode_request(stdin)?;
     let subcommand = subcommand_from_args(args, &request.request_id)?;
     let activity = ActivityContext::from_request(&request, subcommand);
-    activity.started()?;
+    if let Err(error) = activity.started() {
+        eprintln!("provider activity start evidence warning: {error:?}");
+    }
     if subcommand == "launch" {
         let result = launch::stream(&request.request_id, &request.host, request.params, writer);
         match &result {
             Ok(exit_code) => {
-                let _ = activity.succeeded(*exit_code);
+                if let Err(error) = activity.succeeded(*exit_code) {
+                    eprintln!("provider activity completion evidence warning: {error:?}");
+                }
             }
             Err(failure) => {
-                let _ = activity.failed(failure);
+                if let Err(error) = activity.failed(failure) {
+                    eprintln!("provider activity completion evidence warning: {error:?}");
+                }
             }
         }
         return result;
@@ -154,7 +160,9 @@ fn write_invocation_result<W: Write>(
             response
         }
         Err(failure) => {
-            let _ = activity.failed(&failure);
+            if let Err(error) = activity.failed(&failure) {
+                eprintln!("provider activity completion evidence warning: {error:?}");
+            }
             return Err(failure);
         }
     };

@@ -14,7 +14,11 @@ The provider recognizes five account-pinned wrappers, `opencode1` through
 `opencode5`. The selected settings record, wrapper command, session commands,
 auth path, quota probe, refresh command, and rotation target must resolve to
 the same profile. Persisted opaque settings IDs are operational IDs and can be
-used anywhere a `settings_id` is accepted.
+used anywhere a `settings_id` is accepted. Stores written by the prior schema
+are compatibility-projected to the current OpenCode-owned account, quota, and
+model shape while preserving record IDs and versions; the next mutation writes
+the upgraded store schema. An unrecognizable record fails the entire store with
+`settings_store_upgrade_required` instead of remaining listable but unusable.
 
 ## Model routes
 
@@ -30,6 +34,12 @@ projection. The current routes are:
 | `gpt-max` | `openai/gpt-5.6-sol` | `max` |
 | `gpt-luna-low` | `openai/gpt-5.6-luna` | `low` |
 | `gpt-luna-max` | `openai/gpt-5.6-luna` | `max` |
+
+Model eligibility is deliberately uniform across all five declared account
+profiles. Discovery publishes that complete account set for every route, and
+policy enforces the same relationship. A native account rejecting an advertised
+route is therefore a dependency/runtime failure, not an unrepresented
+account-specific policy branch.
 
 Policy accepts only the exact `provider_args` advertised by
 `discovery.models`, requires the configured wrapper to match the selected
@@ -84,6 +94,12 @@ policy, launch, session, quota, settings, migration, and rotation without
 recording prompts, tokens, or environment values. Rotation authorizations,
 idempotency records, and decision receipts live under the adjacent
 `provider-state/opencode/rotation` tree.
+
+Activity evidence is operational and explicitly best-effort. A directory,
+lock, write, or chain-validation failure is emitted as a stderr warning but
+does not deny or change the capability result. The recorder never appends past
+a malformed chain; operators must repair or archive that ledger to restore
+continuous evidence.
 
 The v1 host envelope supplies a request ID and optional provider instance ID,
 but no authenticated human/service principal or delegation. The provider

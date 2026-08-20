@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 const STORE_DIR: &str = "agent-runner-opencode";
 const STORE_FILE: &str = "settings-store.json";
 const STORE_LOCK_FILE: &str = ".settings-store.lock";
+const CURRENT_STORE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Deserialize)]
 struct SettingsCreateParams {
@@ -87,11 +88,23 @@ pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, Provi
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct SettingsStore {
+    #[serde(default)]
+    schema_version: u32,
     records: Vec<SettingsRecord>,
     #[serde(default)]
     history: Vec<Value>,
+}
+
+impl Default for SettingsStore {
+    fn default() -> Self {
+        Self {
+            schema_version: CURRENT_STORE_SCHEMA_VERSION,
+            records: Vec::new(),
+            history: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -465,7 +478,95 @@ fn read_store_bytes(path: &Path, request_id: &str) -> Result<Vec<u8>, ProviderFa
 }
 
 fn parse_store_bytes(bytes: &[u8], request_id: &str) -> Result<SettingsStore, ProviderFailure> {
-    serde_json::from_slice(bytes).map_err(|err| settings_store_parse_failure(request_id, err))
+    let store = serde_json::from_slice(bytes)
+        .map_err(|err| settings_store_parse_failure(request_id, err))?;
+    upgrade_persisted_store(store, request_id)
+}
+
+fn upgrade_persisted_store(
+    mut store: SettingsStore,
+    request_id: &str,
+) -> Result<SettingsStore, ProviderFailure> {
+    if store.schema_version > CURRENT_STORE_SCHEMA_VERSION {
+        return Err(settings_store_upgrade_failure(
+            request_id,
+            format!(
+                "settings store schema {} is newer than supported schema {}",
+                store.schema_version, CURRENT_STORE_SCHEMA_VERSION
+            ),
+        ));
+    }
+    if store.schema_version == CURRENT_STORE_SCHEMA_VERSION {
+        return Ok(store);
+    }
+    for record in &mut store.records {
+        record.values = upgrade_persisted_values(&record.values).ok_or_else(|| {
+            settings_store_upgrade_failure(
+                request_id,
+                format!(
+                    "settings record {} cannot be upgraded automatically; back up and recreate that record",
+                    record.id
+                ),
+            )
+        })?;
+    }
+    store.schema_version = CURRENT_STORE_SCHEMA_VERSION;
+    Ok(store)
+}
+
+fn upgrade_persisted_values(values: &Value) -> Option<Value> {
+    let account = persisted_settings_account(values)?;
+    let model = persisted_model_alias(values)?;
+    let mut upgraded = json!({
+        "provider": "opencode",
+        "profile": account.opencode_wrapper,
+        "wrapper": account.opencode_wrapper,
+        "model": {
+            "name": model.name,
+            "provider_model": model.provider_model,
+            "variant": model.effort,
+        },
+        "quota": {
+            "source": account.quota_source_kind(),
+            "auth_path": account.quota_auth_path(),
+            "probe": account.quota_probe_kind(),
+        },
+        "launch": {
+            "format": "json",
+            "dangerously_skip_permissions": true,
+        },
+    });
+    copy_persisted_optional_field(values, &mut upgraded, "extra_env");
+    copy_persisted_optional_field(values, &mut upgraded, "working_directory");
+    copy_persisted_optional_field(values, &mut upgraded, "mode");
+    if let Some(preserve) = values
+        .pointer("/launch/preserve_pure_wrapper")
+        .and_then(Value::as_bool)
+    {
+        upgraded["launch"]["preserve_pure_wrapper"] = json!(preserve);
+    }
+    settings_valid(&validate_values(&upgraded)).then_some(upgraded)
+}
+
+fn persisted_settings_account(values: &Value) -> Option<&'static AccountProfile> {
+    ["wrapper", "profile", "opencode_wrapper", "account"]
+        .into_iter()
+        .find_map(|key| values.get(key).and_then(Value::as_str))
+        .and_then(account_for_settings_reference)
+}
+
+fn persisted_model_alias(values: &Value) -> Option<&'static crate::models::ModelAlias> {
+    values
+        .pointer("/model/name")
+        .and_then(Value::as_str)
+        .or_else(|| values.get("model").and_then(Value::as_str))
+        .and_then(model_alias)
+}
+
+fn copy_persisted_optional_field(source: &Value, target: &mut Value, field: &str) {
+    if let Some(value) = source.get(field) {
+        target[field] = sanitize_value(value);
+    }
 }
 
 fn write_store_path(
@@ -1462,6 +1563,10 @@ fn settings_store_parse_failure(request_id: &str, err: serde_json::Error) -> Pro
         "settings_store_parse_failed",
         format!("provider settings store is invalid JSON: {err}"),
     )
+}
+
+fn settings_store_upgrade_failure(request_id: &str, message: impl Into<String>) -> ProviderFailure {
+    ProviderFailure::invalid_request(request_id, "settings_store_upgrade_required", message)
 }
 
 fn settings_store_serialize_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {

@@ -286,6 +286,37 @@ fn contract_activity_evidence_is_redacted_private_and_hash_chained() {
     }
 }
 
+#[test]
+fn contract_corrupt_activity_evidence_warns_without_denial() {
+    let host = HostRoots::new("agent-runner-opencode-activity-best-effort");
+    let activity_root = host.data_root().join("provider-state/opencode/activity");
+    fs::create_dir_all(&activity_root).expect("create corrupt activity root");
+    let ledger_path = activity_root.join("operations.jsonl");
+    fs::write(&ledger_path, b"not-json\n").expect("write corrupt activity ledger");
+
+    let output = invoke_validated_with_host(
+        "describe",
+        json!({}),
+        host.overrides(),
+        "describe.schema.json#/$defs/DescribeRequest",
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("provider activity start evidence warning"),
+        "activity failure must be observable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = success_result(
+        output,
+        "describe.schema.json#/$defs/DescribeResponse",
+        "describe.schema.json#/$defs/DescribeResult",
+    );
+    assert_eq!(
+        fs::read(&ledger_path).expect("read unchanged corrupt ledger"),
+        b"not-json\n"
+    );
+}
+
 fn assert_settings_history(host: &HostRoots, expected_events: usize) {
     let store_path = host
         .config_root()
@@ -306,6 +337,103 @@ fn assert_settings_history(host: &HostRoots, expected_events: usize) {
     let serialized = String::from_utf8(bytes).expect("settings store UTF-8");
     assert!(!serialized.contains(SECRET_TOKEN));
     assert!(!serialized.contains(UPDATE_SECRET_TOKEN));
+}
+
+#[test]
+fn contract_prior_settings_store_is_upgraded_without_losing_identity() {
+    let host = HostRoots::new("agent-runner-opencode-settings-prior-store-upgrade");
+    let store_path = host
+        .config_root()
+        .join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(store_path.parent().expect("settings store parent"))
+        .expect("create prior settings store parent");
+    let mut prior_values = opencode_settings_values(None);
+    prior_values["quota"] = json!({
+        "source": "codex",
+        "auth_path": "~/.codex/auth.json",
+        "usage_command": "chatgpt-usage"
+    });
+    fs::write(
+        &store_path,
+        serde_json::to_vec(&json!({
+            "records": [{
+                "id": "prior-settings-id",
+                "display_name": "Prior settings",
+                "version": "prior-version",
+                "values": prior_values
+            }]
+        }))
+        .expect("serialize prior settings store"),
+    )
+    .expect("write prior settings store");
+
+    let get = success_result(
+        invoke_validated_with_host(
+            "settings.get",
+            settings_get_params("prior-settings-id"),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsGetRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsGetResponse",
+        "settings.schema.json#/$defs/SettingsGetResult",
+    );
+    assert_eq!(get["record"]["id"], "prior-settings-id");
+    assert_eq!(get["record"]["version"], "prior-version");
+    assert_normalized_account_settings_record(
+        &get["record"],
+        "opencode1",
+        "~/.local/share/opencode/auth.json",
+    );
+
+    let policy = success_result(
+        invoke_validated_with_host(
+            "policy.evaluate",
+            json!({
+                "settings_id": "prior-settings-id",
+                "mode": "agent",
+                "model": {
+                    "name": "gpt-high",
+                    "provider_args": ["-m", "openai/gpt-5.6-sol", "--variant", "high"],
+                    "inputs": { "prompt": "ok", "named": {} }
+                },
+                "launch": {
+                    "argv": [
+                        "opencode1", "run", "--dangerously-skip-permissions",
+                        "-m", "openai/gpt-5.6-sol", "--variant", "high", "ok"
+                    ]
+                }
+            }),
+            host.overrides(),
+            "policy.schema.json#/$defs/PolicyEvaluateRequest",
+        ),
+        "policy.schema.json#/$defs/PolicyEvaluateResponse",
+        "policy.schema.json#/$defs/PolicyEvaluateResult",
+    );
+    assert_eq!(policy["accepted"], true, "{policy}");
+
+    let updated = success_result(
+        invoke_validated_with_host(
+            "settings.update",
+            settings_update_params("prior-settings-id", "prior-version", None),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsUpdateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsUpdateResponse",
+        "settings.schema.json#/$defs/SettingsUpdateResult",
+    );
+    assert_eq!(updated["record"]["id"], "prior-settings-id");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store_path).expect("read upgraded settings store"))
+            .expect("parse upgraded settings store");
+    assert_eq!(persisted["schema_version"], 2);
+    assert_eq!(persisted["records"][0]["id"], "prior-settings-id");
+    assert_eq!(
+        persisted["records"][0]["values"]["quota"]["source"],
+        "opencode_auth"
+    );
+    assert!(persisted["records"][0]["values"]["quota"]
+        .get("usage_command")
+        .is_none());
 }
 
 #[test]

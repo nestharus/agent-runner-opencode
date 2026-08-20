@@ -164,12 +164,21 @@ pub fn policy_evaluate_params() -> Value {
 }
 
 pub fn policy_evaluate_params_for_model(alias: &str, provider_model: &str, effort: &str) -> Value {
+    policy_evaluate_params_for_account_model("opencode1", alias, provider_model, effort)
+}
+
+pub fn policy_evaluate_params_for_account_model(
+    account: &str,
+    alias: &str,
+    provider_model: &str,
+    effort: &str,
+) -> Value {
     json!({
-        "settings_id": "opencode1",
+        "settings_id": account,
         "mode": "agent",
         "model": model_request_for(alias, provider_model, effort),
         "launch": {
-            "argv": host_candidate_argv_for_model("opencode1", provider_model, effort),
+            "argv": host_candidate_argv_for_model(account, provider_model, effort),
             "working_directory": env!("CARGO_MANIFEST_DIR")
         }
     })

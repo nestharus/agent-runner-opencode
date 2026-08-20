@@ -86,7 +86,7 @@ pub fn opencode_settings_schema() -> Value {
                 "type": "object",
                 "oneOf": model_schema_variants(),
                 "default": default_model_schema_value(),
-                "description": "One exact provider-owned alias, OpenCode model, and effort tuple."
+                "description": "One exact provider-owned alias, OpenCode model, and effort tuple. Every advertised tuple is eligible for every declared OpenCode account profile."
             },
             "launch": {
                 "type": "object",
