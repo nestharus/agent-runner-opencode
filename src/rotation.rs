@@ -25,6 +25,8 @@ const ROTATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ROTATION_ARTIFACT_BYTES: usize = opencode::MAX_EXPORT_OUTPUT_BYTES;
 const MAX_ROTATION_STATE_BYTES: usize = 1024 * 1024;
 const MAX_ROTATION_LIVE_RECORDS: usize = 64;
+const ROTATION_BINDING_LOCK_STRIPES: u8 = 64;
+const ROTATION_RESERVATION_RETENTION: Duration = Duration::from_secs(2 * 60);
 const MAX_ROTATION_ARTIFACT_RECORDS: usize = MAX_ROTATION_LIVE_RECORDS * 2;
 const MAX_ROTATION_COMPATIBILITY_RECORDS: usize = 4096;
 const ROTATION_STATE_DIR: &str = "provider-state/opencode/rotation";
@@ -34,8 +36,33 @@ struct RotationCapacity {
     authorizations: usize,
     materializations: usize,
     operations: usize,
+    reservations: usize,
     artifacts: usize,
     decisions: usize,
+}
+
+struct RotationReservationGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl RotationReservationGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RotationReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if fs::remove_file(&self.path).is_ok() {
+            if let Some(parent) = self.path.parent() {
+                let _ = durable_fs::sync_directory(parent);
+            }
+        }
+    }
 }
 
 struct RotationBudget {
@@ -82,7 +109,8 @@ pub fn assess_params(
         && facts_allow
         && binding.source_provider_id != binding.target_provider_id
         && binding.source_account.opencode_wrapper != binding.target_account.opencode_wrapper;
-    let _lock = acquire_rotation_lock(host, &budget, request_id)?;
+    let _binding_lock = acquire_rotation_binding_lock(host, &binding, &budget, request_id)?;
+    let _capacity_lock = acquire_rotation_capacity_lock(host, &budget, request_id)?;
     budget.checkpoint(request_id)?;
     let capacity = maintain_rotation_capacity(host, &binding, &budget, request_id)?;
     if allowed
@@ -113,44 +141,17 @@ pub fn materialize_params(
 ) -> Result<Value, ProviderFailure> {
     let budget = RotationBudget::new(host);
     let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
-    let _lock = acquire_rotation_lock(host, &budget, request_id)?;
+    let _binding_lock = acquire_rotation_binding_lock(host, &binding, &budget, request_id)?;
+    let capacity_lock = acquire_rotation_capacity_lock(host, &budget, request_id)?;
     budget.checkpoint(request_id)?;
     let capacity = maintain_rotation_capacity(host, &binding, &budget, request_id)?;
-    let receipt_exists = materialization_receipt_path(host, &binding, request_id)?.exists();
-    let operation_exists = rotation_operation_path(host, &binding, request_id)?.exists();
-    if !receipt_exists && capacity.materializations >= MAX_ROTATION_LIVE_RECORDS {
-        return Err(rotation_state_capacity_exceeded(
-            request_id,
-            "materialization receipts",
-        ));
-    }
-    if !receipt_exists
-        && !operation_exists
-        && capacity
-            .materializations
-            .saturating_add(capacity.operations)
-            >= MAX_ROTATION_LIVE_RECORDS
-    {
-        return Err(rotation_state_capacity_exceeded(
-            request_id,
-            "operations and materialization receipts",
-        ));
-    }
-    if !receipt_exists
-        && (capacity.artifacts >= MAX_ROTATION_ARTIFACT_RECORDS
-            || capacity.decisions >= MAX_ROTATION_ARTIFACT_RECORDS)
-    {
-        return Err(rotation_state_capacity_exceeded(
-            request_id,
-            "artifacts or decisions",
-        ));
-    }
     if let Some(result) = read_materialization_receipt(host, &binding, request_id)? {
         budget.checkpoint(request_id)?;
         return Ok(result);
     }
     budget.checkpoint(request_id)?;
     if let Some(mut operation) = read_rotation_operation(host, &binding, request_id)? {
+        drop(capacity_lock);
         budget.checkpoint(request_id)?;
         if operation.phase == RotationOperationPhase::Prepared {
             let target_runtime = native_runtime::resolve_for_account_with_timeout(
@@ -171,7 +172,35 @@ pub fn materialize_params(
         }
         return finalize_rotation_operation(host, &binding, &operation, &budget, request_id);
     }
+    let reservation_path = rotation_reservation_path(host, &binding, request_id)?;
+    let reservation_exists = reservation_path.exists();
+    if !reservation_exists
+        && capacity
+            .materializations
+            .saturating_add(capacity.operations)
+            .saturating_add(capacity.reservations)
+            >= MAX_ROTATION_LIVE_RECORDS
+    {
+        return Err(rotation_state_capacity_exceeded(
+            request_id,
+            "reservations, operations, and materialization receipts",
+        ));
+    }
+    if !reservation_exists
+        && (capacity.artifacts.saturating_add(capacity.reservations)
+            >= MAX_ROTATION_ARTIFACT_RECORDS
+            || capacity.decisions.saturating_add(capacity.reservations)
+                >= MAX_ROTATION_ARTIFACT_RECORDS)
+    {
+        return Err(rotation_state_capacity_exceeded(
+            request_id,
+            "artifacts or decisions",
+        ));
+    }
     let authorization = require_fresh_authorization(host, &binding, request_id)?;
+    let mut reservation =
+        persist_rotation_reservation(&reservation_path, &binding, request_id, reservation_exists)?;
+    drop(capacity_lock);
     budget.checkpoint(request_id)?;
     let working_directory = rotation_working_directory(host, request_id)?;
     let source_runtime = native_runtime::resolve_for_account_with_timeout(
@@ -232,7 +261,11 @@ pub fn materialize_params(
         target_session_id: None,
         imported_at_unix_ms: None,
     };
+    let operation_capacity_lock = acquire_rotation_capacity_lock(host, &budget, request_id)?;
     write_rotation_operation(host, &binding, &operation, request_id)?;
+    remove_rotation_record(&reservation_path, request_id)?;
+    reservation.disarm();
+    drop(operation_capacity_lock);
     budget.checkpoint(request_id)?;
     let target_session_id = opencode::import_session(
         &artifact_path,
@@ -578,7 +611,7 @@ fn require_fresh_authorization(
     Ok(record)
 }
 
-fn acquire_rotation_lock(
+fn acquire_rotation_capacity_lock(
     host: &HostContext,
     budget: &RotationBudget,
     request_id: &str,
@@ -602,6 +635,63 @@ fn acquire_rotation_lock(
         return Err(rotation_lock_timeout(request_id));
     }
     Ok(lock)
+}
+
+fn acquire_rotation_binding_lock(
+    host: &HostContext,
+    binding: &RotationBinding,
+    budget: &RotationBudget,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    let lock = open_rotation_binding_lock(host, binding, request_id)?;
+    let timeout = budget.remaining(request_id)?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| rotation_state_failure(request_id, error))?
+    {
+        return Err(rotation_lock_timeout(request_id));
+    }
+    Ok(lock)
+}
+
+fn open_rotation_binding_lock(
+    host: &HostContext,
+    binding: &RotationBinding,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    let digest = binding_digest(binding);
+    open_rotation_binding_lock_for_digest(host, &digest, request_id)
+}
+
+fn open_rotation_binding_lock_for_digest(
+    host: &HostContext,
+    digest: &str,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(rotation_state_failure(
+            request_id,
+            "rotation binding digest is not hexadecimal SHA-256",
+        ));
+    }
+    let prefix = u8::from_str_radix(&digest[..2], 16)
+        .expect("binding digest always starts with one hexadecimal byte");
+    let stripe = prefix % ROTATION_BINDING_LOCK_STRIPES;
+    let root = rotation_state_root(host, request_id)?;
+    let lock_root = confined_rotation_state_target(host, &root.join("binding-locks"), request_id)?;
+    durable_fs::create_private_directories(&lock_root)
+        .map_err(|error| rotation_state_failure(request_id, error))?;
+    let lock_path = confined_rotation_state_target(
+        host,
+        &lock_root.join(format!("stripe-{stripe:02}.lock")),
+        request_id,
+    )?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|error| rotation_state_failure(request_id, error))
 }
 
 fn maintain_rotation_capacity(
@@ -637,6 +727,35 @@ fn maintain_rotation_capacity(
     }
 
     let materialization_root = root.join("materializations");
+    let operation_root = root.join("operations");
+    for path in rotation_collection_paths(&root, "reservations", request_id)? {
+        budget.checkpoint(request_id)?;
+        let digest = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| rotation_state_failure(request_id, "reservation has no digest"))?;
+        let successor = path
+            .file_name()
+            .map(|name| operation_root.join(name))
+            .is_some_and(|operation| operation.is_file());
+        let stale = digest != current_digest
+            && rotation_record_expired(&path, ROTATION_RESERVATION_RETENTION);
+        let abandoned = if stale {
+            let lock = open_rotation_binding_lock_for_digest(host, digest, request_id)?;
+            match fs2::FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) => return Err(rotation_state_failure(request_id, error)),
+            }
+        } else {
+            false
+        };
+        if successor || abandoned {
+            remove_rotation_record(&path, request_id)?;
+        } else {
+            capacity.reservations += 1;
+        }
+    }
     for path in rotation_collection_paths(&root, "operations", request_id)? {
         budget.checkpoint(request_id)?;
         let successor = path
@@ -672,10 +791,22 @@ fn maintain_rotation_capacity(
         ("authorizations", capacity.authorizations),
         ("materialization receipts", capacity.materializations),
         ("operations", capacity.operations),
+        ("reservations", capacity.reservations),
     ] {
         if observed > MAX_ROTATION_LIVE_RECORDS {
             return Err(rotation_state_capacity_exceeded(request_id, name));
         }
+    }
+    if capacity
+        .materializations
+        .saturating_add(capacity.operations)
+        .saturating_add(capacity.reservations)
+        > MAX_ROTATION_LIVE_RECORDS
+    {
+        return Err(rotation_state_capacity_exceeded(
+            request_id,
+            "reservations, operations, and materialization receipts",
+        ));
     }
     for (name, observed) in [
         ("artifacts", capacity.artifacts),
@@ -853,6 +984,57 @@ fn rotation_operation_path(
         .join("operations")
         .join(format!("{}.json", binding_digest(binding)));
     confined_rotation_state_target(host, &path, request_id)
+}
+
+fn rotation_reservation_path(
+    host: &HostContext,
+    binding: &RotationBinding,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let path = rotation_state_root(host, request_id)?
+        .join("reservations")
+        .join(format!("{}.json", binding_digest(binding)));
+    confined_rotation_state_target(host, &path, request_id)
+}
+
+fn persist_rotation_reservation(
+    path: &Path,
+    binding: &RotationBinding,
+    request_id: &str,
+    existing: bool,
+) -> Result<RotationReservationGuard, ProviderFailure> {
+    let digest = binding_digest(binding);
+    if existing {
+        let bytes = durable_fs::read_file_bounded(path, MAX_ROTATION_STATE_BYTES)
+            .map_err(|error| rotation_state_failure(request_id, error))?;
+        let reservation: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| rotation_state_failure(request_id, error))?;
+        if reservation["schema_version"] != 1
+            || reservation["binding_sha256"].as_str() != Some(digest.as_str())
+            || reservation["binding"] != binding_value(binding)
+        {
+            return Err(rotation_state_failure(
+                request_id,
+                "rotation reservation identity is inconsistent",
+            ));
+        }
+    } else {
+        write_private_json_atomic(
+            path,
+            &json!({
+                "schema_version": 1,
+                "binding_sha256": digest,
+                "binding": binding_value(binding),
+                "materialization_request_id": request_id,
+                "reserved_at_unix_ms": now_unix_ms(),
+            }),
+        )
+        .map_err(|error| rotation_state_failure(request_id, error))?;
+    }
+    Ok(RotationReservationGuard {
+        path: path.to_path_buf(),
+        armed: true,
+    })
 }
 
 fn rotation_state_root(host: &HostContext, request_id: &str) -> Result<PathBuf, ProviderFailure> {
@@ -1129,6 +1311,7 @@ fn finalize_rotation_operation(
         "artifacts": [artifact, decision_artifact],
         "host_state_plan": host_state_plan,
     });
+    let capacity_lock = acquire_rotation_capacity_lock(host, budget, request_id)?;
     write_materialization_receipt(
         host,
         binding,
@@ -1142,6 +1325,7 @@ fn finalize_rotation_operation(
         request_id,
     )?;
     remove_rotation_record(&authorization_path(host, binding, request_id)?, request_id)?;
+    drop(capacity_lock);
     budget.checkpoint(request_id)?;
     Ok(result)
 }
@@ -1589,7 +1773,7 @@ fn rotation_deadline_exceeded(request_id: &str) -> ProviderFailure {
     ProviderFailure::internal(
         request_id,
         "rotation_deadline_exceeded",
-        "the end-to-end rotation operation deadline was reached while the shared rotation lock was held",
+        "the end-to-end rotation operation deadline was reached during bounded coordination or native work",
     )
 }
 

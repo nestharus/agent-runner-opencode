@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 #[cfg(unix)]
 use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
 
@@ -61,7 +61,8 @@ const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
 const LAUNCH_REQUEST_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const LAUNCH_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_LAUNCH_REQUEST_RECORDS: usize = 64;
+const MAX_ACTIVE_LAUNCH_REQUEST_RECORDS: usize = 64;
+const MAX_LAUNCH_REPLAY_RECORDS: usize = 4096;
 const MAX_LAUNCH_STATE_BYTES: usize = 256 * 1024;
 #[cfg(unix)]
 const LAUNCH_EXEC_GATE_ARG: &str = "__launch_exec_gate";
@@ -165,6 +166,18 @@ struct LaunchRequestGuard {
     state_path: PathBuf,
     state: LaunchRequestState,
     _lock: fs::File,
+}
+
+#[derive(Default)]
+struct LaunchRequestCapacity {
+    active: usize,
+    replay: usize,
+}
+
+struct LaunchReplayCandidate {
+    modified: SystemTime,
+    lock_path: PathBuf,
+    state_path: PathBuf,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1909,16 +1922,16 @@ fn acquire_launch_request_lock(
     admit_new: bool,
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
-    let capacity = acquire_launch_capacity_lock(root, host, request_id)?;
+    let capacity_lock = acquire_launch_capacity_lock(root, host, request_id)?;
     let lock_path = state_path.with_extension("lock");
     let existing_lock = lock_path.exists();
-    let retained = maintain_launch_request_capacity(root, &lock_path, request_id)?;
-    if admit_new && !existing_lock && retained >= MAX_LAUNCH_REQUEST_RECORDS {
+    let capacity = maintain_launch_request_capacity(root, &lock_path, request_id)?;
+    if admit_new && !existing_lock && capacity.active >= MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
         return Err(launch_state_capacity_exceeded(request_id));
     }
     let lock = open_launch_state_lock(&lock_path)
         .map_err(|error| launch_state_failure(request_id, error))?;
-    drop(capacity);
+    drop(capacity_lock);
     let timeout =
         operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
             .ok_or_else(|| launch_state_lock_timeout(request_id))?;
@@ -1955,69 +1968,79 @@ fn maintain_launch_request_capacity(
     root: &Path,
     current_lock_path: &Path,
     request_id: &str,
-) -> Result<usize, ProviderFailure> {
-    let mut retained = 0_usize;
+) -> Result<LaunchRequestCapacity, ProviderFailure> {
+    let mut capacity = LaunchRequestCapacity::default();
+    let mut replay_candidates = Vec::new();
     let mut visited = 0_usize;
     for entry in fs::read_dir(root).map_err(|error| launch_state_failure(request_id, error))? {
         let entry = entry.map_err(|error| launch_state_failure(request_id, error))?;
         let path = entry.path();
-        if path == current_lock_path
-            || path.file_name().and_then(|name| name.to_str()) == Some(".capacity.lock")
+        if path.file_name().and_then(|name| name.to_str()) == Some(".capacity.lock")
             || path.extension().and_then(|extension| extension.to_str()) != Some("lock")
         {
             continue;
         }
         visited += 1;
-        if visited > MAX_LAUNCH_REQUEST_RECORDS.saturating_add(1) {
+        if visited
+            > MAX_ACTIVE_LAUNCH_REQUEST_RECORDS
+                .saturating_add(MAX_LAUNCH_REPLAY_RECORDS)
+                .saturating_add(1)
+        {
             return Err(launch_state_capacity_exceeded(request_id));
         }
         let state_path = path.with_extension("json");
-        if launch_request_record_expired(&path, &state_path, request_id)?
+        let state_exists = state_path.exists();
+        let replay = launch_request_record_is_replay(&state_path, request_id)?;
+        if (replay || !state_exists)
+            && path != current_lock_path
+            && launch_request_record_expired(&path, &state_path)?
             && remove_expired_launch_record(&path, &state_path, request_id)?
         {
             continue;
         }
-        retained += 1;
+        if replay {
+            capacity.replay += 1;
+            replay_candidates.push(LaunchReplayCandidate {
+                modified: launch_record_modified(&path, &state_path),
+                lock_path: path,
+                state_path,
+            });
+        } else {
+            capacity.active += 1;
+        }
     }
-    if current_lock_path.exists() {
-        retained += 1;
+    replay_candidates.sort_by_key(|candidate| candidate.modified);
+    for candidate in replay_candidates {
+        if capacity.replay <= MAX_LAUNCH_REPLAY_RECORDS {
+            break;
+        }
+        if candidate.lock_path != current_lock_path
+            && remove_expired_launch_record(
+                &candidate.lock_path,
+                &candidate.state_path,
+                request_id,
+            )?
+        {
+            capacity.replay -= 1;
+        }
     }
-    Ok(retained)
+    if capacity.active > MAX_ACTIVE_LAUNCH_REQUEST_RECORDS
+        || capacity.replay > MAX_LAUNCH_REPLAY_RECORDS
+    {
+        return Err(launch_state_capacity_exceeded(request_id));
+    }
+    Ok(capacity)
 }
 
-fn launch_request_record_expired(
-    lock_path: &Path,
+fn launch_request_record_is_replay(
     state_path: &Path,
     request_id: &str,
 ) -> Result<bool, ProviderFailure> {
-    let state_metadata = match fs::metadata(state_path) {
-        Ok(metadata) if metadata.is_file() => Some(metadata),
-        Ok(_) => {
-            return Err(launch_state_failure(
-                request_id,
-                "launch state is not a file",
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let bytes = match durable_fs::read_file_bounded(state_path, MAX_LAUNCH_STATE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(launch_state_failure(request_id, error)),
     };
-    let modified = match state_metadata.as_ref() {
-        Some(metadata) => metadata.modified().ok(),
-        None => fs::metadata(lock_path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok()),
-    };
-    let old_enough = modified
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age >= LAUNCH_REQUEST_RETENTION);
-    if !old_enough {
-        return Ok(false);
-    }
-    let Some(_) = state_metadata else {
-        return Ok(true);
-    };
-    let bytes = durable_fs::read_file_bounded(state_path, MAX_LAUNCH_STATE_BYTES)
-        .map_err(|error| launch_state_failure(request_id, error))?;
     let state: Value =
         serde_json::from_slice(&bytes).map_err(|error| launch_state_invalid(request_id, error))?;
     Ok(matches!(
@@ -2029,6 +2052,35 @@ fn launch_request_record_expired(
                 | "terminal_without_submission"
         )
     ))
+}
+
+fn launch_request_record_expired(
+    lock_path: &Path,
+    state_path: &Path,
+) -> Result<bool, ProviderFailure> {
+    let state_metadata = match fs::metadata(state_path) {
+        Ok(metadata) if metadata.is_file() => Some(metadata),
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Ok(false),
+    };
+    let modified = match state_metadata.as_ref() {
+        Some(metadata) => metadata.modified().ok(),
+        None => fs::metadata(lock_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok()),
+    };
+    let old_enough = modified
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= LAUNCH_REQUEST_RETENTION);
+    Ok(old_enough)
+}
+
+fn launch_record_modified(lock_path: &Path, state_path: &Path) -> SystemTime {
+    fs::metadata(state_path)
+        .or_else(|_| fs::metadata(lock_path))
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn remove_expired_launch_record(
@@ -2241,7 +2293,7 @@ fn launch_state_capacity_exceeded(request_id: &str) -> ProviderFailure {
         request_id,
         "launch_state_capacity_exceeded",
         format!(
-            "durable launch custody has reached its supported {MAX_LAUNCH_REQUEST_RECORDS}-request active/replay bound; reconcile unresolved requests or wait for the 24-hour terminal replay window to expire"
+            "durable launch custody has reached its supported {MAX_ACTIVE_LAUNCH_REQUEST_RECORDS}-request active bound or {MAX_LAUNCH_REPLAY_RECORDS}-request completed replay bound; reconcile unresolved requests or allow the bounded recent-replay pool to retire its oldest completion"
         ),
     )
 }
@@ -3414,4 +3466,34 @@ extern "C" {
     fn getpid() -> i32;
     fn getppid() -> i32;
     fn prctl(option: i32, arg2: i32, arg3: usize, arg4: usize, arg5: usize) -> i32;
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+
+    #[test]
+    fn completed_history_does_not_consume_active_launch_capacity() {
+        let directory = tempfile::tempdir().expect("launch custody directory");
+        for index in 0..MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
+            let stem = format!("{index:064x}");
+            fs::write(directory.path().join(format!("{stem}.lock")), b"")
+                .expect("launch request lock");
+            fs::write(
+                directory.path().join(format!("{stem}.json")),
+                br#"{"phase":"session_observed"}"#,
+            )
+            .expect("completed launch record");
+        }
+
+        let capacity = maintain_launch_request_capacity(
+            directory.path(),
+            &directory.path().join("new.lock"),
+            "request-test",
+        )
+        .expect("classify bounded launch custody");
+
+        assert_eq!(capacity.active, 0);
+        assert_eq!(capacity.replay, MAX_ACTIVE_LAUNCH_REQUEST_RECORDS);
+    }
 }

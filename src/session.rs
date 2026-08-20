@@ -764,6 +764,12 @@ fn load_enumeration_snapshot_page(
         );
     }
     let complete = end == total;
+    if complete {
+        fs::remove_dir_all(&snapshot_root)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+        durable_fs::sync_directory(&root)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+    }
     Ok(EnumeratePage {
         sessions,
         warnings: Vec::new(),

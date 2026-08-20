@@ -5,7 +5,7 @@ mod cluster_d;
 mod support;
 
 use cluster_d::*;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs;
 use std::fs::OpenOptions;
 use std::thread;
@@ -1954,6 +1954,115 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
 }
 
 #[test]
+fn contract_rotation_independent_binding_progresses_during_native_import() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-independent-overlap");
+    let opencode = RotationOpencodeFixture::with_hanging_import();
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+
+    let first_params = rotation_materialize_params();
+    let first_stripe = rotation_binding_test_stripe(&first_params);
+    let mut independent_params = rotation_assess_params(false);
+    let independent_chain = (0..256)
+        .map(|index| format!("chain-independent-{index}"))
+        .find(|chain| {
+            independent_params["chain_id"] = json!(chain);
+            rotation_binding_test_stripe(&independent_params) != first_stripe
+        })
+        .expect("one independent binding must map to another lock stripe");
+    independent_params["chain_id"] = json!(independent_chain);
+
+    let mut first_host = host.overrides();
+    first_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 4_000);
+    let path = opencode.path_env();
+    let first_path = path.clone();
+    let worker = thread::spawn(move || {
+        invoke_validated_with_host_and_env(
+            "rotation.materialize",
+            first_params,
+            first_host,
+            "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            &[("PATH", first_path.as_str())],
+        )
+    });
+
+    let operation_root = host
+        .data_root()
+        .join("provider-state/opencode/rotation/operations");
+    let wait_started = std::time::Instant::now();
+    while !fs::read_dir(&operation_root).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().is_file())
+    }) {
+        assert!(
+            wait_started.elapsed() < std::time::Duration::from_secs(2),
+            "the first rotation must publish its prepared operation"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let mut independent_host = host.overrides();
+    independent_host["deadline_unix_ms"] =
+        json!(agent_runner_opencode::encoding::now_unix_ms() + 1_500);
+    let started = std::time::Instant::now();
+    let independent = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            independent_params,
+            independent_host,
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    assert_rotation_denied(&independent);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1_500),
+        "independent binding work must not wait for another binding's native import"
+    );
+
+    let first = error_response(worker.join().expect("join hanging rotation worker"));
+    assert_eq!(first["error"]["code"], "rotation_import_failed");
+}
+
+fn rotation_binding_test_stripe(params: &Value) -> u8 {
+    let source_account = match params["source_account"].as_str() {
+        Some("opencode") => "opencode1",
+        Some(value) => value,
+        None => "",
+    };
+    let target_account = match params["target_account"].as_str() {
+        Some("opencode-secondary") => "opencode2",
+        Some(value) => value,
+        None => "",
+    };
+    let binding = json!({
+        "chain_id": params["chain_id"],
+        "source_provider": params["source_provider"],
+        "target_provider": params["target_provider"],
+        "source_account": source_account,
+        "target_account": target_account,
+        "source_session_id": params["source_session_id"],
+        "model_name": params["model_name"],
+        "settings_id": params["settings_id"].as_str().unwrap_or(""),
+        "transition_reason": params["transition_reason"],
+        "provider_instance_id": "opencode-primary",
+        "host_app": "oulipoly-agent-runner",
+    });
+    let digest = sha256_hex(binding.to_string().as_bytes());
+    u8::from_str_radix(&digest[..2], 16).expect("binding digest prefix") % 64
+}
+
+#[test]
 fn contract_rotation_runtime_lock_contention_obeys_global_budget() {
     let host = HostRoots::new("agent-runner-opencode-rotation-runtime-lock-timeout");
     let opencode = RotationOpencodeFixture::new();
@@ -1980,7 +2089,8 @@ fn contract_rotation_runtime_lock_contention_obeys_global_budget() {
         .expect("open source runtime lock");
     fs2::FileExt::lock_exclusive(&runtime_lock).expect("hold source runtime lock");
     let mut bounded_host = host.overrides();
-    bounded_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 750);
+    bounded_host["deadline_unix_ms"] =
+        json!(agent_runner_opencode::encoding::now_unix_ms() + 2_000);
     let path = opencode.path_env();
     let started = std::time::Instant::now();
     let failed = error_response(invoke_validated_with_host_and_env(
@@ -2046,7 +2156,8 @@ fn contract_rotation_prepared_recovery_runtime_lock_obeys_global_budget() {
         .expect("open target runtime lock");
     fs2::FileExt::lock_exclusive(&runtime_lock).expect("hold target runtime lock");
     let mut bounded_host = host.overrides();
-    bounded_host["deadline_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms() + 750);
+    bounded_host["deadline_unix_ms"] =
+        json!(agent_runner_opencode::encoding::now_unix_ms() + 2_000);
     let started = std::time::Instant::now();
     let failed = error_response(invoke_validated_with_host_and_env(
         "rotation.materialize",

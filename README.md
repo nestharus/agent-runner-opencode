@@ -142,10 +142,11 @@ Exact refresh retries inspect this immutable request record before resolving
 live settings. Deleting or updating the former settings record therefore cannot
 hide either a committed result or an admitted-effect reconciliation handoff;
 prepared work continues from its stored canonical account and auth-source path.
-Quota refresh custody is capped at 64 active/replay request records. Committed
-results have a 24-hour retention window and are retired under a fixed capacity
-lock; prepared, effect-admitted, and reconciliation-required records are never
-aged out. Each record is capped at 256 KiB. The selected auth file is read
+Quota refresh custody reserves 64 records for active obligations independently
+of a 4,096-record recent replay pool. Committed results remain replayable for up
+to 24 hours and the oldest completion is retired when that bounded pool fills;
+prepared, effect-admitted, and reconciliation-required records never age out or
+lose their active reserve. Each record is capped at 256 KiB. The selected auth file is read
 through a 1 MiB bound, access tokens and account IDs have explicit field bounds,
 and WHAM `curl` capture is limited to 512 KiB stdout, 64 KiB stderr, and 20
 seconds.
@@ -202,11 +203,13 @@ identity and any durable session, terminal, or resume observation before
 consulting mutable live settings. Current settings admission occurs only when
 there is no prior operation or authoritative recovery proved that it had no
 native effect.
-Launch custody is capped at 64 active/replay request records, each no larger
-than 256 KiB. Terminal records are retained for 24 hours and retired under a
-fixed capacity lock; prepared, submission-observed, and unresolved records are
-never aged out because they may still own an effect. Admission fails explicitly
-at the cap until those obligations are reconciled or terminal replay expires.
+Launch custody reserves 64 records for active obligations independently of a
+4,096-record recent replay pool; every record is no larger than 256 KiB.
+Terminal records remain replayable for up to 24 hours and the oldest completion
+is retired when that bounded pool fills. Prepared, submission-observed, and
+unresolved records never age out because they may still own an effect. New work
+fails at the active cap until those live obligations are reconciled, but routine
+completed history cannot consume its admission reserve.
 
 For resumed sessions, model switching is allowed per turn. During the normal
 launch, matching bounded `opencode run --format json` `step_start` and successful
@@ -262,8 +265,9 @@ completed materialization.
 `session.enumerate` materializes one bounded, private pagination snapshot on
 the first page instead of relisting the complete native population for every
 cursor. Page size and admitted population are each capped at 256, list capture
-at 2 MiB, each row at 64 KiB, and each snapshot at 4 MiB. At most 32 snapshots
-are retained for 15 minutes; continuation cursors read only the requested rows.
+at 2 MiB, each row at 64 KiB, and each snapshot at 4 MiB. At most 32 abandoned
+snapshots are retained for 15 minutes; continuation cursors read only the
+requested rows and consuming the terminal page immediately retires its snapshot.
 An above-bound native population fails explicitly.
 
 ## State, evidence, and authority
@@ -393,23 +397,26 @@ operation. This drain/reconcile/reset boundary preserves the old identities for
 recovery while giving wrapper and observer upgrades an explicit restoration
 path.
 
-Rotation assessment and materialization likewise bound acquisition of their
-shared state lock. One monotonic budget—the earlier of the host deadline and a
-20-second provider ceiling—covers lock admission and every action while the
-lock is held: state reads, bounded native export, parsing and hashing, artifact
-publication, native import, reconciliation, and receipt finalization. Nested
-native-runtime identity admission receives that same remaining budget, so a
-contended account lock cannot extend ownership of the global rotation lane.
-Each
-phase checks the remaining absolute budget, native children are terminated and
-reaped at expiry, artifacts are read back through the same 16 MiB bound, and
-provider-owned rotation state records are capped at 1 MiB. Every deadline path
-releases the lock while retaining any prepared/imported record needed for
-identity-safe reconciliation. Unrelated rotation actors can therefore regain
-the shared capability without terminating the provider manually.
-Authorizations are capped at 64 records, while unresolved operations and
-materialization receipts share one 64-record lifecycle cap so every admitted
-operation has capacity to become its replay receipt. Authorizations expire after ten minutes;
+Rotation assessment and materialization use 64 deterministic binding-lock
+stripes, so the full native interval serializes only identical bindings (plus a
+bounded collision domain), not every provider rotation. A provider-wide
+capacity lock covers only bounded collection maintenance, durable admission
+reservation, prepared-operation publication, and final receipt replacement; it
+is released before runtime admission, export, import, and recovery. One
+monotonic budget—the earlier of the host deadline and a 20-second provider
+ceiling—still covers all lock admission and native work. Each phase checks the
+remaining absolute budget, native children are terminated and reaped at expiry,
+artifacts are read back through the same 16 MiB bound, and provider-owned
+rotation state records are capped at 1 MiB. Every deadline path releases its
+binding lane while retaining any prepared/imported record needed for
+identity-safe reconciliation, and independent binding stripes retain useful
+overlap.
+Authorizations are capped at 64 records, while pre-effect reservations,
+unresolved operations, and materialization receipts share one 64-record
+lifecycle cap so every admitted operation has capacity to become its replay
+receipt. Abandoned reservations are removed immediately on ordinary failure and
+reclaimed after two minutes when their binding stripe proves no owner remains.
+Authorizations expire after ten minutes;
 completed materializations replay for 24 hours, after which unreferenced source
 and decision artifacts are retired. A durable receipt replaces its completed
 operation record, while prepared/imported operations remain until safely

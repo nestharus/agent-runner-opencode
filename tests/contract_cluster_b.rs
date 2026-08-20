@@ -6,6 +6,7 @@ mod support;
 
 use cluster_b::*;
 use serde_json::{json, Value};
+use std::fs;
 use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env};
 
 #[test]
@@ -139,6 +140,52 @@ fn contract_session_enumerate_honors_limit() {
     let second = enumerate_result(session_enumerate_cursor_params(2, cursor), &path);
     assert_second_enumerate_page(&second);
     assert_session_list_uses_bounded_snapshot(fake_opencode.log_path());
+}
+
+#[test]
+fn contract_session_enumerate_retires_consumed_snapshot() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-consumed-session-snapshot");
+    fs::create_dir_all(&data_root).expect("create isolated session snapshot data root");
+    let host = json!({"data_root": data_root.to_string_lossy()});
+
+    let first = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_limit_params(2),
+            host.clone(),
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("truncated page cursor");
+    let second = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_cursor_params(2, cursor),
+            host.clone(),
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_second_enumerate_page(&second);
+
+    let consumed = assert_error_envelope(invoke_with_host_and_env(
+        "session.enumerate",
+        session_enumerate_cursor_params(2, cursor),
+        host,
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        consumed["error"]["code"], "invalid_session_enumerate_cursor",
+        "a consumed cursor must be retired immediately"
+    );
+    fs::remove_dir_all(&data_root).expect("remove isolated session snapshot data root");
 }
 
 #[test]
