@@ -607,53 +607,33 @@ fn policy_effective_args(model: &ModelAlias) -> Vec<String> {
 }
 
 fn is_forbidden_launch_arg(arg: &str) -> bool {
-    intrinsic_host_launch_command(arg) || is_provider_managed_launch_control_arg(arg)
+    intrinsic_host_launch_command(arg)
+        || (arg.starts_with('-') && arg != "-" && !is_caller_owned_launch_option(arg))
 }
 
-fn is_provider_managed_launch_control_arg(arg: &str) -> bool {
-    const LONG_CONTROLS: &[&str] = &[
-        "--agent",
-        "--attach",
-        "--auto",
-        "--continue",
-        "--dangerously-skip-permissions",
-        "--dir",
-        "--fork",
-        "--format",
-        "--help",
-        "--interactive",
-        "--model",
-        "--password",
-        "--port",
-        "--pure",
-        "--session",
-        "--username",
-        "--variant",
-        "--version",
+fn is_caller_owned_launch_option(arg: &str) -> bool {
+    const LONG_OPTIONS: &[&str] = &[
+        "--file",
+        "--log-level",
+        "--print-logs",
+        "--share",
+        "--thinking",
+        "--title",
     ];
-    const NEGATED_LONG_CONTROLS: &[&str] = &[
-        "--no-auto",
-        "--no-continue",
-        "--no-dangerously-skip-permissions",
-        "--no-fork",
-        "--no-interactive",
-        "--no-pure",
-    ];
-    const SHORT_CONTROLS: &[&str] = &["-c", "-h", "-i", "-m", "-p", "-s", "-u", "-v"];
+    const NEGATED_LONG_OPTIONS: &[&str] = &["--no-print-logs", "--no-share", "--no-thinking"];
 
-    LONG_CONTROLS.iter().any(|control| {
-        arg == *control
+    LONG_OPTIONS.iter().any(|option| {
+        arg == *option
             || arg
-                .strip_prefix(control)
+                .strip_prefix(option)
                 .is_some_and(|suffix| suffix.starts_with('='))
-    }) || NEGATED_LONG_CONTROLS.iter().any(|control| {
-        arg == *control
+    }) || NEGATED_LONG_OPTIONS.iter().any(|option| {
+        arg == *option
             || arg
-                .strip_prefix(control)
+                .strip_prefix(option)
                 .is_some_and(|suffix| suffix.starts_with('='))
-    }) || SHORT_CONTROLS
-        .iter()
-        .any(|control| arg == *control || (arg.len() > control.len() && arg.starts_with(control)))
+    }) || arg == "-f"
+        || (arg.len() > 2 && arg.starts_with("-f"))
 }
 
 pub(crate) fn forbidden_user_launch_arg<'a>(

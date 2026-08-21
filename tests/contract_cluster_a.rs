@@ -947,6 +947,8 @@ fn contract_launch_rejects_user_native_controls_before_durable_admission() {
         vec!["--auto"],
         vec!["--no-auto"],
         vec!["--attach=http://localhost:4096"],
+        vec!["--command=review"],
+        vec!["--future-native-selector=value"],
         vec!["--pure=false"],
         vec!["--no-pure"],
         vec!["--dangerously-skip-permissions=false"],
@@ -1614,6 +1616,9 @@ fn contract_policy_evaluate_rejects_user_injected_managed_flag_after_host_prefix
         "--attach=http://localhost:4096",
         "--auto",
         "--no-auto",
+        "--command",
+        "--command=review",
+        "--future-native-selector=value",
         "--dangerously-skip-permissions",
         "--dangerously-skip-permissions=false",
         "--no-dangerously-skip-permissions",
@@ -1655,6 +1660,48 @@ fn contract_policy_evaluate_rejects_user_injected_managed_flag_after_host_prefix
 }
 
 #[test]
+fn contract_policy_evaluate_accepts_caller_owned_native_options() {
+    let mut params = policy_evaluate_params_for_account_host_candidate("opencode2");
+    let argv = params["launch"]["argv"]
+        .as_array_mut()
+        .expect("host candidate argv");
+    let prompt = argv.pop().expect("host candidate prompt");
+    argv.extend([
+        json!("--file"),
+        json!("notes.txt"),
+        json!("-fdiagram.png"),
+        json!("--title=caller title"),
+        json!("--share"),
+        json!("--thinking"),
+        json!("--print-logs"),
+        json!("--log-level=INFO"),
+        prompt,
+    ]);
+
+    let output = invoke_with_env("policy.evaluate", params, &[]);
+
+    assert_output_success(&output, "policy.evaluate caller-owned native options");
+    let response = json_stdout(&output);
+    let result = policy_result(&response);
+    assert_policy_accepted(result);
+    let effective_argv = result["argv"].as_array().expect("effective argv");
+    for option in [
+        "--file",
+        "-fdiagram.png",
+        "--title=caller title",
+        "--share",
+        "--thinking",
+        "--print-logs",
+        "--log-level=INFO",
+    ] {
+        assert!(
+            effective_argv.iter().any(|arg| arg == option),
+            "caller-owned option {option} missing from {effective_argv:?}"
+        );
+    }
+}
+
+#[test]
 fn contract_policy_evaluate_preserves_native_control_text_after_message_boundary() {
     let mut params = policy_evaluate_params_for_account_host_candidate("opencode2");
     let argv = params["launch"]["argv"]
@@ -1671,6 +1718,8 @@ fn contract_policy_evaluate_preserves_native_control_text_after_message_boundary
         json!("--auto"),
         json!("--no-auto"),
         json!("--attach=http://localhost:4096"),
+        json!("--command=review"),
+        json!("--future-native-selector=value"),
         json!("--pure=false"),
         json!("--no-pure"),
         json!("--dangerously-skip-permissions=false"),
@@ -1706,6 +1755,8 @@ fn contract_policy_evaluate_preserves_native_control_text_after_message_boundary
             json!("--auto"),
             json!("--no-auto"),
             json!("--attach=http://localhost:4096"),
+            json!("--command=review"),
+            json!("--future-native-selector=value"),
             json!("--pure=false"),
             json!("--no-pure"),
             json!("--dangerously-skip-permissions=false"),
