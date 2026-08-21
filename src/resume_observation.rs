@@ -168,6 +168,7 @@ pub fn unconfirmed_observation() -> ResumeObservation {
 pub fn observe_durable(
     request: &DurableResumeObservationRequest,
     program: &str,
+    fixed_args: &[String],
     working_directory: &str,
     env: &BTreeMap<String, String>,
 ) -> ResumeObservation {
@@ -180,6 +181,7 @@ pub fn observe_durable(
     let Ok(native) = opencode::export_with_launch_context(
         &request.session_id,
         program,
+        fixed_args,
         working_directory,
         env,
         RESUME_EXPORT_TIMEOUT,

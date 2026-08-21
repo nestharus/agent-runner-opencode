@@ -352,6 +352,11 @@ pub fn fake_wrapper_log_path(dir: &Path) -> PathBuf {
 pub fn write_fake_wrapper(wrapper_path: &Path, script: String) {
     fs::write(wrapper_path, script).expect("write fake opencode1 wrapper");
     make_executable(wrapper_path);
+    crate::support::write_fake_opencode_dispatcher(
+        wrapper_path
+            .parent()
+            .expect("fake wrapper path has a parent"),
+    );
 }
 
 #[cfg(unix)]

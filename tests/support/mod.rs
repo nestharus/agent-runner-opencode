@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -13,6 +13,35 @@ use std::sync::Mutex;
 pub const CONTRACT: &str = "oulipoly.provider/v1";
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[allow(dead_code)]
+pub fn write_fake_opencode_dispatcher(directory: &Path) {
+    let path = directory.join("opencode");
+    let directory = directory.to_string_lossy().replace('\'', "'\\''");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+if [ \"${{1-}}\" != \"--pure\" ]; then exit 65; fi\n\
+shift\n\
+case \"${{OULIPOLY_OPENCODE_ACCOUNT-}}\" in\n\
+  opencode1|opencode2|opencode3|opencode4|opencode5)\n\
+    exec '{directory}/'\"${{OULIPOLY_OPENCODE_ACCOUNT}}\" \"$@\" ;;\n\
+  *) exit 64 ;;\n\
+esac\n"
+        ),
+    )
+    .expect("write fake direct OpenCode dispatcher");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&path)
+            .expect("fake direct OpenCode dispatcher metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod fake direct OpenCode dispatcher");
+    }
+}
 
 const DEFAULT_RUNTIME_PROVIDERS_TOML: &str = r#"
 [opencode]
@@ -378,15 +407,20 @@ fn request_stdin_bytes(request_json: &Value) -> Vec<u8> {
 }
 
 fn spawn_provider(subcommand: &str, env: &[(&str, &str)]) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_agent-runner-opencode"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-runner-opencode"));
+    command
         .arg(subcommand)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear()
-        .envs(env.iter().copied())
-        .spawn()
-        .unwrap()
+        .envs(env.iter().copied());
+    if !env.iter().any(|(key, _)| *key == "HOME") {
+        let home = default_test_root().join("home");
+        fs::create_dir_all(&home).expect("create default native HOME fixture");
+        command.env("HOME", home);
+    }
+    command.spawn().unwrap()
 }
 
 fn write_provider_stdin(child: &mut std::process::Child, stdin_bytes: &[u8]) {

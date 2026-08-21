@@ -433,17 +433,32 @@ post-rename sync failure remains an error until durability completes.
 
 Every native effect also passes through one durable runtime context per
 numbered account under `host.data_root/provider-state/opencode/native-runtimes`.
-The context privately records the canonical absolute wrapper, its content hash,
-and the stable execution environment that can select OpenCode state or alter
-wrapper behavior. Launch establishes or validates that binding before spawn;
+The context privately records the canonical absolute `opencode` implementation,
+its content hash, the fixed `--pure` argument, the
+`agent-runner-opencode.opencode-native-state/v1` adapter contract, and the
+stable execution environment that selects the OpenCode state namespace. The
+numbered wrapper remains a logical account/policy identity and is never the
+effectful executable. Launch establishes or validates that binding before spawn;
 session export/enumeration, resume observation, rotation export/import, auth
 refresh, and quota-source observation after a binding exists reuse it instead
-of resolving a fresh ambient command or auth path. Explicitly
+of resolving a fresh ambient command or auth path. The complete native state,
+effect, observation, and synchronization boundary is declared in
+`contract/opencode-native-state-v1.md`. Explicitly
 transient runner-linkage and contract-test logging variables are forwarded for
 the current invocation but do not change the state identity. A different
-wrapper, stable environment, or changed wrapper implementation is rejected
+stable environment or changed direct implementation is rejected
 before another native effect rather than silently addressing a second state
 namespace with the same account/session labels.
+
+Predecessor schema-v1 runtime records are validated against their recorded
+wrapper bytes, then atomically replaced under the per-account runtime lock with
+the schema-v2 direct `opencode` binding before the first new native effect. A
+missing or changed predecessor wrapper, or a missing or invalid direct
+implementation, fails closed without publishing the upgrade. Durable launch
+records created by this version carry the same direct program hash, fixed
+arguments, contract identity, and state environment; older launch records
+without that evidence are retained for reconciliation but never execute their
+unbound recovery program.
 
 Quota probes use a separate durable implementation context under
 `host.data_root/provider-state/opencode/quota-observers`. The first probe for an

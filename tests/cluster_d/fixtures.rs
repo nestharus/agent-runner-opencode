@@ -199,6 +199,7 @@ impl RotationOpencodeFixture {
                 hang_import,
             ),
         );
+        crate::support::write_fake_opencode_dispatcher(&root);
         Self {
             root,
             import_record,

@@ -4,7 +4,7 @@
 //!     role: intrinsic-surface
 //!     Domain: durable OpenCode native runtime identity
 //!     Owns:
-//!       - one executable and stable execution-environment binding per declared account
+//!       - one direct OpenCode executable and stable state-namespace binding per declared account
 //!       - executable content validation before every native operation
 //!       - exact launch-context admission against the durable account binding
 
@@ -24,7 +24,12 @@ use std::process::Command;
 use std::time::Duration;
 
 const NATIVE_RUNTIME_STATE_DIR: &str = "provider-state/opencode/native-runtimes";
-const NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 1;
+const NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 2;
+const PREDECESSOR_NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 1;
+const OPENCODE_NATIVE_PROGRAM: &str = "opencode";
+pub(crate) const OPENCODE_NATIVE_CONTRACT_ID: &str =
+    "agent-runner-opencode.opencode-native-state/v1";
+pub(crate) const OPENCODE_NATIVE_FIXED_ARGS: &[&str] = &["--pure"];
 const NATIVE_RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_NATIVE_RUNTIME_STATE_BYTES: usize = 1024 * 1024;
 const STABLE_AMBIENT_ENV_KEYS: &[&str] = &[
@@ -36,6 +41,11 @@ const STABLE_AMBIENT_ENV_KEYS: &[&str] = &[
     "XDG_CACHE_HOME",
     "OPENCODE_CONFIG",
     "OPENCODE_CONFIG_DIR",
+    "OPENCODE_DISABLE_EXTERNAL_SKILLS",
+    "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+    "OPENCODE_DISABLE_FFF",
+    "OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER",
+    "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS",
     "OULIPOLY_DATA_DIR",
     "AGENT_BASH_AGENT_RUNNER_BIN",
 ];
@@ -52,6 +62,10 @@ pub struct NativeRuntimeContext {
     program: String,
     program_sha256: String,
     execution_env: BTreeMap<String, String>,
+    #[serde(default)]
+    native_contract_id: String,
+    #[serde(default)]
+    fixed_args: Vec<String>,
     identity_sha256: String,
 }
 
@@ -72,8 +86,7 @@ pub(crate) fn resolve_for_account_with_timeout(
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
     let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
     if let Some(context) = read_runtime_context(host, account, request_id)? {
-        validate_runtime_context(&context, account, request_id)?;
-        return Ok(context);
+        return activate_runtime_context(host, account, context, request_id);
     }
     let context = candidate_context(account, ambient_stable_environment(), request_id)?;
     write_runtime_context(host, account, &context, request_id)?;
@@ -153,7 +166,7 @@ pub fn resolve_for_launch(
             .unwrap_or(Duration::ZERO);
     let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
     if let Some(context) = read_runtime_context(host, account, request_id)? {
-        validate_runtime_context(&context, account, request_id)?;
+        let context = activate_runtime_context(host, account, context, request_id)?;
         if context.identity_sha256 != candidate.identity_sha256 {
             return Err(ProviderFailure::conflict(
                 request_id,
@@ -179,6 +192,7 @@ impl NativeRuntimeContext {
     pub fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
         command
+            .args(&self.fixed_args)
             .env_clear()
             .envs(self.execution_environment(&BTreeMap::new()));
         command
@@ -205,6 +219,18 @@ impl NativeRuntimeContext {
         &self.program
     }
 
+    pub(crate) fn program_sha256(&self) -> &str {
+        &self.program_sha256
+    }
+
+    pub(crate) fn fixed_args(&self) -> &[String] {
+        &self.fixed_args
+    }
+
+    pub(crate) fn native_contract_id(&self) -> &str {
+        &self.native_contract_id
+    }
+
     pub fn stable_execution_env(&self) -> &BTreeMap<String, String> {
         &self.execution_env
     }
@@ -226,12 +252,13 @@ fn candidate_context(
     execution_env: BTreeMap<String, String>,
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
-    let program = resolve_program(account.opencode_wrapper, &execution_env).ok_or_else(|| {
+    let execution_env = native_execution_environment(account, execution_env, request_id)?;
+    let program = resolve_program(OPENCODE_NATIVE_PROGRAM, &execution_env).ok_or_else(|| {
         native_runtime_failure(
             request_id,
             format!(
-                "canonical wrapper {} was not found in the selected native PATH",
-                account.opencode_wrapper
+                "the direct {OPENCODE_NATIVE_PROGRAM} implementation for account {} was not found in the selected native PATH",
+                account.opencode_wrapper,
             ),
         )
     })?;
@@ -241,8 +268,8 @@ fn candidate_context(
         return Err(native_runtime_failure(
             request_id,
             format!(
-                "canonical wrapper {} is not an executable regular file",
-                account.opencode_wrapper
+                "the direct OpenCode implementation for account {} is not an executable regular file",
+                account.opencode_wrapper,
             ),
         ));
     }
@@ -250,14 +277,23 @@ fn candidate_context(
         durable_fs::read_file_bounded(&program, durable_fs::MAX_BOUND_EXECUTABLE_BYTES)
             .map_err(|error| native_runtime_failure(request_id, error))?;
     let program = program.to_str().ok_or_else(|| {
-        native_runtime_failure(request_id, "native wrapper path is not valid UTF-8")
+        native_runtime_failure(
+            request_id,
+            "direct OpenCode implementation path is not valid UTF-8",
+        )
     })?;
     let program_sha256 = sha256_hex(&program_bytes);
+    let fixed_args = OPENCODE_NATIVE_FIXED_ARGS
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
     let identity_sha256 = runtime_identity_sha256(
         account.opencode_wrapper,
         program,
         &program_sha256,
         &execution_env,
+        OPENCODE_NATIVE_CONTRACT_ID,
+        &fixed_args,
     );
     Ok(NativeRuntimeContext {
         schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
@@ -265,8 +301,46 @@ fn candidate_context(
         program: program.to_string(),
         program_sha256,
         execution_env,
+        native_contract_id: OPENCODE_NATIVE_CONTRACT_ID.to_string(),
+        fixed_args,
         identity_sha256,
     })
+}
+
+fn native_execution_environment(
+    account: &AccountProfile,
+    mut execution_env: BTreeMap<String, String>,
+    request_id: &str,
+) -> Result<BTreeMap<String, String>, ProviderFailure> {
+    execution_env.insert(
+        "OULIPOLY_OPENCODE_ACCOUNT".to_string(),
+        account.opencode_wrapper.to_string(),
+    );
+    if account.opencode_index > 1 && !execution_env.contains_key("XDG_DATA_HOME") {
+        let home = execution_env
+            .get("HOME")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                native_runtime_failure(
+                    request_id,
+                    format!(
+                        "account {} requires HOME to select its native OpenCode state namespace",
+                        account.opencode_wrapper
+                    ),
+                )
+            })?;
+        execution_env.insert(
+            "XDG_DATA_HOME".to_string(),
+            Path::new(home)
+                .join(format!(".opencode{}", account.opencode_index))
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    execution_env
+        .entry("OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS".to_string())
+        .or_insert_with(|| "2000000000".to_string());
+    Ok(execution_env)
 }
 
 pub(crate) fn ambient_stable_environment() -> BTreeMap<String, String> {
@@ -278,16 +352,6 @@ pub(crate) fn ambient_stable_environment() -> BTreeMap<String, String> {
                 .map(|value| ((*key).to_string(), value))
         })
         .collect()
-}
-
-pub(crate) fn ambient_launch_environment() -> BTreeMap<String, String> {
-    let mut environment = ambient_stable_environment();
-    for key in TRANSIENT_ENV_KEYS {
-        if let Ok(value) = std::env::var(key) {
-            environment.insert((*key).to_string(), value);
-        }
-    }
-    environment
 }
 
 fn stable_launch_environment(declared_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -325,6 +389,8 @@ fn runtime_identity_sha256(
     program: &str,
     program_sha256: &str,
     execution_env: &BTreeMap<String, String>,
+    native_contract_id: &str,
+    fixed_args: &[String],
 ) -> String {
     sha256_hex(
         json!({
@@ -332,6 +398,8 @@ fn runtime_identity_sha256(
             "program": program,
             "program_sha256": program_sha256,
             "execution_env": execution_env,
+            "native_contract_id": native_contract_id,
+            "fixed_args": fixed_args,
         })
         .to_string()
         .as_bytes(),
@@ -352,15 +420,32 @@ fn validate_runtime_record_identity(
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let identity_sha256 = runtime_identity_sha256(
-        &context.account_wrapper,
-        &context.program,
-        &context.program_sha256,
-        &context.execution_env,
-    );
-    if context.schema_version != NATIVE_RUNTIME_SCHEMA_VERSION
-        || context.account_wrapper != account.opencode_wrapper
+    let identity_sha256 = match context.schema_version {
+        NATIVE_RUNTIME_SCHEMA_VERSION => runtime_identity_sha256(
+            &context.account_wrapper,
+            &context.program,
+            &context.program_sha256,
+            &context.execution_env,
+            &context.native_contract_id,
+            &context.fixed_args,
+        ),
+        PREDECESSOR_NATIVE_RUNTIME_SCHEMA_VERSION => predecessor_runtime_identity_sha256(
+            &context.account_wrapper,
+            &context.program,
+            &context.program_sha256,
+            &context.execution_env,
+        ),
+        _ => String::new(),
+    };
+    if context.account_wrapper != account.opencode_wrapper
         || context.identity_sha256 != identity_sha256
+        || (context.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION
+            && (context.native_contract_id != OPENCODE_NATIVE_CONTRACT_ID
+                || context.fixed_args
+                    != OPENCODE_NATIVE_FIXED_ARGS
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect::<Vec<_>>()))
     {
         return Err(native_runtime_failure(
             request_id,
@@ -368,6 +453,39 @@ fn validate_runtime_record_identity(
         ));
     }
     Ok(())
+}
+
+fn predecessor_runtime_identity_sha256(
+    account_wrapper: &str,
+    program: &str,
+    program_sha256: &str,
+    execution_env: &BTreeMap<String, String>,
+) -> String {
+    sha256_hex(
+        json!({
+            "account_wrapper": account_wrapper,
+            "program": program,
+            "program_sha256": program_sha256,
+            "execution_env": execution_env,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+fn activate_runtime_context(
+    host: &HostContext,
+    account: &AccountProfile,
+    context: NativeRuntimeContext,
+    request_id: &str,
+) -> Result<NativeRuntimeContext, ProviderFailure> {
+    validate_runtime_context(&context, account, request_id)?;
+    if context.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
+        return Ok(context);
+    }
+    let upgraded = candidate_context(account, context.execution_env, request_id)?;
+    write_runtime_context(host, account, &upgraded, request_id)?;
+    Ok(upgraded)
 }
 
 fn validate_runtime_implementation(
@@ -381,7 +499,7 @@ fn validate_runtime_implementation(
         return Err(native_runtime_failure(
             request_id,
             format!(
-                "bound native wrapper for account {} is no longer executable",
+                "bound native OpenCode implementation for account {} is no longer executable",
                 account.opencode_wrapper
             ),
         ));
@@ -396,7 +514,7 @@ fn validate_runtime_implementation(
             request_id,
             "native_runtime_implementation_changed",
             format!(
-                "bound native wrapper for account {} changed after admission",
+                "bound native OpenCode implementation for account {} changed after admission",
                 account.opencode_wrapper
             ),
             json!({

@@ -210,6 +210,7 @@ impl FakeOpencodeExport {
         fs::write(&wrapper_path, fake_opencode_export_script(session_id))
             .expect("write fake opencode1 export wrapper");
         make_fake_opencode_export_executable(&wrapper_path);
+        crate::support::write_fake_opencode_dispatcher(&dir);
         Self { dir }
     }
 
@@ -227,6 +228,7 @@ impl FakeOpencodeExport {
         )
         .expect("write pipe-sensitive fake opencode1 export wrapper");
         make_fake_opencode_export_executable(&wrapper_path);
+        crate::support::write_fake_opencode_dispatcher(&dir);
         Self { dir }
     }
 }
@@ -266,6 +268,7 @@ impl FakeOpencodeSessionList {
         )
         .expect("write fake opencode1 session list wrapper");
         make_fake_opencode_export_executable(&wrapper_path);
+        crate::support::write_fake_opencode_dispatcher(&dir);
         Self { dir, log_path }
     }
 

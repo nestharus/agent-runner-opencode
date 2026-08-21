@@ -331,12 +331,14 @@ pub fn export_with_timeout(
 pub fn export_with_launch_context(
     session_id: &str,
     program: &str,
+    fixed_args: &[String],
     working_directory: &str,
     env: &BTreeMap<String, String>,
     timeout: Duration,
 ) -> Result<OpencodeExport, OpencodeExportError> {
     let mut command = Command::new(program);
     command
+        .args(fixed_args)
         .arg("export")
         .arg(session_id)
         .current_dir(working_directory)
@@ -416,13 +418,18 @@ pub fn session_list_with_timeout(
 
 pub fn session_list_with_launch_context(
     program: &str,
+    fixed_args: &[String],
     working_directory: &str,
     env: &BTreeMap<String, String>,
     limit: Option<usize>,
     timeout: Duration,
 ) -> Result<Vec<Value>, OpencodeSessionListError> {
     let mut command = Command::new(program);
-    command.current_dir(working_directory).env_clear().envs(env);
+    command
+        .args(fixed_args)
+        .current_dir(working_directory)
+        .env_clear()
+        .envs(env);
     configure_session_list_command(&mut command, limit);
     run_session_list_command(command, timeout)
 }

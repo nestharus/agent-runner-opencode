@@ -5,6 +5,7 @@ mod support;
 
 use cluster_a::*;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::{
@@ -85,6 +86,14 @@ impl IsolatedLaunchSettings {
 
     fn host_overrides(&self) -> serde_json::Value {
         self.host_overrides.clone()
+    }
+
+    fn data_root(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            self.host_overrides["data_root"]
+                .as_str()
+                .expect("isolated launch data root"),
+        )
     }
 
     fn delete_settings_record(&self) {
@@ -489,10 +498,17 @@ fn contract_launch_route_handoff_failure_releases_request_before_spawn() {
         "route handoff must complete before the child can spawn"
     );
 
-    let home = std::env::var("HOME").expect("test HOME");
-    let replay = support::invoke_with_request_and_env("launch", request, &[("HOME", &home)]);
-    assert_output_success(&replay, "launch after pre-spawn route handoff failure");
-    let events = launch_events_from_output(&replay, "route handoff retry stdout");
+    let mut replay_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&request).expect("serialize launch retry"),
+            &mut replay_stdout,
+        ),
+        0,
+        "launch should be readmitted after the failed pre-spawn handoff"
+    );
+    let events = parse_launch_events(&replay_stdout);
     assert!(events.iter().any(|event| {
         event["kind"] == "marker"
             && event["name"] == "oulipoly.provider_session"
@@ -581,6 +597,11 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
         .duration_since(std::time::UNIX_EPOCH)
         .expect("current time")
         .as_millis() as u64;
+    let recovery_program = fs::canonicalize(fake_wrapper.dir().join("opencode"))
+        .expect("canonical direct recovery implementation");
+    let recovery_program_sha256 = agent_runner_opencode::encoding::sha256_hex(
+        &fs::read(&recovery_program).expect("read direct recovery implementation"),
+    );
     let mut prepared_state = serde_json::json!({
         "schema_version": 5,
         "operation_kind": "new_session",
@@ -589,8 +610,13 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
         "binding_sha256": binding_sha256,
         "prompt_sha256": prompt_sha256,
         "recovery": {
-            "program": fake_wrapper.dir().join("opencode1").to_string_lossy(),
-            "passthrough_env": {},
+            "program": recovery_program.to_string_lossy(),
+            "program_sha256": recovery_program_sha256,
+            "native_contract_id": "agent-runner-opencode.opencode-native-state/v1",
+            "fixed_args": ["--pure"],
+            "passthrough_env": {
+                "OULIPOLY_OPENCODE_ACCOUNT": "opencode1"
+            },
             "declared_env_sha256": declared_env_sha256,
             "working_directory": env!("CARGO_MANIFEST_DIR"),
             "provider_id": "openai",
@@ -641,6 +667,8 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
     prior_actor.kill().expect("terminate prior launch actor");
     prior_actor.wait().expect("reap prior launch actor");
 
+    prepared_state["schema_version"] = serde_json::json!(8);
+    prepared_state["delivery_nonce"] = serde_json::json!("prepared-recovery-contract");
     prepared_state["actor_process_group_id"] = serde_json::Value::Null;
     fs::write(
         &state_path,
@@ -890,6 +918,156 @@ fn contract_native_runtime_identity_is_shared_across_capabilities() {
     assert_eq!(
         conflict_response["error"]["code"],
         "native_runtime_context_conflict"
+    );
+}
+
+#[test]
+fn contract_native_runtime_binds_direct_opencode_implementation() {
+    let runtime = IsolatedLaunchSettings::new();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_runtime_identity_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let home = tempfile::tempdir().expect("create direct native HOME");
+    let home_path = home.path().to_string_lossy().into_owned();
+    let launch = invoke_with_host_and_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                ("HOME", home_path.as_str()),
+                ("CONTEXT_SELECTOR", "runtime-a"),
+            ],
+        ),
+        runtime.host_overrides(),
+        &[("PATH", path.as_str()), ("HOME", home_path.as_str())],
+    );
+    assert_output_success(&launch, "launch that binds direct OpenCode identity");
+
+    let state_path = runtime
+        .data_root()
+        .join("provider-state/opencode/native-runtimes/opencode1.json");
+    let state: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read direct native runtime identity"),
+    )
+    .expect("parse direct native runtime identity");
+    assert_eq!(state["schema_version"], 2);
+    assert_eq!(
+        state["native_contract_id"],
+        "agent-runner-opencode.opencode-native-state/v1"
+    );
+    assert_eq!(state["fixed_args"], serde_json::json!(["--pure"]));
+    assert_eq!(
+        state["program"],
+        fs::canonicalize(fake_wrapper.dir().join("opencode"))
+            .expect("canonical fake direct OpenCode")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_ne!(
+        state["program"],
+        fake_wrapper
+            .dir()
+            .join("opencode1")
+            .to_string_lossy()
+            .as_ref(),
+        "the numbered account wrapper must not be the acting implementation"
+    );
+
+    fs::write(fake_wrapper.dir().join("opencode"), "#!/bin/sh\nexit 17\n")
+        .expect("replace direct OpenCode implementation");
+    make_executable(&fake_wrapper.dir().join("opencode"));
+    let export = support::invoke_validated_with_host_and_env(
+        "session.export",
+        serde_json::json!({
+            "settings_id": "opencode1",
+            "session_id": "ses_native_runtime_identity",
+        }),
+        runtime.host_overrides(),
+        "session.schema.json#/$defs/SessionExportRequest",
+        &[("PATH", path.as_str()), ("HOME", home_path.as_str())],
+    );
+    let response = json_stdout(&export);
+    assert_eq!(
+        response["error"]["code"],
+        "native_runtime_implementation_changed"
+    );
+}
+
+#[test]
+fn contract_native_runtime_upgrades_predecessor_wrapper_binding_before_effect() {
+    let runtime = IsolatedLaunchSettings::new();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_runtime_identity_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let home = tempfile::tempdir().expect("create predecessor native HOME");
+    let home_path = home.path().to_string_lossy().into_owned();
+    let wrapper_program = fs::canonicalize(fake_wrapper.dir().join("opencode1"))
+        .expect("canonical predecessor wrapper");
+    let wrapper_program_sha256 = agent_runner_opencode::encoding::sha256_hex(
+        &fs::read(&wrapper_program).expect("read predecessor wrapper"),
+    );
+    let execution_env = BTreeMap::from([
+        ("CONTEXT_SELECTOR".to_string(), "runtime-a".to_string()),
+        ("HOME".to_string(), home_path.clone()),
+        ("PATH".to_string(), path.clone()),
+    ]);
+    let identity_sha256 = agent_runner_opencode::encoding::sha256_hex(
+        serde_json::json!({
+            "account_wrapper": "opencode1",
+            "program": wrapper_program.to_string_lossy(),
+            "program_sha256": wrapper_program_sha256,
+            "execution_env": execution_env,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let state_path = runtime
+        .data_root()
+        .join("provider-state/opencode/native-runtimes/opencode1.json");
+    fs::create_dir_all(state_path.parent().expect("predecessor runtime parent"))
+        .expect("create predecessor runtime parent");
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "account_wrapper": "opencode1",
+            "program": wrapper_program.to_string_lossy(),
+            "program_sha256": wrapper_program_sha256,
+            "execution_env": execution_env,
+            "identity_sha256": identity_sha256,
+        }))
+        .expect("serialize predecessor runtime binding"),
+    )
+    .expect("write predecessor runtime binding");
+
+    let export = support::invoke_validated_with_host_and_env(
+        "session.export",
+        serde_json::json!({
+            "settings_id": "opencode1",
+            "session_id": "ses_predecessor_runtime_upgrade",
+        }),
+        runtime.host_overrides(),
+        "session.schema.json#/$defs/SessionExportRequest",
+        &[("PATH", path.as_str()), ("HOME", home_path.as_str())],
+    );
+    let response = json_stdout(&export);
+    assert_eq!(response["ok"], true, "response={response}");
+
+    let upgraded: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read upgraded native runtime binding"),
+    )
+    .expect("parse upgraded native runtime binding");
+    assert_eq!(upgraded["schema_version"], 2);
+    assert_eq!(
+        upgraded["native_contract_id"],
+        "agent-runner-opencode.opencode-native-state/v1"
+    );
+    assert_eq!(upgraded["fixed_args"], serde_json::json!(["--pure"]));
+    assert_eq!(
+        upgraded["program"],
+        fs::canonicalize(fake_wrapper.dir().join("opencode"))
+            .expect("canonical direct OpenCode after upgrade")
+            .to_string_lossy()
+            .as_ref()
     );
 }
 

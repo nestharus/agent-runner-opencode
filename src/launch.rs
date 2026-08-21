@@ -147,6 +147,12 @@ struct LaunchOperationDiscriminator {
 #[derive(Clone, Serialize, Deserialize)]
 struct LaunchRecoveryIdentity {
     program: String,
+    #[serde(default)]
+    program_sha256: String,
+    #[serde(default)]
+    native_contract_id: String,
+    #[serde(default)]
+    fixed_args: Vec<String>,
     passthrough_env: BTreeMap<String, String>,
     declared_env_sha256: String,
     working_directory: String,
@@ -264,12 +270,7 @@ pub(crate) fn stream<W: Write>(
         .prompt
         .as_deref()
         .map(|prompt| sha256_hex(prompt.as_bytes()));
-    let recovery = launch_recovery_context(
-        &effective.argv,
-        &params.working_directory,
-        &effective.env,
-        &effective.route,
-    );
+    let recovery = effective.recovery;
     let resume_durable_identity = effective
         .resume_observation_request
         .as_ref()
@@ -430,15 +431,14 @@ fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, 
 
 struct EffectiveLaunch {
     argv: Vec<String>,
-    env: BTreeMap<String, String>,
     execution_env: BTreeMap<String, String>,
     stdin: Option<Vec<u8>>,
     prompt: Option<String>,
     delivery_nonce: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
-    route: policy::PolicyRouteIdentity,
     route_evidence: Value,
     activity_targets: ActivityTargets,
+    recovery: LaunchRecoveryContext,
 }
 
 enum PolicyLaunch {
@@ -506,6 +506,9 @@ fn effective_launch(
     if let Some(program) = argv.first_mut() {
         *program = native_runtime.program().to_string();
     }
+    argv.splice(1..1, native_runtime.fixed_args().iter().cloned());
+    let recovery =
+        launch_recovery_context(&native_runtime, &params.working_directory, &env, &route);
     let argv = resume_argv(
         params,
         argv,
@@ -532,15 +535,14 @@ fn effective_launch(
     let argv = split_oversized_prompt_argv(argv, request_id)?;
     Ok(EffectiveLaunch {
         argv,
-        env,
         execution_env,
         stdin: stdin.map(String::into_bytes),
         prompt,
         delivery_nonce,
         resume_observation_request,
-        route,
         route_evidence: json!(markers),
         activity_targets,
+        recovery,
     })
 }
 
@@ -1335,8 +1337,12 @@ fn interpret_existing_resume_retry(
                 request_id,
                 &state.binding_sha256,
             )?;
-            let recovered =
-                observe_durable_resume(&state.observation, &state.recovery, declared_env);
+            let recovered = observe_durable_resume(
+                &state.observation,
+                &state.recovery,
+                declared_env,
+                request_id,
+            )?;
             if recovered.completion_observed() {
                 state.phase = ResumeLaunchRequestPhase::CompletionObserved;
                 state.observed_at_unix_ms = Some(now_unix_ms());
@@ -1368,8 +1374,12 @@ fn interpret_existing_resume_retry(
                     &state.binding_sha256,
                 )?;
             }
-            let recovered =
-                observe_durable_resume(&state.observation, &state.recovery, declared_env);
+            let recovered = observe_durable_resume(
+                &state.observation,
+                &state.recovery,
+                declared_env,
+                request_id,
+            )?;
             if !recovered.available {
                 state.phase = ResumeLaunchRequestPhase::Unresolved;
                 state.observed_at_unix_ms = Some(now_unix_ms());
@@ -1434,7 +1444,7 @@ impl LaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = LaunchRequestState {
-            schema_version: 7,
+            schema_version: 8,
             operation_kind: LaunchOperationKind::NewSession,
             request_id: request_id.to_string(),
             request_identity_sha256,
@@ -1566,7 +1576,7 @@ impl ResumeLaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = ResumeLaunchRequestState {
-            schema_version: 7,
+            schema_version: 8,
             operation_kind: LaunchOperationKind::Resume,
             request_id: request_id.to_string(),
             request_identity_sha256,
@@ -1721,18 +1731,18 @@ fn launch_request_identity_sha256(host: &HostContext, params: &Value) -> String 
 }
 
 fn launch_recovery_context(
-    argv: &[String],
+    runtime: &native_runtime::NativeRuntimeContext,
     working_directory: &str,
     declared_env: &BTreeMap<String, String>,
     route: &policy::PolicyRouteIdentity,
 ) -> LaunchRecoveryContext {
-    let passthrough_env = native_runtime::ambient_launch_environment();
-    let mut effective_env = passthrough_env.clone();
-    effective_env.extend(declared_env.clone());
     LaunchRecoveryContext {
         identity: LaunchRecoveryIdentity {
-            program: resolve_launch_program(&argv[0], working_directory, &effective_env),
-            passthrough_env,
+            program: runtime.program().to_string(),
+            program_sha256: runtime.program_sha256().to_string(),
+            native_contract_id: runtime.native_contract_id().to_string(),
+            fixed_args: runtime.fixed_args().to_vec(),
+            passthrough_env: runtime.stable_execution_env().clone(),
             declared_env_sha256: launch_environment_sha256(declared_env),
             working_directory: working_directory.to_string(),
             provider_id: route.provider_id.clone(),
@@ -1765,19 +1775,63 @@ fn validate_launch_recovery_environment(
     ))
 }
 
+fn validate_launch_recovery_implementation(
+    recovery: &LaunchRecoveryIdentity,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if !launch_recovery_identity_is_current(recovery) {
+        return Err(launch_recovery_unavailable(
+            request_id,
+            "the durable request predates the pinned direct OpenCode recovery contract; reconcile it without invoking an unbound implementation",
+        ));
+    }
+    let program = Path::new(&recovery.program);
+    if !durable_fs::is_executable_file(program)
+        .map_err(|error| launch_recovery_unavailable(request_id, error))?
+    {
+        return Err(launch_recovery_unavailable(
+            request_id,
+            "the pinned direct OpenCode recovery implementation is no longer executable",
+        ));
+    }
+    let bytes = durable_fs::read_file_bounded(program, durable_fs::MAX_BOUND_EXECUTABLE_BYTES)
+        .map_err(|error| launch_recovery_unavailable(request_id, error))?;
+    if sha256_hex(&bytes) != recovery.program_sha256 {
+        return Err(launch_recovery_unavailable(
+            request_id,
+            "the pinned direct OpenCode recovery implementation changed after launch admission",
+        ));
+    }
+    Ok(())
+}
+
+fn launch_recovery_identity_is_current(recovery: &LaunchRecoveryIdentity) -> bool {
+    recovery.native_contract_id == native_runtime::OPENCODE_NATIVE_CONTRACT_ID
+        && recovery
+            .fixed_args
+            .iter()
+            .map(String::as_str)
+            .eq(native_runtime::OPENCODE_NATIVE_FIXED_ARGS.iter().copied())
+        && !recovery.program_sha256.trim().is_empty()
+        && Path::new(&recovery.program).is_absolute()
+}
+
 fn observe_durable_resume(
     observation: &DurableResumeObservationRequest,
     recovery: &LaunchRecoveryIdentity,
     declared_env: &BTreeMap<String, String>,
-) -> ResumeObservation {
+    request_id: &str,
+) -> Result<ResumeObservation, ProviderFailure> {
+    validate_launch_recovery_implementation(recovery, request_id)?;
     let mut env = recovery.passthrough_env.clone();
     env.extend(declared_env.clone());
-    resume_observation::observe_durable(
+    Ok(resume_observation::observe_durable(
         observation,
         &recovery.program,
+        &recovery.fixed_args,
         &recovery.working_directory,
         &env,
-    )
+    ))
 }
 
 fn observe_launch_actor(
@@ -1864,31 +1918,6 @@ fn require_prior_actor_terminal(
     }
 }
 
-fn resolve_launch_program(
-    program: &str,
-    working_directory: &str,
-    env: &BTreeMap<String, String>,
-) -> String {
-    let path = Path::new(program);
-    if path.is_absolute() {
-        return program.to_string();
-    }
-    if path.components().count() > 1 {
-        return Path::new(working_directory)
-            .join(path)
-            .to_string_lossy()
-            .into_owned();
-    }
-    env.get("PATH")
-        .and_then(|path| {
-            std::env::split_paths(path)
-                .map(|directory| directory.join(program))
-                .find(|candidate| candidate.is_file())
-        })
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.to_string())
-}
-
 fn recover_prepared_launch(
     host: &HostContext,
     state: &LaunchRequestState,
@@ -1896,9 +1925,11 @@ fn recover_prepared_launch(
     request_id: &str,
 ) -> Result<PreparedLaunchRecovery, ProviderFailure> {
     let started = Instant::now();
+    validate_launch_recovery_implementation(&state.recovery, request_id)?;
     let env = launch_recovery_environment(state, declared_env);
     let sessions = opencode::session_list_with_launch_context(
         &state.recovery.program,
+        &state.recovery.fixed_args,
         &state.recovery.working_directory,
         &env,
         Some(MAX_LAUNCH_RECOVERY_SESSIONS.saturating_add(1)),
@@ -2018,6 +2049,7 @@ fn recovered_session_matches_request(
     let export = opencode::export_with_launch_context(
         session_id,
         &state.recovery.program,
+        &state.recovery.fixed_args,
         &state.recovery.working_directory,
         env,
         launch_recovery_remaining(host, started, &state.request_id)?,
@@ -2334,7 +2366,7 @@ fn validate_launch_request_state(
                 .is_some_and(|nonce| !nonce.trim().is_empty())
                 && state.actor_process_group_incarnation.is_none()
         }
-        7 => {
+        7 | 8 => {
             state
                 .delivery_nonce
                 .as_deref()
@@ -2361,6 +2393,7 @@ fn validate_launch_request_state(
         && !state.recovery.provider_id.trim().is_empty()
         && !state.recovery.model_id.trim().is_empty()
         && !state.recovery.effort.trim().is_empty()
+        && (state.schema_version < 8 || launch_recovery_identity_is_current(&state.recovery))
         && state.actor_process_group_id.is_none_or(|id| id > 0)
         && phase_valid
     {
@@ -2405,7 +2438,7 @@ fn validate_resume_launch_request_state(
                 .is_some_and(|nonce| !nonce.trim().is_empty())
                 && state.actor_process_group_incarnation.is_none()
         }
-        7 => {
+        7 | 8 => {
             observation
                 .delivery_nonce
                 .as_deref()
@@ -2438,6 +2471,7 @@ fn validate_resume_launch_request_state(
         && state.recovery.provider_id == observation.provider_id
         && state.recovery.model_id == observation.model_id
         && state.recovery.effort == observation.variant
+        && (state.schema_version < 8 || launch_recovery_identity_is_current(&state.recovery))
         && state.actor_process_group_id.is_none_or(|id| id > 0)
         && phase_valid
     {
@@ -4078,6 +4112,9 @@ mod recovery_tests {
             delivery_nonce: Some("request-a".to_string()),
             recovery: LaunchRecoveryIdentity {
                 program: "opencode1".to_string(),
+                program_sha256: String::new(),
+                native_contract_id: String::new(),
+                fixed_args: Vec::new(),
                 passthrough_env: BTreeMap::new(),
                 declared_env_sha256: "environment".to_string(),
                 working_directory: "/tmp".to_string(),

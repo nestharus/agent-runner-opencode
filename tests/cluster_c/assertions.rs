@@ -557,6 +557,7 @@ impl FakeOpencodeAuth {
         let script_path = dir.join(wrapper);
         fs::write(&script_path, script).expect("write fake opencode auth");
         make_path_executable(&script_path);
+        crate::support::write_fake_opencode_dispatcher(&dir);
         Self { dir }
     }
 
