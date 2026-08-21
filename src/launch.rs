@@ -214,6 +214,15 @@ enum PreparedLaunchRecovery {
     Ambiguous(Vec<String>),
 }
 
+/// The shared conclusion of interpreting an existing durable launch request.
+///
+/// Every other conclusion is a terminal `ProviderFailure` that tells the caller
+/// to reconcile or retry later. This one result authorizes the phase-specific
+/// caller to retire the old state and, when appropriate, admit a fresh actor.
+enum ExistingLaunchRetryOutcome {
+    AuthoritativeNoEffect,
+}
+
 pub(crate) struct LaunchOutcome {
     pub exit_code: i32,
     pub activity_targets: ActivityTargets,
@@ -230,7 +239,7 @@ pub(crate) fn stream<W: Write>(
     let new_session = known_provider_session_id(&params).is_none();
     let request_identity_sha256 = launch_request_identity_sha256(host, &raw_params);
     let declared_env = params.env.clone().unwrap_or_default();
-    reconcile_existing_launch_request(
+    preflight_existing_launch_replay(
         host,
         request_id,
         &request_identity_sha256,
@@ -285,7 +294,7 @@ pub(crate) fn stream<W: Write>(
     };
     let (launch_request, resume_launch_request) = if new_session {
         (
-            Some(LaunchRequestGuard::prepare(
+            Some(LaunchRequestGuard::admit_after_policy(
                 host,
                 request_id,
                 request_identity_sha256,
@@ -305,7 +314,7 @@ pub(crate) fn stream<W: Write>(
         })?;
         (
             None,
-            Some(ResumeLaunchRequestGuard::prepare(
+            Some(ResumeLaunchRequestGuard::admit_after_policy(
                 host,
                 request_id,
                 request_identity_sha256,
@@ -1141,7 +1150,11 @@ fn stream_policy_rejection<W: Write>(
     state.finish(writer)
 }
 
-fn reconcile_existing_launch_request(
+/// Resolve settings-independent exact-retry state before consulting mutable
+/// policy or settings. The later admission phase repeats the file lookup while
+/// holding the creating lock, but both phases delegate the durable state
+/// meaning to the same operation-specific interpreters below.
+fn preflight_existing_launch_replay(
     host: &HostContext,
     request_id: &str,
     request_identity_sha256: &str,
@@ -1185,61 +1198,98 @@ fn reconcile_existing_launch_request(
         LaunchOperationKind::Resume
     };
     validate_launch_operation_kind(&bytes, expected_kind, request_id, request_identity_sha256)?;
-    if new_session {
-        let mut state: LaunchRequestState = serde_json::from_slice(&bytes)
-            .map_err(|error| launch_state_invalid(request_id, error))?;
-        validate_launch_request_state(&state, request_id)?;
-        if state.schema_version == 5 {
-            state.delivery_nonce = None;
+    let outcome = if new_session {
+        interpret_existing_new_session_retry(
+            host,
+            &bytes,
+            &state_path,
+            request_id,
+            request_identity_sha256,
+            declared_env,
+        )?
+    } else {
+        let state = decode_existing_resume_retry(&bytes, request_id, request_identity_sha256)?;
+        interpret_existing_resume_retry(state, &state_path, request_id, declared_env)?
+    };
+    match outcome {
+        ExistingLaunchRetryOutcome::AuthoritativeNoEffect => {
+            remove_launch_request_state(&state_path, request_id)?;
+            drop(lock);
+            retire_orphan_launch_request_lock(&state_path, request_id)
         }
-        if state.request_identity_sha256 != request_identity_sha256 {
-            return Err(launch_request_reuse_conflict(
+    }
+}
+
+/// Interpret the durable state machine for one existing new-session request.
+/// Callers own when the state was discovered and what to do with an
+/// authoritative no-effect result; this function is the single authority for
+/// the stored phases and their recovery observations.
+fn interpret_existing_new_session_retry(
+    host: &HostContext,
+    bytes: &[u8],
+    state_path: &Path,
+    request_id: &str,
+    request_identity_sha256: &str,
+    declared_env: &BTreeMap<String, String>,
+) -> Result<ExistingLaunchRetryOutcome, ProviderFailure> {
+    let mut state: LaunchRequestState =
+        serde_json::from_slice(bytes).map_err(|error| launch_state_invalid(request_id, error))?;
+    validate_launch_request_state(&state, request_id)?;
+    if state.schema_version == 5 {
+        state.delivery_nonce = None;
+    }
+    if state.request_identity_sha256 != request_identity_sha256 {
+        return Err(launch_request_reuse_conflict(
+            request_id,
+            request_identity_sha256,
+            &state,
+        ));
+    }
+    match state.phase {
+        LaunchRequestPhase::SessionObserved => {
+            Err(launch_session_reconciliation_required(request_id, &state))
+        }
+        LaunchRequestPhase::TerminalWithoutSession => {
+            Err(launch_terminal_reconciliation_required(request_id, &state))
+        }
+        LaunchRequestPhase::Prepared => {
+            validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
+            require_prior_actor_terminal(
+                state.actor_process_group_id,
+                state.actor_process_group_incarnation.as_deref(),
                 request_id,
-                request_identity_sha256,
-                &state,
-            ));
-        }
-        match state.phase {
-            LaunchRequestPhase::SessionObserved => {
-                return Err(launch_session_reconciliation_required(request_id, &state));
-            }
-            LaunchRequestPhase::TerminalWithoutSession => {
-                return Err(launch_terminal_reconciliation_required(request_id, &state));
-            }
-            LaunchRequestPhase::Prepared => {
-                validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
-                require_prior_actor_terminal(
-                    state.actor_process_group_id,
-                    state.actor_process_group_incarnation.as_deref(),
-                    request_id,
-                    &state.binding_sha256,
-                )?;
-                match recover_prepared_launch(host, &state, declared_env, request_id)? {
-                    PreparedLaunchRecovery::NoEffectObserved => {
-                        remove_launch_request_state(&state_path, request_id)?;
-                        drop(lock);
-                        return retire_orphan_launch_request_lock(&state_path, request_id);
-                    }
-                    PreparedLaunchRecovery::SessionObserved(provider_session_id) => {
-                        state.phase = LaunchRequestPhase::SessionObserved;
-                        state.provider_session_id = Some(provider_session_id);
-                        state.terminal_status = None;
-                        state.observed_at_unix_ms = Some(now_unix_ms());
-                        write_launch_request_state(&state_path, &state, request_id)?;
-                        return Err(launch_session_reconciliation_required(request_id, &state));
-                    }
-                    PreparedLaunchRecovery::Ambiguous(candidates) => {
-                        return Err(launch_session_recovery_required(
-                            request_id, &state, candidates,
-                        ));
-                    }
+                &state.binding_sha256,
+            )?;
+            match recover_prepared_launch(host, &state, declared_env, request_id)? {
+                PreparedLaunchRecovery::NoEffectObserved => {
+                    Ok(ExistingLaunchRetryOutcome::AuthoritativeNoEffect)
                 }
+                PreparedLaunchRecovery::SessionObserved(provider_session_id) => {
+                    state.phase = LaunchRequestPhase::SessionObserved;
+                    state.provider_session_id = Some(provider_session_id);
+                    state.terminal_status = None;
+                    state.observed_at_unix_ms = Some(now_unix_ms());
+                    write_launch_request_state(state_path, &state, request_id)?;
+                    Err(launch_session_reconciliation_required(request_id, &state))
+                }
+                PreparedLaunchRecovery::Ambiguous(candidates) => Err(
+                    launch_session_recovery_required(request_id, &state, candidates),
+                ),
             }
         }
     }
+}
 
+/// Interpret the durable state machine for one existing resumed-turn request.
+/// Like the new-session interpreter, this is independent of whether the caller
+/// is doing the early replay preflight or the locked post-policy admission.
+fn decode_existing_resume_retry(
+    bytes: &[u8],
+    request_id: &str,
+    request_identity_sha256: &str,
+) -> Result<ResumeLaunchRequestState, ProviderFailure> {
     let mut state: ResumeLaunchRequestState =
-        serde_json::from_slice(&bytes).map_err(|error| launch_state_invalid(request_id, error))?;
+        serde_json::from_slice(bytes).map_err(|error| launch_state_invalid(request_id, error))?;
     validate_resume_launch_request_state(&state, request_id)?;
     if state.schema_version == 5 {
         state.observation.delivery_nonce = None;
@@ -1251,13 +1301,22 @@ fn reconcile_existing_launch_request(
             &state,
         ));
     }
+    Ok(state)
+}
+
+fn interpret_existing_resume_retry(
+    mut state: ResumeLaunchRequestState,
+    state_path: &Path,
+    request_id: &str,
+    declared_env: &BTreeMap<String, String>,
+) -> Result<ExistingLaunchRetryOutcome, ProviderFailure> {
     match state.phase {
         ResumeLaunchRequestPhase::CompletionObserved => {
             Err(resume_launch_reconciliation_required(request_id, &state))
         }
         ResumeLaunchRequestPhase::SubmissionObserved | ResumeLaunchRequestPhase::Unresolved => {
-            let prior_phase = state.phase;
             validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
+            let prior_phase = state.phase;
             require_prior_actor_terminal(
                 state.actor_process_group_id,
                 state.actor_process_group_incarnation.as_deref(),
@@ -1269,19 +1328,17 @@ fn reconcile_existing_launch_request(
             if recovered.completion_observed() {
                 state.phase = ResumeLaunchRequestPhase::CompletionObserved;
                 state.observed_at_unix_ms = Some(now_unix_ms());
-                write_launch_request_state(&state_path, &state, request_id)?;
+                write_launch_request_state(state_path, &state, request_id)?;
                 return Err(resume_launch_reconciliation_required(request_id, &state));
             }
             if recovered.submitted_user_turn.is_some() {
                 state.phase = ResumeLaunchRequestPhase::SubmissionObserved;
                 state.observed_at_unix_ms = Some(now_unix_ms());
-                write_launch_request_state(&state_path, &state, request_id)?;
+                write_launch_request_state(state_path, &state, request_id)?;
                 return Err(resume_launch_reconciliation_required(request_id, &state));
             }
             if prior_phase == ResumeLaunchRequestPhase::Unresolved && recovered.available {
-                remove_launch_request_state(&state_path, request_id)?;
-                drop(lock);
-                return retire_orphan_launch_request_lock(&state_path, request_id);
+                return Ok(ExistingLaunchRetryOutcome::AuthoritativeNoEffect);
             }
             if prior_phase == ResumeLaunchRequestPhase::SubmissionObserved {
                 return Err(resume_launch_reconciliation_required(request_id, &state));
@@ -1304,7 +1361,7 @@ fn reconcile_existing_launch_request(
             if !recovered.available {
                 state.phase = ResumeLaunchRequestPhase::Unresolved;
                 state.observed_at_unix_ms = Some(now_unix_ms());
-                write_launch_request_state(&state_path, &state, request_id)?;
+                write_launch_request_state(state_path, &state, request_id)?;
                 return Err(resume_launch_recovery_unavailable(request_id, &state));
             }
             if recovered.submitted_user_turn.is_some() {
@@ -1314,18 +1371,19 @@ fn reconcile_existing_launch_request(
                     ResumeLaunchRequestPhase::SubmissionObserved
                 };
                 state.observed_at_unix_ms = Some(now_unix_ms());
-                write_launch_request_state(&state_path, &state, request_id)?;
+                write_launch_request_state(state_path, &state, request_id)?;
                 return Err(resume_launch_reconciliation_required(request_id, &state));
             }
-            remove_launch_request_state(&state_path, request_id)?;
-            drop(lock);
-            retire_orphan_launch_request_lock(&state_path, request_id)
+            Ok(ExistingLaunchRetryOutcome::AuthoritativeNoEffect)
         }
     }
 }
 
 impl LaunchRequestGuard {
-    fn prepare(
+    /// Recheck exact-retry state while holding the creating request lock after
+    /// policy has selected the immutable route, then publish a fresh prepared
+    /// record only when the shared interpreter proves no prior effect.
+    fn admit_after_policy(
         host: &HostContext,
         request_id: &str,
         request_identity_sha256: String,
@@ -1349,61 +1407,16 @@ impl LaunchRequestGuard {
                     request_id,
                     &binding_sha256,
                 )?;
-                let mut state: LaunchRequestState = serde_json::from_slice(&bytes)
-                    .map_err(|error| launch_state_invalid(request_id, error))?;
-                validate_launch_request_state(&state, request_id)?;
-                if state.schema_version == 5 {
-                    state.delivery_nonce = None;
-                }
-                if state.request_identity_sha256 != request_identity_sha256 {
-                    return Err(launch_request_reuse_conflict(
+                let ExistingLaunchRetryOutcome::AuthoritativeNoEffect =
+                    interpret_existing_new_session_retry(
+                        host,
+                        &bytes,
+                        &state_path,
                         request_id,
                         &request_identity_sha256,
-                        &state,
-                    ));
-                }
-                match state.phase {
-                    LaunchRequestPhase::Prepared => {
-                        validate_launch_recovery_context(&state.recovery, &recovery, request_id)?;
-                        require_prior_actor_terminal(
-                            state.actor_process_group_id,
-                            state.actor_process_group_incarnation.as_deref(),
-                            request_id,
-                            &state.binding_sha256,
-                        )?;
-                        match recover_prepared_launch(
-                            host,
-                            &state,
-                            &recovery.declared_env,
-                            request_id,
-                        )? {
-                            PreparedLaunchRecovery::NoEffectObserved => {
-                                remove_launch_request_state(&state_path, request_id)?;
-                            }
-                            PreparedLaunchRecovery::SessionObserved(provider_session_id) => {
-                                state.phase = LaunchRequestPhase::SessionObserved;
-                                state.provider_session_id = Some(provider_session_id);
-                                state.terminal_status = None;
-                                state.observed_at_unix_ms = Some(now_unix_ms());
-                                write_launch_request_state(&state_path, &state, request_id)?;
-                                return Err(launch_session_reconciliation_required(
-                                    request_id, &state,
-                                ));
-                            }
-                            PreparedLaunchRecovery::Ambiguous(candidates) => {
-                                return Err(launch_session_recovery_required(
-                                    request_id, &state, candidates,
-                                ));
-                            }
-                        }
-                    }
-                    LaunchRequestPhase::SessionObserved => {
-                        return Err(launch_session_reconciliation_required(request_id, &state));
-                    }
-                    LaunchRequestPhase::TerminalWithoutSession => {
-                        return Err(launch_terminal_reconciliation_required(request_id, &state));
-                    }
-                }
+                        &recovery.declared_env,
+                    )?;
+                remove_launch_request_state(&state_path, request_id)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(launch_state_failure(request_id, error)),
@@ -1495,7 +1508,10 @@ impl LaunchRequestGuard {
 }
 
 impl ResumeLaunchRequestGuard {
-    fn prepare(
+    /// Recheck exact-retry state while holding the creating request lock after
+    /// policy has selected the immutable route, then publish a fresh prepared
+    /// record only when the shared interpreter proves no prior effect.
+    fn admit_after_policy(
         host: &HostContext,
         request_id: &str,
         request_identity_sha256: String,
@@ -1518,94 +1534,21 @@ impl ResumeLaunchRequestGuard {
                     request_id,
                     &binding_sha256,
                 )?;
-                let mut state: ResumeLaunchRequestState = serde_json::from_slice(&bytes)
-                    .map_err(|error| launch_state_invalid(request_id, error))?;
-                validate_resume_launch_request_state(&state, request_id)?;
-                if state.schema_version == 5 {
-                    state.observation.delivery_nonce = None;
-                }
-                if state.request_identity_sha256 != request_identity_sha256 {
-                    return Err(resume_launch_request_reuse_conflict(
+                let state =
+                    decode_existing_resume_retry(&bytes, request_id, &request_identity_sha256)?;
+                validate_launch_recovery_environment(
+                    &state.recovery,
+                    &recovery.declared_env,
+                    request_id,
+                )?;
+                let ExistingLaunchRetryOutcome::AuthoritativeNoEffect =
+                    interpret_existing_resume_retry(
+                        state,
+                        &state_path,
                         request_id,
-                        &request_identity_sha256,
-                        &state,
-                    ));
-                }
-                validate_launch_recovery_context(&state.recovery, &recovery, request_id)?;
-                match state.phase {
-                    ResumeLaunchRequestPhase::CompletionObserved => {
-                        return Err(resume_launch_reconciliation_required(request_id, &state));
-                    }
-                    ResumeLaunchRequestPhase::SubmissionObserved
-                    | ResumeLaunchRequestPhase::Unresolved => {
-                        let prior_phase = state.phase;
-                        require_prior_actor_terminal(
-                            state.actor_process_group_id,
-                            state.actor_process_group_incarnation.as_deref(),
-                            request_id,
-                            &state.binding_sha256,
-                        )?;
-                        let recovered = observe_durable_resume(
-                            &state.observation,
-                            &state.recovery,
-                            &recovery.declared_env,
-                        );
-                        if recovered.completion_observed() {
-                            state.phase = ResumeLaunchRequestPhase::CompletionObserved;
-                            state.observed_at_unix_ms = Some(now_unix_ms());
-                            write_launch_request_state(&state_path, &state, request_id)?;
-                            return Err(resume_launch_reconciliation_required(request_id, &state));
-                        }
-                        if recovered.submitted_user_turn.is_some() {
-                            state.phase = ResumeLaunchRequestPhase::SubmissionObserved;
-                            state.observed_at_unix_ms = Some(now_unix_ms());
-                            write_launch_request_state(&state_path, &state, request_id)?;
-                            return Err(resume_launch_reconciliation_required(request_id, &state));
-                        }
-                        if prior_phase == ResumeLaunchRequestPhase::Unresolved
-                            && recovered.available
-                        {
-                            remove_launch_request_state(&state_path, request_id)?;
-                        } else if prior_phase == ResumeLaunchRequestPhase::SubmissionObserved {
-                            return Err(resume_launch_reconciliation_required(request_id, &state));
-                        } else {
-                            return Err(resume_launch_recovery_unavailable(request_id, &state));
-                        }
-                    }
-                    ResumeLaunchRequestPhase::Prepared
-                    | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
-                        if state.phase == ResumeLaunchRequestPhase::Prepared {
-                            require_prior_actor_terminal(
-                                state.actor_process_group_id,
-                                state.actor_process_group_incarnation.as_deref(),
-                                request_id,
-                                &state.binding_sha256,
-                            )?;
-                        }
-                        let recovered = observe_durable_resume(
-                            &state.observation,
-                            &state.recovery,
-                            &recovery.declared_env,
-                        );
-                        if !recovered.available {
-                            state.phase = ResumeLaunchRequestPhase::Unresolved;
-                            state.observed_at_unix_ms = Some(now_unix_ms());
-                            write_launch_request_state(&state_path, &state, request_id)?;
-                            return Err(resume_launch_recovery_unavailable(request_id, &state));
-                        }
-                        if recovered.submitted_user_turn.is_some() {
-                            state.phase = if recovered.completion_observed() {
-                                ResumeLaunchRequestPhase::CompletionObserved
-                            } else {
-                                ResumeLaunchRequestPhase::SubmissionObserved
-                            };
-                            state.observed_at_unix_ms = Some(now_unix_ms());
-                            write_launch_request_state(&state_path, &state, request_id)?;
-                            return Err(resume_launch_reconciliation_required(request_id, &state));
-                        }
-                        remove_launch_request_state(&state_path, request_id)?;
-                    }
-                }
+                        &recovery.declared_env,
+                    )?;
+                remove_launch_request_state(&state_path, request_id)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(launch_state_failure(request_id, error)),
@@ -1794,14 +1737,6 @@ fn launch_environment_sha256(env: &BTreeMap<String, String>) -> String {
             .expect("launch environment serialization cannot fail")
             .as_slice(),
     )
-}
-
-fn validate_launch_recovery_context(
-    identity: &LaunchRecoveryIdentity,
-    recovery: &LaunchRecoveryContext,
-    request_id: &str,
-) -> Result<(), ProviderFailure> {
-    validate_launch_recovery_environment(identity, &recovery.declared_env, request_id)
 }
 
 fn validate_launch_recovery_environment(
