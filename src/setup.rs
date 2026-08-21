@@ -461,10 +461,10 @@ fn required_settings_ids(params: &Value, request_id: &str) -> Result<Vec<String>
         let values = values.as_array().ok_or_else(|| {
             invalid_setup_settings_ids(request_id, "settings_ids must be an array")
         })?;
-        if values.is_empty() || values.len() > ACCOUNTS.len() {
+        if values.is_empty() || values.len() > settings::MAX_SETTINGS_ACTIVATION_IDS {
             return Err(invalid_setup_settings_ids(
                 request_id,
-                "settings_ids must contain between one and five exact record IDs",
+                "settings_ids must contain between one and 4096 exact record IDs",
             ));
         }
         values

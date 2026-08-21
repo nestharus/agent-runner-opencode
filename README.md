@@ -17,8 +17,9 @@ identities, and launch accepts only the exact canonical wrapper name selected
 by the settings record. Path-shaped or basename-equivalent commands are not
 account aliases. The bare `opencode` name remains an account-one compatibility
 reference only at catalog-mediated setup and legacy inputs; it is not an
-accepted launch command. Setup plans and legacy-provider migration emit
-canonical numbered identities, while unknown or path-shaped OpenCode
+accepted launch command. Setup plans emit canonical numbered profile
+identities, while legacy-provider migration preserves each recognized provider
+table key as an exact settings-record ID. Unknown or path-shaped OpenCode
 references are diagnostic errors and are never inferred from a basename. A
 contract field named `settings_id` identifies only an opaque,
 persisted settings record; account or wrapper aliases are not accepted as a
@@ -71,6 +72,9 @@ and their absence selects the installed Agent Runner compatibility population
 both store compatibility and caller activation to pass; install plans expose
 the exact required and missing IDs as a blocking step, and sync plans emit an
 error diagnostic until migration or explicit record configuration completes.
+The declared caller population is bounded by the same 4,096-record predecessor
+transition envelope as the settings store, independently of the five native
+account profiles; multiple caller records may select one account.
 This prevents cutover from removing every settings-selected route before its
 required reducer has run or declaring an installation ready while established
 provider-name callers still lack exact records.

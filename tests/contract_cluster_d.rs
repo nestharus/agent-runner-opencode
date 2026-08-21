@@ -1525,6 +1525,77 @@ fn contract_settings_migrate() {
 }
 
 #[test]
+fn contract_setup_activation_population_is_not_bounded_by_account_count() {
+    let host = HostRoots::new("agent-runner-opencode-setup-caller-population");
+    let providers_toml = r#"
+[opencode]
+command = "opencode1"
+
+[opencode1]
+command = "opencode1"
+
+[opencode2]
+command = "opencode2"
+
+[opencode3]
+command = "opencode3"
+
+[opencode4]
+command = "opencode4"
+
+[opencode5]
+command = "opencode5"
+"#;
+    let expected_ids = [
+        "opencode",
+        "opencode1",
+        "opencode2",
+        "opencode3",
+        "opencode4",
+        "opencode5",
+    ];
+    success_result(
+        invoke_validated_with_host(
+            "settings.migrate",
+            json!({
+                "dry_run": false,
+                "legacy": { "providers_toml": providers_toml }
+            }),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsMigrateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsMigrateResponse",
+        "settings.schema.json#/$defs/SettingsMigrateResult",
+    );
+
+    let install = success_result(
+        invoke_validated_with_host(
+            "setup.install_plan",
+            json!({ "target": "local", "settings_ids": expected_ids }),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupInstallPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupInstallPlanResponse",
+        "setup.schema.json#/$defs/SetupInstallPlanResult",
+    );
+    let activation = install["steps"]
+        .as_array()
+        .expect("install steps")
+        .iter()
+        .find(|step| step["kind"] == "verify_settings_transition")
+        .expect("settings activation step");
+    assert_eq!(activation["blocking"], false);
+    assert_eq!(
+        activation["settings_store"]["required_settings_ids"],
+        json!(expected_ids)
+    );
+    assert!(activation["settings_store"]["missing_settings_ids"]
+        .as_array()
+        .expect("missing settings IDs")
+        .is_empty());
+}
+
+#[test]
 fn contract_settings_migrate_rejects_path_shaped_legacy_accounts() {
     let host = HostRoots::new("agent-runner-opencode-settings-migrate-account-admission");
     let providers_toml = r#"
