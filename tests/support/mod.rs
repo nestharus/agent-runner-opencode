@@ -14,6 +14,26 @@ pub const CONTRACT: &str = "oulipoly.provider/v1";
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+const DEFAULT_RUNTIME_PROVIDERS_TOML: &str = r#"
+[opencode]
+command = "opencode1"
+
+[opencode1]
+command = "opencode1"
+
+[opencode2]
+command = "opencode2"
+
+[opencode3]
+command = "opencode3"
+
+[opencode4]
+command = "opencode4"
+
+[opencode5]
+command = "opencode5"
+"#;
+
 pub fn invoke(subcommand: &str, params: Value) -> Output {
     invoke_with_host(subcommand, params, json!({}))
 }
@@ -193,19 +213,28 @@ pub fn ensure_default_runtime_settings(request: &Value) {
     let _guard = INITIALIZE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let store_root = config_root.join("agent-runner-opencode");
-    let store_path = store_root.join("settings-store.json");
-    fs::create_dir_all(&store_root).expect("create default provider settings fixture");
+    let store_path = config_root.join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(&config_root).expect("create host config root fixture");
     if let Some(data_root) = request.pointer("/host/data_root").and_then(Value::as_str) {
         fs::create_dir_all(data_root).expect("create default provider data fixture");
     }
     if !store_path.exists() {
-        fs::write(
-            store_path,
-            serde_json::to_vec_pretty(&default_runtime_settings_store())
-                .expect("serialize default provider settings fixture"),
-        )
-        .expect("write default provider settings fixture");
+        let migration = json!({
+            "contract": CONTRACT,
+            "request_id": "fixture-activate-default-runtime-settings",
+            "provider_instance_id": "opencode-primary",
+            "host": request["host"],
+            "params": {
+                "dry_run": false,
+                "legacy": { "providers_toml": DEFAULT_RUNTIME_PROVIDERS_TOML }
+            }
+        });
+        let output = invoke_raw_stdin("settings.migrate", &request_stdin_bytes(&migration));
+        let response = json_stdout(&output);
+        assert_eq!(
+            response["ok"], true,
+            "production settings migration must activate the default runtime fixture: {response}"
+        );
     }
 }
 
@@ -227,46 +256,6 @@ fn scope_default_host_to_native_env(request: &mut Value, env: &[(&str, &str)]) {
     let root = default_test_root().join(format!("native-env-{:016x}", hasher.finish()));
     request["host"]["config_root"] = json!(root.join("config").to_string_lossy());
     request["host"]["data_root"] = json!(root.join("data").to_string_lossy());
-}
-
-fn default_runtime_settings_store() -> Value {
-    json!({
-        "schema_version": 3,
-        "records": (1..=5).map(default_runtime_settings_record).collect::<Vec<_>>(),
-        "history": [],
-        "mutation_receipts": {}
-    })
-}
-
-fn default_runtime_settings_record(index: usize) -> Value {
-    let wrapper = format!("opencode{index}");
-    let auth_path = match index {
-        1 => "~/.local/share/opencode/auth.json".to_string(),
-        _ => format!("~/.opencode{index}/opencode/auth.json"),
-    };
-    json!({
-        "id": wrapper,
-        "display_name": format!("OpenCode account {index} test fixture"),
-        "version": "fixture-v1",
-        "values": {
-            "provider": "opencode",
-            "profile": wrapper,
-            "wrapper": wrapper,
-            "model": { "selection": "requested" },
-            "quota": {
-                "source": "opencode_auth",
-                "auth_path": auth_path,
-                "probe": "native_chatgpt_usage"
-            },
-            "launch": {
-                "dangerously_skip_permissions": true,
-                "format": "json",
-                "preserve_pure_wrapper": true
-            },
-            "extra_env": {},
-            "mode": "non_interactive"
-        }
-    })
 }
 
 pub fn json_stdout(output: &Output) -> Value {

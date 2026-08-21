@@ -179,10 +179,11 @@ pub fn detect_params(
 ) -> Result<Value, ProviderFailure> {
     let data_root = string_param(&params, "data_root").or(host.data_root.as_deref());
     let profile_root = string_param(&params, "profile_root");
+    let required_settings_ids = required_settings_ids(&params, request_id)?;
     let opencode = executable_evidence("opencode", host.deadline_unix_ms);
     let curl = executable_evidence("curl", host.deadline_unix_ms);
     let profiles = profile_evidence(data_root, profile_root, host.deadline_unix_ms);
-    let settings_store = settings::transition_readiness(host, request_id);
+    let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
     let installed = setup_installed(&opencode, &curl, &profiles, &settings_store);
     Ok(detect_result(
         opencode,
@@ -199,7 +200,8 @@ pub fn install_plan_params(
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let target = string_param(&params, "target").unwrap_or("local");
-    let settings_store = settings::transition_readiness(host, request_id);
+    let required_settings_ids = required_settings_ids(&params, request_id)?;
+    let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
     Ok(install_plan_result(target, &settings_store))
 }
 
@@ -208,12 +210,13 @@ pub fn sync_plan_params(
     params: Value,
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
+    let required_settings_ids = required_settings_ids(&params, request_id)?;
     let desired = desired_profiles(&params);
     let mut operations = sync_operations(&desired);
     if let Some(rebind) = parse_native_identity_rebind(&params, request_id)? {
         operations.extend(native_identity_rebind_operations(host, rebind, request_id)?);
     }
-    let settings_store = settings::transition_readiness(host, request_id);
+    let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
     let diagnostics = sync_diagnostics(&params, &settings_store);
     Ok(sync_plan_result(operations, diagnostics))
 }
@@ -439,6 +442,73 @@ fn string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Provider setup defaults to the exact record IDs used by the installed
+/// Agent Runner OpenCode provider names. A host that has adopted opaque record
+/// IDs can instead declare one `settings_id` or the complete `settings_ids`
+/// population whose activation must be proven before setup reports ready.
+fn required_settings_ids(params: &Value, request_id: &str) -> Result<Vec<String>, ProviderFailure> {
+    let one = params.get("settings_id");
+    let many = params.get("settings_ids");
+    if one.is_some() && many.is_some() {
+        return Err(invalid_setup_settings_ids(
+            request_id,
+            "settings_id and settings_ids are mutually exclusive",
+        ));
+    }
+    let declared = if let Some(value) = one {
+        vec![non_empty_setup_settings_id(value, request_id)?.to_string()]
+    } else if let Some(values) = many {
+        let values = values.as_array().ok_or_else(|| {
+            invalid_setup_settings_ids(request_id, "settings_ids must be an array")
+        })?;
+        if values.is_empty() || values.len() > ACCOUNTS.len() {
+            return Err(invalid_setup_settings_ids(
+                request_id,
+                "settings_ids must contain between one and five exact record IDs",
+            ));
+        }
+        values
+            .iter()
+            .map(|value| non_empty_setup_settings_id(value, request_id).map(str::to_string))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        ACCOUNTS
+            .iter()
+            .map(|account| {
+                if account.opencode_index == 1 {
+                    "opencode".to_string()
+                } else {
+                    account.opencode_wrapper.to_string()
+                }
+            })
+            .collect()
+    };
+    let unique = declared.into_iter().collect::<BTreeSet<_>>();
+    if unique.is_empty() {
+        return Err(invalid_setup_settings_ids(
+            request_id,
+            "at least one exact settings ID is required",
+        ));
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn non_empty_setup_settings_id<'a>(
+    value: &'a Value,
+    request_id: &str,
+) -> Result<&'a str, ProviderFailure> {
+    value
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            invalid_setup_settings_ids(request_id, "settings IDs must be non-empty strings")
+        })
+}
+
+fn invalid_setup_settings_ids(request_id: &str, message: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(request_id, "invalid_setup_settings_ids", message)
+}
+
 fn find_on_path(program: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
@@ -512,7 +582,12 @@ fn install_plan_result(target: &str, settings_store: &SettingsTransitionReadines
             {"kind": "verify_tool", "target": target, "command": "opencode --version"},
             {"kind": "verify_tool", "target": target, "command": "curl --version"},
             {"kind": "verify_wrappers", "target": target, "wrappers": wrapper_names()},
-            {"kind": "prepare_provider_settings", "schema_id": "opencode.settings/v1"}
+            {
+                "kind": "prepare_provider_settings",
+                "schema_id": "opencode.settings/v1",
+                "activation_operation": "settings.migrate",
+                "activation_identity": "legacy_provider_table_key_to_exact_settings_record_id"
+            }
         ]
     })
 }

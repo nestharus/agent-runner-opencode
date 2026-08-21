@@ -1387,7 +1387,9 @@ fn contract_policy_evaluate_accepts_luna_for_every_declared_account() {
             .iter()
             .any(|marker| {
                 marker["name"] == "opencode.settings_record_identity"
-                    && marker["value"] == format!("settings record {account} at version fixture-v1")
+                    && marker["value"].as_str().is_some_and(|value| {
+                        value.starts_with(&format!("settings record {account} at version v"))
+                    })
             }));
     }
 }

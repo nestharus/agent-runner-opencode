@@ -23,6 +23,18 @@ command = "opencode2"
 args = ["run", "--dangerously-skip-permissions"]
 quota_script = "chatgpt-usage ~/.codex5/auth.json"
 refresh_auth_command = "/bin/false"
+
+[opencode3]
+command = "opencode3"
+args = ["run", "--dangerously-skip-permissions"]
+
+[opencode4]
+command = "opencode4"
+args = ["run", "--dangerously-skip-permissions"]
+
+[opencode5]
+command = "opencode5"
+args = ["run", "--dangerously-skip-permissions"]
 "#;
 
 pub const MODEL_TOML: &str = r#"

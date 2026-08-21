@@ -200,9 +200,19 @@ pub fn assert_detect_profiles(detect: &Value) {
 
 pub fn assert_setup_install_result(install: &Value) {
     assert_setup_auth_sentinel_absent(install);
+    let steps = install["steps"].as_array().expect("steps");
     assert!(
-        !install["steps"].as_array().expect("steps").is_empty(),
+        !steps.is_empty(),
         "setup.install_plan should return actionable setup steps"
+    );
+    let activation = steps
+        .iter()
+        .find(|step| step["kind"] == "prepare_provider_settings")
+        .expect("provider settings activation step");
+    assert_eq!(activation["activation_operation"], "settings.migrate");
+    assert_eq!(
+        activation["activation_identity"],
+        "legacy_provider_table_key_to_exact_settings_record_id"
     );
 }
 

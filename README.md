@@ -22,8 +22,16 @@ canonical numbered identities, while unknown or path-shaped OpenCode
 references are diagnostic errors and are never inferred from a basename. A
 contract field named `settings_id` identifies only an opaque,
 persisted settings record; account or wrapper aliases are not accepted as a
-second hidden token kind. A record carries its ID, version, account, and either
-an exact stored route or the explicit `model.selection=requested` policy.
+second hidden token kind. The installed-base transition makes the former token
+an exact key instead of teaching runtime selection two meanings:
+`settings.migrate` preserves every recognized legacy provider table key as the
+ID of its current persisted record and reports that ID in the corresponding
+activation action. Thus the existing `opencode`, `opencode2`, ... provider names
+continue only after migration has materialized records with those exact keys.
+New installations may instead configure model-provider names from the opaque
+IDs returned by `settings.create`. A record carries its ID, version, account,
+and either an exact stored route or the explicit
+`model.selection=requested` policy.
 Policy evidence publishes that record identity and its effective account.
 Rotation preserves `source_provider` and `target_provider` as opaque host
 provider-instance identities. Provider-local `source_account` and
@@ -54,11 +62,18 @@ summary instead of rejecting the shared store; selecting that record fails with
 its settings diagnostics, while its preserved ID and version allow an in-band
 update or delete. Unrelated projected records remain fully usable.
 `setup.detect` runs this same bounded, parsed-schema transition preflight
-against the exact `host.config_root` store. Provider-wide `installed=true`
-requires that preflight to pass; install plans expose it as a blocking step and
-sync plans emit an error diagnostic until an above-envelope store is reduced
-with the predecessor provider. This prevents cutover from removing every
-settings-selected route before its required reducer has run.
+against the exact `host.config_root` store. It also requires a valid exact
+record for every caller ID being activated. `params.settings_id` declares one
+opaque caller ID, `params.settings_ids` declares the complete caller population,
+and their absence selects the installed Agent Runner compatibility population
+`opencode`, `opencode2`, ... `opencode5`. An absent or empty store is therefore
+`activation_required`, never ready. Provider-wide `installed=true` requires
+both store compatibility and caller activation to pass; install plans expose
+the exact required and missing IDs as a blocking step, and sync plans emit an
+error diagnostic until migration or explicit record configuration completes.
+This prevents cutover from removing every settings-selected route before its
+required reducer has run or declaring an installation ready while established
+provider-name callers still lack exact records.
 Rotation assessment and materialization share one provider-state lock, so a
 decision cannot race native materialization. A denied assessment durably removes
 any earlier binding-matched authorization—including parent-directory
@@ -418,7 +433,8 @@ admits a credential mutation.
 
 `setup.detect` reports provider-wide `installed=true` only after exact-path
 `--version` probes succeed for `opencode`, `curl`, and every one of the five
-account wrappers, and every account's OpenCode auth file is present. Each probe
+account wrappers, every account's OpenCode auth file is present, and every
+declared caller `settings_id` resolves to a valid exact persisted record. Each probe
 uses the earlier of the host deadline and a two-second ceiling. A missing,
 non-executable, failing, or stalled dependency leaves the provider non-installed
 and produces a tool- or profile-specific warning; regular-file presence alone

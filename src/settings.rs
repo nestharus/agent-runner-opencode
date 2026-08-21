@@ -7,13 +7,14 @@
 //!       - profile record persistence rooted at host.config_root
 //!       - opaque settings version tokens and stale-write conflict detection
 //!       - record normalization, sanitization, and legacy-store mapping
+//!       - legacy provider caller activation into exact persisted record IDs
 
 use crate::account::{profile_for_wrapper_reference, AccountProfile};
 use crate::activity::ActivityTargets;
 use crate::durable_fs;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
-use crate::models::{default_model, model_alias, DEFAULT_MODEL_ALIAS, MODEL_ALIASES};
+use crate::models::{model_alias, MODEL_ALIASES};
 use crate::operation_bounds;
 use crate::path_guard;
 use crate::settings_definition::{model_name_value, validate_values, wrapper_value};
@@ -73,6 +74,11 @@ struct SettingsValidateParams {
 struct SettingsMigrateParams {
     dry_run: bool,
     legacy: Value,
+}
+
+struct LegacyProviderActivation {
+    settings_id: String,
+    account: &'static AccountProfile,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -141,6 +147,33 @@ pub(crate) fn activity_targets(
     if command == Command::Delete {
         if let Some(id) = non_empty_value(result.get("id")) {
             targets.resolved("settings_record", id, "result.id");
+        }
+    }
+    if command == Command::Migrate {
+        let applied = params.get("dry_run").and_then(Value::as_bool) == Some(false);
+        for (index, action) in result
+            .get("actions")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            if let Some(id) = non_empty_value(action.get("settings_id")) {
+                let provenance = format!("result.actions[{index}].settings_id");
+                if applied {
+                    targets.generated("settings_record", id, provenance);
+                } else {
+                    targets.attempted("settings_record", id, provenance);
+                }
+            }
+            if let Some(profile) = non_empty_value(action.get("profile")) {
+                targets.resolved(
+                    "account",
+                    profile,
+                    format!("result.actions[{index}].profile"),
+                );
+            }
         }
     }
     targets
@@ -231,6 +264,8 @@ pub(crate) struct SettingsTransitionReadiness {
     message: Option<String>,
     store_bytes: Option<usize>,
     record_count: Option<usize>,
+    required_settings_ids: Vec<String>,
+    missing_settings_ids: Vec<String>,
 }
 
 impl SettingsTransitionReadiness {
@@ -242,6 +277,8 @@ impl SettingsTransitionReadiness {
             "message": self.message,
             "store_bytes": self.store_bytes,
             "record_count": self.record_count,
+            "required_settings_ids": self.required_settings_ids,
+            "missing_settings_ids": self.missing_settings_ids,
             "maximum_current_bytes": MAX_SETTINGS_STORE_BYTES,
             "maximum_current_records": MAX_SETTINGS_RECORDS,
             "maximum_predecessor_bytes": MAX_PREDECESSOR_SETTINGS_STORE_BYTES,
@@ -474,8 +511,8 @@ pub fn migrate_params(
             let warnings = legacy_warnings(&params.legacy);
             let diagnostics = legacy_diagnostics(&params.legacy);
             ensure_valid_settings(request_id, &diagnostics)?;
-            for provider in legacy_provider_names(&params.legacy) {
-                upsert_migrated_record(store, &provider, request_id)?;
+            for activation in legacy_provider_activations(&params.legacy) {
+                upsert_migrated_record(store, &activation, request_id)?;
             }
             let requires_user_input = settings_requires_user_input(&diagnostics);
             Ok(settings_migrate_result(
@@ -561,20 +598,14 @@ fn read_store(host: &HostContext, request_id: &str) -> Result<SettingsStore, Pro
 pub(crate) fn transition_readiness(
     host: &HostContext,
     request_id: &str,
+    required_settings_ids: &[String],
 ) -> SettingsTransitionReadiness {
     let path = match store_path(host, request_id) {
         Ok(path) => path,
         Err(failure) => return transition_failure(failure),
     };
     if !store_path_exists(&path) {
-        return SettingsTransitionReadiness {
-            ready: true,
-            state: "absent",
-            code: None,
-            message: None,
-            store_bytes: Some(0),
-            record_count: Some(0),
-        };
+        return settings_activation_required(required_settings_ids, Vec::new(), 0, 0);
     }
     let (bytes, predecessor_capacity_recovery) = match read_store_bytes(&path, request_id) {
         Ok(result) => result,
@@ -582,19 +613,74 @@ pub(crate) fn transition_readiness(
     };
     let byte_count = bytes.len();
     match parse_store_bytes(&bytes, predecessor_capacity_recovery, request_id) {
-        Ok(store) => SettingsTransitionReadiness {
-            ready: true,
-            state: if store.predecessor_capacity_recovery {
-                "predecessor_recovery"
-            } else {
-                "current"
-            },
-            code: None,
-            message: None,
-            store_bytes: Some(byte_count),
-            record_count: Some(store.records.len()),
-        },
+        Ok(store) => settings_store_readiness(store, byte_count, required_settings_ids),
         Err(failure) => transition_failure(failure),
+    }
+}
+
+fn settings_store_readiness(
+    store: SettingsStore,
+    byte_count: usize,
+    required_settings_ids: &[String],
+) -> SettingsTransitionReadiness {
+    let missing_settings_ids = required_settings_ids
+        .iter()
+        .filter(|required| {
+            store
+                .records
+                .iter()
+                .find(|record| record.id == required.as_str())
+                .is_none_or(|record| !settings_valid(&validate_values(&record.values)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_settings_ids.is_empty() {
+        return settings_activation_required(
+            required_settings_ids,
+            missing_settings_ids,
+            byte_count,
+            store.records.len(),
+        );
+    }
+    SettingsTransitionReadiness {
+        ready: true,
+        state: if store.predecessor_capacity_recovery {
+            "predecessor_recovery"
+        } else {
+            "current"
+        },
+        code: None,
+        message: None,
+        store_bytes: Some(byte_count),
+        record_count: Some(store.records.len()),
+        required_settings_ids: required_settings_ids.to_vec(),
+        missing_settings_ids,
+    }
+}
+
+fn settings_activation_required(
+    required_settings_ids: &[String],
+    missing_settings_ids: Vec<String>,
+    byte_count: usize,
+    record_count: usize,
+) -> SettingsTransitionReadiness {
+    let missing = if missing_settings_ids.is_empty() {
+        required_settings_ids.to_vec()
+    } else {
+        missing_settings_ids
+    };
+    SettingsTransitionReadiness {
+        ready: false,
+        state: "activation_required",
+        code: Some("settings_activation_required".to_string()),
+        message: Some(format!(
+            "provider settings activation is incomplete for exact settings IDs [{}]; run settings.migrate with the installed legacy provider TOML or configure setup with the exact opaque settings IDs returned by settings.create",
+            missing.join(", ")
+        )),
+        store_bytes: Some(byte_count),
+        record_count: Some(record_count),
+        required_settings_ids: required_settings_ids.to_vec(),
+        missing_settings_ids: missing,
     }
 }
 
@@ -611,6 +697,8 @@ fn transition_failure(failure: ProviderFailure) -> SettingsTransitionReadiness {
         message: Some(format!("{}; {action}", failure.message)),
         store_bytes: None,
         record_count: None,
+        required_settings_ids: Vec::new(),
+        missing_settings_ids: Vec::new(),
     }
 }
 
@@ -1333,18 +1421,20 @@ fn child_object<'a>(object: &'a mut Map<String, Value>, key: &str) -> &'a mut Ma
 }
 
 fn legacy_actions(legacy: &Value) -> Vec<Value> {
-    let providers = legacy_provider_names(legacy);
-    let mut actions = providers
+    let activations = legacy_provider_activations(legacy);
+    let mut actions = activations
         .iter()
-        .map(|provider| {
+        .map(|activation| {
             json!({
-                "kind": "settings_profile",
-                "provider": provider,
-                "operation": "create_or_update_provider_owned_profile",
+                "kind": "settings_profile_activation",
+                "legacy_provider": activation.settings_id,
+                "settings_id": activation.settings_id,
+                "profile": activation.account.opencode_wrapper,
+                "operation": "create_or_update_exact_settings_record",
             })
         })
         .collect::<Vec<_>>();
-    if providers.is_empty() {
+    if activations.is_empty() {
         actions.push(legacy_inspect_tables_action());
     }
     actions
@@ -1359,7 +1449,7 @@ fn legacy_inspect_tables_action() -> Value {
 
 fn legacy_warnings(legacy: &Value) -> Vec<Value> {
     let mut warnings = vec![json!(
-        "legacy live provider/model TOML is design input only; no live route cutover is performed"
+        "each recognized legacy provider table key is preserved as its exact persisted settings ID, so existing provider-name callers cross the settings-record activation boundary without a second token mapping"
     )];
     if legacy_models(legacy).is_empty() {
         warnings.push(json!("legacy input did not include model TOML entries"));
@@ -1368,9 +1458,9 @@ fn legacy_warnings(legacy: &Value) -> Vec<Value> {
 }
 
 fn legacy_diagnostics(legacy: &Value) -> Vec<Value> {
-    let providers = legacy_provider_names(legacy);
+    let activations = legacy_provider_activations(legacy);
     let mut diagnostics = Vec::new();
-    if providers.is_empty() {
+    if activations.is_empty() {
         diagnostics.push(legacy_providers_missing_diagnostic());
     }
     diagnostics.extend(
@@ -1408,7 +1498,7 @@ fn diagnostic(
     })
 }
 
-fn legacy_provider_names(legacy: &Value) -> Vec<String> {
+fn legacy_provider_activations(legacy: &Value) -> Vec<LegacyProviderActivation> {
     let Some(parsed) = legacy_providers_toml(legacy) else {
         return Vec::new();
     };
@@ -1417,10 +1507,12 @@ fn legacy_provider_names(legacy: &Value) -> Vec<String> {
     };
     table
         .iter()
-        .filter_map(|(_, value)| legacy_provider_account(value))
-        .map(|account| account.opencode_wrapper.to_string())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
+        .filter_map(|(settings_id, value)| {
+            legacy_provider_account(value).map(|account| LegacyProviderActivation {
+                settings_id: settings_id.clone(),
+                account,
+            })
+        })
         .collect()
 }
 
@@ -1475,47 +1567,38 @@ fn legacy_models(legacy: &Value) -> Vec<String> {
 
 fn upsert_migrated_record(
     store: &mut SettingsStore,
-    provider: &str,
+    activation: &LegacyProviderActivation,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let account = profile_for_wrapper_reference(provider)
-        .ok_or_else(|| legacy_account_resolution_failure(request_id, provider))?;
+    let account = activation.account;
     let values = migrated_values_for_account(account);
-    if let Some(index) = store.records.iter().position(|record| {
-        record.values.get("profile").and_then(Value::as_str) == Some(account.opencode_wrapper)
-    }) {
+    if let Some(index) = store
+        .records
+        .iter()
+        .position(|record| record.id == activation.settings_id)
+    {
         let id = store.records[index].id.clone();
         update_record(store, index, &id, values, request_id);
         return Ok(());
     }
-    let record = new_record(
-        store,
-        Some(account.opencode_wrapper.to_string()),
+    let id = activation.settings_id.clone();
+    let record = SettingsRecord {
+        display_name: account.opencode_wrapper.to_string(),
+        version: version_token(&id, &values, request_id),
+        id,
         values,
-        request_id,
-    );
+    };
     store.records.push(record);
     Ok(())
 }
 
-fn legacy_account_resolution_failure(request_id: &str, provider: &str) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "legacy_provider_unknown",
-        format!("legacy provider {provider} does not resolve to a declared OpenCode account"),
-    )
-}
-
 fn migrated_values_for_account(account: &crate::account::AccountProfile) -> Value {
-    let model = default_model();
     json!({
         "provider": "opencode",
         "profile": account.opencode_wrapper,
         "wrapper": account.opencode_wrapper,
         "model": {
-            "name": DEFAULT_MODEL_ALIAS,
-            "provider_model": model.provider_model,
-            "variant": model.effort
+            "selection": "requested"
         },
         "quota": {
             "source": account.quota_source_kind(),

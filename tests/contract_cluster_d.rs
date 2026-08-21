@@ -240,8 +240,8 @@ fn contract_settings_mutations_replay_committed_results_after_response_loss() {
     .expect("settings store JSON");
     assert_eq!(
         store["records"].as_array().expect("settings records").len(),
-        2,
-        "migration replay must not repeat its two record upserts"
+        5,
+        "migration replay must not repeat its five exact caller activations"
     );
     assert_eq!(
         store["history"].as_array().expect("settings history").len(),
@@ -377,6 +377,31 @@ fn contract_generated_settings_id_is_usable_by_policy() {
     );
     let settings_id = settings_create_id(&created);
     let expected_settings_id = settings_id.clone();
+    let install = success_result(
+        invoke_validated_with_host(
+            "setup.install_plan",
+            json!({ "target": "local", "settings_id": settings_id.clone() }),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupInstallPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupInstallPlanResponse",
+        "setup.schema.json#/$defs/SetupInstallPlanResult",
+    );
+    let activation = install["steps"]
+        .as_array()
+        .expect("install steps")
+        .iter()
+        .find(|step| step["kind"] == "verify_settings_transition")
+        .expect("settings activation step");
+    assert_eq!(activation["blocking"], false);
+    assert_eq!(
+        activation["settings_store"]["required_settings_ids"],
+        json!([expected_settings_id.clone()])
+    );
+    assert!(activation["settings_store"]["missing_settings_ids"]
+        .as_array()
+        .expect("missing settings IDs")
+        .is_empty());
     let policy = success_result(
         invoke_validated_with_host(
             "policy.evaluate",
@@ -1437,7 +1462,7 @@ fn normalized_account_cases() -> [(&'static str, &'static str); 5] {
 fn contract_settings_migrate() {
     let host = HostRoots::new("agent-runner-opencode-settings-migrate");
     let before = snapshot_tree(host.config_root());
-    let result = success_result(
+    let dry_run = success_result(
         invoke_validated_with_host(
             "settings.migrate",
             settings_migrate_params(),
@@ -1447,7 +1472,56 @@ fn contract_settings_migrate() {
         "settings.schema.json#/$defs/SettingsMigrateResponse",
         "settings.schema.json#/$defs/SettingsMigrateResult",
     );
-    assert_settings_migrate_result(&result, host.config_root(), &before);
+    assert_settings_migrate_result(&dry_run, host.config_root(), &before);
+    let expected_ids = [
+        "opencode",
+        "opencode2",
+        "opencode3",
+        "opencode4",
+        "opencode5",
+    ];
+    assert_eq!(
+        dry_run["actions"]
+            .as_array()
+            .expect("migration actions")
+            .iter()
+            .filter_map(|action| action["settings_id"].as_str())
+            .collect::<Vec<_>>(),
+        expected_ids,
+        "dry-run actions must declare the exact caller IDs that apply will activate"
+    );
+
+    let applied = success_result(
+        invoke_validated_with_host(
+            "settings.migrate",
+            json!({ "dry_run": false, "legacy": legacy_fixture() }),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsMigrateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsMigrateResponse",
+        "settings.schema.json#/$defs/SettingsMigrateResult",
+    );
+    assert_eq!(applied["actions"], dry_run["actions"]);
+    let listed = success_result(
+        invoke_validated_with_host(
+            "settings.list",
+            empty_request_params(),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsListRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsListResponse",
+        "settings.schema.json#/$defs/SettingsListResult",
+    );
+    assert_eq!(
+        listed["records"]
+            .as_array()
+            .expect("activated settings records")
+            .iter()
+            .filter_map(|record| record["id"].as_str())
+            .collect::<Vec<_>>(),
+        expected_ids,
+        "apply must materialize the same exact record IDs consumed by legacy provider-name callers"
+    );
 }
 
 #[test]
@@ -1533,6 +1607,37 @@ fn contract_setup_detect_install_sync() {
     let data_root = path_string(host.data_root());
     let profile_root = path_string(&profile_root);
     let path = prepend_path(toolchain.dir());
+
+    let before_activation = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.detect",
+            setup_detect_params(&data_root, &profile_root),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupDetectRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupDetectResponse",
+        "setup.schema.json#/$defs/SetupDetectResult",
+    );
+    assert_eq!(before_activation["installed"], false);
+    assert!(before_activation["warnings"]
+        .as_array()
+        .expect("setup warnings")
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|warning| warning.contains("settings activation is incomplete"))));
+
+    success_result(
+        invoke_validated_with_host(
+            "settings.migrate",
+            json!({ "dry_run": false, "legacy": legacy_fixture() }),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsMigrateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsMigrateResponse",
+        "settings.schema.json#/$defs/SettingsMigrateResult",
+    );
 
     let detect = success_result(
         invoke_validated_with_host_and_env(
