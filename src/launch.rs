@@ -124,6 +124,8 @@ struct LaunchRequestState {
     recovery: LaunchRecoveryIdentity,
     phase: LaunchRequestPhase,
     actor_process_group_id: Option<u32>,
+    #[serde(default)]
+    actor_process_group_incarnation: Option<String>,
     provider_session_id: Option<String>,
     terminal_status: Option<Value>,
     prepared_at_unix_ms: u64,
@@ -183,6 +185,8 @@ struct ResumeLaunchRequestState {
     recovery: LaunchRecoveryIdentity,
     phase: ResumeLaunchRequestPhase,
     actor_process_group_id: Option<u32>,
+    #[serde(default)]
+    actor_process_group_incarnation: Option<String>,
     terminal_status: Option<Value>,
     prepared_at_unix_ms: u64,
     observed_at_unix_ms: Option<u64>,
@@ -352,11 +356,19 @@ pub(crate) fn stream<W: Write>(
         let _ = terminate_child(child);
     });
     let actor_process_group_id = custody.child_mut().id();
+    let actor_process_group_incarnation = launch_process_incarnation(actor_process_group_id)
+        .map_err(|error| {
+            spawn_failure(
+                request_id,
+                "identify durably registered launch actor",
+                error,
+            )
+        })?;
     if let Some(launch_request) = state.launch_request.as_mut() {
-        launch_request.observe_actor(actor_process_group_id)?;
+        launch_request.observe_actor(actor_process_group_id, &actor_process_group_incarnation)?;
     }
     if let Some(launch_request) = state.resume_launch_request.as_mut() {
-        launch_request.observe_actor(actor_process_group_id)?;
+        launch_request.observe_actor(actor_process_group_id, &actor_process_group_incarnation)?;
     }
     if let Some(launch_exec_gate) = launch_exec_gate {
         launch_exec_gate.release().map_err(|error| {
@@ -1198,6 +1210,7 @@ fn reconcile_existing_launch_request(
                 validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
                 require_prior_actor_terminal(
                     state.actor_process_group_id,
+                    state.actor_process_group_incarnation.as_deref(),
                     request_id,
                     &state.binding_sha256,
                 )?;
@@ -1247,6 +1260,7 @@ fn reconcile_existing_launch_request(
             validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
             require_prior_actor_terminal(
                 state.actor_process_group_id,
+                state.actor_process_group_incarnation.as_deref(),
                 request_id,
                 &state.binding_sha256,
             )?;
@@ -1280,6 +1294,7 @@ fn reconcile_existing_launch_request(
             if state.phase == ResumeLaunchRequestPhase::Prepared {
                 require_prior_actor_terminal(
                     state.actor_process_group_id,
+                    state.actor_process_group_incarnation.as_deref(),
                     request_id,
                     &state.binding_sha256,
                 )?;
@@ -1352,6 +1367,7 @@ impl LaunchRequestGuard {
                         validate_launch_recovery_context(&state.recovery, &recovery, request_id)?;
                         require_prior_actor_terminal(
                             state.actor_process_group_id,
+                            state.actor_process_group_incarnation.as_deref(),
                             request_id,
                             &state.binding_sha256,
                         )?;
@@ -1393,7 +1409,7 @@ impl LaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = LaunchRequestState {
-            schema_version: 6,
+            schema_version: 7,
             operation_kind: LaunchOperationKind::NewSession,
             request_id: request_id.to_string(),
             request_identity_sha256,
@@ -1403,6 +1419,7 @@ impl LaunchRequestGuard {
             recovery: recovery.identity,
             phase: LaunchRequestPhase::Prepared,
             actor_process_group_id: None,
+            actor_process_group_incarnation: None,
             provider_session_id: None,
             terminal_status: None,
             prepared_at_unix_ms: now_unix_ms(),
@@ -1438,10 +1455,16 @@ impl LaunchRequestGuard {
         write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
     }
 
-    fn observe_actor(&mut self, process_group_id: u32) -> Result<(), ProviderFailure> {
+    fn observe_actor(
+        &mut self,
+        process_group_id: u32,
+        process_group_incarnation: &str,
+    ) -> Result<(), ProviderFailure> {
         observe_launch_actor(
             &mut self.state.actor_process_group_id,
+            &mut self.state.actor_process_group_incarnation,
             process_group_id,
+            process_group_incarnation,
             &self.state.request_id,
             &self.state.binding_sha256,
         )?;
@@ -1518,6 +1541,7 @@ impl ResumeLaunchRequestGuard {
                         let prior_phase = state.phase;
                         require_prior_actor_terminal(
                             state.actor_process_group_id,
+                            state.actor_process_group_incarnation.as_deref(),
                             request_id,
                             &state.binding_sha256,
                         )?;
@@ -1553,6 +1577,7 @@ impl ResumeLaunchRequestGuard {
                         if state.phase == ResumeLaunchRequestPhase::Prepared {
                             require_prior_actor_terminal(
                                 state.actor_process_group_id,
+                                state.actor_process_group_incarnation.as_deref(),
                                 request_id,
                                 &state.binding_sha256,
                             )?;
@@ -1586,7 +1611,7 @@ impl ResumeLaunchRequestGuard {
             Err(error) => return Err(launch_state_failure(request_id, error)),
         }
         let state = ResumeLaunchRequestState {
-            schema_version: 6,
+            schema_version: 7,
             operation_kind: LaunchOperationKind::Resume,
             request_id: request_id.to_string(),
             request_identity_sha256,
@@ -1595,6 +1620,7 @@ impl ResumeLaunchRequestGuard {
             recovery: recovery.identity,
             phase: ResumeLaunchRequestPhase::Prepared,
             actor_process_group_id: None,
+            actor_process_group_incarnation: None,
             terminal_status: None,
             prepared_at_unix_ms: now_unix_ms(),
             observed_at_unix_ms: None,
@@ -1607,10 +1633,16 @@ impl ResumeLaunchRequestGuard {
         })
     }
 
-    fn observe_actor(&mut self, process_group_id: u32) -> Result<(), ProviderFailure> {
+    fn observe_actor(
+        &mut self,
+        process_group_id: u32,
+        process_group_incarnation: &str,
+    ) -> Result<(), ProviderFailure> {
         observe_launch_actor(
             &mut self.state.actor_process_group_id,
+            &mut self.state.actor_process_group_incarnation,
             process_group_id,
+            process_group_incarnation,
             &self.state.request_id,
             &self.state.binding_sha256,
         )?;
@@ -1802,32 +1834,50 @@ fn observe_durable_resume(
 }
 
 fn observe_launch_actor(
-    committed: &mut Option<u32>,
-    observed: u32,
+    committed_process_group_id: &mut Option<u32>,
+    committed_incarnation: &mut Option<String>,
+    observed_process_group_id: u32,
+    observed_incarnation: &str,
     request_id: &str,
     binding_sha256: &str,
 ) -> Result<(), ProviderFailure> {
-    match *committed {
-        Some(existing) if existing == observed => Ok(()),
-        Some(existing) => Err(ProviderFailure::conflict(
-            request_id,
-            "launch_actor_conflict",
-            "one launch request observed conflicting native process-group identities",
-            json!({
-                "binding_sha256": binding_sha256,
-                "committed_process_group_id": existing,
-                "observed_process_group_id": observed,
-            }),
-        )),
-        None => {
-            *committed = Some(observed);
+    match (
+        *committed_process_group_id,
+        committed_incarnation.as_deref(),
+    ) {
+        (Some(existing_process_group_id), Some(existing_incarnation))
+            if existing_process_group_id == observed_process_group_id
+                && existing_incarnation == observed_incarnation =>
+        {
             Ok(())
         }
+        (Some(existing_process_group_id), existing_incarnation) => Err(ProviderFailure::conflict(
+            request_id,
+            "launch_actor_conflict",
+            "one launch request observed conflicting native process-group incarnations",
+            json!({
+                "binding_sha256": binding_sha256,
+                "committed_process_group_id": existing_process_group_id,
+                "committed_process_group_incarnation": existing_incarnation,
+                "observed_process_group_id": observed_process_group_id,
+                "observed_process_group_incarnation": observed_incarnation,
+            }),
+        )),
+        (None, None) => {
+            *committed_process_group_id = Some(observed_process_group_id);
+            *committed_incarnation = Some(observed_incarnation.to_string());
+            Ok(())
+        }
+        (None, Some(_)) => Err(launch_state_invalid(
+            request_id,
+            "launch actor incarnation exists without a process-group identity",
+        )),
     }
 }
 
 fn require_prior_actor_terminal(
     process_group_id: Option<u32>,
+    process_group_incarnation: Option<&str>,
     request_id: &str,
     binding_sha256: &str,
 ) -> Result<(), ProviderFailure> {
@@ -1838,15 +1888,33 @@ fn require_prior_actor_terminal(
         // native effect and may proceed to authoritative native recovery.
         return Ok(());
     };
-    if launch_process_group_is_live(process_group_id) {
+    if !launch_process_group_is_live(process_group_id) {
+        return Ok(());
+    }
+    let Some(expected_incarnation) = process_group_incarnation else {
         return Err(launch_actor_reconciliation_required(
             request_id,
             binding_sha256,
             Some(process_group_id),
-            "the previously admitted native process group is still alive",
+            "a predecessor launch record has a live process-group number but no durable actor incarnation",
         ));
+    };
+    match launch_process_incarnation(process_group_id) {
+        Ok(current_incarnation) if current_incarnation != expected_incarnation => Ok(()),
+        Ok(_) => Err(launch_actor_reconciliation_required(
+            request_id,
+            binding_sha256,
+            Some(process_group_id),
+            "the previously admitted native process-group incarnation is still alive",
+        )),
+        Err(error) if !launch_process_group_is_live(process_group_id) => Ok(()),
+        Err(error) => Err(launch_actor_reconciliation_required(
+            request_id,
+            binding_sha256,
+            Some(process_group_id),
+            &format!("the live process group leader incarnation could not be verified: {error}"),
+        )),
     }
-    Ok(())
 }
 
 fn resolve_launch_program(
@@ -2272,6 +2340,12 @@ fn validate_launch_request_state(
     state: &LaunchRequestState,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
+    let actor_published = state.actor_process_group_id.is_some_and(|id| id > 0)
+        && (state.schema_version < 7
+            || state
+                .actor_process_group_incarnation
+                .as_deref()
+                .is_some_and(|incarnation| !incarnation.trim().is_empty()));
     let phase_valid = match state.phase {
         LaunchRequestPhase::Prepared => {
             state.provider_session_id.is_none()
@@ -2283,23 +2357,40 @@ fn validate_launch_request_state(
                 .provider_session_id
                 .as_deref()
                 .is_some_and(|session_id| !session_id.trim().is_empty())
-                && state.actor_process_group_id.is_some_and(|id| id > 0)
+                && actor_published
                 && state.terminal_status.is_none()
                 && state.observed_at_unix_ms.is_some()
         }
         LaunchRequestPhase::TerminalWithoutSession => {
             state.provider_session_id.is_none()
-                && state.actor_process_group_id.is_some_and(|id| id > 0)
+                && actor_published
                 && state.terminal_status.as_ref().is_some_and(Value::is_object)
                 && state.observed_at_unix_ms.is_some()
         }
     };
     let schema_valid = match state.schema_version {
-        5 => true,
-        6 => state
-            .delivery_nonce
-            .as_deref()
-            .is_some_and(|nonce| !nonce.trim().is_empty()),
+        5 => state.actor_process_group_incarnation.is_none(),
+        6 => {
+            state
+                .delivery_nonce
+                .as_deref()
+                .is_some_and(|nonce| !nonce.trim().is_empty())
+                && state.actor_process_group_incarnation.is_none()
+        }
+        7 => {
+            state
+                .delivery_nonce
+                .as_deref()
+                .is_some_and(|nonce| !nonce.trim().is_empty())
+                && match (
+                    state.actor_process_group_id,
+                    state.actor_process_group_incarnation.as_deref(),
+                ) {
+                    (None, None) => true,
+                    (Some(id), Some(incarnation)) => id > 0 && !incarnation.trim().is_empty(),
+                    _ => false,
+                }
+        }
         _ => false,
     };
     if schema_valid
@@ -2328,6 +2419,12 @@ fn validate_resume_launch_request_state(
     state: &ResumeLaunchRequestState,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
+    let actor_published = state.actor_process_group_id.is_some_and(|id| id > 0)
+        && (state.schema_version < 7
+            || state
+                .actor_process_group_incarnation
+                .as_deref()
+                .is_some_and(|incarnation| !incarnation.trim().is_empty()));
     let phase_valid = match state.phase {
         ResumeLaunchRequestPhase::Prepared => {
             state.terminal_status.is_none() && state.observed_at_unix_ms.is_none()
@@ -2336,18 +2433,35 @@ fn validate_resume_launch_request_state(
         | ResumeLaunchRequestPhase::CompletionObserved
         | ResumeLaunchRequestPhase::Unresolved
         | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
-            state.actor_process_group_id.is_some_and(|id| id > 0)
+            actor_published
                 && state.observed_at_unix_ms.is_some()
                 && state.terminal_status.as_ref().is_none_or(Value::is_object)
         }
     };
     let observation = &state.observation;
     let schema_valid = match state.schema_version {
-        5 => true,
-        6 => observation
-            .delivery_nonce
-            .as_deref()
-            .is_some_and(|nonce| !nonce.trim().is_empty()),
+        5 => state.actor_process_group_incarnation.is_none(),
+        6 => {
+            observation
+                .delivery_nonce
+                .as_deref()
+                .is_some_and(|nonce| !nonce.trim().is_empty())
+                && state.actor_process_group_incarnation.is_none()
+        }
+        7 => {
+            observation
+                .delivery_nonce
+                .as_deref()
+                .is_some_and(|nonce| !nonce.trim().is_empty())
+                && match (
+                    state.actor_process_group_id,
+                    state.actor_process_group_incarnation.as_deref(),
+                ) {
+                    (None, None) => true,
+                    (Some(id), Some(incarnation)) => id > 0 && !incarnation.trim().is_empty(),
+                    _ => false,
+                }
+        }
         _ => false,
     };
     if schema_valid
@@ -3509,6 +3623,99 @@ fn process_group_setup_failed(result: i32) -> bool {
     result == -1
 }
 
+#[cfg(target_os = "linux")]
+fn launch_process_incarnation(process_id: u32) -> std::io::Result<String> {
+    let stat = fs::read_to_string(format!("/proc/{process_id}/stat"))?;
+    let command_end = stat.rfind(')').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process stat has no command terminator",
+        )
+    })?;
+    let start_ticks = stat[command_end + 1..]
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process stat has no start-time field",
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let boot_id = boot_id.trim();
+    if boot_id.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "kernel boot identity is empty",
+        ));
+    }
+    Ok(format!("linux:{boot_id}:{start_ticks}"))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_process_incarnation(process_id: u32) -> std::io::Result<String> {
+    let process_id = i32::try_from(process_id).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process identity exceeds the platform pid range",
+        )
+    })?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let info_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process identity structure exceeds the platform query range",
+        )
+    })?;
+    let read_size = unsafe {
+        libc::proc_pidinfo(
+            process_id,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            info_size,
+        )
+    };
+    if read_size <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if read_size != info_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "process identity query returned a partial record",
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != process_id as u32 || info.pbi_pgid != process_id as u32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "launch actor is not the leader of its registered process group",
+        ));
+    }
+    Ok(format!(
+        "macos:{}:{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn launch_process_incarnation(_process_id: u32) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable launch actor incarnation is unsupported on this Unix platform",
+    ))
+}
+
+#[cfg(not(unix))]
+fn launch_process_incarnation(_process_id: u32) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable launch actor incarnation requires Unix process custody",
+    ))
+}
+
 #[cfg(unix)]
 fn launch_process_group_is_live(process_group_id: u32) -> bool {
     let Ok(process_group_id) = i32::try_from(process_group_id) else {
@@ -3746,6 +3953,39 @@ mod custody_tests {
 mod recovery_tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn launch_actor_recovery_distinguishes_a_recycled_process_group() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        configure_process_group(&mut command);
+        let mut actor = command.spawn().expect("spawn isolated launch actor");
+        let process_group_id = actor.id();
+        let incarnation =
+            launch_process_incarnation(process_group_id).expect("read launch actor incarnation");
+
+        let same_actor = require_prior_actor_terminal(
+            Some(process_group_id),
+            Some(&incarnation),
+            "request-a",
+            "binding-a",
+        );
+        let recycled_actor = require_prior_actor_terminal(
+            Some(process_group_id),
+            Some(&format!("{incarnation}:different")),
+            "request-a",
+            "binding-a",
+        );
+
+        actor.kill().expect("terminate isolated launch actor");
+        actor.wait().expect("reap isolated launch actor");
+        assert!(same_actor.is_err(), "the admitted incarnation remains live");
+        assert!(
+            recycled_actor.is_ok(),
+            "a live group with a different leader incarnation is unrelated"
+        );
+    }
+
     #[test]
     fn new_session_recovery_does_not_claim_an_identical_sibling_prompt() {
         let export = opencode::parse_export_stdout(
@@ -3792,6 +4032,7 @@ mod recovery_tests {
             },
             phase: LaunchRequestPhase::Prepared,
             actor_process_group_id: None,
+            actor_process_group_incarnation: None,
             provider_session_id: None,
             terminal_status: None,
             prepared_at_unix_ms: 20,

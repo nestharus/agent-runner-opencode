@@ -204,10 +204,13 @@ prepared by an interrupted provider invocation runs native session discovery,
 using the original passthrough environment plus the exact request-bound
 declared environment. Every Unix launch starts behind a provider-owned exec
 gate: its child process group is durably attached to the prepared request
-before the gate can execute the native command. Provider loss or publication
-failure closes an unreleased gate without admitting a native effect. Recovery
-refuses readmission while a published actor is live; once that actor is
-terminal (or a prepared record proves no actor was ever published), recovery
+before the gate can execute the native command. That attachment includes the
+group leader's platform process-start incarnation, so a later process group
+that reuses the same numeric ID cannot impersonate the admitted actor. Provider
+loss or publication failure closes an unreleased gate without admitting a
+native effect. Recovery refuses readmission while the published group and
+leader incarnation are live; once that actor is terminal (or a prepared record
+proves no actor was ever published), recovery
 binds a matching session only when its user turn carries the provider-authored
 delivery identity embedded in that request's actual child payload, and readmits
 the request only after a
