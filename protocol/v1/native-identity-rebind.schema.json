@@ -100,13 +100,14 @@
       "properties": {
         "protocol": { "const": "opencode.native-identity-rebind/v1" },
         "action": { "const": "seal" },
+        "cycle_id": { "$ref": "#/$defs/Digest" },
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
         "component": { "$ref": "#/$defs/Component" },
         "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
         "host_handoff": { "$ref": "#/$defs/SealHandoff" }
       },
-      "required": ["protocol", "action", "operation_id", "profile", "component", "prior_evidence", "host_handoff"],
+      "required": ["protocol", "action", "cycle_id", "operation_id", "profile", "component", "prior_evidence", "host_handoff"],
       "additionalProperties": false
     },
     "ObservationRequest": {
@@ -114,6 +115,7 @@
       "properties": {
         "protocol": { "const": "opencode.native-identity-rebind/v1" },
         "action": { "const": "observe" },
+        "cycle_id": { "$ref": "#/$defs/Digest" },
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
         "component": { "$ref": "#/$defs/Component" },
@@ -121,7 +123,7 @@
         "disposition": { "enum": ["committed", "rolled_back"] },
         "host_handoff": { "$ref": "#/$defs/ObservationHandoff" }
       },
-      "required": ["protocol", "action", "operation_id", "profile", "component", "prior_evidence", "disposition", "host_handoff"],
+      "required": ["protocol", "action", "cycle_id", "operation_id", "profile", "component", "prior_evidence", "disposition", "host_handoff"],
       "additionalProperties": false
     },
     "ReleaseRequest": {
@@ -129,6 +131,7 @@
       "properties": {
         "protocol": { "const": "opencode.native-identity-rebind/v1" },
         "action": { "const": "release" },
+        "cycle_id": { "$ref": "#/$defs/Digest" },
         "operation_id": { "$ref": "#/$defs/Digest" },
         "observation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
@@ -138,7 +141,7 @@
         "disposition": { "enum": ["committed", "rolled_back"] },
         "host_handoff": { "$ref": "#/$defs/ReleaseHandoff" }
       },
-      "required": ["protocol", "action", "operation_id", "observation_id", "profile", "component", "prior_evidence", "observed_evidence", "disposition", "host_handoff"],
+      "required": ["protocol", "action", "cycle_id", "operation_id", "observation_id", "profile", "component", "prior_evidence", "observed_evidence", "disposition", "host_handoff"],
       "additionalProperties": false
     },
     "Request": {
@@ -165,6 +168,7 @@
         "kind": { "const": "native_identity_rebind" },
         "protocol": { "const": "opencode.native-identity-rebind/v1" },
         "schema_id": { "const": "opencode.native-identity-rebind/v1" },
+        "cycle_id": { "$ref": "#/$defs/Digest" },
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
         "component": { "$ref": "#/$defs/Component" },
@@ -191,7 +195,7 @@
         }
       },
       "required": [
-        "kind", "protocol", "schema_id", "operation_id", "profile", "component", "phase",
+        "kind", "protocol", "schema_id", "cycle_id", "operation_id", "profile", "component", "phase",
         "maximum_drain_ms", "prior_evidence", "observed_evidence",
         "responsibilities", "implementation_evidence"
       ],

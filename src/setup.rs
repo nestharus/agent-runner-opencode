@@ -3,7 +3,7 @@
 use crate::account::{profile_for_wrapper_reference, ACCOUNTS};
 use crate::child_custody::ChildCustody;
 use crate::durable_fs;
-use crate::encoding::sha256_hex;
+use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::native_runtime;
 use crate::operation_bounds;
@@ -25,9 +25,11 @@ const SETUP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const NATIVE_IDENTITY_REBIND_PROTOCOL: &str = "opencode.native-identity-rebind/v1";
 const NATIVE_IDENTITY_REBIND_DRAIN_MS: u64 = 20_000;
 const NATIVE_IDENTITY_REBIND_STATE_DIR: &str = "provider-state/opencode/native-identity-rebind";
-const NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION: u32 = 1;
+const NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION: u32 = 2;
 const NATIVE_IDENTITY_REBIND_STATE_BYTES: usize = 16 * 1024;
 const NATIVE_IDENTITY_REBIND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT: usize = 64;
+const NATIVE_IDENTITY_REBIND_REPLAY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -38,6 +40,7 @@ enum NativeIdentityRebindRequest {
     },
     Seal {
         protocol: String,
+        cycle_id: String,
         operation_id: String,
         profile: String,
         component: NativeIdentityRebindComponent,
@@ -46,6 +49,7 @@ enum NativeIdentityRebindRequest {
     },
     Observe {
         protocol: String,
+        cycle_id: String,
         operation_id: String,
         profile: String,
         component: NativeIdentityRebindComponent,
@@ -55,6 +59,7 @@ enum NativeIdentityRebindRequest {
     },
     Release {
         protocol: String,
+        cycle_id: String,
         operation_id: String,
         observation_id: String,
         profile: String,
@@ -115,6 +120,7 @@ struct NativeIdentityRebindReleaseHandoff {
 }
 
 struct NativeIdentityRebindOperationView<'a> {
+    cycle_id: &'a str,
     component: NativeIdentityRebindComponent,
     prior_evidence: &'a NativeIdentityRebindEvidence,
     observed_evidence: &'a NativeIdentityRebindEvidence,
@@ -124,10 +130,20 @@ struct NativeIdentityRebindOperationView<'a> {
     next_action: Option<&'a str>,
 }
 
+struct NativeIdentityRebindObservationBinding<'a> {
+    cycle_id: &'a str,
+    profile: &'a str,
+    component: NativeIdentityRebindComponent,
+    prior_evidence: &'a NativeIdentityRebindEvidence,
+    observed_evidence: &'a NativeIdentityRebindEvidence,
+    disposition: NativeIdentityRebindDisposition,
+}
+
 #[derive(Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeIdentityRebindObservationRecord {
     schema_version: u32,
+    cycle_id: String,
     operation_id: String,
     observation_id: String,
     profile: String,
@@ -136,6 +152,7 @@ struct NativeIdentityRebindObservationRecord {
     observed_evidence: NativeIdentityRebindEvidence,
     disposition: NativeIdentityRebindDisposition,
     phase: NativeIdentityRebindObservationPhase,
+    updated_at_unix_ms: u64,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -716,6 +733,11 @@ fn native_identity_rebind_operations(
                 .into_iter()
                 .map(|target| {
                     let account = canonical_rebind_profile(&target.profile, request_id)?;
+                    let cycle_id = native_identity_rebind_cycle_id(
+                        request_id,
+                        account.opencode_wrapper,
+                        target.component,
+                    );
                     let prior_evidence = native_identity_evidence(
                         host,
                         account,
@@ -726,6 +748,7 @@ fn native_identity_rebind_operations(
                     Ok(native_identity_rebind_operation(
                         account.opencode_wrapper,
                         NativeIdentityRebindOperationView {
+                            cycle_id: &cycle_id,
                             component: target.component,
                             prior_evidence: &prior_evidence,
                             observed_evidence: &prior_evidence,
@@ -740,6 +763,7 @@ fn native_identity_rebind_operations(
         }
         NativeIdentityRebindRequest::Seal {
             protocol,
+            cycle_id,
             operation_id,
             profile,
             component,
@@ -747,9 +771,11 @@ fn native_identity_rebind_operations(
             host_handoff,
         } => {
             require_native_identity_rebind_protocol(&protocol, request_id)?;
+            validate_native_identity_rebind_cycle_id(&cycle_id, request_id)?;
             validate_native_identity_evidence(&prior_evidence, request_id)?;
             let account = canonical_rebind_profile(&profile, request_id)?;
             let expected_operation_id = native_identity_rebind_operation_id(
+                &cycle_id,
                 account.opencode_wrapper,
                 component,
                 &prior_evidence,
@@ -777,6 +803,7 @@ fn native_identity_rebind_operations(
             Ok(vec![native_identity_rebind_operation(
                 account.opencode_wrapper,
                 NativeIdentityRebindOperationView {
+                    cycle_id: &cycle_id,
                     component,
                     prior_evidence: &prior_evidence,
                     observed_evidence: &sealed_evidence,
@@ -789,6 +816,7 @@ fn native_identity_rebind_operations(
         }
         NativeIdentityRebindRequest::Observe {
             protocol,
+            cycle_id,
             operation_id,
             profile,
             component,
@@ -797,9 +825,11 @@ fn native_identity_rebind_operations(
             host_handoff,
         } => {
             require_native_identity_rebind_protocol(&protocol, request_id)?;
+            validate_native_identity_rebind_cycle_id(&cycle_id, request_id)?;
             validate_native_identity_evidence(&prior_evidence, request_id)?;
             let account = canonical_rebind_profile(&profile, request_id)?;
             let expected_operation_id = native_identity_rebind_operation_id(
+                &cycle_id,
                 account.opencode_wrapper,
                 component,
                 &prior_evidence,
@@ -824,11 +854,14 @@ fn native_identity_rebind_operations(
                 {
                     let admitted_phase = persist_native_identity_rebind_observation(
                         host,
-                        account.opencode_wrapper,
-                        component,
-                        &prior_evidence,
-                        &observed_evidence,
-                        disposition,
+                        NativeIdentityRebindObservationBinding {
+                            cycle_id: &cycle_id,
+                            profile: account.opencode_wrapper,
+                            component,
+                            prior_evidence: &prior_evidence,
+                            observed_evidence: &observed_evidence,
+                            disposition,
+                        },
                         request_id,
                     )?;
                     (admitted_phase.as_str(), None)
@@ -845,6 +878,7 @@ fn native_identity_rebind_operations(
             Ok(vec![native_identity_rebind_operation(
                 account.opencode_wrapper,
                 NativeIdentityRebindOperationView {
+                    cycle_id: &cycle_id,
                     component,
                     prior_evidence: &prior_evidence,
                     observed_evidence: &observed_evidence,
@@ -857,6 +891,7 @@ fn native_identity_rebind_operations(
         }
         NativeIdentityRebindRequest::Release {
             protocol,
+            cycle_id,
             operation_id,
             observation_id,
             profile,
@@ -867,10 +902,12 @@ fn native_identity_rebind_operations(
             host_handoff,
         } => {
             require_native_identity_rebind_protocol(&protocol, request_id)?;
+            validate_native_identity_rebind_cycle_id(&cycle_id, request_id)?;
             validate_native_identity_evidence(&prior_evidence, request_id)?;
             validate_native_identity_evidence(&observed_evidence, request_id)?;
             let account = canonical_rebind_profile(&profile, request_id)?;
             let expected_operation_id = native_identity_rebind_operation_id(
+                &cycle_id,
                 account.opencode_wrapper,
                 component,
                 &prior_evidence,
@@ -900,6 +937,7 @@ fn native_identity_rebind_operations(
             )?;
             let admitted_observation = read_native_identity_rebind_observation(
                 host,
+                &cycle_id,
                 account.opencode_wrapper,
                 component,
                 request_id,
@@ -910,8 +948,30 @@ fn native_identity_rebind_operations(
                     "release requires a provider-admitted awaiting_host_release observation",
                 )
             })?;
+            if native_identity_rebind_observation_expired(&admitted_observation, now_unix_ms()) {
+                let expired_path = native_identity_rebind_observation_path(
+                    host,
+                    &cycle_id,
+                    account.opencode_wrapper,
+                    component,
+                    request_id,
+                )?;
+                fs::remove_file(&expired_path)
+                    .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+                durable_fs::sync_directory(
+                    expired_path
+                        .parent()
+                        .expect("native identity rebind observation always has a parent"),
+                )
+                .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "the rebind cycle replay window expired; begin a new plan request",
+                ));
+            }
             let expected_observation = NativeIdentityRebindObservationRecord {
                 schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
+                cycle_id: cycle_id.clone(),
                 operation_id: operation_id.clone(),
                 observation_id: observation_id.clone(),
                 profile: account.opencode_wrapper.to_string(),
@@ -920,6 +980,7 @@ fn native_identity_rebind_operations(
                 observed_evidence: observed_evidence.clone(),
                 disposition,
                 phase: admitted_observation.phase,
+                updated_at_unix_ms: admitted_observation.updated_at_unix_ms,
             };
             if !native_identity_rebind_observation_matches(
                 &admitted_observation,
@@ -934,6 +995,7 @@ fn native_identity_rebind_operations(
                 return Ok(vec![native_identity_rebind_operation(
                     account.opencode_wrapper,
                     NativeIdentityRebindOperationView {
+                        cycle_id: &cycle_id,
                         component,
                         prior_evidence: &prior_evidence,
                         observed_evidence: &observed_evidence,
@@ -952,6 +1014,7 @@ fn native_identity_rebind_operations(
                 return Ok(vec![native_identity_rebind_operation(
                     account.opencode_wrapper,
                     NativeIdentityRebindOperationView {
+                        cycle_id: &cycle_id,
                         component,
                         prior_evidence: &prior_evidence,
                         observed_evidence: &admitted_observation.observed_evidence,
@@ -989,6 +1052,7 @@ fn native_identity_rebind_operations(
                 };
                 let terminal_observation = NativeIdentityRebindObservationRecord {
                     phase: terminal_phase,
+                    updated_at_unix_ms: now_unix_ms(),
                     ..admitted_observation
                 };
                 write_native_identity_rebind_observation(host, &terminal_observation, request_id)?;
@@ -997,6 +1061,7 @@ fn native_identity_rebind_operations(
             Ok(vec![native_identity_rebind_operation(
                 account.opencode_wrapper,
                 NativeIdentityRebindOperationView {
+                    cycle_id: &cycle_id,
                     component,
                     prior_evidence: &prior_evidence,
                     observed_evidence: &current_evidence,
@@ -1045,6 +1110,7 @@ fn native_identity_rebind_operation(
     view: NativeIdentityRebindOperationView<'_>,
 ) -> Value {
     let NativeIdentityRebindOperationView {
+        cycle_id,
         component,
         prior_evidence,
         observed_evidence,
@@ -1053,12 +1119,14 @@ fn native_identity_rebind_operation(
         disposition,
         next_action,
     } = view;
-    let operation_id = native_identity_rebind_operation_id(profile, component, prior_evidence);
+    let operation_id =
+        native_identity_rebind_operation_id(cycle_id, profile, component, prior_evidence);
     let validation_capability = component.validation_capability();
     let mut operation = json!({
         "kind": "native_identity_rebind",
         "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
         "schema_id": NATIVE_IDENTITY_REBIND_SCHEMA_ID,
+        "cycle_id": cycle_id,
         "operation_id": operation_id,
         "profile": profile,
         "component": component.as_str(),
@@ -1102,6 +1170,7 @@ fn native_identity_rebind_operation(
             operation["next_request"] = json!({
                 "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
                 "action": "seal",
+                "cycle_id": cycle_id,
                 "operation_id": operation_id,
                 "profile": profile,
                 "component": component.as_str(),
@@ -1116,6 +1185,7 @@ fn native_identity_rebind_operation(
             operation["next_request"] = json!({
                 "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
                 "action": "observe",
+                "cycle_id": cycle_id,
                 "operation_id": operation_id,
                 "profile": profile,
                 "component": component.as_str(),
@@ -1139,6 +1209,7 @@ fn native_identity_rebind_operation(
             operation["next_request"] = json!({
                 "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
                 "action": "release",
+                "cycle_id": cycle_id,
                 "operation_id": operation_id,
                 "observation_id": observation_id,
                 "profile": profile,
@@ -1198,17 +1269,23 @@ fn native_identity_rebind_disposition_matches(
 
 fn persist_native_identity_rebind_observation(
     host: &HostContext,
-    profile: &str,
-    component: NativeIdentityRebindComponent,
-    prior_evidence: &NativeIdentityRebindEvidence,
-    observed_evidence: &NativeIdentityRebindEvidence,
-    disposition: NativeIdentityRebindDisposition,
+    binding: NativeIdentityRebindObservationBinding<'_>,
     request_id: &str,
 ) -> Result<NativeIdentityRebindObservationPhase, ProviderFailure> {
+    let NativeIdentityRebindObservationBinding {
+        cycle_id,
+        profile,
+        component,
+        prior_evidence,
+        observed_evidence,
+        disposition,
+    } = binding;
     let _lock = acquire_native_identity_rebind_lock(host, profile, component, request_id)?;
-    let operation_id = native_identity_rebind_operation_id(profile, component, prior_evidence);
+    let operation_id =
+        native_identity_rebind_operation_id(cycle_id, profile, component, prior_evidence);
     let observation = NativeIdentityRebindObservationRecord {
         schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
+        cycle_id: cycle_id.to_string(),
         observation_id: native_identity_rebind_observation_id(
             &operation_id,
             observed_evidence,
@@ -1221,19 +1298,19 @@ fn persist_native_identity_rebind_observation(
         observed_evidence: observed_evidence.clone(),
         disposition,
         phase: NativeIdentityRebindObservationPhase::AwaitingHostRelease,
+        updated_at_unix_ms: now_unix_ms(),
     };
+    prepare_native_identity_rebind_cycle_slot(host, cycle_id, profile, component, request_id)?;
     if let Some(existing) =
-        read_native_identity_rebind_observation(host, profile, component, request_id)?
+        read_native_identity_rebind_observation(host, cycle_id, profile, component, request_id)?
     {
         if native_identity_rebind_observation_matches(&existing, &observation) {
             return Ok(existing.phase);
         }
-        if existing.phase == NativeIdentityRebindObservationPhase::AwaitingHostRelease {
-            return Err(invalid_native_identity_rebind(
-                request_id,
-                "a different admitted observation still owns release for this profile/component identity",
-            ));
-        }
+        return Err(invalid_native_identity_rebind(
+            request_id,
+            "the rebind cycle already owns a different admitted observation",
+        ));
     }
     write_native_identity_rebind_observation(host, &observation, request_id)?;
     Ok(observation.phase)
@@ -1246,6 +1323,7 @@ fn write_native_identity_rebind_observation(
 ) -> Result<(), ProviderFailure> {
     let path = native_identity_rebind_observation_path(
         host,
+        &observation.cycle_id,
         &observation.profile,
         observation.component,
         request_id,
@@ -1253,6 +1331,8 @@ fn write_native_identity_rebind_observation(
     let parent = path
         .parent()
         .expect("native identity rebind observation always has a parent");
+    durable_fs::create_private_directories(parent)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
     let bytes = serde_json::to_vec_pretty(&observation)
         .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
     if bytes.len() > NATIVE_IDENTITY_REBIND_STATE_BYTES {
@@ -1284,6 +1364,7 @@ fn native_identity_rebind_observation_matches(
     right: &NativeIdentityRebindObservationRecord,
 ) -> bool {
     left.schema_version == right.schema_version
+        && left.cycle_id == right.cycle_id
         && left.operation_id == right.operation_id
         && left.observation_id == right.observation_id
         && left.profile == right.profile
@@ -1295,11 +1376,13 @@ fn native_identity_rebind_observation_matches(
 
 fn read_native_identity_rebind_observation(
     host: &HostContext,
+    cycle_id: &str,
     profile: &str,
     component: NativeIdentityRebindComponent,
     request_id: &str,
 ) -> Result<Option<NativeIdentityRebindObservationRecord>, ProviderFailure> {
-    let path = native_identity_rebind_observation_path(host, profile, component, request_id)?;
+    let path =
+        native_identity_rebind_observation_path(host, cycle_id, profile, component, request_id)?;
     let bytes = match durable_fs::read_file_bounded(&path, NATIVE_IDENTITY_REBIND_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1307,6 +1390,23 @@ fn read_native_identity_rebind_observation(
     };
     let observation: NativeIdentityRebindObservationRecord = serde_json::from_slice(&bytes)
         .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    validate_native_identity_rebind_observation_record(
+        &observation,
+        cycle_id,
+        profile,
+        component,
+        request_id,
+    )?;
+    Ok(Some(observation))
+}
+
+fn validate_native_identity_rebind_observation_record(
+    observation: &NativeIdentityRebindObservationRecord,
+    cycle_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
     let phase_matches_disposition = match observation.phase {
         NativeIdentityRebindObservationPhase::AwaitingHostRelease => true,
         NativeIdentityRebindObservationPhase::Completed => {
@@ -1317,11 +1417,18 @@ fn read_native_identity_rebind_observation(
         }
     };
     if observation.schema_version != NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION
+        || observation.cycle_id != cycle_id
         || observation.profile != profile
         || observation.component != component
+        || observation.updated_at_unix_ms == 0
         || !phase_matches_disposition
         || observation.operation_id
-            != native_identity_rebind_operation_id(profile, component, &observation.prior_evidence)
+            != native_identity_rebind_operation_id(
+                cycle_id,
+                profile,
+                component,
+                &observation.prior_evidence,
+            )
         || observation.observation_id
             != native_identity_rebind_observation_id(
                 &observation.operation_id,
@@ -1334,7 +1441,92 @@ fn read_native_identity_rebind_observation(
             "persisted observation record is inconsistent",
         ));
     }
-    Ok(Some(observation))
+    Ok(())
+}
+
+fn prepare_native_identity_rebind_cycle_slot(
+    host: &HostContext,
+    cycle_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let root = native_identity_rebind_component_state_root(host, profile, component, request_id)?;
+    durable_fs::create_private_directories(&root)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    let now = now_unix_ms();
+    let mut retained = 0_usize;
+    for entry in fs::read_dir(&root)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?
+    {
+        let entry =
+            entry.map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+        if !entry
+            .file_type()
+            .map_err(|error| native_identity_rebind_state_failure(request_id, error))?
+            .is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+        retained = retained.saturating_add(1);
+        if retained > MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT {
+            return Err(native_identity_rebind_capacity_failure(request_id));
+        }
+        let retained_cycle_id = entry
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| valid_sha256(value))
+            .ok_or_else(|| {
+                native_identity_rebind_state_failure(
+                    request_id,
+                    "persisted observation path has an invalid cycle identity",
+                )
+            })?
+            .to_string();
+        let path = confined_native_identity_rebind_target(host, &entry.path(), request_id)?;
+        let bytes = durable_fs::read_file_bounded(&path, NATIVE_IDENTITY_REBIND_STATE_BYTES)
+            .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+        let observation: NativeIdentityRebindObservationRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+        validate_native_identity_rebind_observation_record(
+            &observation,
+            &retained_cycle_id,
+            profile,
+            component,
+            request_id,
+        )?;
+        if native_identity_rebind_observation_expired(&observation, now) {
+            fs::remove_file(&path)
+                .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+            durable_fs::sync_directory(&root)
+                .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+            retained = retained.saturating_sub(1);
+            if retained_cycle_id == cycle_id {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "the rebind cycle replay window expired; begin a new plan request",
+                ));
+            }
+        }
+    }
+    let target =
+        native_identity_rebind_observation_path(host, cycle_id, profile, component, request_id)?;
+    if retained >= MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT && !target.exists() {
+        return Err(native_identity_rebind_capacity_failure(request_id));
+    }
+    Ok(())
+}
+
+fn native_identity_rebind_observation_expired(
+    observation: &NativeIdentityRebindObservationRecord,
+    now: u64,
+) -> bool {
+    observation
+        .updated_at_unix_ms
+        .saturating_add(NATIVE_IDENTITY_REBIND_REPLAY_WINDOW_MS)
+        < now
 }
 
 fn acquire_native_identity_rebind_lock(
@@ -1376,6 +1568,17 @@ fn acquire_native_identity_rebind_lock(
 
 fn native_identity_rebind_observation_path(
     host: &HostContext,
+    cycle_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let root = native_identity_rebind_component_state_root(host, profile, component, request_id)?;
+    confined_native_identity_rebind_target(host, &root.join(format!("{cycle_id}.json")), request_id)
+}
+
+fn native_identity_rebind_component_state_root(
+    host: &HostContext,
     profile: &str,
     component: NativeIdentityRebindComponent,
     request_id: &str,
@@ -1383,7 +1586,7 @@ fn native_identity_rebind_observation_path(
     let root = native_identity_rebind_state_root(host, request_id)?;
     confined_native_identity_rebind_target(
         host,
-        &root.join(format!("{profile}-{}.json", component.as_str())),
+        &root.join(format!("{profile}-{}", component.as_str())),
         request_id,
     )
 }
@@ -1445,7 +1648,52 @@ fn native_identity_rebind_lock_timeout(request_id: &str) -> ProviderFailure {
     )
 }
 
+fn native_identity_rebind_capacity_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "native_identity_rebind_cycle_capacity",
+        format!(
+            "native identity rebind retains at most {MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT} cycles per profile/component for its bounded replay window"
+        ),
+        json!({
+            "maximum_cycles_per_component": MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT,
+            "replay_window_ms": NATIVE_IDENTITY_REBIND_REPLAY_WINDOW_MS,
+        }),
+    )
+}
+
+fn native_identity_rebind_cycle_id(
+    plan_request_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+) -> String {
+    sha256_hex(
+        json!({
+            "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
+            "plan_request_id": plan_request_id,
+            "profile": profile,
+            "component": component.as_str(),
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+fn validate_native_identity_rebind_cycle_id(
+    cycle_id: &str,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if valid_sha256(cycle_id) {
+        return Ok(());
+    }
+    Err(invalid_native_identity_rebind(
+        request_id,
+        "cycle_id must be a lowercase SHA-256 value emitted by a plan response",
+    ))
+}
+
 fn native_identity_rebind_operation_id(
+    cycle_id: &str,
     profile: &str,
     component: NativeIdentityRebindComponent,
     prior_evidence: &NativeIdentityRebindEvidence,
@@ -1453,6 +1701,7 @@ fn native_identity_rebind_operation_id(
     sha256_hex(
         json!({
             "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
+            "cycle_id": cycle_id,
             "profile": profile,
             "component": component.as_str(),
             "prior_evidence": prior_evidence,

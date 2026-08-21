@@ -1816,6 +1816,7 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
     assert_eq!(rebinds.len(), 2);
     assert_eq!(rebinds[0]["component"], "native_runtime");
     assert_eq!(rebinds[1]["component"], "quota_observer");
+    assert_ne!(rebinds[0]["cycle_id"], rebinds[1]["cycle_id"]);
     assert_ne!(rebinds[0]["operation_id"], rebinds[1]["operation_id"]);
     assert_ne!(
         rebinds[0]["implementation_evidence"]["provider_state_record"],
@@ -1826,6 +1827,13 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
     assert_eq!(rebind["component"], "native_runtime");
     assert_eq!(rebind["protocol"], "opencode.native-identity-rebind/v1");
     assert_eq!(rebind["schema_id"], "opencode.native-identity-rebind/v1");
+    assert_eq!(
+        rebind["cycle_id"]
+            .as_str()
+            .expect("rebind cycle identity")
+            .len(),
+        64
+    );
     assert_eq!(
         rebind["operation_id"]
             .as_str()
@@ -2143,6 +2151,108 @@ fn contract_native_identity_rebind_rejects_false_rollback_and_changed_evidence()
     );
 }
 
+#[test]
+fn contract_native_identity_rebind_distinguishes_identical_maintenance_cycles() {
+    let host = HostRoots::new("agent-runner-opencode-rebind-distinct-cycles");
+    let mut first_plan_request = support::validated_request_envelope(
+        "setup.sync_plan",
+        setup_sync_rebind_params(),
+        host.overrides(),
+        "setup.schema.json#/$defs/SetupSyncPlanRequest",
+    );
+    first_plan_request["request_id"] = json!("req-native-rebind-cycle-exact-replay");
+    let first_plan = success_result(
+        support::invoke_with_request("setup.sync_plan", first_plan_request.clone()),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    let replayed_plan = success_result(
+        support::invoke_with_request("setup.sync_plan", first_plan_request),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    assert_eq!(replayed_plan, first_plan);
+    let first_plan = native_identity_rebind_component(&first_plan, "native_runtime");
+    let first_cycle_id = first_plan["cycle_id"].clone();
+    let first_operation_id = first_plan["operation_id"].clone();
+    let first_seal = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": first_plan["next_request"]
+        }),
+    );
+    let first_seal = native_identity_rebind_component(&first_seal, "native_runtime");
+    let mut first_rollback = first_seal["next_request"].clone();
+    first_rollback["disposition"] = json!("rolled_back");
+    let first_observation = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": first_rollback
+        }),
+    );
+    let first_observation = native_identity_rebind_component(&first_observation, "native_runtime");
+    assert_eq!(first_observation["phase"], "awaiting_host_release");
+    let first_release = first_observation["next_request"].clone();
+    let first_terminal = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": first_release
+        }),
+    );
+    assert_eq!(
+        native_identity_rebind_component(&first_terminal, "native_runtime")["phase"],
+        "rolled_back"
+    );
+
+    let second_plan = native_identity_rebind_step(&host, setup_sync_rebind_params());
+    let second_plan = native_identity_rebind_component(&second_plan, "native_runtime");
+    assert_ne!(second_plan["cycle_id"], first_cycle_id);
+    assert_ne!(second_plan["operation_id"], first_operation_id);
+    assert_eq!(second_plan["prior_evidence"], first_plan["prior_evidence"]);
+    let second_seal = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": second_plan["next_request"]
+        }),
+    );
+    let second_seal = native_identity_rebind_component(&second_seal, "native_runtime");
+    let mut second_rollback = second_seal["next_request"].clone();
+    second_rollback["disposition"] = json!("rolled_back");
+    let second_observation = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": second_rollback
+        }),
+    );
+    let second_observation =
+        native_identity_rebind_component(&second_observation, "native_runtime");
+    assert_eq!(second_observation["phase"], "awaiting_host_release");
+    assert_eq!(second_observation["cycle_id"], second_plan["cycle_id"]);
+    assert_eq!(second_observation["next_request"]["action"], "release");
+    let second_terminal = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": second_observation["next_request"]
+        }),
+    );
+    assert_eq!(
+        native_identity_rebind_component(&second_terminal, "native_runtime")["phase"],
+        "rolled_back"
+    );
+}
+
 fn native_identity_rebind_step(host: &HostRoots, params: Value) -> Value {
     success_result(
         invoke_validated_with_host(
@@ -2171,6 +2281,7 @@ fn native_identity_rebind_release_request(observation: &Value) -> Value {
     json!({
         "protocol": "opencode.native-identity-rebind/v1",
         "action": "release",
+        "cycle_id": observation["cycle_id"],
         "operation_id": observation["operation_id"],
         "observation_id": observation["observation_id"],
         "profile": observation["profile"],

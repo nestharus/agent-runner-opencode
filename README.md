@@ -461,8 +461,8 @@ identity is admitted. This provider owns the separately versioned
 `opencode.native-identity-rebind/v1` maintenance protocol; its exact JSON Schema
 is available through `schema`. `setup.sync_plan` accepts that protocol under
 `params.native_identity_rebind` and emits operations carrying the same protocol,
-schema ID, component-scoped operation ID, actor responsibilities, prior identity
-evidence, and a typed completion-observation request. Evidence separately names
+schema ID, plan-request-bound cycle ID, component-scoped operation ID, actor
+responsibilities, prior identity evidence, and a typed completion-observation request. Evidence separately names
 the component's semantic implementation `component_identity_sha256` and the
 serialized persistence revision `state_record_sha256`; the full pair is bound to
 the operation, while semantic identity change decides a commit. Each target names
@@ -487,8 +487,8 @@ request with a named identity-lock result rather than waiting indefinitely.
 3. The host submits the plan's typed `seal` request while admission remains
    blocked. The provider rejects sealing if either host assertion is false or
    the selected provider identity record changed during drain; a successful seal
-   binds its exact pre-cutover semantic identity, state-record digest, and
-   component into the operation ID.
+   binds its plan-request cycle, exact pre-cutover semantic identity,
+   state-record digest, and component into the operation ID.
 4. The operator stages only the selected replacement implementation without
    altering the implementation named by its old identity. Back up and remove
    only `native-runtimes/<profile>.json` for a `native_runtime` target or only
@@ -502,8 +502,8 @@ request with a named identity-lock result rather than waiting indefinitely.
 6. While ordinary admission is still blocked, the host sends the plan-bound
    `observe` request and attests that the selected validation capability completed.
    The provider validates the operation ID and both named current evidence layers. A valid
-   commit or rollback is durably admitted in one bounded component-scoped
-   observation record, then returns `awaiting_host_release`, an observation-bound
+   commit or rollback is durably admitted in one bounded per-cycle observation
+   record, then returns `awaiting_host_release`, an observation-bound
    release request, and not a terminal success. Rejected observations do not
    acquire release authority.
 7. The host reopens ordinary admission and sends that exact `release` request.
@@ -513,6 +513,13 @@ request with a named identity-lock result rather than waiting indefinitely.
    terminal result. A skipped or rejected observation or invalid disposition
    fails admission; a false release assertion or changed binding returns
    `rejected`.
+
+Each profile/component retains at most 64 cycle records for a 24-hour replay
+window. An exact retry retains its original plan-derived cycle identity and
+replays only that cycle. A later plan request receives a new cycle identity even
+when its prior and observed component evidence are byte-identical, and therefore
+must complete its own observation and host-release handoff. Expired cycles fail
+closed and must restart from a new plan request.
 
 Private state paths are included only as implementation evidence, not as the
 protocol's meaning. A component commit reaches release only when its semantic
