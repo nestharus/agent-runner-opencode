@@ -35,7 +35,10 @@ pub fn setup_sync_rebind_params() -> Value {
         "native_identity_rebind": {
             "protocol": "opencode.native-identity-rebind/v1",
             "action": "plan",
-            "profiles": ["opencode3"]
+            "targets": [
+                { "profile": "opencode3", "component": "native_runtime" },
+                { "profile": "opencode3", "component": "quota_observer" }
+            ]
         }
     })
 }

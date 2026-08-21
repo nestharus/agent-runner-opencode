@@ -1619,13 +1619,23 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
         "setup.schema.json#/$defs/SetupSyncPlanResponse",
         "setup.schema.json#/$defs/SetupSyncPlanResult",
     );
-    let rebind = result["operations"]
+    let rebinds = result["operations"]
         .as_array()
         .expect("sync operations")
         .iter()
-        .find(|operation| operation["kind"] == "native_identity_rebind")
-        .expect("identity rebind operation");
+        .filter(|operation| operation["kind"] == "native_identity_rebind")
+        .collect::<Vec<_>>();
+    assert_eq!(rebinds.len(), 2);
+    assert_eq!(rebinds[0]["component"], "native_runtime");
+    assert_eq!(rebinds[1]["component"], "quota_observer");
+    assert_ne!(rebinds[0]["operation_id"], rebinds[1]["operation_id"]);
+    assert_ne!(
+        rebinds[0]["implementation_evidence"]["provider_state_record"],
+        rebinds[1]["implementation_evidence"]["provider_state_record"]
+    );
+    let rebind = rebinds[0];
     assert_eq!(rebind["profile"], "opencode3");
+    assert_eq!(rebind["component"], "native_runtime");
     assert_eq!(rebind["protocol"], "opencode.native-identity-rebind/v1");
     assert_eq!(rebind["schema_id"], "opencode.native-identity-rebind/v1");
     assert_eq!(
@@ -1653,6 +1663,14 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
         "schema.schema.json#/$defs/SchemaResult",
     )["schema"]
         .clone();
+    assert_native_identity_rebind_schema(
+        &protocol,
+        "Request",
+        &setup_sync_rebind_params()["native_identity_rebind"],
+    );
+    for operation in &rebinds {
+        assert_native_identity_rebind_schema(&protocol, "Operation", operation);
+    }
     assert_native_identity_rebind_schema(&protocol, "Operation", rebind);
     assert_native_identity_rebind_schema(&protocol, "Request", &rebind["next_request"]);
 

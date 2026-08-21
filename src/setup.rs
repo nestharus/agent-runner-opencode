@@ -11,7 +11,7 @@ use crate::quota_observer;
 use crate::schema::NATIVE_IDENTITY_REBIND_SCHEMA_ID;
 use crate::settings::{self, SettingsTransitionReadiness};
 use crate::shell;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -27,20 +27,22 @@ const NATIVE_IDENTITY_REBIND_DRAIN_MS: u64 = 20_000;
 enum NativeIdentityRebindRequest {
     Plan {
         protocol: String,
-        profiles: Vec<String>,
+        targets: Vec<NativeIdentityRebindTarget>,
     },
     Seal {
         protocol: String,
         operation_id: String,
         profile: String,
-        prior_binding: NativeIdentityBindingEvidence,
+        component: NativeIdentityRebindComponent,
+        prior_identity_sha256: Option<String>,
         host_handoff: NativeIdentityRebindSealHandoff,
     },
     Observe {
         protocol: String,
         operation_id: String,
         profile: String,
-        prior_binding: NativeIdentityBindingEvidence,
+        component: NativeIdentityRebindComponent,
+        prior_identity_sha256: Option<String>,
         disposition: NativeIdentityRebindDisposition,
         host_handoff: NativeIdentityRebindObservationHandoff,
     },
@@ -49,18 +51,26 @@ enum NativeIdentityRebindRequest {
         operation_id: String,
         observation_id: String,
         profile: String,
-        prior_binding: NativeIdentityBindingEvidence,
-        observed_binding: NativeIdentityBindingEvidence,
+        component: NativeIdentityRebindComponent,
+        prior_identity_sha256: Option<String>,
+        observed_identity_sha256: Option<String>,
         disposition: NativeIdentityRebindDisposition,
         host_handoff: NativeIdentityRebindReleaseHandoff,
     },
 }
 
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(deny_unknown_fields)]
-struct NativeIdentityBindingEvidence {
-    native_runtime_state_sha256: Option<String>,
-    quota_observer_state_sha256: Option<String>,
+struct NativeIdentityRebindTarget {
+    profile: String,
+    component: NativeIdentityRebindComponent,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum NativeIdentityRebindComponent {
+    NativeRuntime,
+    QuotaObserver,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -81,8 +91,7 @@ struct NativeIdentityRebindSealHandoff {
 #[serde(deny_unknown_fields)]
 struct NativeIdentityRebindObservationHandoff {
     ordinary_admission_blocked: bool,
-    validation_launch_completed: bool,
-    validation_quota_probe_completed: bool,
+    validation_capability_completed: bool,
 }
 
 #[derive(Deserialize)]
@@ -91,11 +100,44 @@ struct NativeIdentityRebindReleaseHandoff {
     ordinary_admission_reopened: bool,
 }
 
+struct NativeIdentityRebindOperationView<'a> {
+    component: NativeIdentityRebindComponent,
+    prior_identity_sha256: Option<&'a str>,
+    observed_identity_sha256: Option<&'a str>,
+    phase: &'a str,
+    diagnostic: Option<&'a str>,
+    disposition: Option<NativeIdentityRebindDisposition>,
+    next_action: Option<&'a str>,
+}
+
 impl NativeIdentityRebindDisposition {
     fn as_str(self) -> &'static str {
         match self {
             Self::Committed => "committed",
             Self::RolledBack => "rolled_back",
+        }
+    }
+}
+
+impl NativeIdentityRebindComponent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeRuntime => "native_runtime",
+            Self::QuotaObserver => "quota_observer",
+        }
+    }
+
+    fn validation_capability(self) -> &'static str {
+        match self {
+            Self::NativeRuntime => "launch",
+            Self::QuotaObserver => "quota_probe",
+        }
+    }
+
+    fn provider_state_record(self, profile: &str) -> String {
+        match self {
+            Self::NativeRuntime => format!("native-runtimes/{profile}.json"),
+            Self::QuotaObserver => format!("quota-observers/{profile}.json"),
         }
     }
 }
@@ -535,34 +577,37 @@ fn native_identity_rebind_operations(
     request_id: &str,
 ) -> Result<Vec<Value>, ProviderFailure> {
     match request {
-        NativeIdentityRebindRequest::Plan { protocol, profiles } => {
+        NativeIdentityRebindRequest::Plan { protocol, targets } => {
             require_native_identity_rebind_protocol(&protocol, request_id)?;
-            if profiles.is_empty() || profiles.len() > ACCOUNTS.len() {
+            if targets.is_empty() || targets.len() > ACCOUNTS.len() * 2 {
                 return Err(invalid_native_identity_rebind(
                     request_id,
-                    "plan profiles must contain between one and five canonical profiles",
+                    "plan targets must contain between one and ten component-scoped identities",
                 ));
             }
-            if profiles.iter().collect::<BTreeSet<_>>().len() != profiles.len() {
+            if targets.iter().collect::<BTreeSet<_>>().len() != targets.len() {
                 return Err(invalid_native_identity_rebind(
                     request_id,
-                    "plan profiles must not contain duplicates",
+                    "plan targets must not contain duplicate profile/component identities",
                 ));
             }
-            profiles
+            targets
                 .into_iter()
-                .map(|profile| {
-                    let account = canonical_rebind_profile(&profile, request_id)?;
-                    let prior_binding =
-                        native_identity_binding_evidence(host, account, request_id, false)?;
+                .map(|target| {
+                    let account = canonical_rebind_profile(&target.profile, request_id)?;
+                    let prior_identity_sha256 =
+                        native_identity_digest(host, account, target.component, request_id, false)?;
                     Ok(native_identity_rebind_operation(
                         account.opencode_wrapper,
-                        &prior_binding,
-                        &prior_binding,
-                        "awaiting_host_drain",
-                        None,
-                        None,
-                        Some("seal"),
+                        NativeIdentityRebindOperationView {
+                            component: target.component,
+                            prior_identity_sha256: prior_identity_sha256.as_deref(),
+                            observed_identity_sha256: prior_identity_sha256.as_deref(),
+                            phase: "awaiting_host_drain",
+                            diagnostic: None,
+                            disposition: None,
+                            next_action: Some("seal"),
+                        },
                     ))
                 })
                 .collect()
@@ -571,18 +616,22 @@ fn native_identity_rebind_operations(
             protocol,
             operation_id,
             profile,
-            prior_binding,
+            component,
+            prior_identity_sha256,
             host_handoff,
         } => {
             require_native_identity_rebind_protocol(&protocol, request_id)?;
-            validate_native_identity_binding_evidence(&prior_binding, request_id)?;
+            validate_optional_identity_digest(prior_identity_sha256.as_deref(), request_id)?;
             let account = canonical_rebind_profile(&profile, request_id)?;
-            let expected_operation_id =
-                native_identity_rebind_operation_id(account.opencode_wrapper, &prior_binding);
+            let expected_operation_id = native_identity_rebind_operation_id(
+                account.opencode_wrapper,
+                component,
+                prior_identity_sha256.as_deref(),
+            );
             if operation_id != expected_operation_id {
                 return Err(invalid_native_identity_rebind(
                     request_id,
-                    "operation_id does not bind the supplied profile and prior identity evidence",
+                    "operation_id does not bind the supplied profile, component, and prior identity evidence",
                 ));
             }
             if !host_handoff.ordinary_admission_blocked || !host_handoff.obligations_reconciled {
@@ -591,84 +640,90 @@ fn native_identity_rebind_operations(
                     "cutover sealing requires blocked ordinary admission and reconciled provider obligations",
                 ));
             }
-            let sealed_binding =
-                native_identity_binding_evidence(host, account, request_id, false)?;
-            if sealed_binding != prior_binding {
+            let sealed_identity_sha256 =
+                native_identity_digest(host, account, component, request_id, false)?;
+            if sealed_identity_sha256 != prior_identity_sha256 {
                 return Err(invalid_native_identity_rebind(
                     request_id,
-                    "provider identity state changed during the host drain; request a new plan while admission remains blocked",
+                    "selected provider identity state changed during the host drain; request a new component-scoped plan while admission remains blocked",
                 ));
             }
             Ok(vec![native_identity_rebind_operation(
                 account.opencode_wrapper,
-                &prior_binding,
-                &sealed_binding,
-                "awaiting_cutover",
-                None,
-                None,
-                Some("observe"),
+                NativeIdentityRebindOperationView {
+                    component,
+                    prior_identity_sha256: prior_identity_sha256.as_deref(),
+                    observed_identity_sha256: sealed_identity_sha256.as_deref(),
+                    phase: "awaiting_cutover",
+                    diagnostic: None,
+                    disposition: None,
+                    next_action: Some("observe"),
+                },
             )])
         }
         NativeIdentityRebindRequest::Observe {
             protocol,
             operation_id,
             profile,
-            prior_binding,
+            component,
+            prior_identity_sha256,
             disposition,
             host_handoff,
         } => {
             require_native_identity_rebind_protocol(&protocol, request_id)?;
-            validate_native_identity_binding_evidence(&prior_binding, request_id)?;
+            validate_optional_identity_digest(prior_identity_sha256.as_deref(), request_id)?;
             let account = canonical_rebind_profile(&profile, request_id)?;
-            let expected_operation_id =
-                native_identity_rebind_operation_id(account.opencode_wrapper, &prior_binding);
+            let expected_operation_id = native_identity_rebind_operation_id(
+                account.opencode_wrapper,
+                component,
+                prior_identity_sha256.as_deref(),
+            );
             if operation_id != expected_operation_id {
                 return Err(invalid_native_identity_rebind(
                     request_id,
-                    "operation_id does not bind the supplied profile and prior identity evidence",
+                    "operation_id does not bind the supplied profile, component, and prior identity evidence",
                 ));
             }
-            let observed_binding =
-                native_identity_binding_evidence(host, account, request_id, true)?;
+            let observed_identity_sha256 =
+                native_identity_digest(host, account, component, request_id, true)?;
             let validation_window_complete = host_handoff.ordinary_admission_blocked
-                && host_handoff.validation_launch_completed
-                && host_handoff.validation_quota_probe_completed;
+                && host_handoff.validation_capability_completed;
             let (phase, diagnostic) = match disposition {
                 NativeIdentityRebindDisposition::Committed
                     if validation_window_complete
-                        && binding_component_rebound(
-                            prior_binding.native_runtime_state_sha256.as_deref(),
-                            observed_binding.native_runtime_state_sha256.as_deref(),
-                        )
-                        && binding_component_rebound(
-                            prior_binding.quota_observer_state_sha256.as_deref(),
-                            observed_binding.quota_observer_state_sha256.as_deref(),
+                        && identity_component_rebound(
+                            prior_identity_sha256.as_deref(),
+                            observed_identity_sha256.as_deref(),
                         ) =>
                 {
                     ("awaiting_host_release", None)
                 }
                 NativeIdentityRebindDisposition::RolledBack
-                    if validation_window_complete && observed_binding == prior_binding =>
+                    if validation_window_complete
+                        && observed_identity_sha256 == prior_identity_sha256 =>
                 {
                     ("awaiting_host_release", None)
                 }
                 NativeIdentityRebindDisposition::Committed => (
                     "rejected",
-                    Some("commit observation requires ordinary admission to remain blocked, completion of the two cutover-validation capabilities, and two newly admitted provider identity records"),
+                    Some("commit observation requires ordinary admission to remain blocked, completion of the selected component's validation capability, and a newly admitted identity record for that component"),
                 ),
                 NativeIdentityRebindDisposition::RolledBack => (
                     "rejected",
-                    Some("rollback observation requires ordinary admission to remain blocked, completion of the two cutover-validation capabilities, and exact restoration of both prior identity records"),
+                    Some("rollback observation requires ordinary admission to remain blocked, completion of the selected component's validation capability, and exact restoration of that component's prior identity record"),
                 ),
             };
             Ok(vec![native_identity_rebind_operation(
                 account.opencode_wrapper,
-                &prior_binding,
-                &observed_binding,
-                phase,
-                diagnostic,
-                Some(disposition),
-                (phase == "awaiting_host_release").then_some("release"),
+                NativeIdentityRebindOperationView {
+                    component,
+                    prior_identity_sha256: prior_identity_sha256.as_deref(),
+                    observed_identity_sha256: observed_identity_sha256.as_deref(),
+                    phase,
+                    diagnostic,
+                    disposition: Some(disposition),
+                    next_action: (phase == "awaiting_host_release").then_some("release"),
+                },
             )])
         }
         NativeIdentityRebindRequest::Release {
@@ -676,45 +731,49 @@ fn native_identity_rebind_operations(
             operation_id,
             observation_id,
             profile,
-            prior_binding,
-            observed_binding,
+            component,
+            prior_identity_sha256,
+            observed_identity_sha256,
             disposition,
             host_handoff,
         } => {
             require_native_identity_rebind_protocol(&protocol, request_id)?;
-            validate_native_identity_binding_evidence(&prior_binding, request_id)?;
-            validate_native_identity_binding_evidence(&observed_binding, request_id)?;
+            validate_optional_identity_digest(prior_identity_sha256.as_deref(), request_id)?;
+            validate_optional_identity_digest(observed_identity_sha256.as_deref(), request_id)?;
             let account = canonical_rebind_profile(&profile, request_id)?;
-            let expected_operation_id =
-                native_identity_rebind_operation_id(account.opencode_wrapper, &prior_binding);
+            let expected_operation_id = native_identity_rebind_operation_id(
+                account.opencode_wrapper,
+                component,
+                prior_identity_sha256.as_deref(),
+            );
             if operation_id != expected_operation_id {
                 return Err(invalid_native_identity_rebind(
                     request_id,
-                    "operation_id does not bind the supplied profile and prior identity evidence",
+                    "operation_id does not bind the supplied profile, component, and prior identity evidence",
                 ));
             }
             let expected_observation_id = native_identity_rebind_observation_id(
                 &operation_id,
-                &observed_binding,
+                observed_identity_sha256.as_deref(),
                 disposition,
             );
             if observation_id != expected_observation_id {
                 return Err(invalid_native_identity_rebind(
                     request_id,
-                    "observation_id does not bind the supplied operation, disposition, and observed identity evidence",
+                    "observation_id does not bind the supplied operation, disposition, and observed component identity",
                 ));
             }
-            let current_binding =
-                native_identity_binding_evidence(host, account, request_id, true)?;
+            let current_identity_sha256 =
+                native_identity_digest(host, account, component, request_id, true)?;
             let (phase, diagnostic) = if !host_handoff.ordinary_admission_reopened {
                 (
                     "rejected",
                     Some("release acknowledgment requires the host to reopen ordinary admission"),
                 )
-            } else if current_binding != observed_binding {
+            } else if current_identity_sha256 != observed_identity_sha256 {
                 (
                     "rejected",
-                    Some("provider identity state changed after observation and before host release acknowledgment"),
+                    Some("selected provider identity changed after observation and before host release acknowledgment"),
                 )
             } else {
                 match disposition {
@@ -724,91 +783,99 @@ fn native_identity_rebind_operations(
             };
             Ok(vec![native_identity_rebind_operation(
                 account.opencode_wrapper,
-                &prior_binding,
-                &current_binding,
-                phase,
-                diagnostic,
-                Some(disposition),
-                None,
+                NativeIdentityRebindOperationView {
+                    component,
+                    prior_identity_sha256: prior_identity_sha256.as_deref(),
+                    observed_identity_sha256: current_identity_sha256.as_deref(),
+                    phase,
+                    diagnostic,
+                    disposition: Some(disposition),
+                    next_action: None,
+                },
             )])
         }
     }
 }
 
-fn native_identity_binding_evidence(
+fn native_identity_digest(
     host: &HostContext,
     account: &crate::account::AccountProfile,
+    component: NativeIdentityRebindComponent,
     request_id: &str,
     require_valid_identity: bool,
-) -> Result<NativeIdentityBindingEvidence, ProviderFailure> {
-    let native_runtime_state_sha256 = if require_valid_identity {
-        native_runtime::validated_persisted_state_sha256(host, account, request_id)?
-    } else {
-        native_runtime::persisted_state_sha256(host, account, request_id)?
-    };
-    let quota_observer_state_sha256 = if require_valid_identity {
-        quota_observer::validated_persisted_state_sha256(host, account, request_id)?
-    } else {
-        quota_observer::persisted_state_sha256(host, account, request_id)?
-    };
-    Ok(NativeIdentityBindingEvidence {
-        native_runtime_state_sha256,
-        quota_observer_state_sha256,
-    })
+) -> Result<Option<String>, ProviderFailure> {
+    match (component, require_valid_identity) {
+        (NativeIdentityRebindComponent::NativeRuntime, true) => {
+            native_runtime::validated_persisted_state_sha256(host, account, request_id)
+        }
+        (NativeIdentityRebindComponent::NativeRuntime, false) => {
+            native_runtime::persisted_state_sha256(host, account, request_id)
+        }
+        (NativeIdentityRebindComponent::QuotaObserver, true) => {
+            quota_observer::validated_persisted_state_sha256(host, account, request_id)
+        }
+        (NativeIdentityRebindComponent::QuotaObserver, false) => {
+            quota_observer::persisted_state_sha256(host, account, request_id)
+        }
+    }
 }
 
 fn native_identity_rebind_operation(
     profile: &str,
-    prior_binding: &NativeIdentityBindingEvidence,
-    observed_binding: &NativeIdentityBindingEvidence,
-    phase: &str,
-    diagnostic: Option<&str>,
-    disposition: Option<NativeIdentityRebindDisposition>,
-    next_action: Option<&str>,
+    view: NativeIdentityRebindOperationView<'_>,
 ) -> Value {
-    let operation_id = native_identity_rebind_operation_id(profile, prior_binding);
+    let NativeIdentityRebindOperationView {
+        component,
+        prior_identity_sha256,
+        observed_identity_sha256,
+        phase,
+        diagnostic,
+        disposition,
+        next_action,
+    } = view;
+    let operation_id =
+        native_identity_rebind_operation_id(profile, component, prior_identity_sha256);
+    let validation_capability = component.validation_capability();
     let mut operation = json!({
         "kind": "native_identity_rebind",
         "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
         "schema_id": NATIVE_IDENTITY_REBIND_SCHEMA_ID,
         "operation_id": operation_id,
         "profile": profile,
+        "component": component.as_str(),
         "phase": phase,
         "maximum_drain_ms": NATIVE_IDENTITY_REBIND_DRAIN_MS,
-        "prior_binding": prior_binding,
-        "observed_binding": observed_binding,
+        "prior_identity_sha256": prior_identity_sha256,
+        "observed_identity_sha256": observed_identity_sha256,
         "responsibilities": [
             {
                 "actor": "host",
-                "action": "block ordinary capability admission for this profile, bound every in-flight request to the declared drain interval, and keep ordinary admission blocked through provider observation",
+                "action": format!("block ordinary capability admission that consumes the selected {} identity, bound in-flight consumers to the drain interval, and keep ordinary admission blocked through provider observation", component.as_str()),
                 "completion": "seal and observe assert host_handoff.ordinary_admission_blocked=true"
             },
             {
                 "actor": "operator",
-                "action": "reconcile every nonterminal launch, rotation, and quota-refresh obligation before cutover",
+                "action": format!("reconcile every nonterminal obligation that consumes the selected {} identity before cutover", component.as_str()),
                 "completion": "the seal request asserts host_handoff.obligations_reconciled=true"
             },
             {
                 "actor": "host",
-                "action": "while ordinary admission remains blocked, authorize exactly one operation-bound validation launch and quota probe, then reopen ordinary admission only after provider observation",
-                "completion": "observe asserts both validation capabilities completed; release asserts ordinary admission reopened"
+                "action": format!("while ordinary admission remains blocked, authorize exactly one operation-bound {validation_capability}, then reopen ordinary admission only after provider observation"),
+                "completion": "observe asserts the selected validation capability completed; release asserts ordinary admission reopened"
             },
             {
                 "actor": "operator",
-                "action": "stage replacement dependencies and preserve both prior provider identity records for rollback",
-                "completion": "both observed provider identity records differ from the plan-bound prior records, or both prior records are restored"
+                "action": format!("stage the replacement {} dependency and preserve its prior provider identity record for rollback", component.as_str()),
+                "completion": "the observed component identity differs from the plan-bound prior identity, or the prior identity is restored"
             },
             {
                 "actor": "provider",
-                "action": "bind the request to the plan identity and observe both provider-owned identity records",
+                "action": "bind the request to the component-scoped plan identity and observe that provider-owned identity record",
                 "completion": "observation emits an observation-bound release request; release returns completed, rolled_back, or rejected"
             }
         ],
         "implementation_evidence": {
-            "provider_state_records": [
-                format!("native-runtimes/{profile}.json"),
-                format!("quota-observers/{profile}.json")
-            ]
+            "provider_state_record": component.provider_state_record(profile)
         }
     });
     match next_action {
@@ -818,7 +885,8 @@ fn native_identity_rebind_operation(
                 "action": "seal",
                 "operation_id": operation_id,
                 "profile": profile,
-                "prior_binding": prior_binding,
+                "component": component.as_str(),
+                "prior_identity_sha256": prior_identity_sha256,
                 "host_handoff": {
                     "ordinary_admission_blocked": true,
                     "obligations_reconciled": true
@@ -831,19 +899,22 @@ fn native_identity_rebind_operation(
                 "action": "observe",
                 "operation_id": operation_id,
                 "profile": profile,
-                "prior_binding": prior_binding,
+                "component": component.as_str(),
+                "prior_identity_sha256": prior_identity_sha256,
                 "disposition": "committed",
                 "host_handoff": {
                     "ordinary_admission_blocked": true,
-                    "validation_launch_completed": true,
-                    "validation_quota_probe_completed": true
+                    "validation_capability_completed": true
                 }
             });
         }
         Some("release") => {
             let disposition = disposition.expect("release follows a typed observation");
-            let observation_id =
-                native_identity_rebind_observation_id(&operation_id, observed_binding, disposition);
+            let observation_id = native_identity_rebind_observation_id(
+                &operation_id,
+                observed_identity_sha256,
+                disposition,
+            );
             operation["observation_id"] = json!(observation_id);
             operation["disposition"] = json!(disposition.as_str());
             operation["next_request"] = json!({
@@ -852,8 +923,9 @@ fn native_identity_rebind_operation(
                 "operation_id": operation_id,
                 "observation_id": observation_id,
                 "profile": profile,
-                "prior_binding": prior_binding,
-                "observed_binding": observed_binding,
+                "component": component.as_str(),
+                "prior_identity_sha256": prior_identity_sha256,
+                "observed_identity_sha256": observed_identity_sha256,
                 "disposition": disposition.as_str(),
                 "host_handoff": {
                     "ordinary_admission_reopened": true
@@ -864,8 +936,11 @@ fn native_identity_rebind_operation(
         None => {}
     }
     if let Some(disposition) = disposition {
-        let observation_id =
-            native_identity_rebind_observation_id(&operation_id, observed_binding, disposition);
+        let observation_id = native_identity_rebind_observation_id(
+            &operation_id,
+            observed_identity_sha256,
+            disposition,
+        );
         operation["observation_id"] = json!(observation_id);
         operation["disposition"] = json!(disposition.as_str());
     }
@@ -877,13 +952,13 @@ fn native_identity_rebind_operation(
 
 fn native_identity_rebind_observation_id(
     operation_id: &str,
-    observed_binding: &NativeIdentityBindingEvidence,
+    observed_identity_sha256: Option<&str>,
     disposition: NativeIdentityRebindDisposition,
 ) -> String {
     sha256_hex(
         json!({
             "operation_id": operation_id,
-            "observed_binding": observed_binding,
+            "observed_identity_sha256": observed_identity_sha256,
             "disposition": disposition.as_str(),
         })
         .to_string()
@@ -893,20 +968,22 @@ fn native_identity_rebind_observation_id(
 
 fn native_identity_rebind_operation_id(
     profile: &str,
-    prior_binding: &NativeIdentityBindingEvidence,
+    component: NativeIdentityRebindComponent,
+    prior_identity_sha256: Option<&str>,
 ) -> String {
     sha256_hex(
         json!({
             "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
             "profile": profile,
-            "prior_binding": prior_binding,
+            "component": component.as_str(),
+            "prior_identity_sha256": prior_identity_sha256,
         })
         .to_string()
         .as_bytes(),
     )
 }
 
-fn binding_component_rebound(prior: Option<&str>, observed: Option<&str>) -> bool {
+fn identity_component_rebound(prior: Option<&str>, observed: Option<&str>) -> bool {
     observed.is_some() && observed != prior
 }
 
@@ -937,24 +1014,16 @@ fn require_native_identity_rebind_protocol(
     ))
 }
 
-fn validate_native_identity_binding_evidence(
-    evidence: &NativeIdentityBindingEvidence,
+fn validate_optional_identity_digest(
+    identity_sha256: Option<&str>,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    if evidence
-        .native_runtime_state_sha256
-        .as_deref()
-        .is_none_or(valid_sha256)
-        && evidence
-            .quota_observer_state_sha256
-            .as_deref()
-            .is_none_or(valid_sha256)
-    {
+    if identity_sha256.is_none_or(valid_sha256) {
         return Ok(());
     }
     Err(invalid_native_identity_rebind(
         request_id,
-        "prior identity evidence must contain lowercase SHA-256 values or null",
+        "component identity evidence must contain a lowercase SHA-256 value or null",
     ))
 }
 

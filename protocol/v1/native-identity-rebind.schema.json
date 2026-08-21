@@ -2,11 +2,23 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.oulipoly.dev/opencode/native-identity-rebind/v1",
   "x-protocol": "opencode.native-identity-rebind/v1",
-  "title": "OpenCode Native Identity Rebind Maintenance Protocol",
+  "title": "OpenCode Component-Scoped Native Identity Rebind Maintenance Protocol",
   "type": "object",
   "$defs": {
     "Profile": {
       "enum": ["opencode1", "opencode2", "opencode3", "opencode4", "opencode5"]
+    },
+    "Component": {
+      "enum": ["native_runtime", "quota_observer"]
+    },
+    "Target": {
+      "type": "object",
+      "properties": {
+        "profile": { "$ref": "#/$defs/Profile" },
+        "component": { "$ref": "#/$defs/Component" }
+      },
+      "required": ["profile", "component"],
+      "additionalProperties": false
     },
     "Digest": {
       "type": "string",
@@ -18,29 +30,20 @@
         { "type": "null" }
       ]
     },
-    "BindingEvidence": {
-      "type": "object",
-      "properties": {
-        "native_runtime_state_sha256": { "$ref": "#/$defs/OptionalDigest" },
-        "quota_observer_state_sha256": { "$ref": "#/$defs/OptionalDigest" }
-      },
-      "required": ["native_runtime_state_sha256", "quota_observer_state_sha256"],
-      "additionalProperties": false
-    },
     "PlanRequest": {
       "type": "object",
       "properties": {
         "protocol": { "const": "opencode.native-identity-rebind/v1" },
         "action": { "const": "plan" },
-        "profiles": {
+        "targets": {
           "type": "array",
           "minItems": 1,
-          "maxItems": 5,
+          "maxItems": 10,
           "uniqueItems": true,
-          "items": { "$ref": "#/$defs/Profile" }
+          "items": { "$ref": "#/$defs/Target" }
         }
       },
-      "required": ["protocol", "action", "profiles"],
+      "required": ["protocol", "action", "targets"],
       "additionalProperties": false
     },
     "SealHandoff": {
@@ -56,14 +59,9 @@
       "type": "object",
       "properties": {
         "ordinary_admission_blocked": { "type": "boolean" },
-        "validation_launch_completed": { "type": "boolean" },
-        "validation_quota_probe_completed": { "type": "boolean" }
+        "validation_capability_completed": { "type": "boolean" }
       },
-      "required": [
-        "ordinary_admission_blocked",
-        "validation_launch_completed",
-        "validation_quota_probe_completed"
-      ],
+      "required": ["ordinary_admission_blocked", "validation_capability_completed"],
       "additionalProperties": false
     },
     "ReleaseHandoff": {
@@ -81,10 +79,11 @@
         "action": { "const": "seal" },
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
-        "prior_binding": { "$ref": "#/$defs/BindingEvidence" },
+        "component": { "$ref": "#/$defs/Component" },
+        "prior_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
         "host_handoff": { "$ref": "#/$defs/SealHandoff" }
       },
-      "required": ["protocol", "action", "operation_id", "profile", "prior_binding", "host_handoff"],
+      "required": ["protocol", "action", "operation_id", "profile", "component", "prior_identity_sha256", "host_handoff"],
       "additionalProperties": false
     },
     "ObservationRequest": {
@@ -94,11 +93,12 @@
         "action": { "const": "observe" },
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
-        "prior_binding": { "$ref": "#/$defs/BindingEvidence" },
+        "component": { "$ref": "#/$defs/Component" },
+        "prior_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
         "disposition": { "enum": ["committed", "rolled_back"] },
         "host_handoff": { "$ref": "#/$defs/ObservationHandoff" }
       },
-      "required": ["protocol", "action", "operation_id", "profile", "prior_binding", "disposition", "host_handoff"],
+      "required": ["protocol", "action", "operation_id", "profile", "component", "prior_identity_sha256", "disposition", "host_handoff"],
       "additionalProperties": false
     },
     "ReleaseRequest": {
@@ -109,12 +109,13 @@
         "operation_id": { "$ref": "#/$defs/Digest" },
         "observation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
-        "prior_binding": { "$ref": "#/$defs/BindingEvidence" },
-        "observed_binding": { "$ref": "#/$defs/BindingEvidence" },
+        "component": { "$ref": "#/$defs/Component" },
+        "prior_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
+        "observed_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
         "disposition": { "enum": ["committed", "rolled_back"] },
         "host_handoff": { "$ref": "#/$defs/ReleaseHandoff" }
       },
-      "required": ["protocol", "action", "operation_id", "observation_id", "profile", "prior_binding", "observed_binding", "disposition", "host_handoff"],
+      "required": ["protocol", "action", "operation_id", "observation_id", "profile", "component", "prior_identity_sha256", "observed_identity_sha256", "disposition", "host_handoff"],
       "additionalProperties": false
     },
     "Request": {
@@ -143,10 +144,11 @@
         "schema_id": { "const": "opencode.native-identity-rebind/v1" },
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
+        "component": { "$ref": "#/$defs/Component" },
         "phase": { "enum": ["awaiting_host_drain", "awaiting_cutover", "awaiting_host_release", "completed", "rolled_back", "rejected"] },
         "maximum_drain_ms": { "const": 20000 },
-        "prior_binding": { "$ref": "#/$defs/BindingEvidence" },
-        "observed_binding": { "$ref": "#/$defs/BindingEvidence" },
+        "prior_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
+        "observed_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
         "observation_id": { "$ref": "#/$defs/Digest" },
         "disposition": { "enum": ["committed", "rolled_back"] },
         "responsibilities": {
@@ -159,27 +161,16 @@
         "implementation_evidence": {
           "type": "object",
           "properties": {
-            "provider_state_records": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 }
-            }
+            "provider_state_record": { "type": "string", "minLength": 1 }
           },
-          "required": ["provider_state_records"],
+          "required": ["provider_state_record"],
           "additionalProperties": false
         }
       },
       "required": [
-        "kind",
-        "protocol",
-        "schema_id",
-        "operation_id",
-        "profile",
-        "phase",
-        "maximum_drain_ms",
-        "prior_binding",
-        "observed_binding",
-        "responsibilities",
-        "implementation_evidence"
+        "kind", "protocol", "schema_id", "operation_id", "profile", "component", "phase",
+        "maximum_drain_ms", "prior_identity_sha256", "observed_identity_sha256",
+        "responsibilities", "implementation_evidence"
       ],
       "allOf": [
         {

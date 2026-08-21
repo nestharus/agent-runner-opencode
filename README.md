@@ -433,8 +433,11 @@ identity is admitted. This provider owns the separately versioned
 `opencode.native-identity-rebind/v1` maintenance protocol; its exact JSON Schema
 is available through `schema`. `setup.sync_plan` accepts that protocol under
 `params.native_identity_rebind` and emits operations carrying the same protocol,
-schema ID, content-bound operation ID, actor responsibilities, prior identity
-evidence, and a typed completion-observation request. The authoritative
+schema ID, component-scoped operation ID, actor responsibilities, prior identity
+evidence, and a typed completion-observation request. Each target names exactly
+one `native_runtime` or `quota_observer` identity. A host that needs a coordinated
+two-component rollout composes two explicit targets; neither independent entity
+is implicitly replaced with the other. The authoritative
 `oulipoly.provider/v1` setup schema remains an unchanged Agent Runner snapshot;
 its intentionally open setup objects carry this explicitly named provider
 extension rather than silently redefining the shared contract.
@@ -444,41 +447,41 @@ identity hashing is capped at 64 MiB, and their per-account lock admission is
 bounded by the earlier host deadline or five seconds. A lock timeout fails the
 request with a named identity-lock result rather than waiting indefinitely.
 
-1. The host stops new admission for the selected profile. It gives every in-flight provider
-   request a deadline of at most 20 seconds and waits one such drain interval.
-2. The operator reconciles every nonterminal launch, rotation, and quota-refresh record. If
-   any effect remains ambiguous, abort the rollout and retain the old binding;
-   the cutover interval does not begin until obligations are settled.
+1. The host stops ordinary admission for capabilities that consume the selected
+   profile/component identity. It gives every affected in-flight provider request
+   a deadline of at most 20 seconds and waits one such drain interval.
+2. The operator reconciles every nonterminal obligation that consumes that
+   component. If any effect remains ambiguous, abort the rollout and retain the
+   old identity; the cutover interval does not begin until obligations are settled.
 3. The host submits the plan's typed `seal` request while admission remains
    blocked. The provider rejects sealing if either host assertion is false or
-   either provider identity record changed during drain; a successful seal
-   binds the exact pre-cutover record digests into the operation ID.
-4. The operator stages the new wrapper and `curl` implementation without altering the files
-   named by the old binding. Back up and remove only
-   `native-runtimes/<profile>.json` and
-   `quota-observers/<profile>.json` under the provider state root.
+   the selected provider identity record changed during drain; a successful seal
+   binds its exact pre-cutover digest and component into the operation ID.
+4. The operator stages only the selected replacement implementation without
+   altering the implementation named by its old identity. Back up and remove
+   only `native-runtimes/<profile>.json` for a `native_runtime` target or only
+   `quota-observers/<profile>.json` for a `quota_observer` target.
 5. Ordinary admission remains blocked. The host opens one operation-bound
-   validation window for exactly one quota probe and one launch under the
-   intended `PATH` and stable environment. They durably admit the new identities
-   without reopening unrelated profile traffic. If either validation admission
-   fails, the operator restores the two binding backups and old staged
-   dependencies, then runs the same two validation capabilities against the
-   restored identity.
+   validation window for exactly one launch for a `native_runtime` target or one
+   quota probe for a `quota_observer` target. That capability durably admits the
+   selected identity without reopening unrelated traffic. If validation fails,
+   the operator restores that component's backup and old staged dependency, then
+   runs the same validation capability against the restored identity.
 6. While ordinary admission is still blocked, the host sends the plan-bound
-   `observe` request and attests that both validation capabilities completed.
-   The provider validates the operation ID and current identity records. A valid
+   `observe` request and attests that the selected validation capability completed.
+   The provider validates the operation ID and current component identity. A valid
    commit or rollback returns `awaiting_host_release`, an observation-bound
    release request, and not a terminal success.
 7. The host reopens ordinary admission and sends that exact `release` request.
-   The provider checks the observation identity and unchanged current binding,
+   The provider checks the observation identity and unchanged current component,
    then returns `completed` or `rolled_back`. A false release assertion or a
    changed binding returns `rejected`.
 
 Private state paths are included only as implementation evidence, not as the
-protocol's meaning. A commit reaches release only when both identities are newly
-admitted, while rollback reaches release only when both prior record digests are
+protocol's meaning. A component commit reaches release only when its identity is
+newly admitted, while rollback reaches release only when its prior identity is
 restored. The host exclusively owns the distinction between blocked ordinary
-traffic and the two cutover-validation exceptions, and the typed release
+traffic and the component's cutover-validation exception, and the typed release
 acknowledgment owns the transition back to ordinary admission.
 
 After obligations are settled, the declared cutover bound is one
