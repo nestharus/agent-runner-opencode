@@ -457,17 +457,29 @@ request with a named identity-lock result rather than waiting indefinitely.
    named by the old binding. Back up and remove only
    `native-runtimes/<profile>.json` and
    `quota-observers/<profile>.json` under the provider state root.
-5. The operator restores admission and runs one quota probe and one launch under the intended
-   `PATH` and stable environment. They durably admit the new identities. If
-   either admission fails, restore the two binding backups and the old staged
-   dependencies.
+5. Ordinary admission remains blocked. The host opens one operation-bound
+   validation window for exactly one quota probe and one launch under the
+   intended `PATH` and stable environment. They durably admit the new identities
+   without reopening unrelated profile traffic. If either validation admission
+   fails, the operator restores the two binding backups and old staged
+   dependencies, then runs the same two validation capabilities against the
+   restored identity.
+6. While ordinary admission is still blocked, the host sends the plan-bound
+   `observe` request and attests that both validation capabilities completed.
+   The provider validates the operation ID and current identity records. A valid
+   commit or rollback returns `awaiting_host_release`, an observation-bound
+   release request, and not a terminal success.
+7. The host reopens ordinary admission and sends that exact `release` request.
+   The provider checks the observation identity and unchanged current binding,
+   then returns `completed` or `rolled_back`. A false release assertion or a
+   changed binding returns `rejected`.
 
-The operator then sends the plan-bound `observe` request. The provider validates
-the operation ID and both current identity records and returns exactly one of
-`completed`, `rolled_back`, or `rejected`; private state paths are included only
-as implementation evidence, not as the protocol's meaning. A commit closes only
-when both identities are newly admitted, while rollback closes only when both
-prior record digests are restored.
+Private state paths are included only as implementation evidence, not as the
+protocol's meaning. A commit reaches release only when both identities are newly
+admitted, while rollback reaches release only when both prior record digests are
+restored. The host exclusively owns the distinction between blocked ordinary
+traffic and the two cutover-validation exceptions, and the typed release
+acknowledgment owns the transition back to ordinary admission.
 
 After obligations are settled, the declared cutover bound is one
 20-second admission interval; rollback is the same bounded two-file maintenance

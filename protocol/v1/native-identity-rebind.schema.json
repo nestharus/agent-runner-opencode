@@ -43,34 +43,35 @@
       "required": ["protocol", "action", "profiles"],
       "additionalProperties": false
     },
-    "ObservationRequest": {
+    "SealHandoff": {
       "type": "object",
       "properties": {
-        "protocol": { "const": "opencode.native-identity-rebind/v1" },
-        "action": { "const": "observe" },
-        "operation_id": { "$ref": "#/$defs/Digest" },
-        "profile": { "$ref": "#/$defs/Profile" },
-        "prior_binding": { "$ref": "#/$defs/BindingEvidence" },
-        "disposition": { "enum": ["committed", "rolled_back"] },
-        "host_handoff": {
-          "type": "object",
-          "properties": {
-            "admission_blocked": { "type": "boolean" },
-            "obligations_reconciled": { "type": "boolean" }
-          },
-          "required": ["admission_blocked", "obligations_reconciled"],
-          "additionalProperties": false
-        }
+        "ordinary_admission_blocked": { "type": "boolean" },
+        "obligations_reconciled": { "type": "boolean" }
+      },
+      "required": ["ordinary_admission_blocked", "obligations_reconciled"],
+      "additionalProperties": false
+    },
+    "ObservationHandoff": {
+      "type": "object",
+      "properties": {
+        "ordinary_admission_blocked": { "type": "boolean" },
+        "validation_launch_completed": { "type": "boolean" },
+        "validation_quota_probe_completed": { "type": "boolean" }
       },
       "required": [
-        "protocol",
-        "action",
-        "operation_id",
-        "profile",
-        "prior_binding",
-        "disposition",
-        "host_handoff"
+        "ordinary_admission_blocked",
+        "validation_launch_completed",
+        "validation_quota_probe_completed"
       ],
+      "additionalProperties": false
+    },
+    "ReleaseHandoff": {
+      "type": "object",
+      "properties": {
+        "ordinary_admission_reopened": { "type": "boolean" }
+      },
+      "required": ["ordinary_admission_reopened"],
       "additionalProperties": false
     },
     "SealRequest": {
@@ -81,31 +82,47 @@
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
         "prior_binding": { "$ref": "#/$defs/BindingEvidence" },
-        "host_handoff": {
-          "type": "object",
-          "properties": {
-            "admission_blocked": { "type": "boolean" },
-            "obligations_reconciled": { "type": "boolean" }
-          },
-          "required": ["admission_blocked", "obligations_reconciled"],
-          "additionalProperties": false
-        }
+        "host_handoff": { "$ref": "#/$defs/SealHandoff" }
       },
-      "required": [
-        "protocol",
-        "action",
-        "operation_id",
-        "profile",
-        "prior_binding",
-        "host_handoff"
-      ],
+      "required": ["protocol", "action", "operation_id", "profile", "prior_binding", "host_handoff"],
+      "additionalProperties": false
+    },
+    "ObservationRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "opencode.native-identity-rebind/v1" },
+        "action": { "const": "observe" },
+        "operation_id": { "$ref": "#/$defs/Digest" },
+        "profile": { "$ref": "#/$defs/Profile" },
+        "prior_binding": { "$ref": "#/$defs/BindingEvidence" },
+        "disposition": { "enum": ["committed", "rolled_back"] },
+        "host_handoff": { "$ref": "#/$defs/ObservationHandoff" }
+      },
+      "required": ["protocol", "action", "operation_id", "profile", "prior_binding", "disposition", "host_handoff"],
+      "additionalProperties": false
+    },
+    "ReleaseRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "opencode.native-identity-rebind/v1" },
+        "action": { "const": "release" },
+        "operation_id": { "$ref": "#/$defs/Digest" },
+        "observation_id": { "$ref": "#/$defs/Digest" },
+        "profile": { "$ref": "#/$defs/Profile" },
+        "prior_binding": { "$ref": "#/$defs/BindingEvidence" },
+        "observed_binding": { "$ref": "#/$defs/BindingEvidence" },
+        "disposition": { "enum": ["committed", "rolled_back"] },
+        "host_handoff": { "$ref": "#/$defs/ReleaseHandoff" }
+      },
+      "required": ["protocol", "action", "operation_id", "observation_id", "profile", "prior_binding", "observed_binding", "disposition", "host_handoff"],
       "additionalProperties": false
     },
     "Request": {
       "oneOf": [
         { "$ref": "#/$defs/PlanRequest" },
         { "$ref": "#/$defs/SealRequest" },
-        { "$ref": "#/$defs/ObservationRequest" }
+        { "$ref": "#/$defs/ObservationRequest" },
+        { "$ref": "#/$defs/ReleaseRequest" }
       ]
     },
     "Responsibility": {
@@ -126,10 +143,12 @@
         "schema_id": { "const": "opencode.native-identity-rebind/v1" },
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
-        "phase": { "enum": ["awaiting_host_drain", "awaiting_cutover", "completed", "rolled_back", "rejected"] },
+        "phase": { "enum": ["awaiting_host_drain", "awaiting_cutover", "awaiting_host_release", "completed", "rolled_back", "rejected"] },
         "maximum_drain_ms": { "const": 20000 },
         "prior_binding": { "$ref": "#/$defs/BindingEvidence" },
         "observed_binding": { "$ref": "#/$defs/BindingEvidence" },
+        "observation_id": { "$ref": "#/$defs/Digest" },
+        "disposition": { "enum": ["committed", "rolled_back"] },
         "responsibilities": {
           "type": "array",
           "minItems": 1,
@@ -161,6 +180,36 @@
         "observed_binding",
         "responsibilities",
         "implementation_evidence"
+      ],
+      "allOf": [
+        {
+          "if": { "properties": { "phase": { "const": "awaiting_host_drain" } } },
+          "then": {
+            "required": ["next_request"],
+            "properties": { "next_request": { "$ref": "#/$defs/SealRequest" } }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "awaiting_cutover" } } },
+          "then": {
+            "required": ["next_request"],
+            "properties": { "next_request": { "$ref": "#/$defs/ObservationRequest" } }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "awaiting_host_release" } } },
+          "then": {
+            "required": ["observation_id", "disposition", "next_request"],
+            "properties": { "next_request": { "$ref": "#/$defs/ReleaseRequest" } }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "enum": ["completed", "rolled_back", "rejected"] } } },
+          "then": {
+            "required": ["observation_id", "disposition"],
+            "not": { "required": ["next_request"] }
+          }
+        }
       ],
       "additionalProperties": false
     }

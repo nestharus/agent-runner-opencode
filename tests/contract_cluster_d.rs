@@ -1677,12 +1677,16 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
         .expect("sealed identity rebind operation");
     assert_eq!(sealed["phase"], "awaiting_cutover");
     assert_eq!(sealed["next_request"]["action"], "observe");
+    assert_eq!(
+        sealed["next_request"]["host_handoff"]["ordinary_admission_blocked"],
+        true
+    );
     assert_native_identity_rebind_schema(&protocol, "Operation", sealed);
     assert_native_identity_rebind_schema(&protocol, "Request", &sealed["next_request"]);
 
     let mut rollback_observation = sealed["next_request"].clone();
     rollback_observation["disposition"] = json!("rolled_back");
-    let rollback = success_result(
+    let observation = success_result(
         invoke_validated(
             "setup.sync_plan",
             json!({
@@ -1695,15 +1699,45 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
         "setup.schema.json#/$defs/SetupSyncPlanResponse",
         "setup.schema.json#/$defs/SetupSyncPlanResult",
     );
-    let observed = rollback["operations"]
+    let observed = observation["operations"]
         .as_array()
         .expect("sync operations")
         .iter()
         .find(|operation| operation["kind"] == "native_identity_rebind")
         .expect("identity rebind observation");
     assert_eq!(observed["operation_id"], rebind["operation_id"]);
-    assert_eq!(observed["phase"], "rolled_back");
+    assert_eq!(observed["phase"], "awaiting_host_release");
+    assert_eq!(observed["next_request"]["action"], "release");
+    assert_eq!(
+        observed["next_request"]["host_handoff"]["ordinary_admission_reopened"],
+        true
+    );
     assert_native_identity_rebind_schema(&protocol, "Operation", observed);
+    assert_native_identity_rebind_schema(&protocol, "Request", &observed["next_request"]);
+
+    let released = success_result(
+        invoke_validated(
+            "setup.sync_plan",
+            json!({
+                "settings_schema_id": "opencode.settings/v1",
+                "desired_profiles": ["opencode3"],
+                "native_identity_rebind": observed["next_request"]
+            }),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    let released = released["operations"]
+        .as_array()
+        .expect("sync operations")
+        .iter()
+        .find(|operation| operation["kind"] == "native_identity_rebind")
+        .expect("released identity rebind operation");
+    assert_eq!(released["operation_id"], rebind["operation_id"]);
+    assert_eq!(released["observation_id"], observed["observation_id"]);
+    assert_eq!(released["phase"], "rolled_back");
+    assert_native_identity_rebind_schema(&protocol, "Operation", released);
 }
 
 fn assert_native_identity_rebind_schema(schema: &Value, definition: &str, value: &Value) {
