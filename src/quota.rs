@@ -270,7 +270,7 @@ pub fn refresh_auth_params(
                 (operation, account, runtime, observer, auth_path)
             }
         };
-    let _account_lock = acquire_quota_refresh_account_lock(host, account, &auth_path, request_id)?;
+    let _effect_lock = acquire_quota_refresh_effect_lock(host, &auth_path, request_id)?;
     let native_timeout = quota_refresh_operation_timeout(host, request_id)?;
     operation.phase = QuotaRefreshOperationPhase::NativeEffectAdmitted;
     operation.native_effect_admitted_at_unix_ms = Some(now_unix_ms());
@@ -329,7 +329,7 @@ fn reconcile_quota_refresh_operation(
     }
     let (account, runtime, observer, auth_path) =
         quota_refresh_operation_route(host, &operation, request_id)?;
-    let _account_lock = acquire_quota_refresh_account_lock(host, account, &auth_path, request_id)?;
+    let _effect_lock = acquire_quota_refresh_effect_lock(host, &auth_path, request_id)?;
     let credential_bytes =
         durable_fs::read_file_bounded(&auth_path, durable_fs::MAX_AUTH_FILE_BYTES)
             .map_err(|error| quota_refresh_state_failure(request_id, error))?;
@@ -601,40 +601,60 @@ fn acquire_quota_refresh_request_lock(
     Ok(lock)
 }
 
-fn acquire_quota_refresh_account_lock(
-    host: &HostContext,
-    account: &AccountProfile,
-    auth_path: &Path,
-    request_id: &str,
-) -> Result<fs::File, ProviderFailure> {
-    let name = sha256_hex(
-        format!(
-            "{}\0{}\0{}",
-            account.opencode_wrapper,
-            account.opencode_index,
-            auth_path.display()
-        )
-        .as_bytes(),
-    );
-    acquire_quota_refresh_lock(host, &format!("locks/accounts/{name}.lock"), request_id)
+struct QuotaRefreshEffectLock {
+    _credential_path_lock: fs::File,
+    _credential_file_lock: Option<fs::File>,
 }
 
-fn acquire_quota_refresh_lock(
+fn acquire_quota_refresh_effect_lock(
     host: &HostContext,
-    relative: &str,
+    auth_path: &Path,
     request_id: &str,
-) -> Result<fs::File, ProviderFailure> {
-    let root = quota_refresh_state_root(host, request_id)?;
-    let path = confined_quota_refresh_target(host, &root.join(relative), request_id)?;
-    let parent = path
-        .parent()
-        .expect("quota refresh lock always has a parent");
-    durable_fs::create_private_directories(parent)
+) -> Result<QuotaRefreshEffectLock, ProviderFailure> {
+    let canonical_auth_path = canonical_credential_path(auth_path)
         .map_err(|error| quota_refresh_state_failure(request_id, error))?;
-    let lock = open_quota_refresh_lock_file(&path)
-        .map_err(|error| quota_refresh_state_failure(request_id, error))?;
-    lock_quota_refresh_file(host, &lock, request_id)?;
-    Ok(lock)
+    let parent = canonical_auth_path.parent().ok_or_else(|| {
+        quota_refresh_state_failure(request_id, "credential source has no parent directory")
+    })?;
+    let path_lock = open_quota_refresh_lock_file(
+        &parent.join(".oulipoly-agent-runner-opencode-quota-refresh.lock"),
+    )
+    .map_err(|error| quota_refresh_state_failure(request_id, error))?;
+    lock_quota_refresh_file(host, &path_lock, request_id)?;
+    let credential_file_lock = match OpenOptions::new().read(true).write(true).open(auth_path) {
+        Ok(lock) => {
+            lock_quota_refresh_file(host, &lock, request_id)?;
+            Some(lock)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(quota_refresh_state_failure(request_id, error)),
+    };
+    Ok(QuotaRefreshEffectLock {
+        _credential_path_lock: path_lock,
+        _credential_file_lock: credential_file_lock,
+    })
+}
+
+fn canonical_credential_path(auth_path: &Path) -> std::io::Result<PathBuf> {
+    match fs::canonicalize(auth_path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = auth_path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "credential source has no parent directory",
+                )
+            })?;
+            let file_name = auth_path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "credential source has no file name",
+                )
+            })?;
+            fs::canonicalize(parent).map(|parent| parent.join(file_name))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn open_quota_refresh_lock_file(path: &Path) -> std::io::Result<fs::File> {

@@ -136,12 +136,17 @@ after response loss replays the same
 again. If provider loss occurs after the native-effect boundary but before that
 observation is committed, the request is durably marked for reconciliation;
 retries return an actionable conflict instead of guessing whether it is safe to
-repeat the credential operation. Account-scoped locks serialize observable auth
-refreshes while their provider invocation remains alive.
-Request/account lock admission and the native auth child are bounded by the
+repeat the credential operation. The complete before/effect/after/commit
+interval holds a stable lock beside the canonical credential path, plus the
+current credential file's advisory lock. Provider invocations with different
+data roots, account aliases, or symlinked path spellings therefore serialize
+when they can observe or mutate the same credential source; hard-link aliases
+converge on the file lock. Per-request durable custody remains scoped to the
+declared data root.
+Request/effect lock admission and the native auth child are bounded by the
 earlier of `host.deadline_unix_ms` and a 20-second provider ceiling. A timed-out
 child is terminated and reaped, the admitted operation becomes
-`reconciliation_required`, and the account lane is released for an authorized
+`reconciliation_required`, and the credential-effect lane is released for an authorized
 follow-up instead of remaining monopolized by the stalled process.
 That authorized follow-up reuses the original request and adds
 `params.reconciliation` with the `accept_current_credentials` disposition and

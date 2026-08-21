@@ -987,6 +987,77 @@ fn contract_auth_list_without_credential_change_is_not_reported_as_refresh() {
 }
 
 #[test]
+fn contract_quota_refresh_serializes_shared_credentials_across_data_roots() {
+    let first_runtime = IsolatedQuotaSettings::new();
+    let second_runtime = IsolatedQuotaSettings::new();
+    let home = HomeFixture::new("agent-runner-opencode-cross-root-refresh-home");
+    let auth_path = home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());
+    let first_started = home.path.join("first-auth-started");
+    let first_auth = FakeOpencodeAuth::with_script(
+        "opencode3",
+        format!(
+            "#!/bin/sh\n: > {}\n/bin/sleep 2\nexit 0\n",
+            shell_single_quote(&first_started.to_string_lossy())
+        ),
+    );
+    let second_auth = FakeOpencodeAuth::rewrites_auth("opencode3", &auth_path);
+    let first_curl = FakeNativeCurl::new();
+    let second_curl = FakeNativeCurl::new();
+    let first_path = prepend_paths(&[first_auth.dir(), &first_curl.dir]);
+    let second_path = prepend_paths(&[second_auth.dir(), &second_curl.dir]);
+    let first_request = support::validated_request_envelope(
+        "quota.refresh_auth",
+        quota_refresh_auth_params(),
+        first_runtime.host_overrides(),
+        "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
+    );
+    let second_request = support::validated_request_envelope(
+        "quota.refresh_auth",
+        quota_refresh_auth_params(),
+        second_runtime.host_overrides(),
+        "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
+    );
+    let first_home = home.path_str().to_string();
+    let first = std::thread::spawn(move || {
+        support::invoke_with_request_and_env(
+            "quota.refresh_auth",
+            first_request,
+            &[("HOME", first_home.as_str()), ("PATH", first_path.as_str())],
+        )
+    });
+    let wait_started = std::time::Instant::now();
+    while !first_started.exists() && wait_started.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        first_started.exists(),
+        "the no-change refresh must enter its native observation interval"
+    );
+
+    let second = support::invoke_with_request_and_env(
+        "quota.refresh_auth",
+        second_request,
+        &[("HOME", home.path_str()), ("PATH", second_path.as_str())],
+    );
+    let first = first.join().expect("join first cross-root refresh");
+    let first_result = success_result(
+        first,
+        "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+        "quota.schema.json#/$defs/QuotaRefreshAuthResult",
+    );
+    let second_result = success_result(
+        second,
+        "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+        "quota.schema.json#/$defs/QuotaRefreshAuthResult",
+    );
+    assert_eq!(
+        first_result["refreshed"], false,
+        "a no-change command must not observe the sibling request's later credential mutation"
+    );
+    assert_eq!(second_result["refreshed"], true);
+}
+
+#[test]
 #[ignore]
 fn integration_quota_probe_live() {
     let path = std::env::var("PATH").expect("live PATH");
