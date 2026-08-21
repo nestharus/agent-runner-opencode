@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTHORIZATION_TTL: Duration = Duration::from_secs(10 * 60);
 const ROTATION_REPLAY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
-const ROTATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
+const ROTATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ROTATION_ARTIFACT_BYTES: usize = opencode::MAX_EXPORT_OUTPUT_BYTES;
 const MAX_ROTATION_STATE_BYTES: usize = 1024 * 1024;
 const MAX_ROTATION_LIVE_RECORDS: usize = 64;

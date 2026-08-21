@@ -672,8 +672,12 @@ fn contract_stale_terminal_cleanup_cannot_delete_recreated_snapshot() {
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
     let data_root = unique_temp_dir("agent-runner-opencode-snapshot-cleanup-generation");
+    let config_root = support::isolated_test_config_root("snapshot-cleanup-generation");
     fs::create_dir_all(&data_root).expect("create snapshot cleanup generation data root");
-    let host = json!({"data_root": data_root.to_string_lossy()});
+    let host = json!({
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy()
+    });
     let prior_path = std::env::var_os("PATH");
     std::env::set_var("PATH", &path);
     let args = vec![
@@ -720,7 +724,12 @@ fn contract_stale_terminal_cleanup_cannot_delete_recreated_snapshot() {
         "the first terminal owner must complete after the nested retries"
     );
     assert_eq!(interleaving.terminal_retry_exit, Some(0));
-    assert_eq!(interleaving.initial_retry_exit, Some(0));
+    assert_eq!(
+        interleaving.initial_retry_exit,
+        Some(0),
+        "recreated initial retry failed: {}",
+        String::from_utf8_lossy(&interleaving.initial_retry_stdout)
+    );
     let replacement: Value = serde_json::from_slice(&interleaving.initial_retry_stdout)
         .expect("parse recreated initial response");
     let replacement_cursor = replacement["result"]["next_cursor"]
@@ -750,6 +759,7 @@ fn contract_stale_terminal_cleanup_cannot_delete_recreated_snapshot() {
         None => std::env::remove_var("PATH"),
     }
     fs::remove_dir_all(&data_root).expect("remove snapshot cleanup generation data root");
+    fs::remove_dir_all(&config_root).expect("remove snapshot cleanup generation config root");
 }
 
 #[test]

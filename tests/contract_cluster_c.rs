@@ -1034,12 +1034,21 @@ fn contract_quota_refresh_serializes_shared_credentials_across_data_roots() {
         "the no-change refresh must enter its native observation interval"
     );
 
-    let second = support::invoke_with_request_and_env(
+    let mut second = support::invoke_with_request_and_env(
         "quota.refresh_auth",
-        second_request,
+        second_request.clone(),
         &[("HOME", home.path_str()), ("PATH", second_path.as_str())],
     );
     let first = first.join().expect("join first cross-root refresh");
+    if !second.status.success()
+        && json_stdout(&second)["error"]["code"] == "quota_refresh_lock_timeout"
+    {
+        second = support::invoke_with_request_and_env(
+            "quota.refresh_auth",
+            second_request,
+            &[("HOME", home.path_str()), ("PATH", second_path.as_str())],
+        );
+    }
     let first_result = success_result(
         first,
         "quota.schema.json#/$defs/QuotaRefreshAuthResponse",

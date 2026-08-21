@@ -117,7 +117,10 @@ the decision into the public JSON result, so supervision never reparses its own
 external DTO or silently weakens launch-plan fields. Every accepted plan also
 carries the resolved account wrapper, provider ID, model ID, and effort used by
 resume observation; launch does not recover those identities from public model
-JSON or generated argv. Agent Runner's `system_prompt_override` and its Claude-
+JSON or generated argv. Native `--session`/`-s`, `--continue`/`-c`, and `--fork`
+controls are reserved to typed `params.session` translation and rejected in the
+user-level option suffix; the same text remains ordinary message content after
+an explicit `--` boundary. Agent Runner's `system_prompt_override` and its Claude-
 and Codex-specific `tool_restrictions` have no proven faithful OpenCode mapping,
 so policy retains their presence and rejects the launch as
 `unsupported_system_prompt_override` or `unsupported_tool_restrictions`
@@ -521,7 +524,7 @@ bounded collision domain), not every provider rotation. A provider-wide
 capacity lock covers only bounded collection maintenance, durable admission
 reservation, prepared-operation publication, and final receipt replacement; it
 is released before runtime admission, export, import, and recovery. One
-monotonic budget—the earlier of the host deadline and a 20-second provider
+monotonic budget—the earlier of the host deadline and a 30-second provider
 ceiling—still covers all lock admission and native work. Each phase checks the
 remaining absolute budget, native children are terminated and reaped at expiry,
 artifacts are read back through the same 16 MiB bound, and provider-owned

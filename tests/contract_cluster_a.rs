@@ -4,7 +4,7 @@ mod cluster_a;
 mod support;
 
 use cluster_a::*;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 #[cfg(unix)]
 use std::{
@@ -909,6 +909,35 @@ fn contract_launch_rejects_caller_selected_create_session_before_spawn() {
 }
 
 #[test]
+fn contract_launch_rejects_untyped_native_session_selector_before_spawn() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params = launch_params_with_argv_and_prompt_env(
+        vec![
+            "--session".to_string(),
+            resume_session_id().to_string(),
+            "hello".to_string(),
+        ],
+        Some("hello"),
+        path.as_str(),
+        fake_wrapper.log_path_str(),
+    );
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_ne!(output.status.code(), Some(0));
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "an untyped native session selector must fail before spawn"
+    );
+    let response = json_stdout(&output);
+    assert_eq!(
+        response["error"]["code"],
+        "native_session_selector_forbidden"
+    );
+}
+
+#[test]
 fn contract_launch_malformed_native_event_prevents_clean_terminal_claim() {
     let fake_wrapper = FakeOpencodeWrapper::with_script(
         fake_opencode_script_with_output_and_status("not-json\n", "", 0),
@@ -1528,16 +1557,73 @@ fn contract_policy_evaluate_rejects_account_one_wrapper_command_aliases() {
 
 #[test]
 fn contract_policy_evaluate_rejects_user_injected_managed_flag_after_host_prefix() {
-    let forbidden_flag = "--variant";
-    let output = invoke_with_env(
-        "policy.evaluate",
-        forbidden_policy_evaluate_params_for_account_host_candidate("opencode2", forbidden_flag),
-        &[],
-    );
+    for forbidden_flag in [
+        "--variant",
+        "--session",
+        "--session=ses_caller_selected",
+        "-s",
+        "-sses_caller_selected",
+        "--continue",
+        "--continue=true",
+        "-c",
+        "--fork",
+        "--fork=true",
+    ] {
+        let output = invoke_with_env(
+            "policy.evaluate",
+            forbidden_policy_evaluate_params_for_account_host_candidate(
+                "opencode2",
+                forbidden_flag,
+            ),
+            &[],
+        );
 
-    assert_output_success(&output, "policy.evaluate injected host suffix rejection");
+        assert_output_success(&output, "policy.evaluate injected host suffix rejection");
+        let response = json_stdout(&output);
+        assert_policy_rejects_forbidden_arg(&response, forbidden_flag);
+    }
+}
+
+#[test]
+fn contract_policy_evaluate_preserves_session_control_text_after_message_boundary() {
+    let mut params = policy_evaluate_params_for_account_host_candidate("opencode2");
+    let argv = params["launch"]["argv"]
+        .as_array_mut()
+        .expect("host candidate argv");
+    argv.pop().expect("host candidate prompt");
+    argv.extend([
+        json!("--"),
+        json!("--session"),
+        json!("literal-session"),
+        json!("-s"),
+        json!("--continue"),
+        json!("-c"),
+        json!("--fork"),
+    ]);
+
+    let output = invoke_with_env("policy.evaluate", params, &[]);
+
+    assert_output_success(&output, "policy.evaluate literal session control text");
     let response = json_stdout(&output);
-    assert_policy_rejects_forbidden_arg(&response, forbidden_flag);
+    assert_policy_response_shape(&response);
+    let result = policy_result(&response);
+    assert_policy_accepted(result);
+    let effective_argv = result["argv"].as_array().expect("effective argv");
+    let boundary = effective_argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("message boundary");
+    assert_eq!(
+        &effective_argv[boundary + 1..],
+        &[
+            json!("--session"),
+            json!("literal-session"),
+            json!("-s"),
+            json!("--continue"),
+            json!("-c"),
+            json!("--fork"),
+        ]
+    );
 }
 
 fn account_host_settings_ids() -> [&'static str; 5] {

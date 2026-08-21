@@ -198,6 +198,14 @@ fn default_test_root() -> PathBuf {
     ))
 }
 
+#[allow(dead_code)]
+pub fn isolated_test_config_root(label: &str) -> PathBuf {
+    default_test_root().join("isolated-config").join(format!(
+        "{label}-{}",
+        REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 pub fn ensure_default_runtime_settings(request: &Value) {
     static INITIALIZE_LOCK: Mutex<()> = Mutex::new(());
     let Some(config_root) = request

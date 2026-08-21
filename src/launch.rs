@@ -236,6 +236,7 @@ pub(crate) fn stream<W: Write>(
 ) -> Result<LaunchOutcome, ProviderFailure> {
     let raw_params = params.clone();
     let params = parse_launch_params(params, request_id)?;
+    validate_launch_session(&params, request_id)?;
     let new_session = known_provider_session_id(&params).is_none();
     let request_identity_sha256 = launch_request_identity_sha256(host, &raw_params);
     let declared_env = params.env.clone().unwrap_or_default();
@@ -451,7 +452,6 @@ fn launch_argv(
     request_id: &str,
     request_identity_sha256: &str,
 ) -> Result<PolicyLaunch, ProviderFailure> {
-    validate_launch_session(params, request_id)?;
     let stdin = policy_stdin_for_launch(params.stdin.as_ref(), request_id)?;
     let decision = policy::evaluate_launch(
         host,
@@ -636,6 +636,15 @@ fn known_provider_session_id(params: &LaunchParams) -> Option<&str> {
 }
 
 fn validate_launch_session(params: &LaunchParams, request_id: &str) -> Result<(), ProviderFailure> {
+    if let Some(arg) = policy::native_session_control_arg(&params.argv) {
+        return Err(ProviderFailure::invalid_request(
+            request_id,
+            "native_session_selector_forbidden",
+            format!(
+                "native OpenCode session control {arg} is forbidden before --; use typed params.session for resume intent or place literal message text after --"
+            ),
+        ));
+    }
     let Some(session) = params.session.as_ref() else {
         return Ok(());
     };

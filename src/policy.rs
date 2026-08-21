@@ -607,7 +607,25 @@ fn policy_effective_args(model: &ModelAlias) -> Vec<String> {
 }
 
 fn is_forbidden_launch_arg(arg: &str) -> bool {
-    intrinsic_host_launch_command(arg) || matches!(arg, "--format" | "--variant" | "-m")
+    intrinsic_host_launch_command(arg)
+        || matches!(arg, "--format" | "--variant" | "-m")
+        || is_native_session_control_arg(arg)
+}
+
+fn is_native_session_control_arg(arg: &str) -> bool {
+    matches!(arg, "--session" | "-s" | "--continue" | "-c" | "--fork")
+        || arg.starts_with("--session=")
+        || arg.starts_with("--continue=")
+        || arg.starts_with("--fork=")
+        || (arg.len() > 2 && (arg.starts_with("-s") || arg.starts_with("-c")))
+}
+
+pub(crate) fn native_session_control_arg(input: &[String]) -> Option<&str> {
+    input
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .map(String::as_str)
+        .find(|arg| is_native_session_control_arg(arg))
 }
 
 fn intrinsic_host_launch_command(command: &str) -> bool {
@@ -683,6 +701,7 @@ fn invalid_policy_params_failure(request_id: &str, err: serde_json::Error) -> Pr
 fn forbidden_launch_args(input: &[String]) -> Vec<&String> {
     input
         .iter()
+        .take_while(|arg| arg.as_str() != "--")
         .filter(|arg| is_forbidden_launch_arg(arg))
         .collect()
 }
