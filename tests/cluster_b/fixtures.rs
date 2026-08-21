@@ -276,6 +276,16 @@ impl FakeOpencodeSessionList {
     pub fn log_path(&self) -> &Path {
         &self.log_path
     }
+
+    pub fn replace_output(&self, stdout: &str, stderr: &str, exit_code: i32) {
+        let wrapper_path = self.dir.join("opencode1");
+        fs::write(
+            &wrapper_path,
+            fake_opencode_session_list_script(stdout, stderr, exit_code, &self.log_path),
+        )
+        .expect("replace fake opencode1 session list wrapper");
+        make_fake_opencode_export_executable(&wrapper_path);
+    }
 }
 
 impl Drop for FakeOpencodeSessionList {
@@ -353,6 +363,22 @@ pub fn session_list_limit_json() -> &'static str {
   { "id": "ses_limit_one", "title": "One", "directory": "/tmp/one" },
   { "id": "ses_limit_two", "title": "Two", "directory": "/tmp/two" },
   { "id": "ses_limit_three", "title": "Three", "directory": "/tmp/three" }
+]"#
+}
+
+pub fn changed_session_list_limit_json() -> &'static str {
+    r#"[
+  { "id": "ses_changed_one", "title": "Changed one", "directory": "/tmp/changed-one" },
+  { "id": "ses_changed_two", "title": "Changed two", "directory": "/tmp/changed-two" },
+  { "id": "ses_changed_three", "title": "Changed three", "directory": "/tmp/changed-three" }
+]"#
+}
+
+pub fn session_list_initial_replay_json() -> &'static str {
+    r#"[
+  { "id": "ses_replay_one", "title": "Replay one", "directory": "relative/replay-one" },
+  { "id": "ses_replay_two", "title": "Replay two", "directory": "/tmp/replay-two" },
+  { "id": "ses_replay_three", "title": "Replay three", "directory": "/tmp/replay-three" }
 ]"#
 }
 

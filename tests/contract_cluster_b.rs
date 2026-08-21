@@ -329,6 +329,108 @@ fn contract_session_enumerate_distinct_requests_have_independent_snapshot_owners
 }
 
 #[test]
+fn contract_session_enumerate_exact_initial_retry_replays_claimed_native_population() {
+    let fake_opencode =
+        FakeOpencodeSessionList::with_output(session_list_initial_replay_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-initial-snapshot-replay");
+    let config_root = support::isolated_test_config_root("initial-snapshot-replay");
+    fs::create_dir_all(&data_root).expect("create initial replay snapshot data root");
+    let host = json!({
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy()
+    });
+    let mut request = support::validated_request_envelope(
+        "session.enumerate",
+        session_enumerate_limit_params(2),
+        host,
+        "session.schema.json#/$defs/SessionEnumerateRequest",
+    );
+    request["request_id"] = json!("req-session-enumerate-initial-snapshot-replay");
+    support::ensure_default_runtime_settings(&request);
+    let request_bytes = serde_json::to_vec(&request).expect("serialize initial enumeration");
+    let args = vec![
+        "agent-runner-opencode".to_string(),
+        "session.enumerate".to_string(),
+    ];
+    let prior_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", &path);
+    let mut rejected_flush = RejectFlush::default();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(&args, &request_bytes, &mut rejected_flush),
+        1,
+        "the first-page response must be lost only after its bytes are accepted"
+    );
+    let lost_response: Value = serde_json::Deserializer::from_slice(&rejected_flush.accepted)
+        .into_iter()
+        .next()
+        .expect("accepted first-page response")
+        .expect("parse accepted first-page response bytes");
+    support::assert_valid(
+        &lost_response,
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+    );
+    assert!(
+        !lost_response["result"]["warnings"]
+            .as_array()
+            .expect("first-page warnings")
+            .is_empty(),
+        "the durable first-page claim must include its warning projection"
+    );
+    fs::remove_file(fake_opencode.log_path()).expect("clear first native-list evidence");
+    fake_opencode.replace_output(changed_session_list_limit_json(), "", 0);
+
+    let mut retry_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(&args, &request_bytes, &mut retry_stdout),
+        0
+    );
+    let retry_response: Value =
+        serde_json::from_slice(&retry_stdout).expect("parse exact initial retry response");
+    support::assert_valid(
+        &retry_response,
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+    );
+    assert_eq!(
+        retry_response["result"], lost_response["result"],
+        "exact retry must replay the claimed first page even after native rows change"
+    );
+    assert!(
+        !fake_opencode.log_path().exists(),
+        "exact retry must consult durable request custody before relisting native sessions"
+    );
+
+    let cursor = retry_response["result"]["next_cursor"]
+        .as_str()
+        .expect("replayed first-page cursor");
+    let mut continuation = request;
+    continuation["request_id"] = json!("req-session-enumerate-initial-snapshot-continuation");
+    continuation["params"] = session_enumerate_cursor_params(2, cursor);
+    let mut continuation_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&continuation).expect("serialize replay continuation"),
+            &mut continuation_stdout,
+        ),
+        0
+    );
+    let continuation_response: Value =
+        serde_json::from_slice(&continuation_stdout).expect("parse replay continuation response");
+    assert_eq!(
+        continuation_response["result"]["sessions"][0]["provider_session_id"], "ses_replay_three",
+        "continuation must remain on the originally claimed native population"
+    );
+
+    match prior_path {
+        Some(value) => std::env::set_var("PATH", value),
+        None => std::env::remove_var("PATH"),
+    }
+    fs::remove_dir_all(&data_root).expect("remove initial replay snapshot data root");
+    fs::remove_dir_all(&config_root).expect("remove initial replay config root");
+}
+
+#[test]
 fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_handoff() {
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());

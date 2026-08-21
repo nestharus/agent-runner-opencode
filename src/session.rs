@@ -53,6 +53,7 @@ const MAX_ENUMERATION_SNAPSHOTS: usize = 32;
 const MAX_ENUMERATION_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENUMERATION_ENTRY_BYTES: usize = 64 * 1024;
 const MAX_ENUMERATION_MANIFEST_BYTES: usize = 16 * 1024;
+const MAX_ENUMERATION_WARNINGS_BYTES: usize = 256 * 1024;
 const MAX_ENUMERATION_WARNINGS: usize = 32;
 
 #[derive(Deserialize)]
@@ -117,6 +118,12 @@ struct EnumerationSnapshotManifest {
     total_sessions: usize,
     created_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    #[serde(default)]
+    initial_request_sha256: String,
+    #[serde(default)]
+    initial_page_end: usize,
+    #[serde(default)]
+    initial_warnings_sha256: String,
     #[serde(default)]
     next_cursor_offset: usize,
     #[serde(default)]
@@ -469,6 +476,9 @@ pub(crate) fn enumerate_params(
         return load_enumeration_snapshot_page(host, &params, cursor, request_id)
             .map(enumerate_result);
     }
+    if let Some(page) = replay_claimed_initial_snapshot_page(host, &params, request_id)? {
+        return Ok(enumerate_result(page));
+    }
     let native = enumerate_native(host, &params.settings_id, request_id)?;
     let page = enumerate_sessions(host, native, &params, request_id)?;
     Ok(enumerate_result(page))
@@ -679,32 +689,16 @@ fn paginate_sessions(
     let limit = params.limit.unwrap_or(MAX_ENUMERATION_PAGE_SIZE);
     let end = limit.min(sessions.len());
     let complete = end == sessions.len();
-    let next_cursor = if complete {
-        None
-    } else {
-        let identity_sha256 = enumeration_request_identity(params);
-        let snapshot_id = persist_enumeration_snapshot(
-            host,
-            &identity_sha256,
-            &sessions,
-            params,
-            end,
-            request_id,
-        )?;
-        Some(enumeration_cursor(
-            &snapshot_id,
-            end,
-            sessions.len(),
-            &identity_sha256,
-        ))
-    };
-    Ok(EnumeratePage {
-        sessions: sessions.into_iter().take(end).collect(),
-        warnings,
-        complete,
-        next_cursor,
-        post_write: None,
-    })
+    if complete {
+        return Ok(EnumeratePage {
+            sessions,
+            warnings,
+            complete: true,
+            next_cursor: None,
+            post_write: None,
+        });
+    }
+    persist_enumeration_snapshot(host, sessions, params, warnings, end, request_id)
 }
 
 fn enumeration_request_identity(params: &SessionEnumerateParams) -> String {
@@ -720,17 +714,131 @@ fn enumeration_request_identity(params: &SessionEnumerateParams) -> String {
     )
 }
 
+fn replay_claimed_initial_snapshot_page(
+    host: &crate::envelope::HostContext,
+    params: &SessionEnumerateParams,
+    request_id: &str,
+) -> Result<Option<EnumeratePage>, ProviderFailure> {
+    if host
+        .data_root
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Ok(None);
+    }
+    let root = enumeration_snapshot_root(host, request_id)?;
+    let _lock = acquire_enumeration_snapshot_lock(host, &root, request_id)?;
+    prune_enumeration_snapshots(host, &root, request_id)?;
+    let initial_request_sha256 = enumeration_page_request_sha256(params, request_id);
+    claimed_initial_snapshot_page_locked(host, &root, params, request_id, &initial_request_sha256)
+}
+
+fn claimed_initial_snapshot_page_locked(
+    host: &crate::envelope::HostContext,
+    root: &Path,
+    params: &SessionEnumerateParams,
+    request_id: &str,
+    initial_request_sha256: &str,
+) -> Result<Option<EnumeratePage>, ProviderFailure> {
+    let snapshot_id = initial_enumeration_snapshot_id(initial_request_sha256);
+    let snapshot_root =
+        confined_enumeration_snapshot_target(host, &root.join(&snapshot_id), request_id)?;
+    if !snapshot_root.exists() {
+        return Ok(None);
+    }
+    let manifest = snapshot_manifest(&snapshot_root, request_id)?;
+    let identity_sha256 = enumeration_request_identity(params);
+    if manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
+        || manifest.snapshot_id != snapshot_id
+        || !is_sha256_hex(&manifest.snapshot_instance_sha256)
+        || manifest.identity_sha256 != identity_sha256
+        || manifest.total_sessions > MAX_ENUMERATED_SESSIONS
+        || manifest.expires_at_unix_ms < now_unix_ms()
+        || manifest.initial_request_sha256 != initial_request_sha256
+        || manifest.initial_page_end == 0
+        || manifest.initial_page_end >= manifest.total_sessions
+        || !is_sha256_hex(&manifest.initial_warnings_sha256)
+    {
+        return Err(session_snapshot_failure(
+            request_id,
+            "the durable initial request claim is invalid",
+        ));
+    }
+    if manifest.terminal_claim_request_sha256.is_some() {
+        return Err(session_snapshot_terminal_handoff_failure(request_id));
+    }
+    let exact_initial_retry = manifest.next_cursor_offset == manifest.initial_page_end
+        && manifest.last_page_claim_request_sha256.as_deref() == Some(initial_request_sha256)
+        && manifest.last_page_claim_start == Some(0)
+        && manifest.last_page_claim_end == Some(manifest.initial_page_end);
+    if !exact_initial_retry {
+        return Err(session_snapshot_cursor_superseded_failure(request_id));
+    }
+    let warnings_bytes = durable_fs::read_file_bounded(
+        &snapshot_root.join("warnings.json"),
+        MAX_ENUMERATION_WARNINGS_BYTES,
+    )
+    .map_err(|error| session_snapshot_failure(request_id, error))?;
+    if sha256_hex(&warnings_bytes) != manifest.initial_warnings_sha256 {
+        return Err(session_snapshot_failure(
+            request_id,
+            "the durable initial warning projection does not match its manifest",
+        ));
+    }
+    let warnings: Vec<String> = serde_json::from_slice(&warnings_bytes)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    if warnings.len() > MAX_ENUMERATION_WARNINGS.saturating_add(1) {
+        return Err(session_snapshot_failure(
+            request_id,
+            "the durable initial warning projection exceeds its count bound",
+        ));
+    }
+    let sessions = read_enumeration_snapshot_rows(
+        host,
+        &snapshot_root,
+        0,
+        manifest.initial_page_end,
+        request_id,
+    )?;
+    Ok(Some(EnumeratePage {
+        sessions,
+        warnings,
+        complete: false,
+        next_cursor: Some(enumeration_cursor(
+            &snapshot_id,
+            manifest.initial_page_end,
+            manifest.total_sessions,
+            &identity_sha256,
+        )),
+        post_write: None,
+    }))
+}
+
+fn initial_enumeration_snapshot_id(initial_request_sha256: &str) -> String {
+    sha256_hex(
+        [
+            b"agent-runner-opencode.session-enumeration.initial.v1".as_slice(),
+            &[0],
+            initial_request_sha256.as_bytes(),
+        ]
+        .concat()
+        .as_slice(),
+    )
+}
+
 fn persist_enumeration_snapshot(
     host: &crate::envelope::HostContext,
-    identity_sha256: &str,
-    sessions: &[Value],
+    sessions: Vec<Value>,
     params: &SessionEnumerateParams,
+    warnings: Vec<String>,
     first_page_end: usize,
     request_id: &str,
-) -> Result<String, ProviderFailure> {
+) -> Result<EnumeratePage, ProviderFailure> {
+    let identity_sha256 = enumeration_request_identity(params);
+    let initial_request_sha256 = enumeration_page_request_sha256(params, request_id);
     let mut encoded_rows = Vec::with_capacity(sessions.len());
     let mut encoded_bytes = 0_usize;
-    for session in sessions {
+    for session in &sessions {
         let bytes = serde_json::to_vec(session)
             .map_err(|error| session_snapshot_failure(request_id, error))?;
         if bytes.len() > MAX_ENUMERATION_ENTRY_BYTES {
@@ -748,45 +856,31 @@ fn persist_enumeration_snapshot(
         }
         encoded_rows.push(bytes);
     }
-    let snapshot_id = sha256_hex(
-        [
-            request_id.as_bytes(),
-            &[0],
-            identity_sha256.as_bytes(),
-            &[0],
-            &encoded_rows.concat(),
-        ]
-        .concat()
-        .as_slice(),
-    );
+    let encoded_warnings = serde_json::to_vec(&warnings)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    if encoded_warnings.len() > MAX_ENUMERATION_WARNINGS_BYTES
+        || encoded_bytes.saturating_add(encoded_warnings.len()) > MAX_ENUMERATION_SNAPSHOT_BYTES
+    {
+        return Err(session_snapshot_capacity_failure(
+            request_id,
+            "the projected session warnings exceed the supported snapshot bound",
+        ));
+    }
+    let snapshot_id = initial_enumeration_snapshot_id(&initial_request_sha256);
     let root = enumeration_snapshot_root(host, request_id)?;
     let _lock = acquire_enumeration_snapshot_lock(host, &root, request_id)?;
     let retained = prune_enumeration_snapshots(host, &root, request_id)?;
+    if let Some(page) = claimed_initial_snapshot_page_locked(
+        host,
+        &root,
+        params,
+        request_id,
+        &initial_request_sha256,
+    )? {
+        return Ok(page);
+    }
     let snapshot_root =
         confined_enumeration_snapshot_target(host, &root.join(&snapshot_id), request_id)?;
-    if let Ok(manifest) = snapshot_manifest(&snapshot_root, request_id) {
-        let reusable = manifest.schema_version == SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
-            && manifest.snapshot_id == snapshot_id
-            && is_sha256_hex(&manifest.snapshot_instance_sha256)
-            && manifest.identity_sha256 == identity_sha256
-            && manifest.total_sessions == sessions.len()
-            && manifest.expires_at_unix_ms >= now_unix_ms();
-        if reusable {
-            if manifest.terminal_claim_request_sha256.is_some() {
-                return Err(session_snapshot_terminal_handoff_failure(request_id));
-            }
-            let request_sha256 = enumeration_page_request_sha256(params, request_id);
-            let exact_initial_retry = manifest.next_cursor_offset == first_page_end
-                && manifest.last_page_claim_request_sha256.as_deref()
-                    == Some(request_sha256.as_str())
-                && manifest.last_page_claim_start == Some(0)
-                && manifest.last_page_claim_end == Some(first_page_end);
-            if exact_initial_retry {
-                return Ok(snapshot_id);
-            }
-            return Err(session_snapshot_cursor_superseded_failure(request_id));
-        }
-    }
     if snapshot_root.exists() {
         fs::remove_dir_all(&snapshot_root)
             .map_err(|error| session_snapshot_failure(request_id, error))?;
@@ -804,20 +898,24 @@ fn persist_enumeration_snapshot(
         write_enumeration_snapshot_file(&snapshot_root.join(format!("{index:04}.json")), bytes)
             .map_err(|error| session_snapshot_failure(request_id, error))?;
     }
+    write_enumeration_snapshot_file(&snapshot_root.join("warnings.json"), &encoded_warnings)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
     let created_at_unix_ms = now_unix_ms();
-    let request_sha256 = enumeration_page_request_sha256(params, request_id);
     let snapshot_instance_sha256 = new_enumeration_snapshot_instance_sha256(&snapshot_root)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
     let manifest = EnumerationSnapshotManifest {
         schema_version: SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: snapshot_id.clone(),
         snapshot_instance_sha256,
-        identity_sha256: identity_sha256.to_string(),
+        identity_sha256: identity_sha256.clone(),
         total_sessions: sessions.len(),
         created_at_unix_ms,
         expires_at_unix_ms: created_at_unix_ms.saturating_add(SESSION_ENUMERATION_SNAPSHOT_TTL_MS),
+        initial_request_sha256: initial_request_sha256.clone(),
+        initial_page_end: first_page_end,
+        initial_warnings_sha256: sha256_hex(&encoded_warnings),
         next_cursor_offset: first_page_end,
-        last_page_claim_request_sha256: Some(request_sha256),
+        last_page_claim_request_sha256: Some(initial_request_sha256),
         last_page_claim_start: Some(0),
         last_page_claim_end: Some(first_page_end),
         terminal_claim_request_sha256: None,
@@ -826,7 +924,18 @@ fn persist_enumeration_snapshot(
         .map_err(|error| session_snapshot_failure(request_id, error))?;
     write_enumeration_snapshot_file(&snapshot_root.join("manifest.json"), &bytes)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
-    Ok(snapshot_id)
+    Ok(EnumeratePage {
+        sessions: sessions.into_iter().take(first_page_end).collect(),
+        warnings,
+        complete: false,
+        next_cursor: Some(enumeration_cursor(
+            &snapshot_id,
+            first_page_end,
+            manifest.total_sessions,
+            &identity_sha256,
+        )),
+        post_write: None,
+    })
 }
 
 fn load_enumeration_snapshot_page(
@@ -881,20 +990,7 @@ fn load_enumeration_snapshot_page(
     } else if !advances_cursor && !exact_page_retry {
         return Err(session_snapshot_cursor_superseded_failure(request_id));
     }
-    let mut sessions = Vec::with_capacity(end - start);
-    for index in start..end {
-        let path = confined_enumeration_snapshot_target(
-            host,
-            &snapshot_root.join(format!("{index:04}.json")),
-            request_id,
-        )?;
-        let bytes = durable_fs::read_file_bounded(&path, MAX_ENUMERATION_ENTRY_BYTES)
-            .map_err(|error| session_snapshot_failure(request_id, error))?;
-        sessions.push(
-            serde_json::from_slice(&bytes)
-                .map_err(|error| session_snapshot_failure(request_id, error))?,
-        );
-    }
+    let sessions = read_enumeration_snapshot_rows(host, &snapshot_root, start, end, request_id)?;
     let complete = end == total;
     if manifest.terminal_claim_request_sha256.is_some() && !complete {
         return Err(session_snapshot_terminal_handoff_failure(request_id));
@@ -935,6 +1031,30 @@ fn load_enumeration_snapshot_page(
             terminal_claim_request_sha256: request_sha256,
         }),
     })
+}
+
+fn read_enumeration_snapshot_rows(
+    host: &crate::envelope::HostContext,
+    snapshot_root: &Path,
+    start: usize,
+    end: usize,
+    request_id: &str,
+) -> Result<Vec<Value>, ProviderFailure> {
+    let mut sessions = Vec::with_capacity(end.saturating_sub(start));
+    for index in start..end {
+        let path = confined_enumeration_snapshot_target(
+            host,
+            &snapshot_root.join(format!("{index:04}.json")),
+            request_id,
+        )?;
+        let bytes = durable_fs::read_file_bounded(&path, MAX_ENUMERATION_ENTRY_BYTES)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+        sessions.push(
+            serde_json::from_slice(&bytes)
+                .map_err(|error| session_snapshot_failure(request_id, error))?,
+        );
+    }
+    Ok(sessions)
 }
 
 fn new_enumeration_snapshot_instance_sha256(snapshot_root: &Path) -> std::io::Result<String> {

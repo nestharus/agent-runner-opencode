@@ -328,15 +328,17 @@ completed materialization.
 
 `session.enumerate` materializes one bounded, request-bound private pagination
 snapshot on the first page instead of relisting the complete native population
-for every cursor. Exact retries of one initial request can converge on its
-snapshot, while distinct requests over identical rows receive independent
-cursor owners. A snapshot advances one page at a time: before a page is exposed,
-the manifest durably records its exact request claim and the sole next cursor
-offset. An exact page retry can replay that claim until its successor is
-admitted, while a different request using the consumed or older cursor is
-rejected instead of publishing a successor that another terminal handoff can
-retire. Page size and admitted population are each capped at 256, list
-capture at 2 MiB, each row at 64 KiB, and each snapshot at 4 MiB. At most 32
+for every cursor. The initial request has a stable durable claim independent of
+the listed row bytes. An exact retry consults that claim before native relisting
+and replays its immutable first-page rows, warnings, and cursor; distinct
+requests over identical rows still receive independent cursor owners. A
+snapshot advances one page at a time: before a page is exposed, the manifest
+durably records its exact request claim and the sole next cursor offset. An
+exact page retry can replay that claim until its successor is admitted, while a
+different request using the consumed or older cursor is rejected instead of
+publishing a successor that another terminal handoff can retire. Page size and
+admitted population are each capped at 256, list capture at 2 MiB, each row at
+64 KiB, and each snapshot at 4 MiB. At most 32
 abandoned snapshots are retained for 15 minutes; continuation cursors read only
 the requested rows. A terminal snapshot is retired only after the complete
 response is successfully written and flushed; a failed write or flush preserves
