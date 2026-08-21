@@ -309,7 +309,11 @@ response is successfully written and flushed; a failed write or flush preserves
 the cursor for an exact retry. Before the terminal page is exposed, its manifest
 durably claims that handoff for the continuation request; a different terminal
 consumer, older cursor, or initial retry cannot reuse the snapshot while that
-claim is live.
+claim is live. Deferred cleanup carries the snapshot's unique durable instance
+identity and terminal claim, reacquires the snapshot lock, and retires the path
+only when the current manifest still matches both. A delayed cleanup from an
+exact terminal retry is therefore a no-op if the deterministic path has since
+been recreated for a new pagination instance.
 A cleanup failure falls back to the existing 15-minute expiry.
 An above-bound native population fails explicitly.
 

@@ -44,7 +44,7 @@ const USER_OBSERVATION_PROJECTION: &str = "user_observation";
 const MAX_OBSERVATION_BODY_TAIL: usize = 16;
 const SESSION_ENUMERATION_SNAPSHOT_DIR: &str =
     "provider-state/opencode/session-enumeration-snapshots";
-const SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+const SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const SESSION_ENUMERATION_SNAPSHOT_TTL_MS: u64 = 15 * 60 * 1_000;
 const SESSION_ENUMERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ENUMERATED_SESSIONS: usize = 256;
@@ -111,6 +111,8 @@ struct SessionEnumerateParams {
 struct EnumerationSnapshotManifest {
     schema_version: u32,
     snapshot_id: String,
+    #[serde(default)]
+    snapshot_instance_sha256: String,
     identity_sha256: String,
     total_sessions: usize,
     created_at_unix_ms: u64,
@@ -155,10 +157,39 @@ pub(crate) struct SessionOutcome {
 pub(crate) struct SessionPostWrite {
     root: PathBuf,
     snapshot_root: PathBuf,
+    snapshot_instance_sha256: String,
+    terminal_claim_request_sha256: String,
 }
 
 impl SessionPostWrite {
     pub fn complete(self) -> Result<(), std::io::Error> {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.root.join(".snapshots.lock"))?;
+        if !operation_bounds::lock_exclusive_for(&lock, SESSION_ENUMERATION_LOCK_TIMEOUT)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "session enumeration snapshot cleanup lock timed out",
+            ));
+        }
+        let bytes = match durable_fs::read_file_bounded(
+            &self.snapshot_root.join("manifest.json"),
+            MAX_ENUMERATION_MANIFEST_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let manifest: EnumerationSnapshotManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
+            || manifest.snapshot_instance_sha256 != self.snapshot_instance_sha256
+            || manifest.terminal_claim_request_sha256.as_deref()
+                != Some(self.terminal_claim_request_sha256.as_str())
+        {
+            return Ok(());
+        }
         match fs::remove_dir_all(&self.snapshot_root) {
             Ok(()) => durable_fs::sync_directory(&self.root),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -736,6 +767,7 @@ fn persist_enumeration_snapshot(
     if let Ok(manifest) = snapshot_manifest(&snapshot_root, request_id) {
         let reusable = manifest.schema_version == SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
             && manifest.snapshot_id == snapshot_id
+            && is_sha256_hex(&manifest.snapshot_instance_sha256)
             && manifest.identity_sha256 == identity_sha256
             && manifest.total_sessions == sessions.len()
             && manifest.expires_at_unix_ms >= now_unix_ms();
@@ -774,9 +806,12 @@ fn persist_enumeration_snapshot(
     }
     let created_at_unix_ms = now_unix_ms();
     let request_sha256 = enumeration_page_request_sha256(params, request_id);
+    let snapshot_instance_sha256 = new_enumeration_snapshot_instance_sha256(&snapshot_root)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
     let manifest = EnumerationSnapshotManifest {
         schema_version: SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: snapshot_id.clone(),
+        snapshot_instance_sha256,
         identity_sha256: identity_sha256.to_string(),
         total_sessions: sessions.len(),
         created_at_unix_ms,
@@ -818,6 +853,7 @@ fn load_enumeration_snapshot_page(
     })?;
     if manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
         || manifest.snapshot_id != snapshot_id
+        || !is_sha256_hex(&manifest.snapshot_instance_sha256)
         || manifest.identity_sha256 != expected_identity
         || manifest.total_sessions != total
         || manifest.expires_at_unix_ms < now_unix_ms()
@@ -895,8 +931,19 @@ fn load_enumeration_snapshot_page(
         post_write: complete.then_some(SessionPostWrite {
             root,
             snapshot_root,
+            snapshot_instance_sha256: manifest.snapshot_instance_sha256,
+            terminal_claim_request_sha256: request_sha256,
         }),
     })
+}
+
+fn new_enumeration_snapshot_instance_sha256(snapshot_root: &Path) -> std::io::Result<String> {
+    let unique = tempfile::Builder::new()
+        .prefix(".snapshot-instance-")
+        .tempfile_in(snapshot_root)?;
+    let instance_sha256 = sha256_hex(unique.path().to_string_lossy().as_bytes());
+    unique.close()?;
+    Ok(instance_sha256)
 }
 
 fn enumeration_page_request_sha256(params: &SessionEnumerateParams, request_id: &str) -> String {

@@ -22,6 +22,17 @@ struct InvokeDuringFlush {
     competing_stdout: Vec<u8>,
 }
 
+struct RecreateSnapshotDuringTerminalFlush {
+    accepted: Vec<u8>,
+    args: Vec<String>,
+    terminal_retry: Vec<u8>,
+    initial_retry: Vec<u8>,
+    terminal_retry_exit: Option<i32>,
+    terminal_retry_stdout: Vec<u8>,
+    initial_retry_exit: Option<i32>,
+    initial_retry_stdout: Vec<u8>,
+}
+
 impl std::io::Write for RejectFlush {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.accepted.extend_from_slice(buffer);
@@ -48,6 +59,29 @@ impl std::io::Write for InvokeDuringFlush {
                 &self.args,
                 &self.competing_request,
                 &mut self.competing_stdout,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Write for RecreateSnapshotDuringTerminalFlush {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.accepted.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.terminal_retry_exit.is_none() {
+            self.terminal_retry_exit = Some(agent_runner_opencode::write_invocation(
+                &self.args,
+                &self.terminal_retry,
+                &mut self.terminal_retry_stdout,
+            ));
+            self.initial_retry_exit = Some(agent_runner_opencode::write_invocation(
+                &self.args,
+                &self.initial_retry,
+                &mut self.initial_retry_stdout,
             ));
         }
         Ok(())
@@ -631,6 +665,91 @@ fn contract_terminal_claim_blocks_older_cursor_during_response_handoff() {
         None => std::env::remove_var("PATH"),
     }
     fs::remove_dir_all(&data_root).expect("remove terminal older-cursor data root");
+}
+
+#[test]
+fn contract_stale_terminal_cleanup_cannot_delete_recreated_snapshot() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-snapshot-cleanup-generation");
+    fs::create_dir_all(&data_root).expect("create snapshot cleanup generation data root");
+    let host = json!({"data_root": data_root.to_string_lossy()});
+    let prior_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", &path);
+    let args = vec![
+        "agent-runner-opencode".to_string(),
+        "session.enumerate".to_string(),
+    ];
+    let mut initial_request = support::validated_request_envelope(
+        "session.enumerate",
+        session_enumerate_limit_params(2),
+        host,
+        "session.schema.json#/$defs/SessionEnumerateRequest",
+    );
+    initial_request["request_id"] = json!("req-session-enumerate-cleanup-generation-initial");
+    support::ensure_default_runtime_settings(&initial_request);
+    let initial_bytes = serde_json::to_vec(&initial_request).expect("serialize initial request");
+    let mut initial_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(&args, &initial_bytes, &mut initial_stdout),
+        0
+    );
+    let initial_response: Value =
+        serde_json::from_slice(&initial_stdout).expect("parse initial response");
+    let terminal_cursor = initial_response["result"]["next_cursor"]
+        .as_str()
+        .expect("terminal cursor");
+    let mut terminal_request = initial_request.clone();
+    terminal_request["request_id"] = json!("req-session-enumerate-cleanup-generation-terminal");
+    terminal_request["params"] = session_enumerate_cursor_params(2, terminal_cursor);
+    let terminal_bytes = serde_json::to_vec(&terminal_request).expect("serialize terminal request");
+    let mut interleaving = RecreateSnapshotDuringTerminalFlush {
+        accepted: Vec::new(),
+        args: args.clone(),
+        terminal_retry: terminal_bytes.clone(),
+        initial_retry: initial_bytes,
+        terminal_retry_exit: None,
+        terminal_retry_stdout: Vec::new(),
+        initial_retry_exit: None,
+        initial_retry_stdout: Vec::new(),
+    };
+
+    assert_eq!(
+        agent_runner_opencode::write_invocation(&args, &terminal_bytes, &mut interleaving),
+        0,
+        "the first terminal owner must complete after the nested retries"
+    );
+    assert_eq!(interleaving.terminal_retry_exit, Some(0));
+    assert_eq!(interleaving.initial_retry_exit, Some(0));
+    let replacement: Value = serde_json::from_slice(&interleaving.initial_retry_stdout)
+        .expect("parse recreated initial response");
+    let replacement_cursor = replacement["result"]["next_cursor"]
+        .as_str()
+        .expect("replacement cursor");
+    let mut replacement_continuation = initial_request;
+    replacement_continuation["request_id"] =
+        json!("req-session-enumerate-cleanup-generation-replacement-terminal");
+    replacement_continuation["params"] = session_enumerate_cursor_params(2, replacement_cursor);
+    let mut replacement_terminal_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&replacement_continuation)
+                .expect("serialize replacement continuation"),
+            &mut replacement_terminal_stdout,
+        ),
+        0,
+        "stale cleanup must not delete the replacement snapshot"
+    );
+    let replacement_terminal: Value = serde_json::from_slice(&replacement_terminal_stdout)
+        .expect("parse replacement terminal response");
+    assert_eq!(replacement_terminal["result"]["complete"], true);
+
+    match prior_path {
+        Some(value) => std::env::set_var("PATH", value),
+        None => std::env::remove_var("PATH"),
+    }
+    fs::remove_dir_all(&data_root).expect("remove snapshot cleanup generation data root");
 }
 
 #[test]
