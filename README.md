@@ -434,8 +434,11 @@ identity is admitted. This provider owns the separately versioned
 is available through `schema`. `setup.sync_plan` accepts that protocol under
 `params.native_identity_rebind` and emits operations carrying the same protocol,
 schema ID, component-scoped operation ID, actor responsibilities, prior identity
-evidence, and a typed completion-observation request. Each target names exactly
-one `native_runtime` or `quota_observer` identity. A host that needs a coordinated
+evidence, and a typed completion-observation request. Evidence separately names
+the component's semantic implementation `component_identity_sha256` and the
+serialized persistence revision `state_record_sha256`; the full pair is bound to
+the operation, while semantic identity change decides a commit. Each target names
+exactly one `native_runtime` or `quota_observer` identity. A host that needs a coordinated
 two-component rollout composes two explicit targets; neither independent entity
 is implicitly replaced with the other. The authoritative
 `oulipoly.provider/v1` setup schema remains an unchanged Agent Runner snapshot;
@@ -456,7 +459,8 @@ request with a named identity-lock result rather than waiting indefinitely.
 3. The host submits the plan's typed `seal` request while admission remains
    blocked. The provider rejects sealing if either host assertion is false or
    the selected provider identity record changed during drain; a successful seal
-   binds its exact pre-cutover digest and component into the operation ID.
+   binds its exact pre-cutover semantic identity, state-record digest, and
+   component into the operation ID.
 4. The operator stages only the selected replacement implementation without
    altering the implementation named by its old identity. Back up and remove
    only `native-runtimes/<profile>.json` for a `native_runtime` target or only
@@ -469,18 +473,19 @@ request with a named identity-lock result rather than waiting indefinitely.
    runs the same validation capability against the restored identity.
 6. While ordinary admission is still blocked, the host sends the plan-bound
    `observe` request and attests that the selected validation capability completed.
-   The provider validates the operation ID and current component identity. A valid
+   The provider validates the operation ID and both named current evidence layers. A valid
    commit or rollback returns `awaiting_host_release`, an observation-bound
    release request, and not a terminal success.
 7. The host reopens ordinary admission and sends that exact `release` request.
-   The provider checks the observation identity and unchanged current component,
+   The provider checks the observation identity and unchanged current evidence pair,
    then returns `completed` or `rolled_back`. A false release assertion or a
    changed binding returns `rejected`.
 
 Private state paths are included only as implementation evidence, not as the
-protocol's meaning. A component commit reaches release only when its identity is
-newly admitted, while rollback reaches release only when its prior identity is
-restored. The host exclusively owns the distinction between blocked ordinary
+protocol's meaning. A component commit reaches release only when its semantic
+implementation identity changes and the validated state record carries it, while
+rollback reaches release only when both prior semantic identity and persistence
+revision are restored. The host exclusively owns the distinction between blocked ordinary
 traffic and the component's cutover-validation exception, and the typed release
 acknowledgment owns the transition back to ordinary admission.
 

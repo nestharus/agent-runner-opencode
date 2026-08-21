@@ -30,6 +30,29 @@
         { "type": "null" }
       ]
     },
+    "ComponentEvidence": {
+      "type": "object",
+      "properties": {
+        "component_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
+        "state_record_sha256": { "$ref": "#/$defs/OptionalDigest" }
+      },
+      "required": ["component_identity_sha256", "state_record_sha256"],
+      "oneOf": [
+        {
+          "properties": {
+            "component_identity_sha256": { "$ref": "#/$defs/Digest" },
+            "state_record_sha256": { "$ref": "#/$defs/Digest" }
+          }
+        },
+        {
+          "properties": {
+            "component_identity_sha256": { "type": "null" },
+            "state_record_sha256": { "type": "null" }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
     "PlanRequest": {
       "type": "object",
       "properties": {
@@ -80,10 +103,10 @@
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
         "component": { "$ref": "#/$defs/Component" },
-        "prior_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
+        "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
         "host_handoff": { "$ref": "#/$defs/SealHandoff" }
       },
-      "required": ["protocol", "action", "operation_id", "profile", "component", "prior_identity_sha256", "host_handoff"],
+      "required": ["protocol", "action", "operation_id", "profile", "component", "prior_evidence", "host_handoff"],
       "additionalProperties": false
     },
     "ObservationRequest": {
@@ -94,11 +117,11 @@
         "operation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
         "component": { "$ref": "#/$defs/Component" },
-        "prior_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
+        "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
         "disposition": { "enum": ["committed", "rolled_back"] },
         "host_handoff": { "$ref": "#/$defs/ObservationHandoff" }
       },
-      "required": ["protocol", "action", "operation_id", "profile", "component", "prior_identity_sha256", "disposition", "host_handoff"],
+      "required": ["protocol", "action", "operation_id", "profile", "component", "prior_evidence", "disposition", "host_handoff"],
       "additionalProperties": false
     },
     "ReleaseRequest": {
@@ -110,12 +133,12 @@
         "observation_id": { "$ref": "#/$defs/Digest" },
         "profile": { "$ref": "#/$defs/Profile" },
         "component": { "$ref": "#/$defs/Component" },
-        "prior_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
-        "observed_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
+        "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
+        "observed_evidence": { "$ref": "#/$defs/ComponentEvidence" },
         "disposition": { "enum": ["committed", "rolled_back"] },
         "host_handoff": { "$ref": "#/$defs/ReleaseHandoff" }
       },
-      "required": ["protocol", "action", "operation_id", "observation_id", "profile", "component", "prior_identity_sha256", "observed_identity_sha256", "disposition", "host_handoff"],
+      "required": ["protocol", "action", "operation_id", "observation_id", "profile", "component", "prior_evidence", "observed_evidence", "disposition", "host_handoff"],
       "additionalProperties": false
     },
     "Request": {
@@ -147,8 +170,8 @@
         "component": { "$ref": "#/$defs/Component" },
         "phase": { "enum": ["awaiting_host_drain", "awaiting_cutover", "awaiting_host_release", "completed", "rolled_back", "rejected"] },
         "maximum_drain_ms": { "const": 20000 },
-        "prior_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
-        "observed_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
+        "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
+        "observed_evidence": { "$ref": "#/$defs/ComponentEvidence" },
         "observation_id": { "$ref": "#/$defs/Digest" },
         "disposition": { "enum": ["committed", "rolled_back"] },
         "responsibilities": {
@@ -169,7 +192,7 @@
       },
       "required": [
         "kind", "protocol", "schema_id", "operation_id", "profile", "component", "phase",
-        "maximum_drain_ms", "prior_identity_sha256", "observed_identity_sha256",
+        "maximum_drain_ms", "prior_evidence", "observed_evidence",
         "responsibilities", "implementation_evidence"
       ],
       "allOf": [

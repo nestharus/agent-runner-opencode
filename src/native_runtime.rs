@@ -92,24 +92,28 @@ pub fn resolve_existing_for_account(
     Ok(Some(context))
 }
 
-pub(crate) fn persisted_state_sha256(
+pub(crate) fn persisted_identity_evidence(
     host: &HostContext,
     account: &AccountProfile,
     request_id: &str,
-) -> Result<Option<String>, ProviderFailure> {
-    let path = runtime_context_path(host, account, request_id)?;
-    match durable_fs::read_file_bounded(&path, MAX_NATIVE_RUNTIME_STATE_BYTES) {
-        Ok(bytes) => Ok(Some(sha256_hex(&bytes))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(native_runtime_failure(request_id, error)),
-    }
+) -> Result<Option<(String, String)>, ProviderFailure> {
+    read_persisted_identity_evidence(host, account, request_id, false)
 }
 
-pub(crate) fn validated_persisted_state_sha256(
+pub(crate) fn validated_persisted_identity_evidence(
     host: &HostContext,
     account: &AccountProfile,
     request_id: &str,
-) -> Result<Option<String>, ProviderFailure> {
+) -> Result<Option<(String, String)>, ProviderFailure> {
+    read_persisted_identity_evidence(host, account, request_id, true)
+}
+
+fn read_persisted_identity_evidence(
+    host: &HostContext,
+    account: &AccountProfile,
+    request_id: &str,
+    require_current_implementation: bool,
+) -> Result<Option<(String, String)>, ProviderFailure> {
     let path = runtime_context_path(host, account, request_id)?;
     let bytes = match durable_fs::read_file_bounded(&path, MAX_NATIVE_RUNTIME_STATE_BYTES) {
         Ok(bytes) => bytes,
@@ -118,8 +122,11 @@ pub(crate) fn validated_persisted_state_sha256(
     };
     let context = serde_json::from_slice(&bytes)
         .map_err(|error| native_runtime_failure(request_id, error))?;
-    validate_runtime_context(&context, account, request_id)?;
-    Ok(Some(sha256_hex(&bytes)))
+    validate_runtime_record_identity(&context, account, request_id)?;
+    if require_current_implementation {
+        validate_runtime_implementation(&context, account, request_id)?;
+    }
+    Ok(Some((context.identity_sha256, sha256_hex(&bytes))))
 }
 
 pub fn resolve_for_launch(
@@ -336,6 +343,15 @@ fn validate_runtime_context(
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
+    validate_runtime_record_identity(context, account, request_id)?;
+    validate_runtime_implementation(context, account, request_id)
+}
+
+fn validate_runtime_record_identity(
+    context: &NativeRuntimeContext,
+    account: &AccountProfile,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
     let identity_sha256 = runtime_identity_sha256(
         &context.account_wrapper,
         &context.program,
@@ -351,6 +367,14 @@ fn validate_runtime_context(
             "persisted native runtime identity is inconsistent",
         ));
     }
+    Ok(())
+}
+
+fn validate_runtime_implementation(
+    context: &NativeRuntimeContext,
+    account: &AccountProfile,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
     if !durable_fs::is_executable_file(Path::new(&context.program))
         .map_err(|error| native_runtime_failure(request_id, error))?
     {
