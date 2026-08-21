@@ -3,13 +3,14 @@
 use crate::durable_fs;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const INDEX_SCHEMA_VERSION: u64 = 2;
+const INDEX_SCHEMA_VERSION: u64 = 3;
+const PREDECESSOR_INDEX_SCHEMA_VERSION: u64 = 2;
 const MAX_INDEX_RECORD_BYTES: usize = 1024;
 const MAX_ACTIVE_INDEX_BYTES: usize = 16 * 1024;
 const MAX_REPLAY_EVICTION_PROBES: usize = 64;
@@ -35,6 +36,48 @@ impl ActiveSlot {
 struct ActiveIndex {
     next_probe: usize,
     slots: Vec<ActiveSlot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ReplaySlot {
+    #[serde(default)]
+    sequence: Option<u64>,
+    request_sha256: String,
+}
+
+impl ReplaySlot {
+    fn current(sequence: u64, request_sha256: String) -> Self {
+        Self {
+            sequence: Some(sequence),
+            request_sha256,
+        }
+    }
+
+    fn validate(&self, replay_slots: usize, slot: u64) -> Result<(), CustodyError> {
+        if !valid_digest(&self.request_sha256)
+            || self
+                .sequence
+                .is_some_and(|sequence| sequence % replay_slots as u64 != slot)
+        {
+            return Err(CustodyError::Invalid(
+                "request custody replay slot is inconsistent".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReplayOwner {
+    sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    displaced: Option<ReplaySlot>,
+}
+
+struct ReplayDisplacement {
+    replay: ReplaySlot,
+    pin: Option<(fs::File, PathBuf)>,
+    _lock: fs::File,
 }
 
 impl ActiveIndex {
@@ -74,6 +117,12 @@ impl ActiveIndex {
 
     fn active(&self) -> usize {
         self.slots.iter().filter(|slot| slot.occupied == 1).count()
+    }
+
+    fn contains(&self, stem: &str) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
     }
 
     fn reserve(&mut self, stem: String) -> Result<(), CustodyError> {
@@ -223,6 +272,18 @@ impl RequestCustody {
         Ok(pin)
     }
 
+    pub(crate) fn replay_owner_exists(&self, state_path: &Path) -> Result<bool, CustodyError> {
+        let stem = required_digest_stem(state_path)?;
+        match fs::metadata(self.owner_path(&stem)) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(CustodyError::Invalid(
+                "request custody replay owner is not a file".to_string(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
     pub(crate) fn release_pin_after_lock(&self, state_path: &Path) -> Result<(), CustodyError> {
         let stem = required_digest_stem(state_path)?;
         let Some((pin, pin_path)) = self.try_lock_pin_exclusive(&stem)? else {
@@ -243,6 +304,16 @@ impl RequestCustody {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn publish_replay_without_retiring_active(
+        &self,
+        state_path: &Path,
+        current_lock_path: &Path,
+    ) -> Result<bool, CustodyError> {
+        let stem = required_digest_stem(state_path)?;
+        self.place_replay(&stem, current_lock_path)
+    }
+
     fn initialize(
         &self,
         classify_replay: &impl Fn(&[u8]) -> Result<bool, String>,
@@ -252,13 +323,26 @@ impl RequestCustody {
             Ok(bytes) => {
                 let schema: Value = serde_json::from_slice(&bytes)
                     .map_err(|error| CustodyError::Invalid(error.to_string()))?;
-                if schema["schema_version"].as_u64() != Some(INDEX_SCHEMA_VERSION)
-                    || schema["active_limit"].as_u64() != Some(self.active_limit as u64)
+                if schema["active_limit"].as_u64() != Some(self.active_limit as u64)
                     || schema["replay_slots"].as_u64() != Some(self.replay_slots as u64)
                 {
                     return Err(CustodyError::Invalid(
                         "request custody index schema or bounds are inconsistent".to_string(),
                     ));
+                }
+                match schema["schema_version"].as_u64() {
+                    Some(INDEX_SCHEMA_VERSION) => {
+                        self.require_index_directory(&self.replay_root())?;
+                        self.require_index_directory(&self.owner_root())?;
+                    }
+                    Some(PREDECESSOR_INDEX_SCHEMA_VERSION) => {
+                        self.upgrade_predecessor_index(&schema_path)?;
+                    }
+                    _ => {
+                        return Err(CustodyError::Invalid(
+                            "request custody index schema or bounds are inconsistent".to_string(),
+                        ))
+                    }
                 }
                 self.prepare_temporary_root()?;
                 return Ok(());
@@ -285,7 +369,12 @@ impl RequestCustody {
         }
         create_private_index_subtree(
             &self.index_root,
-            &[self.replay_root(), self.pin_root(), self.temporary_root()],
+            &[
+                self.replay_root(),
+                self.owner_root(),
+                self.pin_root(),
+                self.temporary_root(),
+            ],
         )?;
         let mut migrated = 0_usize;
         let mut active_index = ActiveIndex::empty(self.active_limit);
@@ -320,12 +409,12 @@ impl RequestCustody {
             }
         }
         replay_candidates.sort_by_key(|candidate| candidate.0);
+        self.write_active_index(&active_index)?;
         for (_, stem) in replay_candidates {
             if !self.place_replay(&stem, Path::new(""))? {
                 return Err(CustodyError::Capacity);
             }
         }
-        self.write_active_index(&active_index)?;
         self.write_json_atomic(
             &schema_path,
             &json!({
@@ -337,80 +426,260 @@ impl RequestCustody {
         Ok(())
     }
 
+    fn upgrade_predecessor_index(&self, schema_path: &Path) -> Result<(), CustodyError> {
+        self.prepare_temporary_root()?;
+        match fs::metadata(self.owner_root()) {
+            Ok(metadata) if metadata.is_dir() => {
+                fs::remove_dir_all(self.owner_root())?;
+                durable_fs::sync_directory(&self.index_root)?;
+            }
+            Ok(_) => {
+                return Err(CustodyError::Invalid(
+                    "request custody replay owner root is not a directory".to_string(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(CustodyError::Io(error)),
+        }
+        create_private_child_directory(&self.owner_root())?;
+
+        let head = self.read_replay_head()?;
+        let mut records = Vec::new();
+        let mut authoritative = HashMap::<String, (u64, u64)>::new();
+        for slot in 0..self.replay_slots as u64 {
+            let path = self.replay_slot_path(slot);
+            let bytes = match durable_fs::read_file_bounded(&path, MAX_INDEX_RECORD_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(CustodyError::Io(error)),
+            };
+            let mut replay: ReplaySlot = serde_json::from_slice(&bytes)
+                .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+            replay.validate(self.replay_slots, slot)?;
+            let sequence = match replay.sequence {
+                Some(sequence) if sequence < head => sequence,
+                Some(_) => {
+                    return Err(CustodyError::Invalid(
+                        "request custody replay slot is ahead of its head".to_string(),
+                    ))
+                }
+                None => predecessor_replay_sequence(head, slot, self.replay_slots)?,
+            };
+            replay.sequence = Some(sequence);
+            let candidate = (sequence, slot);
+            authoritative
+                .entry(replay.request_sha256.clone())
+                .and_modify(|selected| {
+                    if candidate.0 > selected.0 {
+                        *selected = candidate;
+                    }
+                })
+                .or_insert(candidate);
+            records.push((slot, replay));
+        }
+
+        let mut removed_duplicate = false;
+        for (slot, replay) in records {
+            let sequence = replay.sequence.expect("predecessor sequence was assigned");
+            if authoritative.get(&replay.request_sha256) == Some(&(sequence, slot)) {
+                self.write_replay_slot(&self.replay_slot_path(slot), &replay)?;
+                self.write_replay_owner(
+                    &replay.request_sha256,
+                    &ReplayOwner {
+                        sequence,
+                        displaced: None,
+                    },
+                )?;
+            } else {
+                remove_file_if_present(&self.replay_slot_path(slot))?;
+                removed_duplicate = true;
+            }
+        }
+        if removed_duplicate {
+            durable_fs::sync_directory(&self.replay_root())?;
+        }
+        let active = self.read_active_index()?;
+        self.write_active_index(&active)?;
+        self.write_json_atomic(
+            schema_path,
+            &json!({
+                "schema_version": INDEX_SCHEMA_VERSION,
+                "active_limit": self.active_limit,
+                "replay_slots": self.replay_slots,
+            }),
+        )
+    }
+
     fn place_replay(&self, stem: &str, current_lock_path: &Path) -> Result<bool, CustodyError> {
         if self.replay_slots == 0 {
             return Err(CustodyError::Capacity);
         }
+        if let Some(owner) = self.read_replay_owner(stem)? {
+            return self.complete_replay_placement(stem, &owner, current_lock_path);
+        }
         let head_path = self.index_root.join("head.json");
-        let head = match durable_fs::read_file_bounded(&head_path, MAX_INDEX_RECORD_BYTES) {
-            Ok(bytes) => {
-                let value: Value = serde_json::from_slice(&bytes)
-                    .map_err(|error| CustodyError::Invalid(error.to_string()))?;
-                value["next_slot"].as_u64().ok_or_else(|| {
-                    CustodyError::Invalid("custody replay head has no next slot".to_string())
-                })?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(CustodyError::Io(error)),
-        };
+        let head = self.read_replay_head()?;
         let probes = self.replay_slots.min(MAX_REPLAY_EVICTION_PROBES);
         for offset in 0..probes {
             let sequence = head.wrapping_add(offset as u64);
             let slot = sequence % self.replay_slots as u64;
-            let slot_path = self.replay_root().join(format!("{slot:04}.json"));
-            let prior = match durable_fs::read_file_bounded(&slot_path, MAX_INDEX_RECORD_BYTES) {
-                Ok(bytes) => {
-                    let value: Value = serde_json::from_slice(&bytes)
-                        .map_err(|error| CustodyError::Invalid(error.to_string()))?;
-                    Some(
-                        value["request_sha256"]
-                            .as_str()
-                            .ok_or_else(|| {
-                                CustodyError::Invalid(
-                                    "custody replay slot has no request digest".to_string(),
-                                )
-                            })?
-                            .to_string(),
-                    )
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(CustodyError::Io(error)),
+            let prior = self.read_replay_slot(slot)?;
+            if prior.as_ref().is_some_and(|prior| {
+                prior.request_sha256 == stem && prior.sequence == Some(sequence)
+            }) {
+                return Err(CustodyError::Invalid(
+                    "request custody replay slot has no matching owner".to_string(),
+                ));
+            }
+            let displacement = match prior.as_ref() {
+                Some(prior) => match self.acquire_replay_displacement(prior, current_lock_path)? {
+                    Some(displacement) => Some(displacement),
+                    None => continue,
+                },
+                None => None,
             };
-            if prior.as_deref() == Some(stem) {
-                self.write_replay_head(&head_path, sequence.wrapping_add(1))?;
-                return Ok(true);
-            }
-            if let Some(prior) = prior {
-                let prior_pin = match self.try_lock_pin_exclusive(&prior)? {
-                    Some(pin) => Some(pin),
-                    None if self.pin_root().join(format!("{prior}.pin")).exists() => continue,
-                    None => None,
-                };
-                let prior_lock_path = self.lock_path(&prior);
-                if prior_lock_path == current_lock_path {
-                    continue;
-                }
-                let lock = open_lock(&prior_lock_path)?;
-                match fs2::FileExt::try_lock_exclusive(&lock) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(error) => return Err(CustodyError::Io(error)),
-                }
-                remove_file_if_present(&self.state_path(&prior))?;
-                remove_file_if_present(&prior_lock_path)?;
-                if let Some((pin, pin_path)) = prior_pin {
-                    remove_file_if_present(&pin_path)?;
-                    drop(pin);
-                    durable_fs::sync_directory(&self.pin_root())?;
-                }
-                durable_fs::sync_directory(&self.state_root)?;
-                durable_fs::sync_directory(&self.lock_root)?;
-            }
-            self.write_json_atomic(&slot_path, &json!({"request_sha256": stem}))?;
             self.write_replay_head(&head_path, sequence.wrapping_add(1))?;
-            return Ok(true);
+            let owner = ReplayOwner {
+                sequence,
+                displaced: prior,
+            };
+            self.write_replay_owner(stem, &owner)?;
+            return self.publish_replay_placement(stem, &owner, displacement);
         }
         Ok(false)
+    }
+
+    fn complete_replay_placement(
+        &self,
+        stem: &str,
+        owner: &ReplayOwner,
+        current_lock_path: &Path,
+    ) -> Result<bool, CustodyError> {
+        let slot = owner.sequence % self.replay_slots as u64;
+        let current = self.read_replay_slot(slot)?;
+        let target_is_published = current.as_ref().is_some_and(|current| {
+            current.request_sha256 == stem && current.sequence == Some(owner.sequence)
+        });
+        if !target_is_published && current != owner.displaced {
+            return Err(CustodyError::Invalid(
+                "request custody pending replay placement lost its reserved slot".to_string(),
+            ));
+        }
+        let displacement = match owner.displaced.as_ref() {
+            Some(displaced) => {
+                match self.acquire_replay_displacement(displaced, current_lock_path)? {
+                    Some(displacement) => Some(displacement),
+                    None => return Ok(false),
+                }
+            }
+            None => None,
+        };
+        self.publish_replay_placement(stem, owner, displacement)
+    }
+
+    fn publish_replay_placement(
+        &self,
+        stem: &str,
+        owner: &ReplayOwner,
+        displacement: Option<ReplayDisplacement>,
+    ) -> Result<bool, CustodyError> {
+        let slot = owner.sequence % self.replay_slots as u64;
+        let slot_path = self.replay_slot_path(slot);
+        let current = self.read_replay_slot(slot)?;
+        if !current.as_ref().is_some_and(|current| {
+            current.request_sha256 == stem && current.sequence == Some(owner.sequence)
+        }) {
+            if current != owner.displaced {
+                return Err(CustodyError::Invalid(
+                    "request custody replay placement changed before publication".to_string(),
+                ));
+            }
+            let replay = ReplaySlot::current(owner.sequence, stem.to_string());
+            self.write_replay_slot(&slot_path, &replay)?;
+        }
+        if let Some(displacement) = displacement {
+            self.retire_replay_displacement(displacement)?;
+        }
+        if owner.displaced.is_some() {
+            self.write_replay_owner(
+                stem,
+                &ReplayOwner {
+                    sequence: owner.sequence,
+                    displaced: None,
+                },
+            )?;
+        }
+        Ok(true)
+    }
+
+    fn acquire_replay_displacement(
+        &self,
+        replay: &ReplaySlot,
+        current_lock_path: &Path,
+    ) -> Result<Option<ReplayDisplacement>, CustodyError> {
+        let sequence = replay.sequence.ok_or_else(|| {
+            CustodyError::Invalid("request custody replay slot has no sequence".to_string())
+        })?;
+        let slot = sequence % self.replay_slots as u64;
+        replay.validate(self.replay_slots, slot)?;
+        let pin_path = self
+            .pin_root()
+            .join(format!("{}.pin", replay.request_sha256));
+        let pin = match self.try_lock_pin_exclusive(&replay.request_sha256)? {
+            Some(pin) => Some(pin),
+            None if pin_path.exists() => return Ok(None),
+            None => None,
+        };
+        let lock_path = self.lock_path(&replay.request_sha256);
+        if lock_path == current_lock_path {
+            return Ok(None);
+        }
+        let lock = open_lock(&lock_path)?;
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(CustodyError::Io(error)),
+        }
+        Ok(Some(ReplayDisplacement {
+            replay: replay.clone(),
+            pin,
+            _lock: lock,
+        }))
+    }
+
+    fn retire_replay_displacement(
+        &self,
+        displacement: ReplayDisplacement,
+    ) -> Result<(), CustodyError> {
+        let stem = &displacement.replay.request_sha256;
+        let owner = self.read_replay_owner(stem)?;
+        if owner
+            .as_ref()
+            .is_some_and(|owner| owner.sequence != displacement.replay.sequence.unwrap_or(u64::MAX))
+        {
+            return Ok(());
+        }
+        if self.read_active_index()?.contains(stem) {
+            if owner.is_some() {
+                remove_file_if_present(&self.owner_path(stem))?;
+                durable_fs::sync_directory(&self.owner_root())?;
+            }
+            return Ok(());
+        }
+        remove_file_if_present(&self.state_path(stem))?;
+        remove_file_if_present(&self.lock_path(stem))?;
+        if let Some((pin, pin_path)) = displacement.pin {
+            remove_file_if_present(&pin_path)?;
+            drop(pin);
+            durable_fs::sync_directory(&self.pin_root())?;
+        }
+        durable_fs::sync_directory(&self.state_root)?;
+        durable_fs::sync_directory(&self.lock_root)?;
+        if owner.is_some() {
+            remove_file_if_present(&self.owner_path(stem))?;
+            durable_fs::sync_directory(&self.owner_root())?;
+        }
+        Ok(())
     }
 
     fn remove_abandoned_active(
@@ -475,6 +744,18 @@ impl RequestCustody {
         self.index_root.join("replay")
     }
 
+    fn replay_slot_path(&self, slot: u64) -> PathBuf {
+        self.replay_root().join(format!("{slot:04}.json"))
+    }
+
+    fn owner_root(&self) -> PathBuf {
+        self.index_root.join("owners")
+    }
+
+    fn owner_path(&self, stem: &str) -> PathBuf {
+        self.owner_root().join(format!("{stem}.json"))
+    }
+
     fn pin_root(&self) -> PathBuf {
         self.index_root.join("pins")
     }
@@ -516,6 +797,90 @@ impl RequestCustody {
 
     fn write_replay_head(&self, path: &Path, next_slot: u64) -> Result<(), CustodyError> {
         self.write_json_atomic(path, &json!({"next_slot": next_slot}))
+    }
+
+    fn read_replay_head(&self) -> Result<u64, CustodyError> {
+        let path = self.index_root.join("head.json");
+        match durable_fs::read_file_bounded(&path, MAX_INDEX_RECORD_BYTES) {
+            Ok(bytes) => {
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+                value["next_slot"].as_u64().ok_or_else(|| {
+                    CustodyError::Invalid("custody replay head has no next slot".to_string())
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
+    fn read_replay_slot(&self, slot: u64) -> Result<Option<ReplaySlot>, CustodyError> {
+        let path = self.replay_slot_path(slot);
+        match durable_fs::read_file_bounded(&path, MAX_INDEX_RECORD_BYTES) {
+            Ok(bytes) => {
+                let replay: ReplaySlot = serde_json::from_slice(&bytes)
+                    .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+                replay.validate(self.replay_slots, slot)?;
+                if replay.sequence.is_none() {
+                    return Err(CustodyError::Invalid(
+                        "request custody replay slot has no sequence".to_string(),
+                    ));
+                }
+                Ok(Some(replay))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
+    fn write_replay_slot(&self, path: &Path, replay: &ReplaySlot) -> Result<(), CustodyError> {
+        let value = serde_json::to_value(replay)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        self.write_json_atomic(path, &value)
+    }
+
+    fn read_replay_owner(&self, stem: &str) -> Result<Option<ReplayOwner>, CustodyError> {
+        let path = self.owner_path(stem);
+        match durable_fs::read_file_bounded(&path, MAX_INDEX_RECORD_BYTES) {
+            Ok(bytes) => {
+                let owner: ReplayOwner = serde_json::from_slice(&bytes)
+                    .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+                let slot = owner.sequence % self.replay_slots as u64;
+                if owner
+                    .displaced
+                    .as_ref()
+                    .is_some_and(|displaced| displaced.validate(self.replay_slots, slot).is_err())
+                {
+                    return Err(CustodyError::Invalid(
+                        "request custody replay owner is inconsistent".to_string(),
+                    ));
+                }
+                Ok(Some(owner))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
+    fn write_replay_owner(&self, stem: &str, owner: &ReplayOwner) -> Result<(), CustodyError> {
+        if !valid_digest(stem) {
+            return Err(CustodyError::Invalid(
+                "request custody replay owner has an invalid digest".to_string(),
+            ));
+        }
+        let value = serde_json::to_value(owner)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        self.write_json_atomic(&self.owner_path(stem), &value)
+    }
+
+    fn require_index_directory(&self, path: &Path) -> Result<(), CustodyError> {
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => Err(CustodyError::Invalid(
+                "request custody index child is not a directory".to_string(),
+            )),
+            Err(error) => Err(CustodyError::Io(error)),
+        }
     }
 
     fn read_active_index(&self) -> Result<ActiveIndex, CustodyError> {
@@ -568,6 +933,25 @@ impl RequestCustody {
         durable_fs::sync_directory(&temporary_root)?;
         Ok(())
     }
+}
+
+fn predecessor_replay_sequence(
+    head: u64,
+    slot: u64,
+    replay_slots: usize,
+) -> Result<u64, CustodyError> {
+    if replay_slots == 0 || head == 0 {
+        return Err(CustodyError::Invalid(
+            "request custody predecessor replay head is inconsistent".to_string(),
+        ));
+    }
+    let last = head - 1;
+    if slot > last {
+        return Err(CustodyError::Invalid(
+            "request custody predecessor replay slot is ahead of its head".to_string(),
+        ));
+    }
+    Ok(last - ((last - slot) % replay_slots as u64))
 }
 
 fn create_private_child_directory(path: &Path) -> Result<(), CustodyError> {
@@ -682,4 +1066,186 @@ fn record_modified(primary: &Path, fallback: &Path) -> SystemTime {
         .or_else(|_| fs::metadata(fallback))
         .and_then(|metadata| metadata.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn predecessor_upgrade_deduplicates_interrupted_replay_handoff() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let index_root = directory.path().join(".custody-v2");
+        let replay_root = index_root.join("replay");
+        fs::create_dir_all(&replay_root).expect("predecessor replay root");
+        fs::create_dir_all(index_root.join("pins")).expect("predecessor pin root");
+        fs::create_dir_all(index_root.join(".write-tmp")).expect("predecessor temporary root");
+        let stem = format!("{:064x}", 1);
+        fs::write(
+            index_root.join("schema.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": PREDECESSOR_INDEX_SCHEMA_VERSION,
+                "active_limit": 2,
+                "replay_slots": 2,
+            }))
+            .expect("serialize predecessor schema"),
+        )
+        .expect("predecessor schema");
+        fs::write(
+            index_root.join("active.json"),
+            serde_json::to_vec(&json!({
+                "next_probe": 0,
+                "slots": [
+                    {"occupied": 1, "request_sha256": stem},
+                    {"occupied": 0, "request_sha256": EMPTY_ACTIVE_DIGEST},
+                ],
+            }))
+            .expect("serialize predecessor active index"),
+        )
+        .expect("predecessor active index");
+        fs::write(index_root.join("head.json"), br#"{"next_slot":2}"#)
+            .expect("predecessor replay head");
+        for slot in 0..2 {
+            fs::write(
+                replay_root.join(format!("{slot:04}.json")),
+                serde_json::to_vec(&json!({"request_sha256": stem}))
+                    .expect("serialize predecessor replay slot"),
+            )
+            .expect("duplicate predecessor replay slot");
+        }
+        let state_path = directory.path().join(format!("{stem}.json"));
+        fs::write(&state_path, br#"{"terminal":true}"#).expect("terminal request state");
+        fs::write(directory.path().join(format!("{stem}.lock")), b"")
+            .expect("terminal request lock");
+
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            index_root.clone(),
+            1024,
+            2,
+            2,
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            custody
+                .maintain(&directory.path().join("current.lock"), |_| Ok(true))
+                .expect("upgrade interrupted predecessor handoff"),
+            0
+        );
+        assert_eq!(replay_references(&replay_root, &stem), 1);
+        assert!(
+            state_path.exists(),
+            "the authoritative terminal remains replayable"
+        );
+        let schema: Value = serde_json::from_slice(
+            &fs::read(index_root.join("schema.json")).expect("upgraded schema"),
+        )
+        .expect("parse upgraded schema");
+        assert_eq!(
+            schema["schema_version"].as_u64(),
+            Some(INDEX_SCHEMA_VERSION)
+        );
+        let owner: ReplayOwner = serde_json::from_slice(
+            &fs::read(index_root.join("owners").join(format!("{stem}.json")))
+                .expect("upgraded replay owner"),
+        )
+        .expect("parse upgraded replay owner");
+        assert_eq!(owner.sequence, 1);
+        assert!(owner.displaced.is_none());
+    }
+
+    #[test]
+    fn replay_eviction_preserves_state_still_owned_by_active_index() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            directory.path().join(".custody-v2"),
+            1024,
+            2,
+            1,
+            Duration::from_secs(60),
+        );
+        let first = format!("{:064x}", 1);
+        let first_state = directory.path().join(format!("{first}.json"));
+        fs::write(directory.path().join(format!("{first}.lock")), b"").expect("first request lock");
+        fs::write(&first_state, br#"{"terminal":false}"#).expect("first active request");
+        assert_eq!(
+            custody
+                .maintain(&directory.path().join("current.lock"), |bytes| {
+                    let state: Value =
+                        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+                    Ok(state["terminal"].as_bool() == Some(true))
+                })
+                .expect("initialize active request"),
+            1
+        );
+        fs::write(&first_state, br#"{"terminal":true}"#).expect("complete first request");
+        assert!(custody
+            .publish_replay_without_retiring_active(
+                &first_state,
+                &directory.path().join("current.lock")
+            )
+            .expect("publish first replay without active retirement"));
+
+        let second = format!("{:064x}", 2);
+        let second_state = directory.path().join(format!("{second}.json"));
+        fs::write(directory.path().join(format!("{second}.lock")), b"")
+            .expect("second request lock");
+        fs::write(&second_state, br#"{"terminal":true}"#).expect("second terminal request");
+        custody
+            .reserve_active(&second_state)
+            .expect("reserve second request");
+        assert!(custody
+            .publish_replay_without_retiring_active(
+                &second_state,
+                &directory.path().join("current.lock")
+            )
+            .expect("replace first replay while its active owner remains"));
+        assert!(
+            first_state.exists(),
+            "replay replacement must not delete state referenced by the active index"
+        );
+        assert_eq!(
+            replay_references(&directory.path().join(".custody-v2/replay"), &first),
+            0
+        );
+        assert_eq!(
+            replay_references(&directory.path().join(".custody-v2/replay"), &second),
+            1
+        );
+
+        let classify = |bytes: &[u8]| {
+            let state: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            Ok(state["terminal"].as_bool() == Some(true))
+        };
+        assert_eq!(
+            custody
+                .maintain(&directory.path().join("current.lock"), classify)
+                .expect("retire second active owner"),
+            1
+        );
+        assert_eq!(
+            custody
+                .maintain(&directory.path().join("current.lock"), classify)
+                .expect("restore first replay owner"),
+            0
+        );
+        assert!(first_state.exists(), "first terminal remains replayable");
+        assert_eq!(
+            replay_references(&directory.path().join(".custody-v2/replay"), &first),
+            1
+        );
+    }
+
+    fn replay_references(root: &Path, stem: &str) -> usize {
+        fs::read_dir(root)
+            .expect("replay root")
+            .map(|entry| entry.expect("replay entry").path())
+            .filter_map(|path| fs::read(path).ok())
+            .filter_map(|bytes| serde_json::from_slice::<ReplaySlot>(&bytes).ok())
+            .filter(|record| record.request_sha256 == stem)
+            .count()
+    }
 }

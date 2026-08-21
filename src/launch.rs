@@ -2097,8 +2097,12 @@ fn acquire_launch_request_lock(
 ) -> Result<fs::File, ProviderFailure> {
     let capacity_lock = acquire_launch_capacity_lock(root, host, request_id)?;
     let lock_path = state_path.with_extension("lock");
-    let observed_existing = lock_path.exists() || state_path.exists();
     let custody = launch_request_custody(root);
+    let observed_existing = lock_path.exists()
+        || state_path.exists()
+        || custody
+            .replay_owner_exists(state_path)
+            .map_err(|error| launch_custody_failure(request_id, error))?;
     let active = maintain_launch_request_capacity(&custody, &lock_path, request_id)?;
     let reserved = admit_new && !observed_existing;
     if reserved && active >= MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
@@ -2152,6 +2156,12 @@ fn acquire_launch_request_lock(
     custody
         .release_pin_after_lock(state_path)
         .map_err(|error| launch_custody_failure(request_id, error))?;
+    if observed_existing && !state_path.exists() {
+        return Err(launch_state_invalid(
+            request_id,
+            "an observed request replay is still retiring its durable state",
+        ));
+    }
     Ok(lock)
 }
 
@@ -3786,6 +3796,104 @@ mod custody_tests {
             "steady-state admission must not parse replay payloads"
         );
         assert!(!temporary_residue.exists());
+    }
+
+    #[test]
+    fn interrupted_replay_handoff_is_idempotent_for_launch_requests() {
+        let directory = tempfile::tempdir().expect("launch custody directory");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            directory.path().join(".custody-v2"),
+            MAX_LAUNCH_STATE_BYTES,
+            2,
+            2,
+            LAUNCH_ORPHAN_RETENTION,
+        );
+        let first = format!("{:064x}", 1);
+        let first_state = directory.path().join(format!("{first}.json"));
+        let first_lock = directory.path().join(format!("{first}.lock"));
+        fs::write(&first_lock, b"").expect("first launch request lock");
+        fs::write(&first_state, br#"{"phase":"prepared"}"#).expect("first active launch state");
+        assert_eq!(
+            custody
+                .maintain(
+                    &directory.path().join("current.lock"),
+                    launch_request_bytes_are_replay
+                )
+                .expect("initialize launch custody"),
+            1
+        );
+
+        fs::write(&first_state, br#"{"phase":"session_observed"}"#)
+            .expect("complete first launch state");
+        assert!(custody
+            .publish_replay_without_retiring_active(
+                &first_state,
+                &directory.path().join("current.lock")
+            )
+            .expect("publish replay before simulated interruption"));
+        assert_eq!(
+            custody
+                .maintain(
+                    &directory.path().join("current.lock"),
+                    launch_request_bytes_are_replay
+                )
+                .expect("resume interrupted launch handoff"),
+            0
+        );
+        assert_eq!(
+            replay_references(directory.path(), ".custody-v2", &first),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(&first_state).expect("recover first launch terminal"),
+            r#"{"phase":"session_observed"}"#
+        );
+
+        for index in 2..=3 {
+            let stem = format!("{index:064x}");
+            let state = directory.path().join(format!("{stem}.json"));
+            fs::write(directory.path().join(format!("{stem}.lock")), b"")
+                .expect("later launch request lock");
+            fs::write(&state, br#"{"phase":"session_observed"}"#)
+                .expect("later completed launch state");
+            custody
+                .reserve_active(&state)
+                .expect("reserve later launch request");
+            assert_eq!(
+                custody
+                    .maintain(
+                        &directory.path().join("current.lock"),
+                        launch_request_bytes_are_replay
+                    )
+                    .expect("place later launch replay"),
+                0
+            );
+        }
+        assert!(!first_state.exists(), "the oldest replay is evicted once");
+        assert_eq!(
+            replay_references(directory.path(), ".custody-v2", &first),
+            0
+        );
+        assert_eq!(
+            replay_references(directory.path(), ".custody-v2", &format!("{:064x}", 2)),
+            1
+        );
+        assert_eq!(
+            replay_references(directory.path(), ".custody-v2", &format!("{:064x}", 3)),
+            1
+        );
+    }
+
+    fn replay_references(root: &Path, index_name: &str, stem: &str) -> usize {
+        fs::read_dir(root.join(index_name).join("replay"))
+            .expect("replay ring")
+            .map(|entry| entry.expect("replay entry").path())
+            .filter_map(|path| fs::read(path).ok())
+            .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(|record| record["request_sha256"].as_str() == Some(stem))
+            .count()
     }
 
     #[test]

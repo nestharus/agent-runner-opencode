@@ -575,8 +575,12 @@ fn acquire_quota_refresh_request_lock(
     lock_quota_refresh_file(host, &capacity_lock, request_id)?;
     let lock_path = lock_root.join(format!("{name}.lock"));
     let state_path = quota_refresh_operation_path(host, request_id)?;
-    let observed_existing = lock_path.exists() || state_path.exists();
     let custody = quota_refresh_custody(host, &root, &lock_root, request_id)?;
+    let observed_existing = lock_path.exists()
+        || state_path.exists()
+        || custody
+            .replay_owner_exists(&state_path)
+            .map_err(|error| quota_refresh_custody_failure(request_id, error))?;
     let active = maintain_quota_refresh_capacity(&custody, &lock_path, request_id)?;
     let reserved = !observed_existing;
     if reserved && active >= MAX_ACTIVE_QUOTA_REFRESH_REQUEST_RECORDS {
@@ -625,6 +629,12 @@ fn acquire_quota_refresh_request_lock(
     custody
         .release_pin_after_lock(&state_path)
         .map_err(|error| quota_refresh_custody_failure(request_id, error))?;
+    if observed_existing && !state_path.exists() {
+        return Err(quota_refresh_operation_invalid(
+            request_id,
+            "an observed request replay is still retiring its durable state",
+        ));
+    }
     Ok(lock)
 }
 
@@ -1566,5 +1576,143 @@ mod custody_tests {
             0,
             "steady-state admission must not parse replay payloads"
         );
+    }
+
+    #[test]
+    fn interrupted_replay_handoff_is_idempotent_for_quota_requests() {
+        let directory = tempfile::tempdir().expect("quota custody directory");
+        let request_root = directory.path().join("requests");
+        let lock_root = directory.path().join("locks");
+        fs::create_dir_all(&request_root).expect("quota request root");
+        fs::create_dir_all(&lock_root).expect("quota lock root");
+        let custody = RequestCustody::new(
+            request_root.clone(),
+            lock_root.clone(),
+            directory.path().join(".custody-v2"),
+            MAX_QUOTA_REFRESH_STATE_BYTES,
+            2,
+            2,
+            QUOTA_REFRESH_ORPHAN_RETENTION,
+        );
+        let first = format!("{:064x}", 1);
+        let first_state = request_root.join(format!("{first}.json"));
+        let first_lock = lock_root.join(format!("{first}.lock"));
+        fs::write(&first_lock, b"").expect("first quota request lock");
+        fs::write(
+            &first_state,
+            serde_json::to_vec(&quota_custody_operation(
+                1,
+                QuotaRefreshOperationPhase::Prepared,
+            ))
+            .expect("serialize active quota operation"),
+        )
+        .expect("first active quota state");
+        assert_eq!(
+            custody
+                .maintain(
+                    &lock_root.join("current.lock"),
+                    quota_refresh_bytes_are_replay
+                )
+                .expect("initialize quota custody"),
+            1
+        );
+
+        fs::write(
+            &first_state,
+            serde_json::to_vec(&quota_custody_operation(
+                1,
+                QuotaRefreshOperationPhase::Committed,
+            ))
+            .expect("serialize terminal quota operation"),
+        )
+        .expect("complete first quota state");
+        assert!(custody
+            .publish_replay_without_retiring_active(&first_state, &lock_root.join("current.lock"))
+            .expect("publish quota replay before simulated interruption"));
+        assert_eq!(
+            custody
+                .maintain(
+                    &lock_root.join("current.lock"),
+                    quota_refresh_bytes_are_replay
+                )
+                .expect("resume interrupted quota handoff"),
+            0
+        );
+        assert_eq!(quota_replay_references(directory.path(), &first), 1);
+        let recovered: QuotaRefreshOperation =
+            serde_json::from_slice(&fs::read(&first_state).expect("recover first quota terminal"))
+                .expect("parse recovered quota terminal");
+        assert!(recovered.phase == QuotaRefreshOperationPhase::Committed);
+
+        for index in 2..=3 {
+            let stem = format!("{index:064x}");
+            let state = request_root.join(format!("{stem}.json"));
+            fs::write(lock_root.join(format!("{stem}.lock")), b"")
+                .expect("later quota request lock");
+            fs::write(
+                &state,
+                serde_json::to_vec(&quota_custody_operation(
+                    index,
+                    QuotaRefreshOperationPhase::Committed,
+                ))
+                .expect("serialize later quota operation"),
+            )
+            .expect("later terminal quota state");
+            custody
+                .reserve_active(&state)
+                .expect("reserve later quota request");
+            assert_eq!(
+                custody
+                    .maintain(
+                        &lock_root.join("current.lock"),
+                        quota_refresh_bytes_are_replay
+                    )
+                    .expect("place later quota replay"),
+                0
+            );
+        }
+        assert!(
+            !first_state.exists(),
+            "the oldest quota replay is evicted once"
+        );
+        assert_eq!(quota_replay_references(directory.path(), &first), 0);
+        assert_eq!(
+            quota_replay_references(directory.path(), &format!("{:064x}", 2)),
+            1
+        );
+        assert_eq!(
+            quota_replay_references(directory.path(), &format!("{:064x}", 3)),
+            1
+        );
+    }
+
+    fn quota_custody_operation(
+        index: usize,
+        phase: QuotaRefreshOperationPhase,
+    ) -> QuotaRefreshOperation {
+        QuotaRefreshOperation {
+            schema_version: QUOTA_REFRESH_SCHEMA_VERSION,
+            operation: "quota.refresh_auth".to_string(),
+            request_id: format!("request-{index}"),
+            binding_sha256: "binding".to_string(),
+            binding: json!({}),
+            phase,
+            prepared_at_unix_ms: 1,
+            native_effect_admitted_at_unix_ms: Some(2),
+            committed_at_unix_ms: (phase == QuotaRefreshOperationPhase::Committed).then_some(3),
+            result: (phase == QuotaRefreshOperationPhase::Committed)
+                .then(|| json!({"available": true})),
+            reconciliation: None,
+        }
+    }
+
+    fn quota_replay_references(root: &Path, stem: &str) -> usize {
+        fs::read_dir(root.join(".custody-v2/replay"))
+            .expect("quota replay ring")
+            .map(|entry| entry.expect("quota replay entry").path())
+            .filter_map(|path| fs::read(path).ok())
+            .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(|record| record["request_sha256"].as_str() == Some(stem))
+            .count()
     }
 }

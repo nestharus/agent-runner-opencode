@@ -188,6 +188,11 @@ Quota refresh custody reserves 64 records for active obligations independently
 of a fixed 4,096-slot recent-replay ring. Cyclic slot replacement retires the
 oldest available completion without parsing replay payloads; admission reads at
 most the 64 active records, and completion probes at most 64 compact ring slots.
+Each replay placement has a durable request-keyed owner and slot sequence before
+the active marker is retired. Interrupted active-to-replay handoff is therefore
+idempotent, and eviction removes request state only after both replay and active
+ownership have ended. The predecessor ring is deduplicated once during its
+bounded index upgrade.
 Shared replay pins protect exact callers between capacity admission and
 request-lock acquisition.
 Prepared, effect-admitted, and reconciliation-required records never age out or
@@ -258,7 +263,11 @@ fixed 4,096-slot recent-replay ring; every record is no larger than 256 KiB.
 Cyclic slot replacement retires the oldest available completion without parsing
 replay payloads. Steady-state admission reads one fixed-shape compact active
 index and classifies at most one active payload per request; completion probes at
-most 64 compact ring slots. Prepared, submission-observed, and unresolved
+most 64 compact ring slots. Durable request-keyed replay ownership and sequenced
+slots make active-to-replay transfer crash-idempotent; state is retired only
+after neither the replay ring nor the active index owns it, and predecessor
+duplicate slots are collapsed during the one-time bounded index upgrade.
+Prepared, submission-observed, and unresolved
 records never age out because they may still own an effect. New work fails at
 the active cap until those live obligations are reconciled, but routine
 completed history cannot consume its admission reserve or make admission work
