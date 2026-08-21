@@ -4,22 +4,28 @@ Contract identity: `agent-runner-opencode.opencode-native-state/v1`
 
 This provider treats OpenCode as one effectful native-state participant behind a
 direct executable boundary. The numbered `opencode1` through `opencode5` values
-remain logical account and policy identities; they are never executed. For every
-native operation the provider instead resolves the `opencode` executable once,
-canonicalizes and streams a bounded hash of its bytes, and admits it only when
+remain logical account and policy identities; they are never executed. On
+initial admission, rebind, and predecessor upgrade the provider resolves the
+`opencode` executable, canonicalizes and streams a bounded hash of its bytes,
+and admits it only when
 the target platform, byte length, digest, version, and semantic contract match
 `contract/native-implementation-manifest-v1.json`. It binds that manifest
-identity, the exact cleared stable environment, and fixed `--pure` argument,
-persists them per numbered account, and revalidates the executable and manifest
-before reuse. OpenCode is therefore unable to
+identity, an admitted size/inode/change metadata stamp, the exact cleared stable
+environment, and fixed `--pure` argument, then persists them per numbered
+account. Reuse validates executable status, canonical path, the constant-time
+metadata stamp, and the immutable build manifest under the account lock without
+rereading the whole executable. The stamp is persistence/incarnation evidence,
+not part of the semantic component identity. OpenCode is therefore unable to
 select a different implementation through a mutable numbered wrapper after
 admission. A changed executable, fixed argument, contract identity, or stable
 state-selection environment requires the native-identity rebind protocol.
-Durable schema-v9 launch recovery records the same direct executable hash,
-manifest ID/version, fixed argument, contract identity, and state environment
-and validates them before list/export observation. Predecessor launch records
-without complete manifest evidence fail closed
-instead of executing an unbound wrapper. Setup uses the same boundary: it
+Durable schema-v10 launch recovery records the same direct executable hash,
+manifest ID/version, constant-time admitted metadata stamp, fixed argument,
+contract identity, and state environment and validates them before list/export
+observation. Predecessor launch records
+with manifest evidence but no stamp use a bounded content check during recovery;
+records without complete manifest evidence fail closed instead of executing an
+unbound wrapper. Setup uses the same boundary: it
 admits the direct executable against the source-included manifest before any
 exact-path `--version` probe and never resolves or executes the numbered logical
 account identities. Per-account setup readiness is the conjunction of that one
@@ -28,7 +34,7 @@ direct-runtime result and the account's declared auth-file evidence.
 Schema-v1 wrapper and schema-v2 direct native-runtime bindings are bounded
 transition inputs only. The provider validates the exact recorded bytes and
 requires the currently selected direct implementation to be manifest-approved.
-While holding the account runtime lock, it persists the schema-v3 manifest-bound
+While holding the account runtime lock, it persists the schema-v4 manifest-bound
 identity before any new native effect. It never uses the schema-v1 wrapper as
 the acting implementation after the upgrade-capable provider is installed.
 

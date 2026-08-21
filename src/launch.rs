@@ -15,7 +15,6 @@ use crate::child_custody::ChildCustody;
 use crate::durable_fs;
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
-use crate::native_implementation_manifest;
 use crate::native_runtime;
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
 use crate::operation_bounds;
@@ -64,7 +63,7 @@ const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
 const LAUNCH_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const LAUNCH_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const LAUNCH_STATE_SCHEMA_VERSION: u32 = 9;
+const LAUNCH_STATE_SCHEMA_VERSION: u32 = 10;
 const MAX_ACTIVE_LAUNCH_REQUEST_RECORDS: usize = 64;
 const MAX_LAUNCH_REPLAY_RECORDS: usize = 4096;
 const MAX_LAUNCH_STATE_BYTES: usize = 256 * 1024;
@@ -159,6 +158,8 @@ struct LaunchRecoveryIdentity {
     implementation_manifest_id: String,
     #[serde(default)]
     implementation_version: String,
+    #[serde(default)]
+    program_stamp: native_runtime::NativeProgramStamp,
     passthrough_env: BTreeMap<String, String>,
     declared_env_sha256: String,
     working_directory: String,
@@ -1750,6 +1751,7 @@ fn launch_recovery_context(
             fixed_args: runtime.fixed_args().to_vec(),
             implementation_manifest_id: runtime.implementation_manifest_id().to_string(),
             implementation_version: runtime.implementation_version().to_string(),
+            program_stamp: runtime.program_stamp().clone(),
             passthrough_env: runtime.stable_execution_env().clone(),
             declared_env_sha256: launch_environment_sha256(declared_env),
             working_directory: working_directory.to_string(),
@@ -1787,55 +1789,35 @@ fn validate_launch_recovery_implementation(
     recovery: &LaunchRecoveryIdentity,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    if !launch_recovery_identity_is_current(recovery) {
+    if !launch_recovery_identity_is_manifest_bound(recovery) {
         return Err(launch_recovery_unavailable(
             request_id,
             "the durable request predates the pinned direct OpenCode recovery contract; reconcile it without invoking an unbound implementation",
         ));
     }
     let program = Path::new(&recovery.program);
-    if !durable_fs::is_executable_file(program)
-        .map_err(|error| launch_recovery_unavailable(request_id, error))?
-    {
-        return Err(launch_recovery_unavailable(
-            request_id,
-            "the pinned direct OpenCode recovery implementation is no longer executable",
-        ));
-    }
-    let (program_sha256, program_bytes) =
-        durable_fs::sha256_file_bounded(program, durable_fs::MAX_BOUND_EXECUTABLE_BYTES)
-            .map_err(|error| launch_recovery_unavailable(request_id, error))?;
-    if program_sha256 != recovery.program_sha256 {
-        return Err(launch_recovery_unavailable(
-            request_id,
-            "the pinned direct OpenCode recovery implementation changed after launch admission",
-        ));
-    }
-    let approved = native_implementation_manifest::approved_implementation(
-        "opencode",
-        &recovery.program_sha256,
-        program_bytes,
-    )
-    .map_err(|error| launch_recovery_unavailable(request_id, error))?
-    .ok_or_else(|| {
-        launch_recovery_unavailable(
-            request_id,
-            "the pinned direct OpenCode recovery implementation is no longer in the reviewed native implementation manifest",
+    let validation = if recovery.program_stamp.is_complete() {
+        native_runtime::validate_pinned_program(
+            program,
+            &recovery.program_sha256,
+            &recovery.implementation_manifest_id,
+            &recovery.implementation_version,
+            &recovery.native_contract_id,
+            &recovery.program_stamp,
         )
-    })?;
-    if approved.semantic_contract != native_runtime::OPENCODE_NATIVE_CONTRACT_ID
-        || approved.id != recovery.implementation_manifest_id
-        || approved.version != recovery.implementation_version
-    {
-        return Err(launch_recovery_unavailable(
-            request_id,
-            "the pinned direct OpenCode recovery manifest identity is inconsistent",
-        ));
-    }
-    Ok(())
+    } else {
+        native_runtime::validate_predecessor_pinned_program(
+            program,
+            &recovery.program_sha256,
+            &recovery.implementation_manifest_id,
+            &recovery.implementation_version,
+            &recovery.native_contract_id,
+        )
+    };
+    validation.map_err(|error| launch_recovery_unavailable(request_id, error))
 }
 
-fn launch_recovery_identity_is_current(recovery: &LaunchRecoveryIdentity) -> bool {
+fn launch_recovery_identity_is_manifest_bound(recovery: &LaunchRecoveryIdentity) -> bool {
     recovery.native_contract_id == native_runtime::OPENCODE_NATIVE_CONTRACT_ID
         && recovery
             .fixed_args
@@ -1846,6 +1828,10 @@ fn launch_recovery_identity_is_current(recovery: &LaunchRecoveryIdentity) -> boo
         && !recovery.implementation_manifest_id.trim().is_empty()
         && !recovery.implementation_version.trim().is_empty()
         && Path::new(&recovery.program).is_absolute()
+}
+
+fn launch_recovery_identity_is_current(recovery: &LaunchRecoveryIdentity) -> bool {
+    launch_recovery_identity_is_manifest_bound(recovery) && recovery.program_stamp.is_complete()
 }
 
 fn observe_durable_resume(
@@ -2398,7 +2384,7 @@ fn validate_launch_request_state(
                 .is_some_and(|nonce| !nonce.trim().is_empty())
                 && state.actor_process_group_incarnation.is_none()
         }
-        7 | 8 | LAUNCH_STATE_SCHEMA_VERSION => {
+        7 | 8 | 9 | LAUNCH_STATE_SCHEMA_VERSION => {
             state
                 .delivery_nonce
                 .as_deref()
@@ -2471,7 +2457,7 @@ fn validate_resume_launch_request_state(
                 .is_some_and(|nonce| !nonce.trim().is_empty())
                 && state.actor_process_group_incarnation.is_none()
         }
-        7 | 8 | LAUNCH_STATE_SCHEMA_VERSION => {
+        7 | 8 | 9 | LAUNCH_STATE_SCHEMA_VERSION => {
             observation
                 .delivery_nonce
                 .as_deref()
@@ -4151,6 +4137,7 @@ mod recovery_tests {
                 fixed_args: Vec::new(),
                 implementation_manifest_id: String::new(),
                 implementation_version: String::new(),
+                program_stamp: native_runtime::NativeProgramStamp::default(),
                 passthrough_env: BTreeMap::new(),
                 declared_env_sha256: "environment".to_string(),
                 working_directory: "/tmp".to_string(),

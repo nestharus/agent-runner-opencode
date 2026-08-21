@@ -256,7 +256,7 @@ pub fn ensure_default_runtime_settings(request: &Value) {
         fs::create_dir_all(data_root).expect("create default provider data fixture");
     }
     if !store_path.exists() {
-        let migration = json!({
+        let mut migration = json!({
             "contract": CONTRACT,
             "request_id": "fixture-activate-default-runtime-settings",
             "provider_instance_id": "opencode-primary",
@@ -266,6 +266,12 @@ pub fn ensure_default_runtime_settings(request: &Value) {
                 "legacy": { "providers_toml": DEFAULT_RUNTIME_PROVIDERS_TOML }
             }
         });
+        // Fixture activation is a prerequisite, not part of the operation whose
+        // deliberately short deadline a contract may be exercising.
+        migration["host"]
+            .as_object_mut()
+            .expect("fixture migration host")
+            .remove("deadline_unix_ms");
         let output = invoke_raw_stdin("settings.migrate", &request_stdin_bytes(&migration));
         let response = json_stdout(&output);
         assert_eq!(

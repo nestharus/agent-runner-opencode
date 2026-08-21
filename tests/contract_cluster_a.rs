@@ -10,13 +10,28 @@ use std::fs;
 #[cfg(unix)]
 use std::{
     os::fd::AsRawFd,
-    os::unix::{net::UnixStream, process::CommandExt},
+    os::unix::{fs::MetadataExt, net::UnixStream, process::CommandExt},
 };
 use support::{invoke_validated, invoke_with_env, invoke_with_host_and_env, json_stdout};
 
 #[cfg(unix)]
 extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn native_program_stamp(path: &std::path::Path) -> Value {
+    let metadata = fs::metadata(path).expect("read native implementation metadata");
+    json!({
+        "kind": "unix-metadata-v1",
+        "byte_length": metadata.len(),
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "modified_seconds": metadata.mtime(),
+        "modified_nanoseconds": metadata.mtime_nsec(),
+        "changed_seconds": metadata.ctime(),
+        "changed_nanoseconds": metadata.ctime_nsec()
+    })
 }
 
 struct FailAfterFirstLaunchEvent {
@@ -617,6 +632,7 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
             "fixed_args": ["--pure"],
             "implementation_manifest_id": recovery_manifest_id,
             "implementation_version": "contract-test-fixture",
+            "program_stamp": native_program_stamp(&recovery_program),
             "passthrough_env": {
                 "OULIPOLY_OPENCODE_ACCOUNT": "opencode1"
             },
@@ -673,6 +689,10 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
     prepared_state["schema_version"] = serde_json::json!(9);
     prepared_state["delivery_nonce"] = serde_json::json!("prepared-recovery-contract");
     prepared_state["actor_process_group_id"] = serde_json::Value::Null;
+    prepared_state["recovery"]
+        .as_object_mut()
+        .expect("prepared recovery object")
+        .remove("program_stamp");
     fs::write(
         &state_path,
         serde_json::to_vec(&prepared_state).expect("serialize unpublished-actor launch state"),
@@ -953,7 +973,13 @@ fn contract_native_runtime_binds_direct_opencode_implementation() {
         &fs::read(&state_path).expect("read direct native runtime identity"),
     )
     .expect("parse direct native runtime identity");
-    assert_eq!(state["schema_version"], 3);
+    assert_eq!(state["schema_version"], 4);
+    assert_eq!(
+        state["program_stamp"]["byte_length"],
+        fs::metadata(fake_wrapper.dir().join("opencode"))
+            .expect("direct implementation metadata")
+            .len()
+    );
     assert_eq!(
         state["native_contract_id"],
         "agent-runner-opencode.opencode-native-state/v1"
@@ -1067,7 +1093,10 @@ fn contract_native_runtime_upgrades_predecessor_wrapper_binding_before_effect() 
         &fs::read(&state_path).expect("read upgraded native runtime binding"),
     )
     .expect("parse upgraded native runtime binding");
-    assert_eq!(upgraded["schema_version"], 3);
+    assert_eq!(upgraded["schema_version"], 4);
+    assert!(upgraded["program_stamp"]["byte_length"]
+        .as_u64()
+        .is_some_and(|length| length > 0));
     assert_eq!(
         upgraded["native_contract_id"],
         "agent-runner-opencode.opencode-native-state/v1"

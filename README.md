@@ -66,7 +66,10 @@ its settings diagnostics, while its preserved ID and version allow an in-band
 update or delete. Unrelated projected records remain fully usable.
 `setup.detect` runs this same bounded, parsed-schema transition preflight
 against the exact `host.config_root` store. It also requires a valid exact
-record for every caller ID being activated. `params.settings_id` declares one
+record for every caller ID being activated. Readiness validates each parsed
+record once and indexes it by exact ID, so the full 4,096-record/4,096-caller
+transition remains linear rather than cross-scanning both populations.
+`params.settings_id` declares one
 opaque caller ID, `params.settings_ids` declares the complete caller population,
 and their absence selects the installed Agent Runner compatibility population
 `opencode`, `opencode2`, ... `opencode5`. An absent or empty store is therefore
@@ -353,7 +356,10 @@ publishing a successor that another terminal handoff can retire. Page size and
 admitted population are each capped at 256, list capture at 2 MiB, each row at
 64 KiB, and each snapshot at 4 MiB. At most 32
 abandoned snapshots are retained for 15 minutes; continuation cursors read only
-the requested rows. A terminal snapshot is retired only after the complete
+the requested rows from one packed row file using manifest-bound offsets and
+per-row hashes. Snapshot publication has a fixed three-file shape and one
+directory synchronization regardless of row count, rather than one durable
+file transaction per row. A terminal snapshot is retired only after the complete
 response is successfully written and flushed; a failed write or flush preserves
 the cursor for an exact retry. Before the terminal page is exposed, its manifest
 durably claims that handoff for the continuation request; a different terminal
@@ -457,13 +463,21 @@ namespace with the same account/session labels.
 
 Predecessor schema-v1 wrapper and schema-v2 direct runtime records are validated
 against their recorded bytes, then atomically replaced under the per-account
-runtime lock with the schema-v3 manifest-bound `opencode` identity before the
+runtime lock with the schema-v4 manifest-bound `opencode` identity before the
 first new native effect. A missing or changed predecessor implementation, or a missing, invalid, or unapproved direct
-implementation, fails closed without publishing the upgrade. Durable launch
-records created as schema v9 carry the same direct program hash, manifest ID,
-implementation version, fixed arguments, contract identity, and state
-environment; older launch records without complete manifest evidence are
-retained for terminal reconciliation but never execute their recovery program.
+implementation, fails closed without publishing the upgrade. Initial admission,
+rebind, and predecessor upgrade stream the bounded executable hash once. A
+schema-v4 reuse compares the canonical path and an admitted size/inode/change
+metadata stamp under the account lock, then rechecks the immutable build
+manifest; it does not reread the entire executable for every native operation.
+The metadata stamp is persistence evidence and does not alter the component's
+semantic implementation identity. Durable launch
+records created as schema v10 carry the same direct program hash, manifest ID,
+implementation version, admitted metadata stamp, fixed arguments, contract
+identity, and state environment. Manifest-bound predecessor launch records
+without a metadata stamp perform the bounded content check during exceptional
+recovery; records without complete manifest evidence are retained for terminal
+reconciliation but never execute an unbound recovery program.
 
 Quota probes use a separate durable implementation context under
 `host.data_root/provider-state/opencode/quota-observers`. The first probe for an

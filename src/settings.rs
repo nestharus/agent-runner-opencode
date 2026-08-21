@@ -624,15 +624,19 @@ fn settings_store_readiness(
     byte_count: usize,
     required_settings_ids: &[String],
 ) -> SettingsTransitionReadiness {
+    let valid_records = store
+        .records
+        .iter()
+        .map(|record| {
+            (
+                record.id.as_str(),
+                settings_valid(&validate_values(&record.values)),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let missing_settings_ids = required_settings_ids
         .iter()
-        .filter(|required| {
-            store
-                .records
-                .iter()
-                .find(|record| record.id == required.as_str())
-                .is_none_or(|record| !settings_valid(&validate_values(&record.values)))
-        })
+        .filter(|required| valid_records.get(required.as_str()) != Some(&true))
         .cloned()
         .collect::<Vec<_>>();
     if !missing_settings_ids.is_empty() {
@@ -1789,5 +1793,53 @@ mod tests {
         prune_expired_settings_receipts(&mut store, SETTINGS_RECEIPT_RETENTION_MS + 2);
         assert!(!store.mutation_receipts.contains_key("expired"));
         assert!(store.mutation_receipts.contains_key("retained"));
+    }
+
+    #[test]
+    fn settings_transition_readiness_indexes_the_full_predecessor_population() {
+        let records = (0..MAX_SETTINGS_ACTIVATION_IDS)
+            .map(|index| SettingsRecord {
+                id: format!("caller-{index:04}"),
+                display_name: format!("caller {index}"),
+                version: format!("version-{index}"),
+                values: json!({
+                    "provider": "opencode",
+                    "profile": "opencode1",
+                    "wrapper": "opencode1",
+                    "model": { "selection": "requested" },
+                    "quota": {
+                        "source": "opencode_auth",
+                        "auth_path": "~/.local/share/opencode/auth.json",
+                        "probe": "native_chatgpt_usage"
+                    },
+                    "launch": {
+                        "dangerously_skip_permissions": true,
+                        "format": "json",
+                        "preserve_pure_wrapper": true
+                    },
+                    "extra_env": {},
+                    "mode": "non_interactive"
+                }),
+            })
+            .collect::<Vec<_>>();
+        let required = records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        let readiness = settings_store_readiness(
+            SettingsStore {
+                schema_version: 0,
+                records,
+                history: Vec::new(),
+                mutation_receipts: BTreeMap::new(),
+                predecessor_capacity_recovery: true,
+            },
+            MAX_PREDECESSOR_SETTINGS_STORE_BYTES,
+            &required,
+        );
+
+        assert!(readiness.ready);
+        assert_eq!(readiness.record_count, Some(MAX_SETTINGS_ACTIVATION_IDS));
+        assert!(readiness.missing_settings_ids.is_empty());
     }
 }

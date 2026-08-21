@@ -33,7 +33,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -44,7 +44,7 @@ const USER_OBSERVATION_PROJECTION: &str = "user_observation";
 const MAX_OBSERVATION_BODY_TAIL: usize = 16;
 const SESSION_ENUMERATION_SNAPSHOT_DIR: &str =
     "provider-state/opencode/session-enumeration-snapshots";
-const SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+const SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 const SESSION_ENUMERATION_SNAPSHOT_TTL_MS: u64 = 15 * 60 * 1_000;
 const SESSION_ENUMERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ENUMERATED_SESSIONS: usize = 256;
@@ -124,6 +124,10 @@ struct EnumerationSnapshotManifest {
     initial_page_end: usize,
     #[serde(default)]
     initial_warnings_sha256: String,
+    #[serde(default)]
+    row_offsets: Vec<u64>,
+    #[serde(default)]
+    row_sha256: Vec<String>,
     #[serde(default)]
     next_cursor_offset: usize,
     #[serde(default)]
@@ -747,6 +751,7 @@ fn claimed_initial_snapshot_page_locked(
         || manifest.initial_request_sha256 != initial_request_sha256
         || manifest.initial_page_end > manifest.total_sessions
         || !is_sha256_hex(&manifest.initial_warnings_sha256)
+        || !enumeration_snapshot_rows_are_valid(&manifest)
     {
         return Err(session_snapshot_failure(
             request_id,
@@ -772,7 +777,7 @@ fn claimed_initial_snapshot_page_locked(
     if !exact_initial_retry {
         return Err(session_snapshot_cursor_superseded_failure(request_id));
     }
-    let warnings_bytes = durable_fs::read_file_bounded(
+    let warnings_bytes = read_enumeration_snapshot_file(
         &snapshot_root.join("warnings.json"),
         MAX_ENUMERATION_WARNINGS_BYTES,
     )
@@ -794,6 +799,7 @@ fn claimed_initial_snapshot_page_locked(
     let sessions = read_enumeration_snapshot_rows(
         host,
         &snapshot_root,
+        &manifest,
         0,
         manifest.initial_page_end,
         request_id,
@@ -861,10 +867,19 @@ fn persist_enumeration_snapshot(
         }
         encoded_rows.push(bytes);
     }
+    let mut rows = Vec::with_capacity(encoded_bytes);
+    let mut row_offsets = Vec::with_capacity(encoded_rows.len().saturating_add(1));
+    let mut row_sha256 = Vec::with_capacity(encoded_rows.len());
+    row_offsets.push(0);
+    for encoded_row in &encoded_rows {
+        rows.extend_from_slice(encoded_row);
+        row_sha256.push(sha256_hex(encoded_row));
+        row_offsets.push(rows.len() as u64);
+    }
     let encoded_warnings = serde_json::to_vec(&warnings)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
     if encoded_warnings.len() > MAX_ENUMERATION_WARNINGS_BYTES
-        || encoded_bytes.saturating_add(encoded_warnings.len()) > MAX_ENUMERATION_SNAPSHOT_BYTES
+        || rows.len().saturating_add(encoded_warnings.len()) > MAX_ENUMERATION_SNAPSHOT_BYTES
     {
         return Err(session_snapshot_capacity_failure(
             request_id,
@@ -899,11 +914,11 @@ fn persist_enumeration_snapshot(
     }
     durable_fs::create_private_directories(&snapshot_root)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
-    for (index, bytes) in encoded_rows.iter().enumerate() {
-        write_enumeration_snapshot_file(&snapshot_root.join(format!("{index:04}.json")), bytes)
-            .map_err(|error| session_snapshot_failure(request_id, error))?;
-    }
-    write_enumeration_snapshot_file(&snapshot_root.join("warnings.json"), &encoded_warnings)
+    stage_enumeration_snapshot_file(&snapshot_root.join("rows.bin"), &rows)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    stage_enumeration_snapshot_file(&snapshot_root.join("warnings.json"), &encoded_warnings)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    durable_fs::sync_directory(&snapshot_root)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
     let created_at_unix_ms = now_unix_ms();
     let snapshot_instance_sha256 = new_enumeration_snapshot_instance_sha256(&snapshot_root)
@@ -920,6 +935,8 @@ fn persist_enumeration_snapshot(
         initial_request_sha256: initial_request_sha256.clone(),
         initial_page_end: first_page_end,
         initial_warnings_sha256: sha256_hex(&encoded_warnings),
+        row_offsets,
+        row_sha256,
         next_cursor_offset: first_page_end,
         last_page_claim_request_sha256: Some(initial_request_sha256.clone()),
         last_page_claim_start: Some(0),
@@ -979,6 +996,7 @@ fn load_enumeration_snapshot_page(
         || manifest.identity_sha256 != expected_identity
         || manifest.total_sessions != total
         || manifest.expires_at_unix_ms < now_unix_ms()
+        || !enumeration_snapshot_rows_are_valid(&manifest)
         || start >= total
     {
         return Err(invalid_session_enumerate_cursor_failure(
@@ -1003,7 +1021,8 @@ fn load_enumeration_snapshot_page(
     } else if !advances_cursor && !exact_page_retry {
         return Err(session_snapshot_cursor_superseded_failure(request_id));
     }
-    let sessions = read_enumeration_snapshot_rows(host, &snapshot_root, start, end, request_id)?;
+    let sessions =
+        read_enumeration_snapshot_rows(host, &snapshot_root, &manifest, start, end, request_id)?;
     let complete = end == total;
     if manifest.terminal_claim_request_sha256.is_some() && !complete {
         return Err(session_snapshot_terminal_handoff_failure(request_id));
@@ -1049,25 +1068,87 @@ fn load_enumeration_snapshot_page(
 fn read_enumeration_snapshot_rows(
     host: &crate::envelope::HostContext,
     snapshot_root: &Path,
+    manifest: &EnumerationSnapshotManifest,
     start: usize,
     end: usize,
     request_id: &str,
 ) -> Result<Vec<Value>, ProviderFailure> {
+    if !enumeration_snapshot_rows_are_valid(manifest)
+        || end > manifest.total_sessions
+        || start > end
+    {
+        return Err(session_snapshot_failure(
+            request_id,
+            "the durable session row population does not match its manifest",
+        ));
+    }
+    let path =
+        confined_enumeration_snapshot_target(host, &snapshot_root.join("rows.bin"), request_id)?;
+    let mut file =
+        fs::File::open(path).map_err(|error| session_snapshot_failure(request_id, error))?;
+    let expected_bytes = *manifest
+        .row_offsets
+        .last()
+        .ok_or_else(|| session_snapshot_failure(request_id, "missing session row offsets"))?;
+    let observed_bytes = file
+        .metadata()
+        .map_err(|error| session_snapshot_failure(request_id, error))?
+        .len();
+    if observed_bytes != expected_bytes {
+        return Err(session_snapshot_failure(
+            request_id,
+            "the durable session row bytes do not match their manifest",
+        ));
+    }
+    let page_start = manifest.row_offsets[start];
+    let page_end = manifest.row_offsets[end];
+    let page_length = usize::try_from(page_end.saturating_sub(page_start))
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    if page_length > MAX_ENUMERATION_SNAPSHOT_BYTES {
+        return Err(session_snapshot_capacity_failure(
+            request_id,
+            "the requested durable session page exceeds its supported encoded-size bound",
+        ));
+    }
+    file.seek(SeekFrom::Start(page_start))
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    let mut page = vec![0_u8; page_length];
+    file.read_exact(&mut page)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
     let mut sessions = Vec::with_capacity(end.saturating_sub(start));
     for index in start..end {
-        let path = confined_enumeration_snapshot_target(
-            host,
-            &snapshot_root.join(format!("{index:04}.json")),
-            request_id,
-        )?;
-        let bytes = durable_fs::read_file_bounded(&path, MAX_ENUMERATION_ENTRY_BYTES)
+        let row_start = usize::try_from(manifest.row_offsets[index] - page_start)
             .map_err(|error| session_snapshot_failure(request_id, error))?;
+        let row_end = usize::try_from(manifest.row_offsets[index + 1] - page_start)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+        let encoded = &page[row_start..row_end];
+        if sha256_hex(encoded) != manifest.row_sha256[index] {
+            return Err(session_snapshot_failure(
+                request_id,
+                "one durable session row does not match its manifest",
+            ));
+        }
         sessions.push(
-            serde_json::from_slice(&bytes)
+            serde_json::from_slice(encoded)
                 .map_err(|error| session_snapshot_failure(request_id, error))?,
         );
     }
     Ok(sessions)
+}
+
+fn enumeration_snapshot_rows_are_valid(manifest: &EnumerationSnapshotManifest) -> bool {
+    manifest.row_offsets.len() == manifest.total_sessions.saturating_add(1)
+        && manifest.row_sha256.len() == manifest.total_sessions
+        && manifest.row_offsets.first() == Some(&0)
+        && manifest
+            .row_offsets
+            .last()
+            .is_some_and(|bytes| *bytes <= MAX_ENUMERATION_SNAPSHOT_BYTES as u64)
+        && manifest.row_offsets.windows(2).all(|offsets| {
+            offsets[0] <= offsets[1]
+                && offsets[1] - offsets[0] <= MAX_ENUMERATION_ENTRY_BYTES as u64
+        })
+        && manifest.row_sha256.iter().all(|hash| is_sha256_hex(hash))
 }
 
 fn new_enumeration_snapshot_instance_sha256(snapshot_root: &Path) -> std::io::Result<String> {
@@ -1224,7 +1305,10 @@ fn prune_enumeration_snapshots(
         }
         let path = confined_enumeration_snapshot_target(host, &entry.path(), request_id)?;
         let expired_or_partial = snapshot_manifest(&path, request_id)
-            .map(|manifest| manifest.expires_at_unix_ms < now_unix_ms())
+            .map(|manifest| {
+                manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
+                    || manifest.expires_at_unix_ms < now_unix_ms()
+            })
             .unwrap_or(true);
         if expired_or_partial {
             fs::remove_dir_all(&path)
@@ -1251,6 +1335,14 @@ fn snapshot_manifest(
 }
 
 fn write_enumeration_snapshot_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    stage_enumeration_snapshot_file(path, bytes)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("snapshot path has no parent"))?;
+    durable_fs::sync_directory(parent)
+}
+
+fn stage_enumeration_snapshot_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("snapshot path has no parent"))?;
@@ -1258,8 +1350,22 @@ fn write_enumeration_snapshot_file(path: &Path, bytes: &[u8]) -> std::io::Result
     temporary.write_all(bytes)?;
     temporary.as_file_mut().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
-    set_private_snapshot_file(path)?;
-    durable_fs::sync_directory(parent)
+    set_private_snapshot_file(path)
+}
+
+fn read_enumeration_snapshot_file(path: &Path, maximum_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(maximum_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("snapshot file exceeds supported {maximum_bytes}-byte bound"),
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(unix)]

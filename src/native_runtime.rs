@@ -5,7 +5,7 @@
 //!     Domain: durable OpenCode native runtime identity
 //!     Owns:
 //!       - one direct OpenCode executable and stable state-namespace binding per declared account
-//!       - executable content validation before every native operation
+//!       - full executable admission at bind/rebind and constant-time metadata validation on reuse
 //!       - exact launch-context admission against the durable account binding
 
 use crate::account::AccountProfile;
@@ -25,7 +25,8 @@ use std::process::Command;
 use std::time::Duration;
 
 const NATIVE_RUNTIME_STATE_DIR: &str = "provider-state/opencode/native-runtimes";
-const NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 3;
+const NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 4;
+const MANIFEST_NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 3;
 const DIRECT_NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 2;
 const WRAPPER_NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 1;
 const OPENCODE_NATIVE_PROGRAM: &str = "opencode";
@@ -72,7 +73,27 @@ pub struct NativeRuntimeContext {
     implementation_manifest_id: String,
     #[serde(default)]
     implementation_version: String,
+    #[serde(default)]
+    program_stamp: NativeProgramStamp,
     identity_sha256: String,
+}
+
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct NativeProgramStamp {
+    kind: String,
+    byte_length: u64,
+    device: u64,
+    inode: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl NativeProgramStamp {
+    pub(crate) fn is_complete(&self) -> bool {
+        !self.kind.is_empty() && self.byte_length > 0
+    }
 }
 
 pub fn resolve_for_account(
@@ -143,7 +164,7 @@ fn read_persisted_identity_evidence(
         .map_err(|error| native_runtime_failure(request_id, error))?;
     validate_runtime_record_identity(&context, account, request_id)?;
     if require_current_implementation {
-        validate_runtime_implementation(&context, account, request_id)?;
+        validate_runtime_context(&context, account, request_id)?;
     }
     Ok(Some((context.identity_sha256, sha256_hex(&bytes))))
 }
@@ -165,15 +186,27 @@ pub fn resolve_for_launch(
             ),
         ));
     }
-    let candidate =
-        candidate_context(account, stable_launch_environment(declared_env), request_id)?;
+    let requested_environment =
+        native_execution_environment(account, stable_launch_environment(declared_env), request_id)?;
+    let requested_program = resolve_program(OPENCODE_NATIVE_PROGRAM, &requested_environment)
+        .ok_or_else(|| {
+            native_runtime_failure(
+                request_id,
+                format!(
+                    "the direct {OPENCODE_NATIVE_PROGRAM} implementation for account {} was not found in the selected native PATH",
+                    account.opencode_wrapper,
+                ),
+            )
+        })?;
     let timeout =
         operation_bounds::remaining_timeout(host.deadline_unix_ms, NATIVE_RUNTIME_LOCK_TIMEOUT)
             .unwrap_or(Duration::ZERO);
     let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
     if let Some(context) = read_runtime_context(host, account, request_id)? {
         let context = activate_runtime_context(host, account, context, request_id)?;
-        if context.identity_sha256 != candidate.identity_sha256 {
+        if Path::new(&context.program) != requested_program
+            || context.execution_env != requested_environment
+        {
             return Err(ProviderFailure::conflict(
                 request_id,
                 "native_runtime_context_conflict",
@@ -183,13 +216,14 @@ pub fn resolve_for_launch(
                 ),
                 json!({
                     "account": account.opencode_wrapper,
-                    "attempted_runtime_identity_sha256": candidate.identity_sha256,
+                    "attempted_program": requested_program,
                     "bound_runtime_identity_sha256": context.identity_sha256,
                 }),
             ));
         }
         return Ok(context);
     }
+    let candidate = candidate_context(account, requested_environment, request_id)?;
     write_runtime_context(host, account, &candidate, request_id)?;
     Ok(candidate)
 }
@@ -245,6 +279,10 @@ impl NativeRuntimeContext {
         &self.implementation_version
     }
 
+    pub(crate) fn program_stamp(&self) -> &NativeProgramStamp {
+        &self.program_stamp
+    }
+
     pub fn stable_execution_env(&self) -> &BTreeMap<String, String> {
         &self.execution_env
     }
@@ -287,9 +325,19 @@ fn candidate_context(
             ),
         ));
     }
+    let program_stamp = native_program_stamp(&program)
+        .map_err(|error| native_runtime_failure(request_id, error))?;
     let (program_sha256, program_bytes) =
         durable_fs::sha256_file_bounded(&program, durable_fs::MAX_BOUND_EXECUTABLE_BYTES)
             .map_err(|error| native_runtime_failure(request_id, error))?;
+    let observed_stamp = native_program_stamp(&program)
+        .map_err(|error| native_runtime_failure(request_id, error))?;
+    if observed_stamp != program_stamp || observed_stamp.byte_length != program_bytes as u64 {
+        return Err(native_runtime_failure(
+            request_id,
+            "the direct OpenCode implementation changed during manifest admission",
+        ));
+    }
     let program = program.to_str().ok_or_else(|| {
         native_runtime_failure(
             request_id,
@@ -348,6 +396,7 @@ fn candidate_context(
         fixed_args,
         implementation_manifest_id: approved.id,
         implementation_version: approved.version,
+        program_stamp,
         identity_sha256,
     })
 }
@@ -429,6 +478,44 @@ fn resolve_program(program: &str, env: &BTreeMap<String, String>) -> Option<Path
         .then_some(canonical)
 }
 
+#[cfg(unix)]
+fn native_program_stamp(path: &Path) -> std::io::Result<NativeProgramStamp> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path)?;
+    Ok(NativeProgramStamp {
+        kind: "unix-metadata-v1".to_string(),
+        byte_length: metadata.len(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(not(unix))]
+fn native_program_stamp(path: &Path) -> std::io::Result<NativeProgramStamp> {
+    use std::time::UNIX_EPOCH;
+
+    let metadata = fs::metadata(path)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?;
+    Ok(NativeProgramStamp {
+        kind: "portable-metadata-v1".to_string(),
+        byte_length: metadata.len(),
+        device: 0,
+        inode: 0,
+        modified_seconds: modified.as_secs().min(i64::MAX as u64) as i64,
+        modified_nanoseconds: i64::from(modified.subsec_nanos()),
+        changed_seconds: modified.as_secs().min(i64::MAX as u64) as i64,
+        changed_nanoseconds: i64::from(modified.subsec_nanos()),
+    })
+}
+
 fn runtime_identity_sha256(
     account_wrapper: &str,
     program: &str,
@@ -461,7 +548,11 @@ fn validate_runtime_context(
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     validate_runtime_record_identity(context, account, request_id)?;
-    validate_runtime_implementation(context, account, request_id)
+    if context.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
+        validate_current_runtime_implementation(context, account, request_id)
+    } else {
+        validate_predecessor_runtime_implementation(context, account, request_id).map(|_| ())
+    }
 }
 
 fn validate_runtime_record_identity(
@@ -471,6 +562,18 @@ fn validate_runtime_record_identity(
 ) -> Result<(), ProviderFailure> {
     let identity_sha256 = match context.schema_version {
         NATIVE_RUNTIME_SCHEMA_VERSION => runtime_identity_sha256(
+            &context.account_wrapper,
+            &context.program,
+            &context.program_sha256,
+            &context.execution_env,
+            &context.native_contract_id,
+            &context.fixed_args,
+            (
+                &context.implementation_manifest_id,
+                &context.implementation_version,
+            ),
+        ),
+        MANIFEST_NATIVE_RUNTIME_SCHEMA_VERSION => manifest_runtime_identity_sha256(
             &context.account_wrapper,
             &context.program,
             &context.program_sha256,
@@ -508,7 +611,8 @@ fn validate_runtime_record_identity(
                         .map(|value| (*value).to_string())
                         .collect::<Vec<_>>()
                 || context.implementation_manifest_id.trim().is_empty()
-                || context.implementation_version.trim().is_empty()))
+                || context.implementation_version.trim().is_empty()
+                || !context.program_stamp.is_complete()))
     {
         return Err(native_runtime_failure(
             request_id,
@@ -516,6 +620,32 @@ fn validate_runtime_record_identity(
         ));
     }
     Ok(())
+}
+
+fn manifest_runtime_identity_sha256(
+    account_wrapper: &str,
+    program: &str,
+    program_sha256: &str,
+    execution_env: &BTreeMap<String, String>,
+    native_contract_id: &str,
+    fixed_args: &[String],
+    implementation: (&str, &str),
+) -> String {
+    let (implementation_manifest_id, implementation_version) = implementation;
+    sha256_hex(
+        json!({
+            "account_wrapper": account_wrapper,
+            "program": program,
+            "program_sha256": program_sha256,
+            "execution_env": execution_env,
+            "native_contract_id": native_contract_id,
+            "fixed_args": fixed_args,
+            "implementation_manifest_id": implementation_manifest_id,
+            "implementation_version": implementation_version,
+        })
+        .to_string()
+        .as_bytes(),
+    )
 }
 
 fn direct_runtime_identity_sha256(
@@ -564,20 +694,83 @@ fn activate_runtime_context(
     context: NativeRuntimeContext,
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
-    validate_runtime_context(&context, account, request_id)?;
+    validate_runtime_record_identity(&context, account, request_id)?;
     if context.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
+        validate_current_runtime_implementation(&context, account, request_id)?;
         return Ok(context);
     }
-    let upgraded = candidate_context(account, context.execution_env, request_id)?;
+    if context.schema_version == WRAPPER_NATIVE_RUNTIME_SCHEMA_VERSION {
+        validate_predecessor_runtime_implementation(&context, account, request_id)?;
+        let upgraded = candidate_context(account, context.execution_env, request_id)?;
+        write_runtime_context(host, account, &upgraded, request_id)?;
+        return Ok(upgraded);
+    }
+    let admitted = validate_predecessor_runtime_implementation(&context, account, request_id)?;
+    let selected_program = resolve_program(OPENCODE_NATIVE_PROGRAM, &context.execution_env)
+        .ok_or_else(|| {
+            native_runtime_failure(
+                request_id,
+                "the selected direct OpenCode implementation is unavailable during runtime identity upgrade",
+            )
+        })?;
+    if selected_program != Path::new(&context.program) {
+        return Err(ProviderFailure::conflict(
+            request_id,
+            "native_runtime_context_conflict",
+            "the selected direct OpenCode implementation changed before runtime identity upgrade",
+            json!({
+                "account": account.opencode_wrapper,
+                "recorded_program": context.program,
+                "selected_program": selected_program,
+            }),
+        ));
+    }
+    let approved = admitted.approved.ok_or_else(|| {
+        native_runtime_failure(
+            request_id,
+            "a direct predecessor runtime has no reviewed implementation identity",
+        )
+    })?;
+    let fixed_args = OPENCODE_NATIVE_FIXED_ARGS
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    let identity_sha256 = runtime_identity_sha256(
+        account.opencode_wrapper,
+        &context.program,
+        &context.program_sha256,
+        &context.execution_env,
+        OPENCODE_NATIVE_CONTRACT_ID,
+        &fixed_args,
+        (&approved.id, &approved.version),
+    );
+    let upgraded = NativeRuntimeContext {
+        schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
+        account_wrapper: account.opencode_wrapper.to_string(),
+        program: context.program,
+        program_sha256: context.program_sha256,
+        execution_env: context.execution_env,
+        native_contract_id: OPENCODE_NATIVE_CONTRACT_ID.to_string(),
+        fixed_args,
+        implementation_manifest_id: approved.id,
+        implementation_version: approved.version,
+        program_stamp: admitted.program_stamp,
+        identity_sha256,
+    };
     write_runtime_context(host, account, &upgraded, request_id)?;
     Ok(upgraded)
 }
 
-fn validate_runtime_implementation(
+struct PredecessorImplementationAdmission {
+    program_stamp: NativeProgramStamp,
+    approved: Option<native_implementation_manifest::ApprovedImplementation>,
+}
+
+fn validate_predecessor_runtime_implementation(
     context: &NativeRuntimeContext,
     account: &AccountProfile,
     request_id: &str,
-) -> Result<(), ProviderFailure> {
+) -> Result<PredecessorImplementationAdmission, ProviderFailure> {
     if !durable_fs::is_executable_file(Path::new(&context.program))
         .map_err(|error| native_runtime_failure(request_id, error))?
     {
@@ -589,12 +782,18 @@ fn validate_runtime_implementation(
             ),
         ));
     }
-    let (program_sha256, program_bytes) = durable_fs::sha256_file_bounded(
-        Path::new(&context.program),
-        durable_fs::MAX_BOUND_EXECUTABLE_BYTES,
-    )
-    .map_err(|error| native_runtime_failure(request_id, error))?;
-    if program_sha256 != context.program_sha256 {
+    let program = Path::new(&context.program);
+    let program_stamp =
+        native_program_stamp(program).map_err(|error| native_runtime_failure(request_id, error))?;
+    let (program_sha256, program_bytes) =
+        durable_fs::sha256_file_bounded(program, durable_fs::MAX_BOUND_EXECUTABLE_BYTES)
+            .map_err(|error| native_runtime_failure(request_id, error))?;
+    let observed_stamp =
+        native_program_stamp(program).map_err(|error| native_runtime_failure(request_id, error))?;
+    if program_sha256 != context.program_sha256
+        || observed_stamp != program_stamp
+        || observed_stamp.byte_length != program_bytes as u64
+    {
         return Err(ProviderFailure::conflict(
             request_id,
             "native_runtime_implementation_changed",
@@ -614,7 +813,10 @@ fn validate_runtime_implementation(
         // evidence. It is never executed by this provider; candidate_context
         // must independently admit the reviewed direct implementation before
         // activate_runtime_context publishes the schema-v3 successor.
-        return Ok(());
+        return Ok(PredecessorImplementationAdmission {
+            program_stamp,
+            approved: None,
+        });
     }
     let approved = native_implementation_manifest::approved_implementation(
         OPENCODE_NATIVE_PROGRAM,
@@ -654,6 +856,113 @@ fn validate_runtime_implementation(
             request_id,
             "persisted native runtime manifest identity is inconsistent",
         ));
+    }
+    Ok(PredecessorImplementationAdmission {
+        program_stamp,
+        approved: Some(approved),
+    })
+}
+
+fn validate_current_runtime_implementation(
+    context: &NativeRuntimeContext,
+    account: &AccountProfile,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    validate_pinned_program(
+        Path::new(&context.program),
+        &context.program_sha256,
+        &context.implementation_manifest_id,
+        &context.implementation_version,
+        &context.native_contract_id,
+        &context.program_stamp,
+    )
+    .map_err(|error| {
+        ProviderFailure::conflict(
+            request_id,
+            "native_runtime_implementation_changed",
+            format!(
+                "bound native OpenCode implementation for account {} is unavailable: {error}",
+                account.opencode_wrapper
+            ),
+            json!({
+                "account": account.opencode_wrapper,
+                "runtime_identity_sha256": context.identity_sha256,
+                "program": context.program,
+            }),
+        )
+    })
+}
+
+pub(crate) fn validate_pinned_program(
+    program: &Path,
+    program_sha256: &str,
+    implementation_manifest_id: &str,
+    implementation_version: &str,
+    native_contract_id: &str,
+    expected_stamp: &NativeProgramStamp,
+) -> Result<(), String> {
+    if !durable_fs::is_executable_file(program).map_err(|error| error.to_string())? {
+        return Err("the implementation is not an executable regular file".to_string());
+    }
+    let observed_stamp = native_program_stamp(program).map_err(|error| error.to_string())?;
+    if &observed_stamp != expected_stamp {
+        return Err("the implementation metadata stamp changed after admission".to_string());
+    }
+    let approved = native_implementation_manifest::approved_implementation(
+        OPENCODE_NATIVE_PROGRAM,
+        program_sha256,
+        observed_stamp.byte_length as usize,
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| {
+        "the implementation identity is no longer in the reviewed manifest".to_string()
+    })?;
+    if approved.semantic_contract != native_contract_id
+        || native_contract_id != OPENCODE_NATIVE_CONTRACT_ID
+        || approved.id != implementation_manifest_id
+        || approved.version != implementation_version
+    {
+        return Err("the implementation manifest identity is inconsistent".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_predecessor_pinned_program(
+    program: &Path,
+    program_sha256: &str,
+    implementation_manifest_id: &str,
+    implementation_version: &str,
+    native_contract_id: &str,
+) -> Result<(), String> {
+    if !durable_fs::is_executable_file(program).map_err(|error| error.to_string())? {
+        return Err("the implementation is not an executable regular file".to_string());
+    }
+    let stamp = native_program_stamp(program).map_err(|error| error.to_string())?;
+    let (observed_sha256, observed_bytes) =
+        durable_fs::sha256_file_bounded(program, durable_fs::MAX_BOUND_EXECUTABLE_BYTES)
+            .map_err(|error| error.to_string())?;
+    let observed_stamp = native_program_stamp(program).map_err(|error| error.to_string())?;
+    if observed_sha256 != program_sha256
+        || observed_stamp != stamp
+        || observed_stamp.byte_length != observed_bytes as u64
+    {
+        return Err("the implementation content changed after launch admission".to_string());
+    }
+    let approved = native_implementation_manifest::approved_implementation(
+        OPENCODE_NATIVE_PROGRAM,
+        program_sha256,
+        observed_bytes,
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| {
+        "the implementation identity is no longer in the reviewed manifest".to_string()
+    })?;
+    if approved.semantic_contract != native_contract_id
+        || native_contract_id != OPENCODE_NATIVE_CONTRACT_ID
+        || approved.id != implementation_manifest_id
+        || approved.version != implementation_version
+    {
+        return Err("the implementation manifest identity is inconsistent".to_string());
     }
     Ok(())
 }

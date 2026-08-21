@@ -7,7 +7,10 @@ mod support;
 use cluster_b::*;
 use serde_json::{json, Value};
 use std::fs;
+use std::sync::Mutex;
 use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env};
+
+static PATH_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct RejectFlush {
@@ -222,6 +225,64 @@ fn contract_session_enumerate_honors_limit() {
 }
 
 #[test]
+fn contract_session_enumerate_packs_the_maximum_snapshot_population() {
+    let native_rows = (0..256)
+        .map(|index| {
+            json!({
+                "id": format!("ses-packed-{index:03}"),
+                "title": format!("Packed {index}"),
+                "directory": format!("/tmp/packed-{index:03}")
+            })
+        })
+        .collect::<Vec<_>>();
+    let native_output = serde_json::to_string(&native_rows).expect("serialize maximum native rows");
+    let fake_opencode = FakeOpencodeSessionList::with_output(&native_output, "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-packed-session-snapshot");
+    let config_root = support::isolated_test_config_root("packed-session-snapshot");
+    fs::create_dir_all(&data_root).expect("create packed session snapshot data root");
+    let host = json!({
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy()
+    });
+
+    let first = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_limit_params(1),
+            host,
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_eq!(first["sessions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first["complete"], false);
+
+    let snapshot_root = data_root.join("provider-state/opencode/session-enumeration-snapshots");
+    let snapshot_directories = fs::read_dir(&snapshot_root)
+        .expect("read packed snapshot root")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .collect::<Vec<_>>();
+    assert_eq!(snapshot_directories.len(), 1);
+    let mut snapshot_files = fs::read_dir(snapshot_directories[0].path())
+        .expect("read packed snapshot")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    snapshot_files.sort();
+    assert_eq!(
+        snapshot_files,
+        vec!["manifest.json", "rows.bin", "warnings.json"],
+        "the maximum admitted population must use a fixed file count"
+    );
+
+    fs::remove_dir_all(&data_root).expect("remove packed session snapshot data root");
+    fs::remove_dir_all(&config_root).expect("remove packed session snapshot config root");
+}
+
+#[test]
 fn contract_session_enumerate_retires_consumed_snapshot() {
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
@@ -330,6 +391,7 @@ fn contract_session_enumerate_distinct_requests_have_independent_snapshot_owners
 
 #[test]
 fn contract_session_enumerate_exact_initial_retry_replays_claimed_native_population() {
+    let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode =
         FakeOpencodeSessionList::with_output(session_list_initial_replay_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
@@ -432,6 +494,7 @@ fn contract_session_enumerate_exact_initial_retry_replays_claimed_native_populat
 
 #[test]
 fn contract_session_enumerate_terminal_initial_retry_replays_after_flush_loss() {
+    let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_multiple_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
     let data_root = unique_temp_dir("agent-runner-opencode-terminal-initial-replay");
@@ -512,11 +575,16 @@ fn contract_session_enumerate_terminal_initial_retry_replays_after_flush_loss() 
 
 #[test]
 fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_handoff() {
+    let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
     let data_root = unique_temp_dir("agent-runner-opencode-response-loss-session-snapshot");
+    let config_root = support::isolated_test_config_root("response-loss-session-snapshot");
     fs::create_dir_all(&data_root).expect("create isolated session snapshot data root");
-    let host = json!({"data_root": data_root.to_string_lossy()});
+    let host = json!({
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy()
+    });
     let mut first_request = support::validated_request_envelope(
         "session.enumerate",
         session_enumerate_limit_params(2),
@@ -620,15 +688,21 @@ fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_hand
         "invalid_session_enumerate_cursor"
     );
     fs::remove_dir_all(&data_root).expect("remove isolated session snapshot data root");
+    fs::remove_dir_all(&config_root).expect("remove isolated session snapshot config root");
 }
 
 #[test]
 fn contract_terminal_snapshot_claim_blocks_initial_retry_during_response_handoff() {
+    let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
     let data_root = unique_temp_dir("agent-runner-opencode-terminal-snapshot-claim");
+    let config_root = support::isolated_test_config_root("terminal-snapshot-claim");
     fs::create_dir_all(&data_root).expect("create isolated session snapshot data root");
-    let host = json!({"data_root": data_root.to_string_lossy()});
+    let host = json!({
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy()
+    });
     let mut initial_request = support::validated_request_envelope(
         "session.enumerate",
         session_enumerate_limit_params(2),
@@ -689,6 +763,7 @@ fn contract_terminal_snapshot_claim_blocks_initial_retry_during_response_handoff
         None => std::env::remove_var("PATH"),
     }
     fs::remove_dir_all(&data_root).expect("remove isolated session snapshot data root");
+    fs::remove_dir_all(&config_root).expect("remove isolated session snapshot config root");
 }
 
 #[test]
@@ -754,11 +829,16 @@ fn contract_session_enumerate_advances_cursor_monotonically() {
 
 #[test]
 fn contract_terminal_claim_blocks_older_cursor_during_response_handoff() {
+    let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
     let data_root = unique_temp_dir("agent-runner-opencode-terminal-older-cursor-race");
+    let config_root = support::isolated_test_config_root("terminal-older-cursor-race");
     fs::create_dir_all(&data_root).expect("create terminal older-cursor data root");
-    let host = json!({"data_root": data_root.to_string_lossy()});
+    let host = json!({
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy()
+    });
     let prior_path = std::env::var_os("PATH");
     std::env::set_var("PATH", &path);
     let args = vec![
@@ -847,10 +927,12 @@ fn contract_terminal_claim_blocks_older_cursor_during_response_handoff() {
         None => std::env::remove_var("PATH"),
     }
     fs::remove_dir_all(&data_root).expect("remove terminal older-cursor data root");
+    fs::remove_dir_all(&config_root).expect("remove terminal older-cursor config root");
 }
 
 #[test]
 fn contract_stale_terminal_cleanup_cannot_delete_recreated_snapshot() {
+    let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
     let data_root = unique_temp_dir("agent-runner-opencode-snapshot-cleanup-generation");

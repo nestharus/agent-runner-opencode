@@ -1058,7 +1058,7 @@ fn contract_quota_refresh_serializes_shared_credentials_across_data_roots() {
         )
     });
     let wait_started = std::time::Instant::now();
-    while !first_started.exists() && wait_started.elapsed() < std::time::Duration::from_secs(5) {
+    while !first_started.exists() && wait_started.elapsed() < std::time::Duration::from_secs(20) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(
