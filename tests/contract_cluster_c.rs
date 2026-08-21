@@ -275,6 +275,38 @@ fn contract_quota_observer_identity_is_reused_across_provider_processes() {
         "quota.schema.json#/$defs/QuotaProbeResult",
     );
     assert_available_probe_result(&first, &native_wham_expected_windows());
+    let observer_state_path = std::path::Path::new(
+        runtime.host_overrides()["data_root"]
+            .as_str()
+            .expect("isolated quota data root"),
+    )
+    .join("provider-state/opencode/quota-observers/opencode3.json");
+    let observer_state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&observer_state_path).expect("read quota observer state"),
+    )
+    .expect("parse quota observer state");
+    assert_eq!(observer_state["schema_version"], 3);
+    assert_eq!(
+        observer_state["observer_contract"],
+        "agent-runner-opencode.chatgpt-wham-http/v1"
+    );
+    assert_eq!(
+        observer_state["transport_kind"],
+        "contract_test_external_curl"
+    );
+    assert_eq!(
+        observer_state["implementation_manifest_id"],
+        format!(
+            "contract-test-fixture:curl:{}",
+            observer_state["program_sha256"]
+                .as_str()
+                .expect("observer program digest")
+        )
+    );
+    assert_eq!(
+        observer_state["implementation_version"],
+        "contract-test-fixture"
+    );
 
     let ambient_curl = FakeNativeCurl::http_failure(503, r#"{"detail":"wrong observer"}"#);
     let ambient_path = ambient_curl.path_env();

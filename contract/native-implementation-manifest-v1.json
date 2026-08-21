@@ -1,0 +1,15 @@
+{
+  "contract": "agent-runner-opencode.native-implementation-manifest/v1",
+  "implementations": [
+    {
+      "id": "opencode-1.18.19-linux-x86_64-fd4cfd76",
+      "component": "opencode",
+      "target_os": "linux",
+      "target_arch": "x86_64",
+      "version": "1.18.19",
+      "sha256": "fd4cfd76ca65a706d0138886dd23094dd07e35460080024b1467baaf32dcee2e",
+      "byte_length": 184277120,
+      "semantic_contract": "agent-runner-opencode.opencode-native-state/v1"
+    }
+  ]
+}

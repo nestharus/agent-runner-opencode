@@ -7,17 +7,19 @@ OpenCode owns every account-scoped boundary: model launch, sessions, native
 session export/import for account rotation, authentication, and quota
 attribution. Quota is read from the selected wrapper's native OpenCode auth
 file and queried through the ChatGPT usage endpoint with a durably bound
-`curl`; Codex configuration and credentials are neither read nor modified.
+in-process HTTPS adapter; Codex configuration and credentials are neither read
+nor modified.
 
 The provider recognizes five account-pinned wrappers, `opencode1` through
-`opencode5`. The selected settings record, wrapper command, session commands,
+`opencode5`. The selected settings record, logical wrapper command, session commands,
 auth path, quota probe, refresh command, and rotation target must resolve to
-the same profile. Numbered wrappers are the canonical persisted and executable
-identities, and launch accepts only the exact canonical wrapper name selected
-by the settings record. Path-shaped or basename-equivalent commands are not
-account aliases. The bare `opencode` name remains an account-one compatibility
-reference only at catalog-mediated setup and legacy inputs; it is not an
-accepted launch command. Setup plans emit canonical numbered profile
+the same profile. Numbered wrappers are canonical persisted account identities,
+while the reviewed direct `opencode` implementation is the only acting native
+executable. Launch accepts only the exact logical wrapper name selected by the
+settings record. Path-shaped or basename-equivalent commands are not account
+aliases. The bare `opencode` name remains an account-one compatibility reference
+only at catalog-mediated setup and legacy inputs; it is not an accepted launch
+command. Setup plans emit canonical numbered profile
 identities, while legacy-provider migration preserves each recognized provider
 table key as an exact settings-record ID. Unknown or path-shaped OpenCode
 references are diagnostic errors and are never inferred from a basename. A
@@ -199,8 +201,7 @@ request-lock acquisition.
 Prepared, effect-admitted, and reconciliation-required records never age out or
 lose their active reserve. Each record is capped at 256 KiB. The selected auth file is read
 through a 1 MiB bound, access tokens and account IDs have explicit field bounds,
-and WHAM `curl` capture is limited to 512 KiB stdout, 64 KiB stderr, and 20
-seconds.
+and the in-process WHAM response is limited to 512 KiB and 20 seconds.
 
 ## Invocation and lifecycle
 
@@ -434,7 +435,7 @@ post-rename sync failure remains an error until durability completes.
 Every native effect also passes through one durable runtime context per
 numbered account under `host.data_root/provider-state/opencode/native-runtimes`.
 The context privately records the canonical absolute `opencode` implementation,
-its content hash, the fixed `--pure` argument, the
+its content hash, reviewed implementation-manifest identity and version, the fixed `--pure` argument, the
 `agent-runner-opencode.opencode-native-state/v1` adapter contract, and the
 stable execution environment that selects the OpenCode state namespace. The
 numbered wrapper remains a logical account/policy identity and is never the
@@ -443,48 +444,58 @@ session export/enumeration, resume observation, rotation export/import, auth
 refresh, and quota-source observation after a binding exists reuse it instead
 of resolving a fresh ambient command or auth path. The complete native state,
 effect, observation, and synchronization boundary is declared in
-`contract/opencode-native-state-v1.md`. Explicitly
+`contract/opencode-native-state-v1.md`. The exact production byte identities
+and target platform are source-included in
+`contract/native-implementation-manifest-v1.json`; a different implementation
+is rejected until a reviewed manifest update and provider rebuild explicitly
+admits it. Explicitly
 transient runner-linkage and contract-test logging variables are forwarded for
 the current invocation but do not change the state identity. A different
 stable environment or changed direct implementation is rejected
 before another native effect rather than silently addressing a second state
 namespace with the same account/session labels.
 
-Predecessor schema-v1 runtime records are validated against their recorded
-wrapper bytes, then atomically replaced under the per-account runtime lock with
-the schema-v2 direct `opencode` binding before the first new native effect. A
-missing or changed predecessor wrapper, or a missing or invalid direct
+Predecessor schema-v1 wrapper and schema-v2 direct runtime records are validated
+against their recorded bytes, then atomically replaced under the per-account
+runtime lock with the schema-v3 manifest-bound `opencode` identity before the
+first new native effect. A missing or changed predecessor implementation, or a missing, invalid, or unapproved direct
 implementation, fails closed without publishing the upgrade. Durable launch
-records created by this version carry the same direct program hash, fixed
-arguments, contract identity, and state environment; older launch records
-without that evidence are retained for reconciliation but never execute their
-unbound recovery program.
+records created as schema v9 carry the same direct program hash, manifest ID,
+implementation version, fixed arguments, contract identity, and state
+environment; older launch records without complete manifest evidence are
+retained for terminal reconciliation but never execute their recovery program.
 
 Quota probes use a separate durable implementation context under
 `host.data_root/provider-state/opencode/quota-observers`. The first probe for an
-account resolves `curl` once, records its canonical path, content hash, and
-minimal cleared environment, and every later probe reuses that exact observer.
-The adapter owns one fixed `chatgpt_wham_curl/v1` request contract, disables
-ambient curl configuration, supplies credentials through stdin configuration,
-and accepts no environment-selected observer branch. Auth refresh binds both
+account records a source-included in-process transport identity derived from the
+quota adapter and complete Cargo dependency lock. Every later probe revalidates
+that identity against the running provider build. Schema-v1 and schema-v2
+external-curl observer records are atomically upgraded under the account lock
+before transport, and their executables are never invoked. The adapter owns the
+fixed `agent-runner-opencode.chatgpt-wham-http/v1` request contract declared in
+`contract/chatgpt-wham-http-v1.md`, disables proxy discovery and redirects,
+supplies credentials only as fixed request headers, and accepts no
+environment-selected transport branch. Auth refresh binds both
 the native OpenCode runtime identity and this quota-observer identity before it
 admits a credential mutation.
 
-`setup.detect` reports provider-wide `installed=true` only after exact-path
-`--version` probes succeed for `opencode`, `curl`, and every one of the five
+`setup.detect` reports provider-wide `installed=true` only after `opencode`
+matches this build's target-specific reviewed manifest, the in-process quota
+transport matches this build's source/dependency identity, and exact-path
+`--version` probes succeed for OpenCode and every one of the five
 account wrappers, every account's OpenCode auth file is present, and every
 declared caller `settings_id` resolves to a valid exact persisted record. Each probe
 uses the earlier of the host deadline and a two-second ceiling. A missing,
 non-executable, failing, or stalled dependency leaves the provider non-installed
 and produces a tool- or profile-specific warning; regular-file presence alone
-is never readiness. Native runtime and quota-observer admission independently
-enforce executable-file status before binding an implementation identity and on
-every later reuse.
+is never readiness. Native runtime admission enforces executable-file status;
+quota-observer admission instead validates the source-included adapter and
+dependency-lock identity before reuse.
 
 ### Native dependency identity upgrades
 
-Wrapper and quota-observer files must not be replaced in place while their
-identity is admitted. This provider owns the separately versioned
+Native-runtime implementations and quota-observer provider builds must not be
+replaced while their identity is admitted. This provider owns the separately versioned
 `opencode.native-identity-rebind/v1` maintenance protocol; its exact JSON Schema
 is available through `schema`. `setup.sync_plan` accepts that protocol under
 `params.native_identity_rebind` and emits operations carrying the same protocol,
@@ -500,8 +511,8 @@ is implicitly replaced with the other. The authoritative
 its intentionally open setup objects carry this explicitly named provider
 extension rather than silently redefining the shared contract.
 
-Wrapper and quota-observer identity state reads and writes are capped at 1 MiB, executable
-identity hashing is capped at 64 MiB, and their per-account lock admission is
+Native-runtime and quota-observer identity state reads and writes are capped at 1 MiB, executable
+identity hashing is streamed and capped at 256 MiB, and their per-account lock admission is
 bounded by the earlier host deadline or five seconds. A lock timeout fails the
 request with a named identity-lock result rather than waiting indefinitely.
 
@@ -516,7 +527,11 @@ request with a named identity-lock result rather than waiting indefinitely.
    the selected provider identity record changed during drain; a successful seal
    binds its plan-request cycle, exact pre-cutover semantic identity,
    state-record digest, and component into the operation ID.
-4. The operator stages only the selected replacement implementation without
+4. A native-runtime replacement must already have a reviewed target-specific
+   entry in `contract/native-implementation-manifest-v1.json`. A quota-observer
+   replacement is a reviewed provider build whose adapter source and complete
+   dependency lock produce the new identity. The corresponding rebuilt provider
+   must be installed before validation. The operator stages only the selected replacement implementation without
    altering the implementation named by its old identity. Back up and remove
    only `native-runtimes/<profile>.json` for a `native_runtime` target or only
    `quota-observers/<profile>.json` for a `quota_observer` target.

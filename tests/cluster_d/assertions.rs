@@ -157,6 +157,18 @@ pub fn assert_detect_binary_readiness(detect: &Value) {
             "setup must prove {program} readiness; detect={detect}"
         );
         assert_eq!(detect["binary"][program]["version"]["status"], 0);
+        assert_eq!(
+            detect["binary"][program]["implementation"]["ready"], true,
+            "setup must prove {program} manifest admission; detect={detect}"
+        );
+        assert_eq!(
+            detect["binary"][program]["implementation"]["manifest_contract"],
+            "agent-runner-opencode.native-implementation-manifest/v1"
+        );
+        assert_eq!(
+            detect["binary"][program]["implementation"]["version"],
+            "contract-test-fixture"
+        );
     }
 }
 

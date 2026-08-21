@@ -6,22 +6,33 @@
 //!       - authenticated ChatGPT WHAM HTTP responses to QuotaObservation
 //!       - source-specific transport and protocol failures to QuotaObservationFailure
 
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 use crate::child_custody::ChildCustody;
 use crate::durable_fs;
 use crate::quota_observer::QuotaObserverContext;
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 use crate::shell::ShellOutput;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
+#[cfg(all(
+    target_os = "linux",
+    not(all(feature = "contract-test-fixtures", debug_assertions))
+))]
+use std::io::Read;
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 use std::io::Write;
 use std::path::Path;
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 use std::process::Stdio;
 use std::time::Duration;
 
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 const HTTP_STATUS_MARKER: &str = "__oulipoly_http_status__:";
 const MAX_ACCESS_TOKEN_BYTES: usize = 32 * 1024;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
 const MAX_WHAM_STDOUT_BYTES: usize = 512 * 1024;
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 const MAX_WHAM_STDERR_BYTES: usize = 64 * 1024;
 const WHAM_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -83,26 +94,16 @@ fn observe_wham_api(
 ) -> Result<QuotaObservation, QuotaObservationFailure> {
     let tokens = read_auth_tokens(auth_path)
         .map_err(|detail| failure(QuotaFailureSource::AuthFile, detail))?;
-    let output = run_curl_usage(&tokens, observer).map_err(|err| {
+    let (body, status_code) = run_wham_transport(&tokens, observer).map_err(|err| {
         failure(
             QuotaFailureSource::WhamTransport,
             format!("ChatGPT WHAM request failed to start: {err}"),
         )
     })?;
-    if output.status != 0 {
-        return Err(failure(
-            QuotaFailureSource::WhamTransport,
-            shell_failure_detail("ChatGPT WHAM curl transport", &output),
-        ));
-    }
-    let (body, status) = split_http_body_and_status(&output.stdout)
-        .map_err(|detail| failure(QuotaFailureSource::WhamProtocol, detail))?;
-    let status_code = parse_http_status(status)
-        .map_err(|detail| failure(QuotaFailureSource::WhamProtocol, detail))?;
     if !(200..300).contains(&status_code) {
-        return Err(http_failure(status_code, body));
+        return Err(http_failure(status_code, &body));
     }
-    let parsed = parse_wham_usage_json(body).map_err(|err| {
+    let parsed = parse_wham_usage_json(&body).map_err(|err| {
         failure(
             QuotaFailureSource::WhamProtocol,
             format!("ChatGPT WHAM response must be JSON: {err}"),
@@ -139,6 +140,7 @@ fn http_failure(status: u16, body: &str) -> QuotaObservationFailure {
     }
 }
 
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 fn shell_failure_detail(participant: &str, output: &ShellOutput) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
@@ -202,6 +204,7 @@ fn nonempty_string(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 fn curl_usage_argv() -> Vec<String> {
     vec![
         "curl".to_string(),
@@ -217,10 +220,11 @@ fn curl_usage_argv() -> Vec<String> {
     ]
 }
 
-fn run_curl_usage(
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
+fn run_wham_transport(
     tokens: &AuthTokens,
     observer: &QuotaObserverContext,
-) -> std::io::Result<ShellOutput> {
+) -> std::io::Result<(String, u16)> {
     let argv = curl_usage_argv();
     let (program, args) = argv
         .split_first()
@@ -253,13 +257,88 @@ fn run_curl_usage(
             "WHAM curl output exceeds the supported bounded response",
         ));
     }
-    Ok(ShellOutput {
+    let output = ShellOutput {
         stdout: output.stdout,
         stderr: output.stderr,
         status: output.status.code().unwrap_or(1),
-    })
+    };
+    if output.status != 0 {
+        return Err(std::io::Error::other(shell_failure_detail(
+            "ChatGPT WHAM contract-test curl transport",
+            &output,
+        )));
+    }
+    let (body, status) = split_http_body_and_status(&output.stdout)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let status = parse_http_status(status)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok((body.to_string(), status))
 }
 
+#[cfg(all(
+    target_os = "linux",
+    not(all(feature = "contract-test-fixtures", debug_assertions))
+))]
+fn run_wham_transport(
+    tokens: &AuthTokens,
+    _observer: &QuotaObserverContext,
+) -> std::io::Result<(String, u16)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(WHAM_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(std::io::Error::other)?;
+    let mut response = client
+        .get(CHATGPT_USAGE_URL)
+        .bearer_auth(&tokens.access_token)
+        .header("ChatGPT-Account-Id", &tokens.account_id)
+        .send()
+        .map_err(std::io::Error::other)?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_WHAM_STDOUT_BYTES as u64)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WHAM response exceeds the supported bounded response",
+        ));
+    }
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    (&mut response)
+        .take(MAX_WHAM_STDOUT_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_WHAM_STDOUT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WHAM response exceeds the supported bounded response",
+        ));
+    }
+    let body = String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("ChatGPT WHAM response must be UTF-8: {error}"),
+        )
+    })?;
+    Ok((body, status))
+}
+
+#[cfg(all(
+    not(target_os = "linux"),
+    not(all(feature = "contract-test-fixtures", debug_assertions))
+))]
+fn run_wham_transport(
+    _tokens: &AuthTokens,
+    _observer: &QuotaObserverContext,
+) -> std::io::Result<(String, u16)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the in-process WHAM transport is currently reviewed only for Linux targets",
+    ))
+}
+
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 fn curl_usage_config(tokens: &AuthTokens) -> String {
     format!(
         "header = \"Authorization: Bearer {}\"\nheader = \"ChatGPT-Account-Id: {}\"\n",
@@ -268,10 +347,12 @@ fn curl_usage_config(tokens: &AuthTokens) -> String {
     )
 }
 
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 fn curl_config_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 fn split_http_body_and_status(raw: &[u8]) -> Result<(&str, &str), String> {
     let text = std::str::from_utf8(raw)
         .map_err(|err| format!("ChatGPT WHAM response must be UTF-8: {err}"))?;
@@ -281,6 +362,7 @@ fn split_http_body_and_status(raw: &[u8]) -> Result<(&str, &str), String> {
     Ok((body.trim_end_matches('\n'), status.trim()))
 }
 
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 fn parse_http_status(status: &str) -> Result<u16, String> {
     status
         .parse::<u16>()

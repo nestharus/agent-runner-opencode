@@ -11,6 +11,7 @@ pub mod envelope;
 pub mod launch;
 pub mod migration;
 pub mod models;
+mod native_implementation_manifest;
 pub mod native_runtime;
 pub mod opencode;
 mod operation_bounds;

@@ -602,6 +602,7 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
     let recovery_program_sha256 = agent_runner_opencode::encoding::sha256_hex(
         &fs::read(&recovery_program).expect("read direct recovery implementation"),
     );
+    let recovery_manifest_id = format!("contract-test-fixture:opencode:{recovery_program_sha256}");
     let mut prepared_state = serde_json::json!({
         "schema_version": 5,
         "operation_kind": "new_session",
@@ -614,6 +615,8 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
             "program_sha256": recovery_program_sha256,
             "native_contract_id": "agent-runner-opencode.opencode-native-state/v1",
             "fixed_args": ["--pure"],
+            "implementation_manifest_id": recovery_manifest_id,
+            "implementation_version": "contract-test-fixture",
             "passthrough_env": {
                 "OULIPOLY_OPENCODE_ACCOUNT": "opencode1"
             },
@@ -667,7 +670,7 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
     prior_actor.kill().expect("terminate prior launch actor");
     prior_actor.wait().expect("reap prior launch actor");
 
-    prepared_state["schema_version"] = serde_json::json!(8);
+    prepared_state["schema_version"] = serde_json::json!(9);
     prepared_state["delivery_nonce"] = serde_json::json!("prepared-recovery-contract");
     prepared_state["actor_process_group_id"] = serde_json::Value::Null;
     fs::write(
@@ -950,12 +953,20 @@ fn contract_native_runtime_binds_direct_opencode_implementation() {
         &fs::read(&state_path).expect("read direct native runtime identity"),
     )
     .expect("parse direct native runtime identity");
-    assert_eq!(state["schema_version"], 2);
+    assert_eq!(state["schema_version"], 3);
     assert_eq!(
         state["native_contract_id"],
         "agent-runner-opencode.opencode-native-state/v1"
     );
     assert_eq!(state["fixed_args"], serde_json::json!(["--pure"]));
+    assert_eq!(
+        state["implementation_manifest_id"],
+        format!(
+            "contract-test-fixture:opencode:{}",
+            state["program_sha256"].as_str().expect("program digest")
+        )
+    );
+    assert_eq!(state["implementation_version"], "contract-test-fixture");
     assert_eq!(
         state["program"],
         fs::canonicalize(fake_wrapper.dir().join("opencode"))
@@ -1056,12 +1067,22 @@ fn contract_native_runtime_upgrades_predecessor_wrapper_binding_before_effect() 
         &fs::read(&state_path).expect("read upgraded native runtime binding"),
     )
     .expect("parse upgraded native runtime binding");
-    assert_eq!(upgraded["schema_version"], 2);
+    assert_eq!(upgraded["schema_version"], 3);
     assert_eq!(
         upgraded["native_contract_id"],
         "agent-runner-opencode.opencode-native-state/v1"
     );
     assert_eq!(upgraded["fixed_args"], serde_json::json!(["--pure"]));
+    assert_eq!(
+        upgraded["implementation_manifest_id"],
+        format!(
+            "contract-test-fixture:opencode:{}",
+            upgraded["program_sha256"]
+                .as_str()
+                .expect("upgraded program digest")
+        )
+    );
+    assert_eq!(upgraded["implementation_version"], "contract-test-fixture");
     assert_eq!(
         upgraded["program"],
         fs::canonicalize(fake_wrapper.dir().join("opencode"))

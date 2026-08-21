@@ -7,11 +7,12 @@
 //!       - ordered creation and parent synchronization of directory links
 //!       - private directory permission persistence
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Error, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
-pub(crate) const MAX_BOUND_EXECUTABLE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_BOUND_EXECUTABLE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn create_directories(path: &Path) -> std::io::Result<()> {
@@ -40,6 +41,42 @@ pub(crate) fn is_executable_file(path: &Path) -> std::io::Result<bool> {
 
 pub(crate) fn read_file_bounded(path: &Path, maximum_bytes: usize) -> std::io::Result<Vec<u8>> {
     read_file_bounded_or(path, maximum_bytes, maximum_bytes, |_| false).map(|(bytes, _)| bytes)
+}
+
+pub(crate) fn sha256_file_bounded(
+    path: &Path,
+    maximum_bytes: usize,
+) -> std::io::Result<(String, usize)> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > maximum_bytes as u64 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("file exceeds supported {maximum_bytes}-byte bound"),
+        ));
+    }
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut observed_bytes = 0_usize;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        observed_bytes = observed_bytes.saturating_add(read);
+        if observed_bytes > maximum_bytes {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("file exceeds supported {maximum_bytes}-byte bound"),
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok((
+        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        observed_bytes,
+    ))
 }
 
 pub(crate) fn read_file_bounded_or(
@@ -226,6 +263,24 @@ mod tests {
         fs::write(&path, vec![b'x'; 33]).expect("write oversized fixture");
         let error = read_file_bounded(&path, 32).expect_err("oversized file must fail");
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bounded_streaming_digest_matches_the_in_memory_identity() {
+        let temporary = tempfile::tempdir().expect("create bounded-digest root");
+        let path = temporary.path().join("executable");
+        let bytes = vec![b'x'; 96 * 1024 + 17];
+        fs::write(&path, &bytes).expect("write digest fixture");
+        let (digest, observed_bytes) =
+            sha256_file_bounded(&path, bytes.len()).expect("digest boundary fixture");
+        assert_eq!(digest, crate::encoding::sha256_hex(&bytes));
+        assert_eq!(observed_bytes, bytes.len());
+        assert_eq!(
+            sha256_file_bounded(&path, bytes.len() - 1)
+                .expect_err("oversized digest input must fail")
+                .kind(),
+            ErrorKind::InvalidData
+        );
     }
 
     #[test]

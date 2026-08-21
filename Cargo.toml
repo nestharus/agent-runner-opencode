@@ -13,6 +13,30 @@ path = "src/main.rs"
 name = "agent_runner_opencode"
 path = "src/lib.rs"
 
+[features]
+default = []
+contract-test-fixtures = []
+
+[[test]]
+name = "contract_cluster_a"
+path = "tests/contract_cluster_a.rs"
+required-features = ["contract-test-fixtures"]
+
+[[test]]
+name = "contract_cluster_b"
+path = "tests/contract_cluster_b.rs"
+required-features = ["contract-test-fixtures"]
+
+[[test]]
+name = "contract_cluster_c"
+path = "tests/contract_cluster_c.rs"
+required-features = ["contract-test-fixtures"]
+
+[[test]]
+name = "contract_cluster_d"
+path = "tests/contract_cluster_d.rs"
+required-features = ["contract-test-fixtures"]
+
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +47,9 @@ libc = "0.2"
 tempfile = "3"
 toml = "0.8"
 wait-timeout = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 jsonschema = { version = "0.18", features = ["draft202012"] }

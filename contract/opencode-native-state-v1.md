@@ -6,21 +6,26 @@ This provider treats OpenCode as one effectful native-state participant behind a
 direct executable boundary. The numbered `opencode1` through `opencode5` values
 remain logical account and policy identities; they are never executed. For every
 native operation the provider instead resolves the `opencode` executable once,
-canonicalizes and hashes its bytes, binds the exact cleared stable environment
-and fixed `--pure` argument, persists that identity per numbered account, and
-revalidates the executable bytes before reuse. OpenCode is therefore unable to
+canonicalizes and streams a bounded hash of its bytes, and admits it only when
+the target platform, byte length, digest, version, and semantic contract match
+`contract/native-implementation-manifest-v1.json`. It binds that manifest
+identity, the exact cleared stable environment, and fixed `--pure` argument,
+persists them per numbered account, and revalidates the executable and manifest
+before reuse. OpenCode is therefore unable to
 select a different implementation through a mutable numbered wrapper after
 admission. A changed executable, fixed argument, contract identity, or stable
 state-selection environment requires the native-identity rebind protocol.
-Durable launch recovery records the same direct executable hash, fixed argument,
-contract identity, and state environment and validates them before list/export
-observation. Predecessor launch records without that evidence fail closed
+Durable schema-v9 launch recovery records the same direct executable hash,
+manifest ID/version, fixed argument, contract identity, and state environment
+and validates them before list/export observation. Predecessor launch records
+without complete manifest evidence fail closed
 instead of executing an unbound wrapper.
 
-Schema-v1 native-runtime bindings are a bounded transition input only. The
-provider first validates the exact predecessor wrapper bytes, then, while
-holding the account runtime lock, resolves and persists the schema-v2 direct
-binding before any new native effect. It never uses that predecessor wrapper as
+Schema-v1 wrapper and schema-v2 direct native-runtime bindings are bounded
+transition inputs only. The provider validates the exact recorded bytes and
+requires the currently selected direct implementation to be manifest-approved.
+While holding the account runtime lock, it persists the schema-v3 manifest-bound
+identity before any new native effect. It never uses the schema-v1 wrapper as
 the acting implementation after the upgrade-capable provider is installed.
 
 The bound environment identifies the native state namespace. `HOME` and any

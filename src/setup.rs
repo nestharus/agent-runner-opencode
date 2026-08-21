@@ -5,6 +5,7 @@ use crate::child_custody::ChildCustody;
 use crate::durable_fs;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
+use crate::native_implementation_manifest;
 use crate::native_runtime;
 use crate::operation_bounds;
 use crate::path_guard;
@@ -237,7 +238,7 @@ pub fn detect_params(
     let profile_root = string_param(&params, "profile_root");
     let required_settings_ids = required_settings_ids(&params, request_id)?;
     let opencode = executable_evidence("opencode", host.deadline_unix_ms);
-    let curl = executable_evidence("curl", host.deadline_unix_ms);
+    let curl = quota_transport_evidence(host.deadline_unix_ms);
     let profiles = profile_evidence(data_root, profile_root, host.deadline_unix_ms);
     let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
     let installed = setup_installed(&opencode, &curl, &profiles, &settings_store);
@@ -248,6 +249,16 @@ pub fn detect_params(
         settings_store,
         installed,
     ))
+}
+
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
+fn quota_transport_evidence(deadline_unix_ms: Option<u64>) -> Value {
+    executable_evidence("curl", deadline_unix_ms)
+}
+
+#[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]
+fn quota_transport_evidence(_deadline_unix_ms: Option<u64>) -> Value {
+    quota_observer::setup_transport_evidence()
 }
 
 pub fn install_plan_params(
@@ -310,6 +321,23 @@ fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
                     },
                 });
             }
+            let implementation = native_implementation_evidence(&program, path);
+            if implementation
+                .as_ref()
+                .is_some_and(|evidence| evidence["ready"] != true)
+            {
+                return json!({
+                    "program": program,
+                    "present": true,
+                    "path": path.to_string_lossy().into_owned(),
+                    "version": {
+                        "present": true,
+                        "ready": false,
+                        "error": "executable identity is not approved for this provider build",
+                    },
+                    "implementation": implementation,
+                });
+            }
             let mut command = shell::command(&program);
             command
                 .arg("--version")
@@ -350,12 +378,67 @@ fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
             "error": format!("{program} was not found in PATH"),
         }),
     };
+    let implementation = path
+        .as_ref()
+        .and_then(|path| native_implementation_evidence(program, path));
     json!({
         "program": program,
         "present": path.is_some(),
         "path": path.map(|path| path.to_string_lossy().into_owned()),
         "version": version,
+        "implementation": implementation,
     })
+}
+
+fn native_implementation_evidence(program: &str, path: &Path) -> Option<Value> {
+    let expected_contract = match program {
+        "opencode" => native_runtime::OPENCODE_NATIVE_CONTRACT_ID,
+        "curl" => quota_observer::QUOTA_OBSERVER_CONTRACT,
+        _ => return None,
+    };
+    let (sha256, byte_length) =
+        match durable_fs::sha256_file_bounded(path, durable_fs::MAX_BOUND_EXECUTABLE_BYTES) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Some(json!({
+                    "ready": false,
+                    "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+                    "error": error.to_string(),
+                }));
+            }
+        };
+    match native_implementation_manifest::approved_implementation(program, &sha256, byte_length) {
+        Ok(Some(approved)) if approved.semantic_contract == expected_contract => Some(json!({
+            "ready": true,
+            "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+            "manifest_id": approved.id,
+            "version": approved.version,
+            "semantic_contract": approved.semantic_contract,
+            "sha256": sha256,
+            "byte_length": byte_length,
+        })),
+        Ok(Some(_)) => Some(json!({
+            "ready": false,
+            "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+            "sha256": sha256,
+            "byte_length": byte_length,
+            "error": "implementation manifest entry has the wrong semantic contract",
+        })),
+        Ok(None) => Some(json!({
+            "ready": false,
+            "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+            "sha256": sha256,
+            "byte_length": byte_length,
+            "error": "implementation identity is not in the reviewed manifest",
+        })),
+        Err(error) => Some(json!({
+            "ready": false,
+            "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+            "sha256": sha256,
+            "byte_length": byte_length,
+            "error": error,
+        })),
+    }
 }
 
 fn profile_evidence(
@@ -419,7 +502,9 @@ fn setup_warnings(
         ));
     }
     if !evidence_ready(curl) {
-        warnings.push(json!("curl executable probe did not complete successfully"));
+        warnings.push(json!(
+            "quota transport readiness probe did not complete successfully"
+        ));
     }
     for profile in profiles {
         if profile.get("profile_ready").and_then(Value::as_bool) == Some(true) {
@@ -604,6 +689,10 @@ fn evidence_present(evidence: &Value) -> bool {
 fn evidence_ready(evidence: &Value) -> bool {
     evidence_present(evidence)
         && evidence.pointer("/version/ready").and_then(Value::as_bool) == Some(true)
+        && evidence
+            .get("implementation")
+            .filter(|implementation| !implementation.is_null())
+            .is_none_or(|implementation| implementation["ready"] == true)
 }
 
 fn detect_result(
@@ -627,6 +716,7 @@ fn detect_result(
 }
 
 fn install_plan_result(target: &str, settings_store: &SettingsTransitionReadiness) -> Value {
+    let quota_transport = quota_transport_install_step(target);
     json!({
         "steps": [
             {
@@ -636,7 +726,7 @@ fn install_plan_result(target: &str, settings_store: &SettingsTransitionReadines
                 "settings_store": settings_store.evidence(),
             },
             {"kind": "verify_tool", "target": target, "command": "opencode --version"},
-            {"kind": "verify_tool", "target": target, "command": "curl --version"},
+            quota_transport,
             {"kind": "verify_wrappers", "target": target, "wrappers": wrapper_names()},
             {
                 "kind": "prepare_provider_settings",
@@ -645,6 +735,20 @@ fn install_plan_result(target: &str, settings_store: &SettingsTransitionReadines
                 "activation_identity": "legacy_provider_table_key_to_exact_settings_record_id"
             }
         ]
+    })
+}
+
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
+fn quota_transport_install_step(target: &str) -> Value {
+    json!({"kind": "verify_tool", "target": target, "command": "curl --version"})
+}
+
+#[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]
+fn quota_transport_install_step(target: &str) -> Value {
+    json!({
+        "kind": "verify_in_process_transport",
+        "target": target,
+        "contract": quota_observer::QUOTA_OBSERVER_CONTRACT,
     })
 }
 
