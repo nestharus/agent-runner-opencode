@@ -1965,7 +1965,7 @@ fn recover_prepared_launch(
     let mut candidates = sessions
         .iter()
         .filter(|entry| launch_recovery_session_is_plausible(entry, state))
-        .filter_map(launch_recovery_session_id)
+        .map(|entry| entry.provider_session_id.clone())
         .collect::<Vec<_>>();
     candidates.sort();
     candidates.dedup();
@@ -2020,40 +2020,21 @@ fn launch_recovery_remaining(
         .ok_or_else(|| launch_recovery_unavailable(request_id, "recovery deadline was reached"))
 }
 
-fn launch_recovery_session_is_plausible(entry: &Value, state: &LaunchRequestState) -> bool {
-    let directory_matches =
-        launch_recovery_string(entry, &["directory", "cwd", "working_directory"])
-            .is_none_or(|directory| directory == state.recovery.working_directory);
-    let timestamp =
-        launch_recovery_integer(entry, &["updated", "updated_unix_ms", "updatedUnixMs"])
-            .or_else(|| {
-                launch_recovery_integer(entry, &["created", "created_unix_ms", "createdUnixMs"])
-            })
-            .or_else(|| {
-                entry.get("time").and_then(|time| {
-                    launch_recovery_integer(time, &["updated", "updated_unix_ms"])
-                        .or_else(|| launch_recovery_integer(time, &["created", "created_unix_ms"]))
-                })
-            });
+fn launch_recovery_session_is_plausible(
+    entry: &opencode::OpencodeSessionListRow,
+    state: &LaunchRequestState,
+) -> bool {
+    let directory_matches = match &entry.directory {
+        opencode::OpencodeSessionDirectory::Absolute(directory) => {
+            directory == &state.recovery.working_directory
+        }
+        opencode::OpencodeSessionDirectory::Missing
+        | opencode::OpencodeSessionDirectory::Invalid(_) => true,
+    };
+    let timestamp = entry.updated_unix_ms.or(entry.created_unix_ms);
     directory_matches
         && timestamp
             .is_none_or(|timestamp| timestamp >= state.prepared_at_unix_ms.saturating_sub(5_000))
-}
-
-fn launch_recovery_session_id(entry: &Value) -> Option<String> {
-    launch_recovery_string(entry, &["id", "sessionID", "sessionId", "session_id"])
-        .map(str::to_string)
-}
-
-fn launch_recovery_string<'a>(entry: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|key| entry.get(*key).and_then(Value::as_str))
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn launch_recovery_integer(entry: &Value, keys: &[&str]) -> Option<u64> {
-    keys.iter()
-        .find_map(|key| entry.get(*key).and_then(Value::as_u64))
 }
 
 fn recovered_session_matches_request(
@@ -4153,6 +4134,19 @@ mod recovery_tests {
             prepared_at_unix_ms: 20,
             observed_at_unix_ms: None,
         };
+        let invalid_directory_observation = opencode::OpencodeSessionListRow {
+            provider_session_id: "session-b".to_string(),
+            title: None,
+            directory: opencode::OpencodeSessionDirectory::Invalid("relative/path".to_string()),
+            created_unix_ms: Some(20),
+            updated_unix_ms: None,
+            turn_count: None,
+        };
+
+        assert!(
+            launch_recovery_session_is_plausible(&invalid_directory_observation, &state),
+            "invalid directory evidence must remain an unknown candidate rather than becoming authoritative absence"
+        );
 
         assert!(!recovered_session_export_matches_request(
             &export,

@@ -1041,6 +1041,27 @@ fn contract_session_enumerate_invalid_json_is_provider_error() {
 }
 
 #[test]
+fn contract_session_enumerate_rejects_an_untyped_native_row() {
+    let fake_opencode =
+        FakeOpencodeSessionList::with_output(r#"[{"created":"4102444800000"}]"#, "", 0);
+    let path = prepend_path(fake_opencode.dir());
+
+    let response = assert_error_envelope(invoke_with_env(
+        "session.enumerate",
+        session_enumerate_params(),
+        &[("PATH", path.as_str())],
+    ));
+
+    assert_eq!(response["error"]["code"], "invalid_opencode_session_list");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("row 0")),
+        "the adapter-owned row failure must retain its source index"
+    );
+}
+
+#[test]
 fn contract_session_enumerate_nonzero_wrapper_exit_is_provider_error() {
     let fake_opencode = FakeOpencodeSessionList::with_output("[]", "list failed", 9);
     let path = prepend_path(fake_opencode.dir());

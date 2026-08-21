@@ -24,7 +24,8 @@ use crate::encoding::{encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{ProviderFailure, RequestEnvelope};
 use crate::native_runtime::{self, NativeRuntimeContext};
 use crate::opencode::{
-    self, OpencodeExport, OpencodeExportError, OpencodeMessage, OpencodeSessionListError,
+    self, OpencodeExport, OpencodeExportError, OpencodeMessage, OpencodeSessionDirectory,
+    OpencodeSessionListError, OpencodeSessionListRow,
 };
 use crate::operation_bounds;
 use crate::path_guard;
@@ -597,7 +598,7 @@ fn enumerate_native(
     host: &crate::envelope::HostContext,
     settings_id: &str,
     request_id: &str,
-) -> Result<Vec<Value>, ProviderFailure> {
+) -> Result<Vec<OpencodeSessionListRow>, ProviderFailure> {
     let runtime = session_runtime(host, settings_id, request_id)?;
     let timeout =
         operation_bounds::remaining_timeout(host.deadline_unix_ms, Duration::from_secs(20))
@@ -624,16 +625,14 @@ struct EnumeratePage {
 
 fn enumerate_sessions(
     host: &crate::envelope::HostContext,
-    native: Vec<Value>,
+    native: Vec<OpencodeSessionListRow>,
     params: &SessionEnumerateParams,
     request_id: &str,
 ) -> Result<EnumeratePage, ProviderFailure> {
     let mut warnings = Vec::new();
     let mut sessions = Vec::new();
     for (index, entry) in native.iter().enumerate() {
-        if let Some(session) =
-            enumerate_session_entry(index, entry, params, request_id, &mut warnings)?
-        {
+        if let Some(session) = enumerate_session_entry(index, entry, params, &mut warnings) {
             sessions.push(session);
         }
     }
@@ -642,16 +641,15 @@ fn enumerate_sessions(
 
 fn enumerate_session_entry(
     index: usize,
-    entry: &Value,
+    entry: &OpencodeSessionListRow,
     params: &SessionEnumerateParams,
-    request_id: &str,
     warnings: &mut Vec<String>,
-) -> Result<Option<Value>, ProviderFailure> {
-    let provider_session_id = required_enumerated_session_id(entry, index, request_id)?;
-    let created_unix_ms = created_unix_ms(entry);
-    let updated_unix_ms = updated_unix_ms(entry);
+) -> Option<Value> {
+    let provider_session_id = &entry.provider_session_id;
+    let created_unix_ms = entry.created_unix_ms;
+    let updated_unix_ms = entry.updated_unix_ms;
     if !matches_since_filter(created_unix_ms, updated_unix_ms, params.since_unix_ms) {
-        return Ok(None);
+        return None;
     }
     if params.since_unix_ms.is_some() && created_unix_ms.is_none() && updated_unix_ms.is_none() {
         warnings.push(format!(
@@ -660,11 +658,11 @@ fn enumerate_session_entry(
     }
     let include_cwd = params.include_cwd.unwrap_or(true);
     let include_turn_count = params.include_turn_count.unwrap_or(true);
-    let cwd = include_cwd.then(|| enumerate_cwd(entry, index, &provider_session_id, warnings));
-    let turn_count = include_turn_count.then(|| enumerated_turn_count(entry));
-    Ok(Some(json!({
+    let cwd = include_cwd.then(|| enumerate_cwd(entry, index, warnings));
+    let turn_count = include_turn_count.then_some(entry.turn_count);
+    Some(json!({
         "provider_session_id": provider_session_id,
-        "title": string_field(entry, &["title"]),
+        "title": entry.title,
         "cwd": cwd.flatten(),
         "created_unix_ms": created_unix_ms,
         "updated_unix_ms": updated_unix_ms,
@@ -673,7 +671,7 @@ fn enumerate_session_entry(
             "kind": "opencode.session_list",
             "detail": "session list --format json"
         }
-    })))
+    }))
 }
 
 fn paginate_sessions(
@@ -1379,29 +1377,21 @@ fn set_private_snapshot_file(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn required_enumerated_session_id(
-    entry: &Value,
-    index: usize,
-    request_id: &str,
-) -> Result<String, ProviderFailure> {
-    string_field(entry, &["id", "sessionID", "sessionId", "session_id"])
-        .ok_or_else(|| invalid_opencode_session_list_row_failure(request_id, index))
-}
-
 fn enumerate_cwd(
-    entry: &Value,
+    entry: &OpencodeSessionListRow,
     index: usize,
-    provider_session_id: &str,
     warnings: &mut Vec<String>,
 ) -> Option<String> {
-    let cwd = match raw_string_field(entry, &["directory", "cwd", "working_directory"]) {
-        Some(cwd) => cwd,
-        None => {
+    let provider_session_id = &entry.provider_session_id;
+    let cwd = match &entry.directory {
+        OpencodeSessionDirectory::Absolute(cwd) => return Some(cwd.clone()),
+        OpencodeSessionDirectory::Missing => {
             warnings.push(format!(
                 "session {provider_session_id} row {index} has no directory/cwd"
             ));
             return None;
         }
+        OpencodeSessionDirectory::Invalid(cwd) => cwd,
     };
     if cwd.trim().is_empty() {
         warnings.push(format!(
@@ -1430,57 +1420,6 @@ fn matches_since_filter(
         .or(created_unix_ms)
         .map(|unix_ms| unix_ms >= since_unix_ms)
         .unwrap_or(true)
-}
-
-fn created_unix_ms(entry: &Value) -> Option<u64> {
-    integer_field(entry, &["created", "created_unix_ms", "createdUnixMs"])
-        .or_else(|| nested_integer_field(entry, "time", &["created", "created_unix_ms"]))
-}
-
-fn updated_unix_ms(entry: &Value) -> Option<u64> {
-    integer_field(entry, &["updated", "updated_unix_ms", "updatedUnixMs"])
-        .or_else(|| nested_integer_field(entry, "time", &["updated", "updated_unix_ms"]))
-}
-
-fn enumerated_turn_count(entry: &Value) -> Option<u64> {
-    integer_field(
-        entry,
-        &["turn_count", "turnCount", "message_count", "messageCount"],
-    )
-    .or_else(|| {
-        entry
-            .get("messages")
-            .and_then(Value::as_array)
-            .map(|messages| messages.len() as u64)
-    })
-}
-
-fn string_field(entry: &Value, keys: &[&str]) -> Option<String> {
-    raw_string_field(entry, keys)
-        .and_then(|value| (!value.trim().is_empty()).then_some(value))
-        .map(str::to_string)
-}
-
-fn raw_string_field<'a>(entry: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|key| entry.get(*key).and_then(Value::as_str))
-}
-
-fn nested_integer_field(entry: &Value, parent: &str, keys: &[&str]) -> Option<u64> {
-    entry
-        .get(parent)
-        .and_then(|nested| integer_field(nested, keys))
-}
-
-fn integer_field(entry: &Value, keys: &[&str]) -> Option<u64> {
-    keys.iter()
-        .find_map(|key| entry.get(*key).and_then(unsigned_integer_value))
-}
-
-fn unsigned_integer_value(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
 }
 
 fn validate_export_session_id(
@@ -1564,6 +1503,12 @@ fn session_list_failure(request_id: &str, err: OpencodeSessionListError) -> Prov
         }
         OpencodeSessionListError::InvalidJson(message) => {
             invalid_opencode_session_list_failure(request_id, message)
+        }
+        OpencodeSessionListError::InvalidRow { index, message } => {
+            invalid_opencode_session_list_failure(
+                request_id,
+                format!("row {index} is invalid: {message}"),
+            )
         }
         OpencodeSessionListError::OutputTooLarge {
             stream,
@@ -2102,15 +2047,7 @@ fn invalid_opencode_session_list_failure(request_id: &str, message: String) -> P
     ProviderFailure::invalid_request(
         request_id,
         "invalid_opencode_session_list",
-        format!("opencode session list output was not valid JSON: {message}"),
-    )
-}
-
-fn invalid_opencode_session_list_row_failure(request_id: &str, index: usize) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "invalid_opencode_session_list",
-        format!("opencode session list row {index} is missing a non-empty id"),
+        format!("opencode session list output was not a valid typed observation: {message}"),
     )
 }
 

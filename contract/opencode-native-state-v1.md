@@ -66,8 +66,17 @@ edge:
   JSON events are transport observations, while durable provider custody and
   later list/export reconciliation own ambiguous response or process failure.
 - `session list --format json` is the bounded set of sessions visible in the
-  bound namespace at that invocation. It is used for enumeration and as a
-  recovery observation; ambiguous or multiple recovery matches fail closed.
+  bound namespace at that invocation. The native edge translates every row
+  once into a typed provider observation with one canonical non-empty session
+  identity plus an explicit missing/absolute/invalid directory classification
+  and optional created/updated time, title, and turn count. Compatibility
+  aliases and decimal-string timestamps are resolved there; conflicting aliases,
+  invalid field types, or a row without identity invalidate the whole
+  observation. Enumeration and launch recovery consume that same type. An
+  invalid directory remains a warning in enumeration but is unknown—not a
+  mismatch—for recovery, so malformed evidence can never become
+  consumer-specific absence. Ambiguous or multiple recovery matches fail
+  closed.
 - `export <session>` is the authoritative serialized state of that exact
   visible session at the observation point. The provider validates all embedded
   session identities before using it for turns, completion, or recovery.

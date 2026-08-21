@@ -344,6 +344,15 @@ completed materialization.
 `session.enumerate` materializes one bounded, request-bound private snapshot on
 the first page, including an empty or otherwise terminal first page, instead of
 relisting the native population during response recovery or for every cursor.
+Before either enumeration or launch recovery can use native session-list
+output, the OpenCode edge translates every row into one typed observation with
+a canonical non-empty session identity, an explicit missing/absolute/invalid
+directory classification, and optional timestamp, title, and turn-count fields.
+Alias and decimal-string timestamp compatibility is owned at that edge. An
+invalid directory remains an enumeration warning but is treated as unknown—not
+a mismatch—during recovery. A malformed row or conflicting alias invalidates
+the whole observation and preserves launch effect custody rather than being
+dropped as apparent absence during recovery.
 The initial request has a stable durable claim independent of the listed row
 bytes. An exact retry consults that claim before native relisting and replays its
 immutable first-page rows, warnings, completion state, and optional cursor;

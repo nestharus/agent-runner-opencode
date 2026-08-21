@@ -6,6 +6,7 @@
 //!       - opencode run --format json event stream
 //!       - opencode sessionID launch marker metadata
 //!       - opencode event type/timestamp/part metadata
+//!       - opencode session list rows to one typed provider observation
 //!       - opencode export native session JSON
 //!       - opencode auth list status plus observed credential-file effect
 
@@ -143,6 +144,23 @@ pub struct OpencodeMessageTime {
     pub completed: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpencodeSessionListRow {
+    pub provider_session_id: String,
+    pub title: Option<String>,
+    pub directory: OpencodeSessionDirectory,
+    pub created_unix_ms: Option<u64>,
+    pub updated_unix_ms: Option<u64>,
+    pub turn_count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OpencodeSessionDirectory {
+    Missing,
+    Absolute(String),
+    Invalid(String),
+}
+
 impl OpencodeExport {
     pub fn native_json(&self) -> &Value {
         &self.native_json
@@ -172,6 +190,10 @@ pub enum OpencodeSessionListError {
         stderr: String,
     },
     InvalidJson(String),
+    InvalidRow {
+        index: usize,
+        message: String,
+    },
     OutputTooLarge {
         stream: &'static str,
         maximum_bytes: usize,
@@ -400,7 +422,7 @@ fn run_export_command(
 pub fn session_list(
     limit: Option<usize>,
     runtime: &NativeRuntimeContext,
-) -> Result<Vec<Value>, OpencodeSessionListError> {
+) -> Result<Vec<OpencodeSessionListRow>, OpencodeSessionListError> {
     let mut command = runtime.command();
     configure_session_list_command(&mut command, limit);
     run_session_list_command(command, SESSION_LIST_TIMEOUT)
@@ -410,7 +432,7 @@ pub fn session_list_with_timeout(
     limit: Option<usize>,
     runtime: &NativeRuntimeContext,
     timeout: Duration,
-) -> Result<Vec<Value>, OpencodeSessionListError> {
+) -> Result<Vec<OpencodeSessionListRow>, OpencodeSessionListError> {
     let mut command = runtime.command();
     configure_session_list_command(&mut command, limit);
     run_session_list_command(command, timeout)
@@ -423,7 +445,7 @@ pub fn session_list_with_launch_context(
     env: &BTreeMap<String, String>,
     limit: Option<usize>,
     timeout: Duration,
-) -> Result<Vec<Value>, OpencodeSessionListError> {
+) -> Result<Vec<OpencodeSessionListRow>, OpencodeSessionListError> {
     let mut command = Command::new(program);
     command
         .args(fixed_args)
@@ -448,7 +470,7 @@ fn configure_session_list_command(command: &mut Command, limit: Option<usize>) {
 fn run_session_list_command(
     mut command: Command,
     timeout: Duration,
-) -> Result<Vec<Value>, OpencodeSessionListError> {
+) -> Result<Vec<OpencodeSessionListRow>, OpencodeSessionListError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().map_err(session_list_spawn_error)?;
     let output = ChildCustody::new(child)
@@ -553,7 +575,9 @@ pub fn parse_export_stdout(stdout: &[u8]) -> Result<OpencodeExport, OpencodeExpo
     parse_export_json(&stdout[start..])
 }
 
-pub fn parse_session_list_stdout(stdout: &[u8]) -> Result<Vec<Value>, OpencodeSessionListError> {
+pub fn parse_session_list_stdout(
+    stdout: &[u8],
+) -> Result<Vec<OpencodeSessionListRow>, OpencodeSessionListError> {
     let start = session_list_json_start(stdout)?;
     parse_session_list_json(&stdout[start..])
 }
@@ -750,8 +774,217 @@ fn parse_export_json(bytes: &[u8]) -> Result<OpencodeExport, OpencodeExportError
     })
 }
 
-fn parse_session_list_json(bytes: &[u8]) -> Result<Vec<Value>, OpencodeSessionListError> {
-    serde_json::from_slice(bytes).map_err(invalid_session_list_json_error)
+fn parse_session_list_json(
+    bytes: &[u8],
+) -> Result<Vec<OpencodeSessionListRow>, OpencodeSessionListError> {
+    let native: Value = serde_json::from_slice(bytes).map_err(invalid_session_list_json_error)?;
+    let rows = native.as_array().ok_or_else(|| {
+        OpencodeSessionListError::InvalidJson("session list is not a JSON array".to_string())
+    })?;
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| parse_session_list_row(index, row))
+        .collect()
+}
+
+fn parse_session_list_row(
+    index: usize,
+    row: &Value,
+) -> Result<OpencodeSessionListRow, OpencodeSessionListError> {
+    if !row.is_object() {
+        return Err(invalid_session_list_row(index, "row is not a JSON object"));
+    }
+    let provider_session_id = optional_session_list_string(
+        index,
+        row,
+        &["id", "sessionID", "sessionId", "session_id"],
+        "session identity",
+    )?
+    .filter(|value| !value.trim().is_empty())
+    .ok_or_else(|| invalid_session_list_row(index, "row has no non-empty session identity"))?;
+    let title = optional_session_list_string(index, row, &["title"], "title")?
+        .filter(|value| !value.trim().is_empty());
+    let directory = match optional_session_list_string(
+        index,
+        row,
+        &["directory", "cwd", "working_directory"],
+        "directory",
+    )? {
+        None => OpencodeSessionDirectory::Missing,
+        Some(directory) if Path::new(&directory).is_absolute() => {
+            OpencodeSessionDirectory::Absolute(directory)
+        }
+        Some(directory) => OpencodeSessionDirectory::Invalid(directory),
+    };
+    let nested_time = optional_session_list_object(index, row, "time")?;
+    let created_unix_ms = merge_session_list_field(
+        index,
+        "created timestamp",
+        optional_session_list_u64(
+            index,
+            row,
+            &["created", "created_unix_ms", "createdUnixMs"],
+            "created timestamp",
+        )?,
+        nested_time
+            .map(|time| {
+                optional_session_list_u64(
+                    index,
+                    time,
+                    &["created", "created_unix_ms"],
+                    "time.created timestamp",
+                )
+            })
+            .transpose()?
+            .flatten(),
+    )?;
+    let updated_unix_ms = merge_session_list_field(
+        index,
+        "updated timestamp",
+        optional_session_list_u64(
+            index,
+            row,
+            &["updated", "updated_unix_ms", "updatedUnixMs"],
+            "updated timestamp",
+        )?,
+        nested_time
+            .map(|time| {
+                optional_session_list_u64(
+                    index,
+                    time,
+                    &["updated", "updated_unix_ms"],
+                    "time.updated timestamp",
+                )
+            })
+            .transpose()?
+            .flatten(),
+    )?;
+    let explicit_turn_count = optional_session_list_u64(
+        index,
+        row,
+        &["turn_count", "turnCount", "message_count", "messageCount"],
+        "turn count",
+    )?;
+    let turn_count = match (explicit_turn_count, row.get("messages")) {
+        (Some(count), _) => Some(count),
+        (None, None | Some(Value::Null)) => None,
+        (None, Some(Value::Array(messages))) => Some(messages.len() as u64),
+        (None, Some(_)) => {
+            return Err(invalid_session_list_row(
+                index,
+                "messages is not a JSON array",
+            ));
+        }
+    };
+    Ok(OpencodeSessionListRow {
+        provider_session_id,
+        title,
+        directory,
+        created_unix_ms,
+        updated_unix_ms,
+        turn_count,
+    })
+}
+
+fn optional_session_list_object<'a>(
+    index: usize,
+    row: &'a Value,
+    key: &str,
+) -> Result<Option<&'a Value>, OpencodeSessionListError> {
+    match row.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value @ Value::Object(_)) => Ok(Some(value)),
+        Some(_) => Err(invalid_session_list_row(
+            index,
+            format!("{key} is not a JSON object"),
+        )),
+    }
+}
+
+fn optional_session_list_string(
+    index: usize,
+    row: &Value,
+    keys: &[&str],
+    label: &str,
+) -> Result<Option<String>, OpencodeSessionListError> {
+    let mut observed = None;
+    for key in keys {
+        let Some(value) = row.get(*key) else {
+            continue;
+        };
+        let candidate = match value {
+            Value::Null => None,
+            Value::String(value) => Some(value.clone()),
+            _ => {
+                return Err(invalid_session_list_row(
+                    index,
+                    format!("{label} field {key} is not a string"),
+                ));
+            }
+        };
+        observed = merge_session_list_field(index, label, observed, candidate)?;
+    }
+    Ok(observed)
+}
+
+fn optional_session_list_u64(
+    index: usize,
+    row: &Value,
+    keys: &[&str],
+    label: &str,
+) -> Result<Option<u64>, OpencodeSessionListError> {
+    let mut observed = None;
+    for key in keys {
+        let Some(value) = row.get(*key) else {
+            continue;
+        };
+        let candidate = match value {
+            Value::Null => None,
+            Value::Number(number) => Some(number.as_u64().ok_or_else(|| {
+                invalid_session_list_row(
+                    index,
+                    format!("{label} field {key} is not an unsigned integer"),
+                )
+            })?),
+            Value::String(value) => Some(value.parse::<u64>().map_err(|_| {
+                invalid_session_list_row(
+                    index,
+                    format!("{label} field {key} is not an unsigned integer"),
+                )
+            })?),
+            _ => {
+                return Err(invalid_session_list_row(
+                    index,
+                    format!("{label} field {key} is not an unsigned integer"),
+                ));
+            }
+        };
+        observed = merge_session_list_field(index, label, observed, candidate)?;
+    }
+    Ok(observed)
+}
+
+fn merge_session_list_field<T: Eq>(
+    index: usize,
+    label: &str,
+    left: Option<T>,
+    right: Option<T>,
+) -> Result<Option<T>, OpencodeSessionListError> {
+    match (left, right) {
+        (Some(left), Some(right)) if left != right => Err(invalid_session_list_row(
+            index,
+            format!("row has conflicting {label} aliases"),
+        )),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn invalid_session_list_row(index: usize, message: impl Into<String>) -> OpencodeSessionListError {
+    OpencodeSessionListError::InvalidRow {
+        index,
+        message: message.into(),
+    }
 }
 
 fn missing_export_json_error() -> OpencodeExportError {
@@ -780,4 +1013,56 @@ fn non_empty_lines(drained: &[u8]) -> Vec<Vec<u8>> {
 
 fn pinned_native_event(event: OpencodeEventMetadata) -> Option<OpencodeEventMetadata> {
     is_pinned_native_event(&event).then_some(event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_session_list_stdout, OpencodeSessionDirectory, OpencodeSessionListError,
+        OpencodeSessionListRow,
+    };
+
+    #[test]
+    fn session_list_edge_canonicalizes_identity_and_string_timestamps() {
+        let rows = parse_session_list_stdout(
+            br#"[{"sessionID":"ses-typed","cwd":"/tmp/typed","time":{"created":"41","updated":42},"messages":[{},{}]}]"#,
+        )
+        .expect("parse typed session-list observation");
+
+        assert_eq!(
+            rows,
+            vec![OpencodeSessionListRow {
+                provider_session_id: "ses-typed".to_string(),
+                title: None,
+                directory: OpencodeSessionDirectory::Absolute("/tmp/typed".to_string()),
+                created_unix_ms: Some(41),
+                updated_unix_ms: Some(42),
+                turn_count: Some(2),
+            }]
+        );
+    }
+
+    #[test]
+    fn session_list_edge_rejects_a_row_without_identity() {
+        let error = parse_session_list_stdout(br#"[{"created":41}]"#)
+            .expect_err("a row without identity must invalidate the whole observation");
+
+        assert!(matches!(
+            error,
+            OpencodeSessionListError::InvalidRow { index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn session_list_edge_rejects_conflicting_timestamp_aliases() {
+        let error = parse_session_list_stdout(
+            br#"[{"id":"ses-conflict","created":41,"time":{"created":"42"}}]"#,
+        )
+        .expect_err("conflicting aliases must not be consumer-selected");
+
+        assert!(matches!(
+            error,
+            OpencodeSessionListError::InvalidRow { index: 0, .. }
+        ));
+    }
 }

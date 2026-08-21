@@ -699,6 +699,28 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
     )
     .expect("write unpublished-actor launch state");
 
+    write_fake_wrapper(
+        &fake_wrapper_path(fake_wrapper.dir()),
+        fake_invalid_session_list_then_counted_new_session_script(
+            fake_wrapper.log_path(),
+            provider_session_id,
+        ),
+    );
+    let unavailable = json_stdout(&support::invoke_with_request("launch", request.clone()));
+    assert_eq!(
+        unavailable["error"]["code"],
+        "launch_session_recovery_unavailable"
+    );
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "an invalid typed session-list observation must preserve custody and prevent readmission"
+    );
+
+    write_fake_wrapper(
+        &fake_wrapper_path(fake_wrapper.dir()),
+        fake_counted_new_session_script(fake_wrapper.log_path(), provider_session_id),
+    );
+
     let replay = support::invoke_with_request("launch", request);
     assert_output_success(&replay, "recovered prepared launch");
     assert_eq!(
