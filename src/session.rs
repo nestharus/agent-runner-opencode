@@ -44,7 +44,7 @@ const USER_OBSERVATION_PROJECTION: &str = "user_observation";
 const MAX_OBSERVATION_BODY_TAIL: usize = 16;
 const SESSION_ENUMERATION_SNAPSHOT_DIR: &str =
     "provider-state/opencode/session-enumeration-snapshots";
-const SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 const SESSION_ENUMERATION_SNAPSHOT_TTL_MS: u64 = 15 * 60 * 1_000;
 const SESSION_ENUMERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ENUMERATED_SESSIONS: usize = 256;
@@ -115,6 +115,14 @@ struct EnumerationSnapshotManifest {
     total_sessions: usize,
     created_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    #[serde(default)]
+    next_cursor_offset: usize,
+    #[serde(default)]
+    last_page_claim_request_sha256: Option<String>,
+    #[serde(default)]
+    last_page_claim_start: Option<usize>,
+    #[serde(default)]
+    last_page_claim_end: Option<usize>,
     #[serde(default)]
     terminal_claim_request_sha256: Option<String>,
 }
@@ -644,8 +652,14 @@ fn paginate_sessions(
         None
     } else {
         let identity_sha256 = enumeration_request_identity(params);
-        let snapshot_id =
-            persist_enumeration_snapshot(host, &identity_sha256, &sessions, request_id)?;
+        let snapshot_id = persist_enumeration_snapshot(
+            host,
+            &identity_sha256,
+            &sessions,
+            params,
+            end,
+            request_id,
+        )?;
         Some(enumeration_cursor(
             &snapshot_id,
             end,
@@ -679,6 +693,8 @@ fn persist_enumeration_snapshot(
     host: &crate::envelope::HostContext,
     identity_sha256: &str,
     sessions: &[Value],
+    params: &SessionEnumerateParams,
+    first_page_end: usize,
     request_id: &str,
 ) -> Result<String, ProviderFailure> {
     let mut encoded_rows = Vec::with_capacity(sessions.len());
@@ -718,15 +734,25 @@ fn persist_enumeration_snapshot(
     let snapshot_root =
         confined_enumeration_snapshot_target(host, &root.join(&snapshot_id), request_id)?;
     if let Ok(manifest) = snapshot_manifest(&snapshot_root, request_id) {
-        let reusable = manifest.snapshot_id == snapshot_id
+        let reusable = manifest.schema_version == SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
+            && manifest.snapshot_id == snapshot_id
             && manifest.identity_sha256 == identity_sha256
             && manifest.total_sessions == sessions.len()
             && manifest.expires_at_unix_ms >= now_unix_ms();
-        if reusable && manifest.terminal_claim_request_sha256.is_none() {
-            return Ok(snapshot_id);
-        }
         if reusable {
-            return Err(session_snapshot_terminal_handoff_failure(request_id));
+            if manifest.terminal_claim_request_sha256.is_some() {
+                return Err(session_snapshot_terminal_handoff_failure(request_id));
+            }
+            let request_sha256 = enumeration_page_request_sha256(params, request_id);
+            let exact_initial_retry = manifest.next_cursor_offset == first_page_end
+                && manifest.last_page_claim_request_sha256.as_deref()
+                    == Some(request_sha256.as_str())
+                && manifest.last_page_claim_start == Some(0)
+                && manifest.last_page_claim_end == Some(first_page_end);
+            if exact_initial_retry {
+                return Ok(snapshot_id);
+            }
+            return Err(session_snapshot_cursor_superseded_failure(request_id));
         }
     }
     if snapshot_root.exists() {
@@ -747,6 +773,7 @@ fn persist_enumeration_snapshot(
             .map_err(|error| session_snapshot_failure(request_id, error))?;
     }
     let created_at_unix_ms = now_unix_ms();
+    let request_sha256 = enumeration_page_request_sha256(params, request_id);
     let manifest = EnumerationSnapshotManifest {
         schema_version: SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: snapshot_id.clone(),
@@ -754,6 +781,10 @@ fn persist_enumeration_snapshot(
         total_sessions: sessions.len(),
         created_at_unix_ms,
         expires_at_unix_ms: created_at_unix_ms.saturating_add(SESSION_ENUMERATION_SNAPSHOT_TTL_MS),
+        next_cursor_offset: first_page_end,
+        last_page_claim_request_sha256: Some(request_sha256),
+        last_page_claim_start: Some(0),
+        last_page_claim_end: Some(first_page_end),
         terminal_claim_request_sha256: None,
     };
     let bytes = serde_json::to_vec(&manifest)
@@ -800,6 +831,20 @@ fn load_enumeration_snapshot_page(
     let end = start
         .saturating_add(params.limit.unwrap_or(MAX_ENUMERATION_PAGE_SIZE))
         .min(total);
+    let request_sha256 = enumeration_page_request_sha256(params, request_id);
+    let exact_page_retry = manifest.last_page_claim_request_sha256.as_deref()
+        == Some(request_sha256.as_str())
+        && manifest.last_page_claim_start == Some(start)
+        && manifest.last_page_claim_end == Some(end)
+        && manifest.next_cursor_offset == end;
+    let advances_cursor = manifest.next_cursor_offset == start;
+    if let Some(owner) = manifest.terminal_claim_request_sha256.as_deref() {
+        if owner != request_sha256.as_str() || !exact_page_retry {
+            return Err(session_snapshot_terminal_handoff_failure(request_id));
+        }
+    } else if !advances_cursor && !exact_page_retry {
+        return Err(session_snapshot_cursor_superseded_failure(request_id));
+    }
     let mut sessions = Vec::with_capacity(end - start);
     for index in start..end {
         let path = confined_enumeration_snapshot_target(
@@ -815,21 +860,31 @@ fn load_enumeration_snapshot_page(
         );
     }
     let complete = end == total;
+    if manifest.terminal_claim_request_sha256.is_some() && !complete {
+        return Err(session_snapshot_terminal_handoff_failure(request_id));
+    }
+    if advances_cursor {
+        manifest.next_cursor_offset = end;
+        manifest.last_page_claim_request_sha256 = Some(request_sha256.clone());
+        manifest.last_page_claim_start = Some(start);
+        manifest.last_page_claim_end = Some(end);
+    }
     if complete {
-        let request_sha256 = sha256_hex(request_id.as_bytes());
         match manifest.terminal_claim_request_sha256.as_deref() {
             Some(owner) if owner != request_sha256.as_str() => {
                 return Err(session_snapshot_terminal_handoff_failure(request_id));
             }
             Some(_) => {}
             None => {
-                manifest.terminal_claim_request_sha256 = Some(request_sha256);
-                let bytes = serde_json::to_vec(&manifest)
-                    .map_err(|error| session_snapshot_failure(request_id, error))?;
-                write_enumeration_snapshot_file(&snapshot_root.join("manifest.json"), &bytes)
-                    .map_err(|error| session_snapshot_failure(request_id, error))?;
+                manifest.terminal_claim_request_sha256 = Some(request_sha256.clone());
             }
         }
+    }
+    if advances_cursor {
+        let bytes = serde_json::to_vec(&manifest)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
+        write_enumeration_snapshot_file(&snapshot_root.join("manifest.json"), &bytes)
+            .map_err(|error| session_snapshot_failure(request_id, error))?;
     }
     Ok(EnumeratePage {
         sessions,
@@ -842,6 +897,22 @@ fn load_enumeration_snapshot_page(
             snapshot_root,
         }),
     })
+}
+
+fn enumeration_page_request_sha256(params: &SessionEnumerateParams, request_id: &str) -> String {
+    sha256_hex(
+        json!({
+            "request_id": request_id,
+            "settings_id": params.settings_id,
+            "limit": params.limit.unwrap_or(MAX_ENUMERATION_PAGE_SIZE),
+            "cursor": params.cursor,
+            "include_cwd": params.include_cwd.unwrap_or(true),
+            "include_turn_count": params.include_turn_count.unwrap_or(true),
+            "since_unix_ms": params.since_unix_ms,
+        })
+        .to_string()
+        .as_bytes(),
+    )
 }
 
 fn enumeration_cursor(
@@ -1817,6 +1888,17 @@ fn session_snapshot_terminal_handoff_failure(request_id: &str) -> ProviderFailur
         "session enumeration snapshot already has a different terminal response handoff owner",
         json!({
             "required_action": "retry only the exact terminal continuation request until its response handoff completes",
+        }),
+    )
+}
+
+fn session_snapshot_cursor_superseded_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "session_enumeration_cursor_superseded",
+        "session enumeration cursor has already advanced to a later page",
+        json!({
+            "required_action": "retry only the exact latest page request, continue from its returned cursor, or restart enumeration",
         }),
     )
 }

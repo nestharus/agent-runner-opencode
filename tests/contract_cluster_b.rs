@@ -476,6 +476,164 @@ fn contract_terminal_snapshot_claim_blocks_initial_retry_during_response_handoff
 }
 
 #[test]
+fn contract_session_enumerate_advances_cursor_monotonically() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-monotonic-session-cursor");
+    fs::create_dir_all(&data_root).expect("create monotonic session cursor data root");
+    let host = json!({"data_root": data_root.to_string_lossy()});
+    let env = [("PATH", path.as_str())];
+
+    let first = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_limit_params(1),
+            host.clone(),
+            &env,
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    let first_cursor = first["next_cursor"].as_str().expect("first page cursor");
+    let second = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_cursor_params(1, first_cursor),
+            host.clone(),
+            &env,
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    let terminal_cursor = second["next_cursor"]
+        .as_str()
+        .expect("terminal page cursor");
+
+    let replay = assert_error_envelope(invoke_with_host_and_env(
+        "session.enumerate",
+        session_enumerate_cursor_params(1, first_cursor),
+        host.clone(),
+        &env,
+    ));
+    assert_eq!(
+        replay["error"]["code"], "session_enumeration_cursor_superseded",
+        "a later issued cursor must make an older cursor unavailable to a new request"
+    );
+
+    let terminal = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_cursor_params(1, terminal_cursor),
+            host,
+            &env,
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_eq!(terminal["sessions"].as_array().expect("sessions").len(), 1);
+    assert_eq!(terminal["complete"], true);
+    assert!(terminal["next_cursor"].is_null());
+    fs::remove_dir_all(&data_root).expect("remove monotonic session cursor data root");
+}
+
+#[test]
+fn contract_terminal_claim_blocks_older_cursor_during_response_handoff() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-terminal-older-cursor-race");
+    fs::create_dir_all(&data_root).expect("create terminal older-cursor data root");
+    let host = json!({"data_root": data_root.to_string_lossy()});
+    let prior_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", &path);
+    let args = vec![
+        "agent-runner-opencode".to_string(),
+        "session.enumerate".to_string(),
+    ];
+    let mut initial_request = support::validated_request_envelope(
+        "session.enumerate",
+        session_enumerate_limit_params(1),
+        host,
+        "session.schema.json#/$defs/SessionEnumerateRequest",
+    );
+    initial_request["request_id"] = json!("req-session-enumerate-race-initial");
+    support::ensure_default_runtime_settings(&initial_request);
+    let mut initial_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&initial_request).expect("serialize initial request"),
+            &mut initial_stdout,
+        ),
+        0
+    );
+    let initial_response: Value =
+        serde_json::from_slice(&initial_stdout).expect("parse initial response");
+    let older_cursor = initial_response["result"]["next_cursor"]
+        .as_str()
+        .expect("older cursor")
+        .to_string();
+
+    let mut middle_request = initial_request.clone();
+    middle_request["request_id"] = json!("req-session-enumerate-race-middle");
+    middle_request["params"] = session_enumerate_cursor_params(1, &older_cursor);
+    let mut middle_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&middle_request).expect("serialize middle request"),
+            &mut middle_stdout,
+        ),
+        0
+    );
+    let middle_response: Value =
+        serde_json::from_slice(&middle_stdout).expect("parse middle response");
+    let terminal_cursor = middle_response["result"]["next_cursor"]
+        .as_str()
+        .expect("terminal cursor");
+
+    let mut terminal_request = initial_request.clone();
+    terminal_request["request_id"] = json!("req-session-enumerate-race-terminal");
+    terminal_request["params"] = session_enumerate_cursor_params(1, terminal_cursor);
+    let mut competing_request = initial_request;
+    competing_request["request_id"] = json!("req-session-enumerate-race-older-replay");
+    competing_request["params"] = session_enumerate_cursor_params(1, &older_cursor);
+    let mut handoff = InvokeDuringFlush {
+        accepted: Vec::new(),
+        args: args.clone(),
+        competing_request: serde_json::to_vec(&competing_request)
+            .expect("serialize competing older-cursor request"),
+        competing_exit: None,
+        competing_stdout: Vec::new(),
+    };
+
+    assert_eq!(
+        agent_runner_opencode::write_invocation(
+            &args,
+            &serde_json::to_vec(&terminal_request).expect("serialize terminal request"),
+            &mut handoff,
+        ),
+        0
+    );
+    assert_eq!(handoff.competing_exit, Some(2));
+    let competing: Value = serde_json::from_slice(&handoff.competing_stdout)
+        .expect("parse competing older-cursor response");
+    assert_eq!(
+        competing["error"]["code"],
+        "session_enumeration_snapshot_terminal_handoff_in_progress"
+    );
+    let terminal: Value =
+        serde_json::from_slice(&handoff.accepted).expect("parse terminal response");
+    assert_eq!(terminal["result"]["complete"], true);
+    assert!(terminal["result"]["next_cursor"].is_null());
+
+    match prior_path {
+        Some(value) => std::env::set_var("PATH", value),
+        None => std::env::remove_var("PATH"),
+    }
+    fs::remove_dir_all(&data_root).expect("remove terminal older-cursor data root");
+}
+
+#[test]
 fn contract_session_enumerate_invalid_json_is_provider_error() {
     let fake_opencode = FakeOpencodeSessionList::with_output("not json", "", 0);
     let path = prepend_path(fake_opencode.dir());
