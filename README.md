@@ -479,12 +479,13 @@ host deadline remains the outer operation limit; when it is absent, the
 provider deliberately favors completion over the corresponding longer resource
 occupancy, with the finite per-Bash fallback as the ceiling.
 
-Predecessor schema-v1 wrapper and schema-v2 direct runtime records are validated
-against their recorded bytes, then atomically replaced under the per-account
-runtime lock with the schema-v4 manifest-bound `opencode` identity before the
-first new native effect. A missing or changed predecessor implementation, or a missing, invalid, or unapproved direct
-implementation, fails closed without publishing the upgrade. Initial admission,
-rebind, and predecessor upgrade stream the bounded executable hash once. A
+Predecessor schema-v1 wrapper, schema-v2 direct runtime, and schema-v3
+manifest-bound runtime records are validated against their recorded bytes, then
+atomically replaced under the per-account runtime lock with the schema-v4
+manifest-bound `opencode` identity and metadata stamp before the first new native
+effect. A missing or changed predecessor implementation, or a missing, invalid,
+or unapproved direct implementation, fails closed without publishing the
+upgrade. Initial admission, rebind, and predecessor upgrade stream the bounded executable hash once. A
 schema-v4 reuse compares the canonical path and an admitted size/inode/change
 metadata stamp under the account lock, then rechecks the immutable build
 manifest; it does not reread the entire executable for every native operation.

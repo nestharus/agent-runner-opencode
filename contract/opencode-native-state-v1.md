@@ -31,12 +31,13 @@ exact-path `--version` probe and never resolves or executes the numbered logical
 account identities. Per-account setup readiness is the conjunction of that one
 direct-runtime result and the account's declared auth-file evidence.
 
-Schema-v1 wrapper and schema-v2 direct native-runtime bindings are bounded
-transition inputs only. The provider validates the exact recorded bytes and
-requires the currently selected direct implementation to be manifest-approved.
-While holding the account runtime lock, it persists the schema-v4 manifest-bound
-identity before any new native effect. It never uses the schema-v1 wrapper as
-the acting implementation after the upgrade-capable provider is installed.
+Schema-v1 wrapper, schema-v2 direct native-runtime, and schema-v3 manifest-bound
+bindings are bounded transition inputs only. The provider validates the exact
+recorded bytes and requires the currently selected direct implementation to be
+manifest-approved. While holding the account runtime lock, it persists the
+schema-v4 manifest-bound identity and metadata stamp before any new native
+effect. It never uses the schema-v1 wrapper as the acting implementation after
+the upgrade-capable provider is installed.
 
 The bound environment identifies the native state namespace. `HOME` and any
 explicit stable XDG/OpenCode configuration values are part of the identity. If

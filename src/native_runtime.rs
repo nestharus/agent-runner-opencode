@@ -820,7 +820,7 @@ fn validate_predecessor_runtime_implementation(
         // The predecessor wrapper is retained only as authenticated transition
         // evidence. It is never executed by this provider; candidate_context
         // must independently admit the reviewed direct implementation before
-        // activate_runtime_context publishes the schema-v3 successor.
+        // activate_runtime_context publishes the schema-v4 successor.
         return Ok(PredecessorImplementationAdmission {
             program_stamp,
             approved: None,
