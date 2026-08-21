@@ -47,6 +47,18 @@ canonical absolute executable; `PATH` remains identity-bound for tools that an
 OpenCode turn may itself execute, but does not select the OpenCode executable
 after admission. `--pure` excludes external plugins from the acting boundary.
 
+Agent Runner launches favor completion of long-running agent work over
+OpenCode's shorter implicit per-Bash cutoff. The provider therefore owns a
+finite fallback of `2000000000` milliseconds (about 23.1 days) for
+`OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS` when the host/request supplies
+no value. The value is below the signed 32-bit millisecond ceiling and is not
+an unbounded timeout. A host/request-authored value takes precedence and becomes
+part of the durable runtime identity. When `host.deadline_unix_ms` is present,
+that deadline remains the outer provider-operation limit independently of this
+per-Bash fallback. Without a host deadline, the provider deliberately accepts
+the longer resource-occupancy window in order to avoid prematurely terminating
+valid agent work; the finite fallback remains the last per-Bash ceiling.
+
 The provider relies on these command observations and validates them at its
 edge:
 

@@ -461,6 +461,15 @@ stable environment or changed direct implementation is rejected
 before another native effect rather than silently addressing a second state
 namespace with the same account/session labels.
 
+The provider owns a finite `2000000000` millisecond (about 23.1 days) fallback
+for OpenCode's per-Bash default timeout so long-running agent work is not
+prematurely terminated by a shorter native default. An explicit
+`OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS` supplied by the host/request
+takes precedence and is bound into the durable runtime identity. The optional
+host deadline remains the outer operation limit; when it is absent, the
+provider deliberately favors completion over the corresponding longer resource
+occupancy, with the finite per-Bash fallback as the ceiling.
+
 Predecessor schema-v1 wrapper and schema-v2 direct runtime records are validated
 against their recorded bytes, then atomically replaced under the per-account
 runtime lock with the schema-v4 manifest-bound `opencode` identity before the

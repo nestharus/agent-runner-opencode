@@ -33,6 +33,14 @@ const OPENCODE_NATIVE_PROGRAM: &str = "opencode";
 pub(crate) const OPENCODE_NATIVE_CONTRACT_ID: &str =
     "agent-runner-opencode.opencode-native-state/v1";
 pub(crate) const OPENCODE_NATIVE_FIXED_ARGS: &[&str] = &["--pure"];
+const OPENCODE_BASH_DEFAULT_TIMEOUT_ENV: &str = "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS";
+// Agent Runner launches are allowed to run long-lived agent work. When the
+// host does not make a different explicit choice, the provider owns this
+// finite fallback so OpenCode's per-Bash default does not terminate otherwise
+// healthy work before provider/host custody does. The value is deliberately
+// below the signed 32-bit millisecond ceiling; an optional host deadline still
+// remains the outer operation limit.
+const PROVIDER_BASH_DEFAULT_TIMEOUT_MS: &str = "2000000000";
 const NATIVE_RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_NATIVE_RUNTIME_STATE_BYTES: usize = 1024 * 1024;
 const STABLE_AMBIENT_ENV_KEYS: &[&str] = &[
@@ -48,7 +56,7 @@ const STABLE_AMBIENT_ENV_KEYS: &[&str] = &[
     "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
     "OPENCODE_DISABLE_FFF",
     "OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER",
-    "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS",
+    OPENCODE_BASH_DEFAULT_TIMEOUT_ENV,
     "OULIPOLY_DATA_DIR",
     "AGENT_BASH_AGENT_RUNNER_BIN",
 ];
@@ -432,8 +440,8 @@ fn native_execution_environment(
         );
     }
     execution_env
-        .entry("OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS".to_string())
-        .or_insert_with(|| "2000000000".to_string());
+        .entry(OPENCODE_BASH_DEFAULT_TIMEOUT_ENV.to_string())
+        .or_insert_with(|| PROVIDER_BASH_DEFAULT_TIMEOUT_MS.to_string());
     Ok(execution_env)
 }
 
@@ -1117,4 +1125,52 @@ fn native_runtime_state_capacity(request_id: &str, observed_bytes: usize) -> Pro
             "native runtime identity state is {observed_bytes} bytes; the supported maximum is {MAX_NATIVE_RUNTIME_STATE_BYTES} bytes"
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        native_execution_environment, OPENCODE_BASH_DEFAULT_TIMEOUT_ENV,
+        PROVIDER_BASH_DEFAULT_TIMEOUT_MS,
+    };
+    use crate::account::ACCOUNTS;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn provider_owns_a_finite_long_running_bash_timeout_fallback() {
+        let environment = native_execution_environment(
+            &ACCOUNTS[0],
+            BTreeMap::new(),
+            "req-provider-bash-timeout-fallback",
+        )
+        .expect("construct account-one native environment");
+
+        assert_eq!(
+            environment
+                .get(OPENCODE_BASH_DEFAULT_TIMEOUT_ENV)
+                .map(String::as_str),
+            Some(PROVIDER_BASH_DEFAULT_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn explicit_host_bash_timeout_overrides_the_provider_fallback() {
+        let explicit_timeout = "45000";
+        let environment = native_execution_environment(
+            &ACCOUNTS[0],
+            BTreeMap::from([(
+                OPENCODE_BASH_DEFAULT_TIMEOUT_ENV.to_string(),
+                explicit_timeout.to_string(),
+            )]),
+            "req-explicit-bash-timeout",
+        )
+        .expect("construct account-one native environment");
+
+        assert_eq!(
+            environment
+                .get(OPENCODE_BASH_DEFAULT_TIMEOUT_ENV)
+                .map(String::as_str),
+            Some(explicit_timeout)
+        );
+    }
 }
