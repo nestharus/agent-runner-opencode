@@ -171,6 +171,16 @@ impl ActiveIndex {
         }
         selected.map(|(_, stem)| stem)
     }
+
+    fn retry_next(&mut self, stem: &str) {
+        if let Some(index) = self
+            .slots
+            .iter()
+            .position(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
+        {
+            self.next_probe = index;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -243,10 +253,12 @@ impl RequestCustody {
                 Err(error) => return Err(CustodyError::Io(error)),
             };
             if let Some(bytes) = state {
-                if classify_replay(&bytes).map_err(CustodyError::Invalid)?
-                    && self.place_replay(&stem, current_lock_path)?
-                {
-                    index.remove(&stem);
+                if classify_replay(&bytes).map_err(CustodyError::Invalid)? {
+                    if self.place_replay(&stem, current_lock_path)? {
+                        index.remove(&stem);
+                    } else if self.read_replay_owner(&stem)?.is_some() {
+                        index.retry_next(&stem);
+                    }
                 }
             } else if record_expired(&lock_path, self.orphan_retention)
                 && self.remove_abandoned_active(&stem, &lock_path, current_lock_path)?
@@ -312,6 +324,18 @@ impl RequestCustody {
     ) -> Result<bool, CustodyError> {
         let stem = required_digest_stem(state_path)?;
         self.place_replay(&stem, current_lock_path)
+    }
+
+    #[cfg(test)]
+    fn reserve_replay_owner_without_advancing_head(
+        &self,
+        state_path: &Path,
+        current_lock_path: &Path,
+    ) -> Result<bool, CustodyError> {
+        let stem = required_digest_stem(state_path)?;
+        Ok(self
+            .reserve_replay_owner(&stem, current_lock_path)?
+            .is_some())
     }
 
     fn initialize(
@@ -517,7 +541,19 @@ impl RequestCustody {
         if let Some(owner) = self.read_replay_owner(stem)? {
             return self.complete_replay_placement(stem, &owner, current_lock_path);
         }
-        let head_path = self.index_root.join("head.json");
+        let Some((owner, displacement)) = self.reserve_replay_owner(stem, current_lock_path)?
+        else {
+            return Ok(false);
+        };
+        self.advance_replay_head(&owner)?;
+        self.publish_replay_placement(stem, &owner, displacement)
+    }
+
+    fn reserve_replay_owner(
+        &self,
+        stem: &str,
+        current_lock_path: &Path,
+    ) -> Result<Option<(ReplayOwner, Option<ReplayDisplacement>)>, CustodyError> {
         let head = self.read_replay_head()?;
         let probes = self.replay_slots.min(MAX_REPLAY_EVICTION_PROBES);
         for offset in 0..probes {
@@ -538,15 +574,14 @@ impl RequestCustody {
                 },
                 None => None,
             };
-            self.write_replay_head(&head_path, sequence.wrapping_add(1))?;
             let owner = ReplayOwner {
                 sequence,
                 displaced: prior,
             };
             self.write_replay_owner(stem, &owner)?;
-            return self.publish_replay_placement(stem, &owner, displacement);
+            return Ok(Some((owner, displacement)));
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn complete_replay_placement(
@@ -555,6 +590,7 @@ impl RequestCustody {
         owner: &ReplayOwner,
         current_lock_path: &Path,
     ) -> Result<bool, CustodyError> {
+        self.advance_replay_head(owner)?;
         let slot = owner.sequence % self.replay_slots as u64;
         let current = self.read_replay_slot(slot)?;
         let target_is_published = current.as_ref().is_some_and(|current| {
@@ -575,6 +611,15 @@ impl RequestCustody {
             None => None,
         };
         self.publish_replay_placement(stem, owner, displacement)
+    }
+
+    fn advance_replay_head(&self, owner: &ReplayOwner) -> Result<(), CustodyError> {
+        let head_path = self.index_root.join("head.json");
+        let head = self.read_replay_head()?;
+        if head <= owner.sequence {
+            self.write_replay_head(&head_path, owner.sequence.wrapping_add(1))?;
+        }
+        Ok(())
     }
 
     fn publish_replay_placement(
@@ -1237,6 +1282,88 @@ mod tests {
             replay_references(&directory.path().join(".custody-v2/replay"), &first),
             1
         );
+    }
+
+    #[test]
+    fn owner_only_interruption_preserves_oldest_first_replay_order() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let index_root = directory.path().join(".custody-v2");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            index_root.clone(),
+            1024,
+            1,
+            2,
+            Duration::from_secs(60),
+        );
+        let current_lock = directory.path().join("current.lock");
+        assert_eq!(
+            custody
+                .maintain(&current_lock, |_| Ok(true))
+                .expect("initialize request custody"),
+            0
+        );
+        for index in 1..=2 {
+            let stem = format!("{index:064x}");
+            let state = directory.path().join(format!("{stem}.json"));
+            fs::write(directory.path().join(format!("{stem}.lock")), b"")
+                .expect("completed request lock");
+            fs::write(&state, br#"{"terminal":true}"#).expect("completed request state");
+            custody.reserve_active(&state).expect("reserve completion");
+            assert_eq!(
+                custody
+                    .maintain(&current_lock, |_| Ok(true))
+                    .expect("fill replay ring"),
+                0
+            );
+        }
+
+        let current = format!("{:064x}", 3);
+        let current_state = directory.path().join(format!("{current}.json"));
+        fs::write(directory.path().join(format!("{current}.lock")), b"")
+            .expect("current request lock");
+        fs::write(&current_state, br#"{"terminal":true}"#).expect("current terminal state");
+        custody
+            .reserve_active(&current_state)
+            .expect("reserve current request");
+        assert!(custody
+            .reserve_replay_owner_without_advancing_head(&current_state, &current_lock)
+            .expect("reserve owner before simulated interruption"));
+        assert_eq!(
+            custody.read_replay_head().expect("unchanged replay head"),
+            2
+        );
+        assert!(custody
+            .read_replay_owner(&current)
+            .expect("current owner")
+            .is_some());
+
+        assert_eq!(
+            custody
+                .maintain(&current_lock, |_| Ok(true))
+                .expect("resume owner-only replay reservation"),
+            0
+        );
+        let oldest = format!("{:064x}", 1);
+        let next_oldest = format!("{:064x}", 2);
+        assert!(
+            !directory.path().join(format!("{oldest}.json")).exists(),
+            "the true oldest replay is retired"
+        );
+        assert!(
+            directory
+                .path()
+                .join(format!("{next_oldest}.json"))
+                .exists(),
+            "the next-oldest replay remains available"
+        );
+        assert_eq!(
+            replay_references(&index_root.join("replay"), &next_oldest),
+            1
+        );
+        assert_eq!(replay_references(&index_root.join("replay"), &current), 1);
+        assert_eq!(custody.read_replay_head().expect("advanced replay head"), 3);
     }
 
     fn replay_references(root: &Path, stem: &str) -> usize {

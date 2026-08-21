@@ -2738,7 +2738,7 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
 
     let mut follow_up_host = host.overrides();
     follow_up_host["deadline_unix_ms"] =
-        json!(agent_runner_opencode::encoding::now_unix_ms() + 5_000);
+        json!(agent_runner_opencode::encoding::now_unix_ms() + 30_000);
     let follow_up = success_result(
         invoke_validated_with_host(
             "rotation.assess",

@@ -188,11 +188,12 @@ Quota refresh custody reserves 64 records for active obligations independently
 of a fixed 4,096-slot recent-replay ring. Cyclic slot replacement retires the
 oldest available completion without parsing replay payloads; admission reads at
 most the 64 active records, and completion probes at most 64 compact ring slots.
-Each replay placement has a durable request-keyed owner and slot sequence before
-the active marker is retired. Interrupted active-to-replay handoff is therefore
-idempotent, and eviction removes request state only after both replay and active
-ownership have ended. The predecessor ring is deduplicated once during its
-bounded index upgrade.
+Each replay placement publishes a durable request-keyed owner and slot sequence
+before the shared head advances or the active marker is retired. Interrupted
+active-to-replay handoff is therefore idempotent and preserves oldest-first
+replacement, and eviction removes request state only after both replay and
+active ownership have ended. The predecessor ring is deduplicated once during
+its bounded index upgrade.
 Shared replay pins protect exact callers between capacity admission and
 request-lock acquisition.
 Prepared, effect-admitted, and reconciliation-required records never age out or
@@ -263,8 +264,9 @@ fixed 4,096-slot recent-replay ring; every record is no larger than 256 KiB.
 Cyclic slot replacement retires the oldest available completion without parsing
 replay payloads. Steady-state admission reads one fixed-shape compact active
 index and classifies at most one active payload per request; completion probes at
-most 64 compact ring slots. Durable request-keyed replay ownership and sequenced
-slots make active-to-replay transfer crash-idempotent; state is retired only
+most 64 compact ring slots. Durable request-keyed replay ownership is published
+before the sequenced head advances, making active-to-replay transfer
+crash-idempotent without skipping the oldest completion. State is retired only
 after neither the replay ring nor the active index owns it, and predecessor
 duplicate slots are collapsed during the one-time bounded index upgrade.
 Prepared, submission-observed, and unresolved
