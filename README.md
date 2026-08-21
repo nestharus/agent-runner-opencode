@@ -337,12 +337,13 @@ host working directory because neither path uses it. The directory is required
 only before a new native import, so removing or renaming it cannot strand a
 completed materialization.
 
-`session.enumerate` materializes one bounded, request-bound private pagination
-snapshot on the first page instead of relisting the complete native population
-for every cursor. The initial request has a stable durable claim independent of
-the listed row bytes. An exact retry consults that claim before native relisting
-and replays its immutable first-page rows, warnings, and cursor; distinct
-requests over identical rows still receive independent cursor owners. A
+`session.enumerate` materializes one bounded, request-bound private snapshot on
+the first page, including an empty or otherwise terminal first page, instead of
+relisting the native population during response recovery or for every cursor.
+The initial request has a stable durable claim independent of the listed row
+bytes. An exact retry consults that claim before native relisting and replays its
+immutable first-page rows, warnings, completion state, and optional cursor;
+distinct requests over identical rows still receive independent owners. A
 snapshot advances one page at a time: before a page is exposed, the manifest
 durably records its exact request claim and the sole next cursor offset. An
 exact page retry can replay that claim until its successor is admitted, while a

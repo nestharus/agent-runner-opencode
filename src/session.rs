@@ -688,16 +688,6 @@ fn paginate_sessions(
     }
     let limit = params.limit.unwrap_or(MAX_ENUMERATION_PAGE_SIZE);
     let end = limit.min(sessions.len());
-    let complete = end == sessions.len();
-    if complete {
-        return Ok(EnumeratePage {
-            sessions,
-            warnings,
-            complete: true,
-            next_cursor: None,
-            post_write: None,
-        });
-    }
     persist_enumeration_snapshot(host, sessions, params, warnings, end, request_id)
 }
 
@@ -755,8 +745,7 @@ fn claimed_initial_snapshot_page_locked(
         || manifest.total_sessions > MAX_ENUMERATED_SESSIONS
         || manifest.expires_at_unix_ms < now_unix_ms()
         || manifest.initial_request_sha256 != initial_request_sha256
-        || manifest.initial_page_end == 0
-        || manifest.initial_page_end >= manifest.total_sessions
+        || manifest.initial_page_end > manifest.total_sessions
         || !is_sha256_hex(&manifest.initial_warnings_sha256)
     {
         return Err(session_snapshot_failure(
@@ -764,8 +753,17 @@ fn claimed_initial_snapshot_page_locked(
             "the durable initial request claim is invalid",
         ));
     }
-    if manifest.terminal_claim_request_sha256.is_some() {
-        return Err(session_snapshot_terminal_handoff_failure(request_id));
+    let complete = manifest.initial_page_end == manifest.total_sessions;
+    match manifest.terminal_claim_request_sha256.as_deref() {
+        Some(owner) if complete && owner == initial_request_sha256 => {}
+        Some(_) => return Err(session_snapshot_terminal_handoff_failure(request_id)),
+        None if complete => {
+            return Err(session_snapshot_failure(
+                request_id,
+                "the durable terminal initial request claim has no handoff owner",
+            ))
+        }
+        None => {}
     }
     let exact_initial_retry = manifest.next_cursor_offset == manifest.initial_page_end
         && manifest.last_page_claim_request_sha256.as_deref() == Some(initial_request_sha256)
@@ -803,14 +801,21 @@ fn claimed_initial_snapshot_page_locked(
     Ok(Some(EnumeratePage {
         sessions,
         warnings,
-        complete: false,
-        next_cursor: Some(enumeration_cursor(
-            &snapshot_id,
-            manifest.initial_page_end,
-            manifest.total_sessions,
-            &identity_sha256,
-        )),
-        post_write: None,
+        complete,
+        next_cursor: (!complete).then(|| {
+            enumeration_cursor(
+                &snapshot_id,
+                manifest.initial_page_end,
+                manifest.total_sessions,
+                &identity_sha256,
+            )
+        }),
+        post_write: complete.then_some(SessionPostWrite {
+            root: root.to_path_buf(),
+            snapshot_root,
+            snapshot_instance_sha256: manifest.snapshot_instance_sha256,
+            terminal_claim_request_sha256: initial_request_sha256.to_string(),
+        }),
     }))
 }
 
@@ -903,6 +908,7 @@ fn persist_enumeration_snapshot(
     let created_at_unix_ms = now_unix_ms();
     let snapshot_instance_sha256 = new_enumeration_snapshot_instance_sha256(&snapshot_root)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
+    let complete = first_page_end == sessions.len();
     let manifest = EnumerationSnapshotManifest {
         schema_version: SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: snapshot_id.clone(),
@@ -915,10 +921,10 @@ fn persist_enumeration_snapshot(
         initial_page_end: first_page_end,
         initial_warnings_sha256: sha256_hex(&encoded_warnings),
         next_cursor_offset: first_page_end,
-        last_page_claim_request_sha256: Some(initial_request_sha256),
+        last_page_claim_request_sha256: Some(initial_request_sha256.clone()),
         last_page_claim_start: Some(0),
         last_page_claim_end: Some(first_page_end),
-        terminal_claim_request_sha256: None,
+        terminal_claim_request_sha256: complete.then_some(initial_request_sha256.clone()),
     };
     let bytes = serde_json::to_vec(&manifest)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
@@ -927,14 +933,21 @@ fn persist_enumeration_snapshot(
     Ok(EnumeratePage {
         sessions: sessions.into_iter().take(first_page_end).collect(),
         warnings,
-        complete: false,
-        next_cursor: Some(enumeration_cursor(
-            &snapshot_id,
-            first_page_end,
-            manifest.total_sessions,
-            &identity_sha256,
-        )),
-        post_write: None,
+        complete,
+        next_cursor: (!complete).then(|| {
+            enumeration_cursor(
+                &snapshot_id,
+                first_page_end,
+                manifest.total_sessions,
+                &identity_sha256,
+            )
+        }),
+        post_write: complete.then_some(SessionPostWrite {
+            root,
+            snapshot_root,
+            snapshot_instance_sha256: manifest.snapshot_instance_sha256,
+            terminal_claim_request_sha256: initial_request_sha256,
+        }),
     })
 }
 

@@ -431,6 +431,86 @@ fn contract_session_enumerate_exact_initial_retry_replays_claimed_native_populat
 }
 
 #[test]
+fn contract_session_enumerate_terminal_initial_retry_replays_after_flush_loss() {
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_multiple_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-terminal-initial-replay");
+    let config_root = support::isolated_test_config_root("terminal-initial-replay");
+    fs::create_dir_all(&data_root).expect("create terminal initial replay data root");
+    let host = json!({
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy()
+    });
+    let mut request = support::validated_request_envelope(
+        "session.enumerate",
+        session_enumerate_params(),
+        host,
+        "session.schema.json#/$defs/SessionEnumerateRequest",
+    );
+    request["request_id"] = json!("req-session-enumerate-terminal-initial-replay");
+    support::ensure_default_runtime_settings(&request);
+    let request_bytes = serde_json::to_vec(&request).expect("serialize terminal enumeration");
+    let args = vec![
+        "agent-runner-opencode".to_string(),
+        "session.enumerate".to_string(),
+    ];
+    let prior_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", &path);
+    let mut rejected_flush = RejectFlush::default();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(&args, &request_bytes, &mut rejected_flush),
+        1,
+        "the terminal first-page response must remain owned after flush loss"
+    );
+    let lost_response: Value = serde_json::Deserializer::from_slice(&rejected_flush.accepted)
+        .into_iter()
+        .next()
+        .expect("accepted terminal first-page response")
+        .expect("parse accepted terminal first-page response bytes");
+    support::assert_valid(
+        &lost_response,
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+    );
+    assert!(lost_response["result"]["complete"]
+        .as_bool()
+        .unwrap_or(false));
+    assert!(lost_response["result"]["next_cursor"].is_null());
+    fs::remove_file(fake_opencode.log_path()).expect("clear first native-list evidence");
+    fake_opencode.replace_output("[]", "", 0);
+
+    let mut retry_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(&args, &request_bytes, &mut retry_stdout),
+        0
+    );
+    let retry_response: Value =
+        serde_json::from_slice(&retry_stdout).expect("parse terminal initial retry response");
+    assert_eq!(
+        retry_response["result"], lost_response["result"],
+        "exact retry must replay the accepted terminal result after native rows change"
+    );
+    assert!(
+        !fake_opencode.log_path().exists(),
+        "terminal exact retry must consult durable request custody before native relisting"
+    );
+    let snapshot_root = data_root.join("provider-state/opencode/session-enumeration-snapshots");
+    assert!(
+        fs::read_dir(&snapshot_root)
+            .expect("enumeration snapshot root")
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_type().is_ok_and(|kind| kind.is_dir())),
+        "successful response flush must retire the matching terminal snapshot"
+    );
+
+    match prior_path {
+        Some(value) => std::env::set_var("PATH", value),
+        None => std::env::remove_var("PATH"),
+    }
+    fs::remove_dir_all(&data_root).expect("remove terminal initial replay data root");
+    fs::remove_dir_all(&config_root).expect("remove terminal initial replay config root");
+}
+
+#[test]
 fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_handoff() {
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
