@@ -196,7 +196,7 @@ pub fn assert_detect_profiles(detect: &Value) {
     ] {
         assert!(
             json_contains_string(detect, wrapper),
-            "detect should reflect {wrapper} wrapper presence; detect={detect}"
+            "detect should reflect the {wrapper} logical account; detect={detect}"
         );
     }
     assert!(
@@ -204,7 +204,8 @@ pub fn assert_detect_profiles(detect: &Value) {
         "detect should report the five opencode profiles"
     );
     assert!(profiles.iter().all(|profile| {
-        profile["wrapper_ready"] == true
+        profile["logical_account_present"] == true
+            && profile["native_runtime_ready"] == true
             && profile["opencode_auth_present"] == true
             && profile["profile_ready"] == true
     }));
@@ -217,6 +218,20 @@ pub fn assert_setup_install_result(install: &Value) {
         !steps.is_empty(),
         "setup.install_plan should return actionable setup steps"
     );
+    let native = steps
+        .iter()
+        .find(|step| step["kind"] == "verify_reviewed_native_implementation")
+        .expect("reviewed native implementation verification step");
+    assert_eq!(native["component"], "opencode");
+    assert_eq!(
+        native["manifest_contract"],
+        "agent-runner-opencode.native-implementation-manifest/v1"
+    );
+    assert_eq!(
+        native["semantic_contract"],
+        "agent-runner-opencode.opencode-native-state/v1"
+    );
+    assert_eq!(native["post_admission_probe"], "--version");
     let activation = steps
         .iter()
         .find(|step| step["kind"] == "prepare_provider_settings")
@@ -237,7 +252,7 @@ pub fn assert_setup_sync_result(sync: &Value) {
 pub fn assert_setup_missing_dependency_result(detect: &Value) {
     assert_eq!(
         detect["installed"], false,
-        "setup.detect must report not installed when required tools and wrappers are absent"
+        "setup.detect must report not installed when required runtime or auth evidence is absent"
     );
     assert!(
         !detect["warnings"]
@@ -248,14 +263,12 @@ pub fn assert_setup_missing_dependency_result(detect: &Value) {
     );
     assert_eq!(detect["binary"]["opencode"]["present"], false);
     assert_eq!(detect["binary"]["curl"]["present"], false);
-    assert!(
-        detect["profiles"]
-            .as_array()
-            .expect("profiles array")
-            .iter()
-            .any(|profile| profile["wrapper_present"] == false),
-        "missing wrappers should be reflected in profile readiness evidence; detect={detect}"
-    );
+    assert!(detect["profiles"]
+        .as_array()
+        .expect("profiles array")
+        .iter()
+        .all(|profile| profile["logical_account_present"] == true
+            && profile["native_runtime_ready"] == false));
     assert!(
         json_contains_string(&detect["binary"], "opencode"),
         "missing dependency diagnostics/evidence must name opencode; detect={detect}"

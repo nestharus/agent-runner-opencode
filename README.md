@@ -479,16 +479,19 @@ environment-selected transport branch. Auth refresh binds both
 the native OpenCode runtime identity and this quota-observer identity before it
 admits a credential mutation.
 
-`setup.detect` reports provider-wide `installed=true` only after `opencode`
-matches this build's target-specific reviewed manifest, the in-process quota
-transport matches this build's source/dependency identity, and exact-path
-`--version` probes succeed for OpenCode and every one of the five
-account wrappers, every account's OpenCode auth file is present, and every
-declared caller `settings_id` resolves to a valid exact persisted record. Each probe
-uses the earlier of the host deadline and a two-second ceiling. A missing,
-non-executable, failing, or stalled dependency leaves the provider non-installed
-and produces a tool- or profile-specific warning; regular-file presence alone
-is never readiness. Native runtime admission enforces executable-file status;
+`setup.detect` reports provider-wide `installed=true` only after the direct
+`opencode` executable matches this build's target-specific reviewed manifest
+before its exact-path `--version` probe, the in-process quota transport matches
+this build's source/dependency identity, every logical account's OpenCode auth
+file is present, and every declared caller `settings_id` resolves to a valid
+exact persisted record. Numbered account names are catalog identities only;
+setup never resolves or executes them as wrappers. Logical profile readiness is
+derived from the one manifest-bound direct runtime plus that profile's auth
+evidence. The direct probe uses the earlier of the host deadline and a
+two-second ceiling. A missing, unapproved, non-executable, failing, or stalled
+direct implementation leaves the provider non-installed and produces a
+tool- or profile-specific warning; regular-file presence alone is never
+readiness. Native runtime admission enforces executable-file status;
 quota-observer admission instead validates the source-included adapter and
 dependency-lock identity before reuse.
 

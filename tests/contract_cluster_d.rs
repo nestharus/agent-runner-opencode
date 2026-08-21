@@ -1673,6 +1673,10 @@ command = "/tmp/bin/opencode9"
 fn contract_setup_detect_install_sync() {
     let host = HostRoots::new("agent-runner-opencode-setup");
     let toolchain = FakeToolchain::new();
+    for wrapper in opencode_wrappers() {
+        fs::remove_file(toolchain.dir().join(wrapper))
+            .expect("remove logical wrapper executable from setup fixture");
+    }
     let home = HomeFixture::new("agent-runner-opencode-setup-home");
     home.write_all_opencode_auths();
     let profile_root = host.data_root().join("provider-profile-root-contract");
@@ -2379,7 +2383,7 @@ fn contract_setup_detect_rejects_present_but_unusable_dependencies() {
     let host = HostRoots::new("agent-runner-opencode-setup-unusable-dependencies");
     let tool_root = unique_temp_dir("agent-runner-opencode-unusable-setup-tools");
     fs::create_dir_all(&tool_root).expect("create unusable setup tool root");
-    for program in ["opencode", "curl", "opencode1"] {
+    for program in ["opencode", "curl"] {
         fs::write(tool_root.join(program), b"regular but not executable\n")
             .expect("write non-executable setup dependency");
     }
@@ -2404,12 +2408,11 @@ fn contract_setup_detect_rejects_present_but_unusable_dependencies() {
     assert_eq!(detect["binary"]["curl"]["present"], true);
     assert_eq!(detect["binary"]["curl"]["version"]["ready"], false);
     let profiles = detect["profiles"].as_array().expect("profile evidence");
-    assert_eq!(profiles[0]["wrapper_present"], true);
-    assert_eq!(profiles[0]["wrapper_ready"], false);
-    assert_eq!(profiles[0]["profile_ready"], false);
-    assert!(profiles[1..]
-        .iter()
-        .all(|profile| profile["wrapper_present"] == false));
+    assert!(profiles.iter().all(|profile| {
+        profile["logical_account_present"] == true
+            && profile["native_runtime_ready"] == false
+            && profile["profile_ready"] == false
+    }));
     assert!(!detect["warnings"].as_array().expect("warnings").is_empty());
     fs::remove_dir_all(&tool_root).expect("remove unusable setup tool root");
 }

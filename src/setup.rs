@@ -239,7 +239,7 @@ pub fn detect_params(
     let required_settings_ids = required_settings_ids(&params, request_id)?;
     let opencode = executable_evidence("opencode", host.deadline_unix_ms);
     let curl = quota_transport_evidence(host.deadline_unix_ms);
-    let profiles = profile_evidence(data_root, profile_root, host.deadline_unix_ms);
+    let profiles = profile_evidence(data_root, profile_root, &opencode);
     let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
     let installed = setup_installed(&opencode, &curl, &profiles, &settings_store);
     Ok(detect_result(
@@ -298,47 +298,23 @@ pub fn brain_unsupported(request_id: String) -> ProviderFailure {
 
 fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
     let path = find_on_path(program);
-    let version = match (
-        &path,
-        operation_bounds::remaining_timeout(deadline_unix_ms, SETUP_PROBE_TIMEOUT),
-    ) {
-        (Some(path), Some(timeout)) => {
-            let program = path.to_string_lossy().into_owned();
-            if path.metadata().is_ok_and(|metadata| {
-                metadata.len() as usize > durable_fs::MAX_BOUND_EXECUTABLE_BYTES
-            }) {
-                return json!({
-                    "program": program,
-                    "present": true,
-                    "path": path.to_string_lossy().into_owned(),
-                    "version": {
-                        "present": true,
-                        "ready": false,
-                        "error": format!(
-                            "executable exceeds the supported {}-byte identity bound",
-                            durable_fs::MAX_BOUND_EXECUTABLE_BYTES
-                        ),
-                    },
-                });
-            }
-            let implementation = native_implementation_evidence(&program, path);
-            if implementation
-                .as_ref()
-                .is_some_and(|evidence| evidence["ready"] != true)
-            {
-                return json!({
-                    "program": program,
-                    "present": true,
-                    "path": path.to_string_lossy().into_owned(),
-                    "version": {
-                        "present": true,
-                        "ready": false,
-                        "error": "executable identity is not approved for this provider build",
-                    },
-                    "implementation": implementation,
-                });
-            }
-            let mut command = shell::command(&program);
+    executable_evidence_at(program, path, deadline_unix_ms)
+}
+
+fn executable_evidence_at(
+    program: &str,
+    path: Option<PathBuf>,
+    deadline_unix_ms: Option<u64>,
+) -> Value {
+    let timeout = operation_bounds::remaining_timeout(deadline_unix_ms, SETUP_PROBE_TIMEOUT);
+    let implementation = match (&path, timeout) {
+        (Some(path), Some(_)) => native_implementation_evidence(program, path),
+        _ => None,
+    };
+    let version = match (&path, &implementation, timeout) {
+        (Some(path), Some(implementation), Some(timeout)) if implementation["ready"] == true => {
+            let resolved_program = path.to_string_lossy().into_owned();
+            let mut command = shell::command(&resolved_program);
             command
                 .arg("--version")
                 .stdin(Stdio::null())
@@ -357,7 +333,7 @@ fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
                     "present": true,
                     "ready": false,
                     "timed_out": true,
-                    "error": format!("{program} --version exceeded the setup probe deadline"),
+                    "error": format!("{resolved_program} --version exceeded the setup probe deadline"),
                 }),
                 Err(err) => json!({
                     "present": true,
@@ -366,21 +342,23 @@ fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
                 }),
             }
         }
-        (Some(_), None) => json!({
+        (Some(_), _, None) => json!({
             "present": true,
             "ready": false,
             "timed_out": true,
             "error": "host deadline expired before the setup probe",
         }),
-        (None, _) => json!({
+        (Some(_), _, Some(_)) => json!({
+            "present": true,
+            "ready": false,
+            "error": "executable identity is not approved for this provider build",
+        }),
+        (None, _, _) => json!({
             "present": false,
             "ready": false,
             "error": format!("{program} was not found in PATH"),
         }),
     };
-    let implementation = path
-        .as_ref()
-        .and_then(|path| native_implementation_evidence(program, path));
     json!({
         "program": program,
         "present": path.is_some(),
@@ -444,24 +422,22 @@ fn native_implementation_evidence(program: &str, path: &Path) -> Option<Value> {
 fn profile_evidence(
     data_root: Option<&str>,
     profile_root: Option<&str>,
-    deadline_unix_ms: Option<u64>,
+    opencode: &Value,
 ) -> Vec<Value> {
+    let native_runtime_ready = evidence_ready(opencode);
     ACCOUNTS
         .iter()
         .map(|account| {
-            let wrapper = executable_evidence(account.opencode_wrapper, deadline_unix_ms);
             let auth_present = opencode_auth_file_present(account.opencode_auth_path);
-            let wrapper_ready = evidence_ready(&wrapper);
             json!({
                 "profile": account.opencode_wrapper,
-                "wrapper": account.opencode_wrapper,
-                "wrapper_present": evidence_present(&wrapper),
-                "wrapper_ready": wrapper_ready,
-                "wrapper_path": wrapper.get("path").cloned().unwrap_or(Value::Null),
-                "wrapper_version": wrapper.get("version").cloned().unwrap_or(Value::Null),
+                "logical_account": account.opencode_wrapper,
+                "logical_account_present": true,
+                "native_runtime": "opencode",
+                "native_runtime_ready": native_runtime_ready,
                 "opencode_auth_path": account.opencode_auth_path,
                 "opencode_auth_present": auth_present,
-                "profile_ready": wrapper_ready && auth_present,
+                "profile_ready": native_runtime_ready && auth_present,
                 "data_root": data_root,
                 "profile_root": profile_root,
                 "quota_probe": account.quota_probe_kind(),
@@ -514,8 +490,8 @@ fn setup_warnings(
             .get("profile")
             .and_then(Value::as_str)
             .unwrap_or("unknown profile");
-        let wrapper_ready = profile
-            .get("wrapper_ready")
+        let native_runtime_ready = profile
+            .get("native_runtime_ready")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let auth_present = profile
@@ -523,7 +499,7 @@ fn setup_warnings(
             .and_then(Value::as_bool)
             .unwrap_or(false);
         warnings.push(json!(format!(
-            "{name} is not ready: wrapper_ready={wrapper_ready}, opencode_auth_present={auth_present}"
+            "{name} is not ready: native_runtime_ready={native_runtime_ready}, opencode_auth_present={auth_present}"
         )));
     }
     if let Some(message) = settings_store.blocking_message() {
@@ -569,7 +545,7 @@ fn profile_reference_diagnostics(params: &Value, field: &str) -> Vec<Value> {
         .collect()
 }
 
-fn wrapper_names() -> Vec<&'static str> {
+fn profile_names() -> Vec<&'static str> {
     ACCOUNTS
         .iter()
         .map(|account| account.opencode_wrapper)
@@ -725,9 +701,22 @@ fn install_plan_result(target: &str, settings_store: &SettingsTransitionReadines
                 "blocking": !settings_store.ready,
                 "settings_store": settings_store.evidence(),
             },
-            {"kind": "verify_tool", "target": target, "command": "opencode --version"},
+            {
+                "kind": "verify_reviewed_native_implementation",
+                "target": target,
+                "component": "opencode",
+                "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+                "semantic_contract": native_runtime::OPENCODE_NATIVE_CONTRACT_ID,
+                "post_admission_probe": "--version"
+            },
             quota_transport,
-            {"kind": "verify_wrappers", "target": target, "wrappers": wrapper_names()},
+            {
+                "kind": "verify_logical_profiles",
+                "target": target,
+                "profiles": profile_names(),
+                "native_runtime": "opencode",
+                "auth_requirement": "per_profile"
+            },
             {
                 "kind": "prepare_provider_settings",
                 "schema_id": "opencode.settings/v1",
@@ -1909,4 +1898,40 @@ fn invalid_profile_type_diagnostic(field: &str) -> Value {
         "message": "OpenCode account wrapper references must be strings",
         "code": "invalid_opencode_profile",
     })
+}
+
+#[cfg(all(test, unix, not(feature = "contract-test-fixtures")))]
+mod tests {
+    use super::executable_evidence_at;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn setup_does_not_execute_an_unapproved_direct_implementation() {
+        let directory = tempfile::tempdir().expect("create setup probe fixture");
+        let sentinel = directory.path().join("unapproved-executed");
+        let program = directory.path().join("opencode");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf acted > '{}'\n",
+                sentinel.to_string_lossy()
+            ),
+        )
+        .expect("write unapproved executable");
+        let mut permissions = fs::metadata(&program)
+            .expect("unapproved executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).expect("mark unapproved fixture executable");
+
+        let evidence = executable_evidence_at("opencode", Some(program), None);
+
+        assert_eq!(evidence["version"]["ready"], false);
+        assert_eq!(evidence["implementation"]["ready"], false);
+        assert!(
+            !sentinel.exists(),
+            "manifest rejection must precede the setup version spawn"
+        );
+    }
 }

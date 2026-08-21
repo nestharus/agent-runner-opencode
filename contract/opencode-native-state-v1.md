@@ -19,7 +19,11 @@ Durable schema-v9 launch recovery records the same direct executable hash,
 manifest ID/version, fixed argument, contract identity, and state environment
 and validates them before list/export observation. Predecessor launch records
 without complete manifest evidence fail closed
-instead of executing an unbound wrapper.
+instead of executing an unbound wrapper. Setup uses the same boundary: it
+admits the direct executable against the source-included manifest before any
+exact-path `--version` probe and never resolves or executes the numbered logical
+account identities. Per-account setup readiness is the conjunction of that one
+direct-runtime result and the account's declared auth-file evidence.
 
 Schema-v1 wrapper and schema-v2 direct native-runtime bindings are bounded
 transition inputs only. The provider validates the exact recorded bytes and

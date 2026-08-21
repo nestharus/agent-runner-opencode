@@ -5,10 +5,10 @@ use super::*;
 
 pub fn missing_prereq_install_needles() -> [&'static str; 7] {
     [
-        "verify_tool",
-        "opencode --version",
+        "verify_reviewed_native_implementation",
+        "agent-runner-opencode.native-implementation-manifest/v1",
         "curl --version",
-        "verify_wrappers",
+        "verify_logical_profiles",
         "opencode1",
         "prepare_provider_settings",
         "opencode.settings/v1",
