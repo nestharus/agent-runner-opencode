@@ -931,10 +931,51 @@ fn contract_launch_rejects_untyped_native_session_selector_before_spawn() {
         "an untyped native session selector must fail before spawn"
     );
     let response = json_stdout(&output);
-    assert_eq!(
-        response["error"]["code"],
-        "native_session_selector_forbidden"
-    );
+    assert_eq!(response["error"]["code"], "native_launch_control_forbidden");
+}
+
+#[test]
+fn contract_launch_rejects_user_native_controls_before_durable_admission() {
+    for injected in [
+        vec!["--model", "openai/gpt-5.6-luna"],
+        vec!["--model=openai/gpt-5.6-luna"],
+        vec!["-mopenai/gpt-5.6-luna"],
+        vec!["-m=openai/gpt-5.6-luna"],
+        vec!["--variant=max"],
+        vec!["--format=default"],
+        vec!["--agent=build"],
+        vec!["--auto"],
+        vec!["--no-auto"],
+        vec!["--attach=http://localhost:4096"],
+        vec!["--pure=false"],
+        vec!["--no-pure"],
+        vec!["--dangerously-skip-permissions=false"],
+        vec!["--no-dangerously-skip-permissions"],
+    ] {
+        let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+        let path = prepend_path(fake_wrapper.dir());
+        let mut suffix = injected.iter().map(ToString::to_string).collect::<Vec<_>>();
+        suffix.push("hello".to_string());
+        let params = launch_params_with_argv_and_prompt_env(
+            suffix,
+            Some("hello"),
+            path.as_str(),
+            fake_wrapper.log_path_str(),
+        );
+
+        let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+        assert_ne!(output.status.code(), Some(0), "injected={injected:?}");
+        assert!(
+            !fake_wrapper.log_path().exists(),
+            "provider-managed control must fail before spawn; injected={injected:?}"
+        );
+        let response = json_stdout(&output);
+        assert_eq!(
+            response["error"]["code"], "native_launch_control_forbidden",
+            "injected={injected:?}; response={response}"
+        );
+    }
 }
 
 #[test]
@@ -1558,7 +1599,34 @@ fn contract_policy_evaluate_rejects_account_one_wrapper_command_aliases() {
 #[test]
 fn contract_policy_evaluate_rejects_user_injected_managed_flag_after_host_prefix() {
     for forbidden_flag in [
+        "--model",
+        "--model=openai/gpt-5.6-luna",
+        "-m",
+        "-mopenai/gpt-5.6-luna",
+        "-m=openai/gpt-5.6-luna",
         "--variant",
+        "--variant=max",
+        "--format",
+        "--format=default",
+        "--agent",
+        "--agent=build",
+        "--attach",
+        "--attach=http://localhost:4096",
+        "--auto",
+        "--no-auto",
+        "--dangerously-skip-permissions",
+        "--dangerously-skip-permissions=false",
+        "--no-dangerously-skip-permissions",
+        "--dir",
+        "--dir=/tmp/foreign-workspace",
+        "--interactive",
+        "-i",
+        "--password",
+        "-psecret",
+        "--port=4096",
+        "--pure",
+        "--pure=false",
+        "--no-pure",
         "--session",
         "--session=ses_caller_selected",
         "-s",
@@ -1568,6 +1636,8 @@ fn contract_policy_evaluate_rejects_user_injected_managed_flag_after_host_prefix
         "-c",
         "--fork",
         "--fork=true",
+        "--username",
+        "-uother",
     ] {
         let output = invoke_with_env(
             "policy.evaluate",
@@ -1585,7 +1655,7 @@ fn contract_policy_evaluate_rejects_user_injected_managed_flag_after_host_prefix
 }
 
 #[test]
-fn contract_policy_evaluate_preserves_session_control_text_after_message_boundary() {
+fn contract_policy_evaluate_preserves_native_control_text_after_message_boundary() {
     let mut params = policy_evaluate_params_for_account_host_candidate("opencode2");
     let argv = params["launch"]["argv"]
         .as_array_mut()
@@ -1593,6 +1663,18 @@ fn contract_policy_evaluate_preserves_session_control_text_after_message_boundar
     argv.pop().expect("host candidate prompt");
     argv.extend([
         json!("--"),
+        json!("--model=openai/gpt-5.6-luna"),
+        json!("-mopenai/gpt-5.6-luna"),
+        json!("--variant=max"),
+        json!("--format=default"),
+        json!("--agent=build"),
+        json!("--auto"),
+        json!("--no-auto"),
+        json!("--attach=http://localhost:4096"),
+        json!("--pure=false"),
+        json!("--no-pure"),
+        json!("--dangerously-skip-permissions=false"),
+        json!("--no-dangerously-skip-permissions"),
         json!("--session"),
         json!("literal-session"),
         json!("-s"),
@@ -1616,6 +1698,18 @@ fn contract_policy_evaluate_preserves_session_control_text_after_message_boundar
     assert_eq!(
         &effective_argv[boundary + 1..],
         &[
+            json!("--model=openai/gpt-5.6-luna"),
+            json!("-mopenai/gpt-5.6-luna"),
+            json!("--variant=max"),
+            json!("--format=default"),
+            json!("--agent=build"),
+            json!("--auto"),
+            json!("--no-auto"),
+            json!("--attach=http://localhost:4096"),
+            json!("--pure=false"),
+            json!("--no-pure"),
+            json!("--dangerously-skip-permissions=false"),
+            json!("--no-dangerously-skip-permissions"),
             json!("--session"),
             json!("literal-session"),
             json!("-s"),

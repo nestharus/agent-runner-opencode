@@ -607,25 +607,66 @@ fn policy_effective_args(model: &ModelAlias) -> Vec<String> {
 }
 
 fn is_forbidden_launch_arg(arg: &str) -> bool {
-    intrinsic_host_launch_command(arg)
-        || matches!(arg, "--format" | "--variant" | "-m")
-        || is_native_session_control_arg(arg)
+    intrinsic_host_launch_command(arg) || is_provider_managed_launch_control_arg(arg)
 }
 
-fn is_native_session_control_arg(arg: &str) -> bool {
-    matches!(arg, "--session" | "-s" | "--continue" | "-c" | "--fork")
-        || arg.starts_with("--session=")
-        || arg.starts_with("--continue=")
-        || arg.starts_with("--fork=")
-        || (arg.len() > 2 && (arg.starts_with("-s") || arg.starts_with("-c")))
+fn is_provider_managed_launch_control_arg(arg: &str) -> bool {
+    const LONG_CONTROLS: &[&str] = &[
+        "--agent",
+        "--attach",
+        "--auto",
+        "--continue",
+        "--dangerously-skip-permissions",
+        "--dir",
+        "--fork",
+        "--format",
+        "--help",
+        "--interactive",
+        "--model",
+        "--password",
+        "--port",
+        "--pure",
+        "--session",
+        "--username",
+        "--variant",
+        "--version",
+    ];
+    const NEGATED_LONG_CONTROLS: &[&str] = &[
+        "--no-auto",
+        "--no-continue",
+        "--no-dangerously-skip-permissions",
+        "--no-fork",
+        "--no-interactive",
+        "--no-pure",
+    ];
+    const SHORT_CONTROLS: &[&str] = &["-c", "-h", "-i", "-m", "-p", "-s", "-u", "-v"];
+
+    LONG_CONTROLS.iter().any(|control| {
+        arg == *control
+            || arg
+                .strip_prefix(control)
+                .is_some_and(|suffix| suffix.starts_with('='))
+    }) || NEGATED_LONG_CONTROLS.iter().any(|control| {
+        arg == *control
+            || arg
+                .strip_prefix(control)
+                .is_some_and(|suffix| suffix.starts_with('='))
+    }) || SHORT_CONTROLS
+        .iter()
+        .any(|control| arg == *control || (arg.len() > control.len() && arg.starts_with(control)))
 }
 
-pub(crate) fn native_session_control_arg(input: &[String]) -> Option<&str> {
-    input
+pub(crate) fn forbidden_user_launch_arg<'a>(
+    model: &PolicyModelRequest,
+    argv: &'a [String],
+) -> Option<&'a str> {
+    let model = model_alias(&model.name)
+        .filter(|candidate| provider_args_match(candidate, &model.provider_args))?;
+    stripped_policy_launch_args(argv, Some(model))?
         .iter()
         .take_while(|arg| arg.as_str() != "--")
         .map(String::as_str)
-        .find(|arg| is_native_session_control_arg(arg))
+        .find(|arg| is_forbidden_launch_arg(arg))
 }
 
 fn intrinsic_host_launch_command(command: &str) -> bool {

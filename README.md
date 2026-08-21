@@ -117,10 +117,13 @@ the decision into the public JSON result, so supervision never reparses its own
 external DTO or silently weakens launch-plan fields. Every accepted plan also
 carries the resolved account wrapper, provider ID, model ID, and effort used by
 resume observation; launch does not recover those identities from public model
-JSON or generated argv. Native `--session`/`-s`, `--continue`/`-c`, and `--fork`
-controls are reserved to typed `params.session` translation and rejected in the
-user-level option suffix; the same text remains ordinary message content after
-an explicit `--` boundary. Agent Runner's `system_prompt_override` and its Claude-
+JSON or generated argv. Provider-managed native controls are rejected in the
+user-level option suffix before an explicit `--` boundary, including every
+long, short, attached, equals, and applicable negated spelling for model,
+variant, output format, account/runtime attachment, permission mode, agent, and
+session selection. Typed `params.session` remains the only session-selection
+input. The same option-shaped text remains ordinary message content after `--`.
+Agent Runner's `system_prompt_override` and its Claude-
 and Codex-specific `tool_restrictions` have no proven faithful OpenCode mapping,
 so policy retains their presence and rejects the launch as
 `unsupported_system_prompt_override` or `unsupported_tool_restrictions`
