@@ -7,6 +7,7 @@ use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
 use crate::native_runtime;
 use crate::operation_bounds;
+use crate::path_guard;
 use crate::quota_observer;
 use crate::schema::NATIVE_IDENTITY_REBIND_SCHEMA_ID;
 use crate::settings::{self, SettingsTransitionReadiness};
@@ -14,6 +15,8 @@ use crate::shell;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -21,6 +24,10 @@ use std::time::Duration;
 const SETUP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const NATIVE_IDENTITY_REBIND_PROTOCOL: &str = "opencode.native-identity-rebind/v1";
 const NATIVE_IDENTITY_REBIND_DRAIN_MS: u64 = 20_000;
+const NATIVE_IDENTITY_REBIND_STATE_DIR: &str = "provider-state/opencode/native-identity-rebind";
+const NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION: u32 = 1;
+const NATIVE_IDENTITY_REBIND_STATE_BYTES: usize = 16 * 1024;
+const NATIVE_IDENTITY_REBIND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -66,7 +73,7 @@ struct NativeIdentityRebindTarget {
     component: NativeIdentityRebindComponent,
 }
 
-#[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum NativeIdentityRebindComponent {
     NativeRuntime,
@@ -80,7 +87,7 @@ struct NativeIdentityRebindEvidence {
     state_record_sha256: Option<String>,
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum NativeIdentityRebindDisposition {
     Committed,
@@ -115,6 +122,38 @@ struct NativeIdentityRebindOperationView<'a> {
     diagnostic: Option<&'a str>,
     disposition: Option<NativeIdentityRebindDisposition>,
     next_action: Option<&'a str>,
+}
+
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeIdentityRebindObservationRecord {
+    schema_version: u32,
+    operation_id: String,
+    observation_id: String,
+    profile: String,
+    component: NativeIdentityRebindComponent,
+    prior_evidence: NativeIdentityRebindEvidence,
+    observed_evidence: NativeIdentityRebindEvidence,
+    disposition: NativeIdentityRebindDisposition,
+    phase: NativeIdentityRebindObservationPhase,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeIdentityRebindObservationPhase {
+    AwaitingHostRelease,
+    Completed,
+    RolledBack,
+}
+
+impl NativeIdentityRebindObservationPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingHostRelease => "awaiting_host_release",
+            Self::Completed => "completed",
+            Self::RolledBack => "rolled_back",
+        }
+    }
 }
 
 impl NativeIdentityRebindDisposition {
@@ -776,20 +815,23 @@ fn native_identity_rebind_operations(
             let validation_window_complete = host_handoff.ordinary_admission_blocked
                 && host_handoff.validation_capability_completed;
             let (phase, diagnostic) = match disposition {
-                NativeIdentityRebindDisposition::Committed
-                    if validation_window_complete
-                        && identity_component_rebound(
-                            prior_evidence.component_identity_sha256.as_deref(),
-                            observed_evidence.component_identity_sha256.as_deref(),
-                        ) =>
+                _ if validation_window_complete
+                    && native_identity_rebind_disposition_matches(
+                        disposition,
+                        &prior_evidence,
+                        &observed_evidence,
+                    ) =>
                 {
-                    ("awaiting_host_release", None)
-                }
-                NativeIdentityRebindDisposition::RolledBack
-                    if validation_window_complete
-                        && observed_evidence == prior_evidence =>
-                {
-                    ("awaiting_host_release", None)
+                    let admitted_phase = persist_native_identity_rebind_observation(
+                        host,
+                        account.opencode_wrapper,
+                        component,
+                        &prior_evidence,
+                        &observed_evidence,
+                        disposition,
+                        request_id,
+                    )?;
+                    (admitted_phase.as_str(), None)
                 }
                 NativeIdentityRebindDisposition::Committed => (
                     "rejected",
@@ -850,23 +892,107 @@ fn native_identity_rebind_operations(
                     "observation_id does not bind the supplied operation, disposition, and observed component identity",
                 ));
             }
+            let _observation_lock = acquire_native_identity_rebind_lock(
+                host,
+                account.opencode_wrapper,
+                component,
+                request_id,
+            )?;
+            let admitted_observation = read_native_identity_rebind_observation(
+                host,
+                account.opencode_wrapper,
+                component,
+                request_id,
+            )?
+            .ok_or_else(|| {
+                invalid_native_identity_rebind(
+                    request_id,
+                    "release requires a provider-admitted awaiting_host_release observation",
+                )
+            })?;
+            let expected_observation = NativeIdentityRebindObservationRecord {
+                schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
+                operation_id: operation_id.clone(),
+                observation_id: observation_id.clone(),
+                profile: account.opencode_wrapper.to_string(),
+                component,
+                prior_evidence: prior_evidence.clone(),
+                observed_evidence: observed_evidence.clone(),
+                disposition,
+                phase: admitted_observation.phase,
+            };
+            if !native_identity_rebind_observation_matches(
+                &admitted_observation,
+                &expected_observation,
+            ) {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "release does not match the provider-admitted awaiting_host_release observation",
+                ));
+            }
+            if !host_handoff.ordinary_admission_reopened {
+                return Ok(vec![native_identity_rebind_operation(
+                    account.opencode_wrapper,
+                    NativeIdentityRebindOperationView {
+                        component,
+                        prior_evidence: &prior_evidence,
+                        observed_evidence: &observed_evidence,
+                        phase: "rejected",
+                        diagnostic: Some(
+                            "release acknowledgment requires the host to reopen ordinary admission",
+                        ),
+                        disposition: Some(disposition),
+                        next_action: None,
+                    },
+                )]);
+            }
+            if admitted_observation.phase
+                != NativeIdentityRebindObservationPhase::AwaitingHostRelease
+            {
+                return Ok(vec![native_identity_rebind_operation(
+                    account.opencode_wrapper,
+                    NativeIdentityRebindOperationView {
+                        component,
+                        prior_evidence: &prior_evidence,
+                        observed_evidence: &admitted_observation.observed_evidence,
+                        phase: admitted_observation.phase.as_str(),
+                        diagnostic: None,
+                        disposition: Some(disposition),
+                        next_action: None,
+                    },
+                )]);
+            }
             let current_evidence =
                 native_identity_evidence(host, account, component, request_id, true)?;
-            let (phase, diagnostic) = if !host_handoff.ordinary_admission_reopened {
-                (
-                    "rejected",
-                    Some("release acknowledgment requires the host to reopen ordinary admission"),
-                )
-            } else if current_evidence != observed_evidence {
+            let (phase, diagnostic) = if current_evidence != observed_evidence {
                 (
                     "rejected",
                     Some("selected provider identity changed after observation and before host release acknowledgment"),
                 )
+            } else if !native_identity_rebind_disposition_matches(
+                disposition,
+                &prior_evidence,
+                &current_evidence,
+            ) {
+                (
+                    "rejected",
+                    Some("selected provider identity no longer satisfies the admitted observation disposition"),
+                )
             } else {
-                match disposition {
-                    NativeIdentityRebindDisposition::Committed => ("completed", None),
-                    NativeIdentityRebindDisposition::RolledBack => ("rolled_back", None),
-                }
+                let terminal_phase = match disposition {
+                    NativeIdentityRebindDisposition::Committed => {
+                        NativeIdentityRebindObservationPhase::Completed
+                    }
+                    NativeIdentityRebindDisposition::RolledBack => {
+                        NativeIdentityRebindObservationPhase::RolledBack
+                    }
+                };
+                let terminal_observation = NativeIdentityRebindObservationRecord {
+                    phase: terminal_phase,
+                    ..admitted_observation
+                };
+                write_native_identity_rebind_observation(host, &terminal_observation, request_id)?;
+                (terminal_phase.as_str(), None)
             };
             Ok(vec![native_identity_rebind_operation(
                 account.opencode_wrapper,
@@ -1053,6 +1179,269 @@ fn native_identity_rebind_observation_id(
         })
         .to_string()
         .as_bytes(),
+    )
+}
+
+fn native_identity_rebind_disposition_matches(
+    disposition: NativeIdentityRebindDisposition,
+    prior_evidence: &NativeIdentityRebindEvidence,
+    observed_evidence: &NativeIdentityRebindEvidence,
+) -> bool {
+    match disposition {
+        NativeIdentityRebindDisposition::Committed => identity_component_rebound(
+            prior_evidence.component_identity_sha256.as_deref(),
+            observed_evidence.component_identity_sha256.as_deref(),
+        ),
+        NativeIdentityRebindDisposition::RolledBack => observed_evidence == prior_evidence,
+    }
+}
+
+fn persist_native_identity_rebind_observation(
+    host: &HostContext,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    prior_evidence: &NativeIdentityRebindEvidence,
+    observed_evidence: &NativeIdentityRebindEvidence,
+    disposition: NativeIdentityRebindDisposition,
+    request_id: &str,
+) -> Result<NativeIdentityRebindObservationPhase, ProviderFailure> {
+    let _lock = acquire_native_identity_rebind_lock(host, profile, component, request_id)?;
+    let operation_id = native_identity_rebind_operation_id(profile, component, prior_evidence);
+    let observation = NativeIdentityRebindObservationRecord {
+        schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
+        observation_id: native_identity_rebind_observation_id(
+            &operation_id,
+            observed_evidence,
+            disposition,
+        ),
+        operation_id,
+        profile: profile.to_string(),
+        component,
+        prior_evidence: prior_evidence.clone(),
+        observed_evidence: observed_evidence.clone(),
+        disposition,
+        phase: NativeIdentityRebindObservationPhase::AwaitingHostRelease,
+    };
+    if let Some(existing) =
+        read_native_identity_rebind_observation(host, profile, component, request_id)?
+    {
+        if native_identity_rebind_observation_matches(&existing, &observation) {
+            return Ok(existing.phase);
+        }
+        if existing.phase == NativeIdentityRebindObservationPhase::AwaitingHostRelease {
+            return Err(invalid_native_identity_rebind(
+                request_id,
+                "a different admitted observation still owns release for this profile/component identity",
+            ));
+        }
+    }
+    write_native_identity_rebind_observation(host, &observation, request_id)?;
+    Ok(observation.phase)
+}
+
+fn write_native_identity_rebind_observation(
+    host: &HostContext,
+    observation: &NativeIdentityRebindObservationRecord,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let path = native_identity_rebind_observation_path(
+        host,
+        &observation.profile,
+        observation.component,
+        request_id,
+    )?;
+    let parent = path
+        .parent()
+        .expect("native identity rebind observation always has a parent");
+    let bytes = serde_json::to_vec_pretty(&observation)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    if bytes.len() > NATIVE_IDENTITY_REBIND_STATE_BYTES {
+        return Err(native_identity_rebind_state_failure(
+            request_id,
+            format!(
+                "observation record exceeds supported {NATIVE_IDENTITY_REBIND_STATE_BYTES}-byte bound"
+            ),
+        ));
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error.error))?;
+    durable_fs::sync_directory(parent)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))
+}
+
+fn native_identity_rebind_observation_matches(
+    left: &NativeIdentityRebindObservationRecord,
+    right: &NativeIdentityRebindObservationRecord,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.operation_id == right.operation_id
+        && left.observation_id == right.observation_id
+        && left.profile == right.profile
+        && left.component == right.component
+        && left.prior_evidence == right.prior_evidence
+        && left.observed_evidence == right.observed_evidence
+        && left.disposition == right.disposition
+}
+
+fn read_native_identity_rebind_observation(
+    host: &HostContext,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<Option<NativeIdentityRebindObservationRecord>, ProviderFailure> {
+    let path = native_identity_rebind_observation_path(host, profile, component, request_id)?;
+    let bytes = match durable_fs::read_file_bounded(&path, NATIVE_IDENTITY_REBIND_STATE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(native_identity_rebind_state_failure(request_id, error)),
+    };
+    let observation: NativeIdentityRebindObservationRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    let phase_matches_disposition = match observation.phase {
+        NativeIdentityRebindObservationPhase::AwaitingHostRelease => true,
+        NativeIdentityRebindObservationPhase::Completed => {
+            observation.disposition == NativeIdentityRebindDisposition::Committed
+        }
+        NativeIdentityRebindObservationPhase::RolledBack => {
+            observation.disposition == NativeIdentityRebindDisposition::RolledBack
+        }
+    };
+    if observation.schema_version != NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION
+        || observation.profile != profile
+        || observation.component != component
+        || !phase_matches_disposition
+        || observation.operation_id
+            != native_identity_rebind_operation_id(profile, component, &observation.prior_evidence)
+        || observation.observation_id
+            != native_identity_rebind_observation_id(
+                &observation.operation_id,
+                &observation.observed_evidence,
+                observation.disposition,
+            )
+    {
+        return Err(native_identity_rebind_state_failure(
+            request_id,
+            "persisted observation record is inconsistent",
+        ));
+    }
+    Ok(Some(observation))
+}
+
+fn acquire_native_identity_rebind_lock(
+    host: &HostContext,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    let root = native_identity_rebind_state_root(host, request_id)?;
+    durable_fs::create_private_directories(&root)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    let lock_path = confined_native_identity_rebind_target(
+        host,
+        &root.join(format!("{profile}-{}.lock", component.as_str())),
+        request_id,
+    )?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(lock_path)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    let timeout = operation_bounds::remaining_timeout(
+        host.deadline_unix_ms,
+        NATIVE_IDENTITY_REBIND_LOCK_TIMEOUT,
+    )
+    .ok_or_else(|| native_identity_rebind_lock_timeout(request_id))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?
+    {
+        return Err(native_identity_rebind_lock_timeout(request_id));
+    }
+    Ok(lock)
+}
+
+fn native_identity_rebind_observation_path(
+    host: &HostContext,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let root = native_identity_rebind_state_root(host, request_id)?;
+    confined_native_identity_rebind_target(
+        host,
+        &root.join(format!("{profile}-{}.json", component.as_str())),
+        request_id,
+    )
+}
+
+fn native_identity_rebind_state_root(
+    host: &HostContext,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let data_root = native_identity_rebind_data_root(host, request_id)?;
+    confined_native_identity_rebind_target(
+        host,
+        &data_root.join(NATIVE_IDENTITY_REBIND_STATE_DIR),
+        request_id,
+    )
+}
+
+fn native_identity_rebind_data_root<'a>(
+    host: &'a HostContext,
+    request_id: &str,
+) -> Result<&'a Path, ProviderFailure> {
+    host.data_root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+        .map(Path::new)
+        .ok_or_else(|| {
+            invalid_native_identity_rebind(
+                request_id,
+                "native identity rebind requires host.data_root for durable observation custody",
+            )
+        })
+}
+
+fn confined_native_identity_rebind_target(
+    host: &HostContext,
+    target: &Path,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let data_root = native_identity_rebind_data_root(host, request_id)?;
+    path_guard::confined_target(data_root, target)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))
+}
+
+fn native_identity_rebind_state_failure(
+    request_id: &str,
+    error: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "native_identity_rebind_state_failed",
+        format!("native identity rebind observation custody failed: {error}"),
+    )
+}
+
+fn native_identity_rebind_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "native_identity_rebind_lock_timeout",
+        "native identity rebind observation lock could not be acquired before the operation deadline",
     )
 }
 

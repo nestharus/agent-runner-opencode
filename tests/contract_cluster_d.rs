@@ -1921,13 +1921,14 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
     assert_native_identity_rebind_schema(&protocol, "Operation", observed);
     assert_native_identity_rebind_schema(&protocol, "Request", &observed["next_request"]);
 
+    let release_request = observed["next_request"].clone();
     let released = success_result(
         invoke_validated(
             "setup.sync_plan",
             json!({
                 "settings_schema_id": "opencode.settings/v1",
                 "desired_profiles": ["opencode3"],
-                "native_identity_rebind": observed["next_request"]
+                "native_identity_rebind": release_request
             }),
             "setup.schema.json#/$defs/SetupSyncPlanRequest",
         ),
@@ -1944,6 +1945,277 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
     assert_eq!(released["observation_id"], observed["observation_id"]);
     assert_eq!(released["phase"], "rolled_back");
     assert_native_identity_rebind_schema(&protocol, "Operation", released);
+
+    let replayed = success_result(
+        invoke_validated(
+            "setup.sync_plan",
+            json!({
+                "settings_schema_id": "opencode.settings/v1",
+                "desired_profiles": ["opencode3"],
+                "native_identity_rebind": release_request
+            }),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    let replayed = replayed["operations"]
+        .as_array()
+        .expect("sync operations")
+        .iter()
+        .find(|operation| operation["kind"] == "native_identity_rebind")
+        .expect("replayed released identity rebind operation");
+    assert_eq!(replayed, released);
+}
+
+#[test]
+fn contract_native_identity_rebind_rejects_unadmitted_release_authority() {
+    let host = HostRoots::new("agent-runner-opencode-rebind-unadmitted-release");
+    let planned = native_identity_rebind_step(&host, setup_sync_rebind_params());
+    let planned = native_identity_rebind_component(&planned, "native_runtime");
+    let sealed = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": planned["next_request"]
+        }),
+    );
+    let sealed = native_identity_rebind_component(&sealed, "native_runtime");
+    let rejected = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": sealed["next_request"]
+        }),
+    );
+    let rejected = native_identity_rebind_component(&rejected, "native_runtime");
+    assert_eq!(rejected["phase"], "rejected");
+    assert_eq!(rejected["disposition"], "committed");
+
+    let rejected_release = native_identity_rebind_release_request(rejected);
+    let rejected_release_response = error_response(invoke_validated_with_host(
+        "setup.sync_plan",
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": rejected_release
+        }),
+        host.overrides(),
+        "setup.schema.json#/$defs/SetupSyncPlanRequest",
+    ));
+    assert_eq!(
+        rejected_release_response["error"]["code"],
+        "invalid_native_identity_rebind"
+    );
+
+    let skipped_host = HostRoots::new("agent-runner-opencode-rebind-skipped-observe");
+    let skipped_release_response = error_response(invoke_validated_with_host(
+        "setup.sync_plan",
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": rejected_release
+        }),
+        skipped_host.overrides(),
+        "setup.schema.json#/$defs/SetupSyncPlanRequest",
+    ));
+    assert_eq!(
+        skipped_release_response["error"]["code"],
+        "invalid_native_identity_rebind"
+    );
+}
+
+#[test]
+fn contract_native_identity_rebind_rejects_false_rollback_and_changed_evidence() {
+    let rejected_host = HostRoots::new("agent-runner-opencode-rebind-false-rollback");
+    let planned = native_identity_rebind_step(&rejected_host, setup_sync_rebind_params());
+    let planned = native_identity_rebind_component(&planned, "native_runtime");
+    let sealed = native_identity_rebind_step(
+        &rejected_host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": planned["next_request"]
+        }),
+    );
+    let sealed = native_identity_rebind_component(&sealed, "native_runtime");
+    let replacement = FakeToolchain::new();
+    write_native_runtime_identity(rejected_host.data_root(), &replacement, "opencode3");
+    let mut false_rollback = sealed["next_request"].clone();
+    false_rollback["disposition"] = json!("rolled_back");
+    let rejected = native_identity_rebind_step(
+        &rejected_host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": false_rollback
+        }),
+    );
+    let rejected = native_identity_rebind_component(&rejected, "native_runtime");
+    assert_eq!(rejected["phase"], "rejected");
+    assert_eq!(rejected["disposition"], "rolled_back");
+    let false_rollback_release = native_identity_rebind_release_request(rejected);
+    let release_response = error_response(invoke_validated_with_host(
+        "setup.sync_plan",
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": false_rollback_release
+        }),
+        rejected_host.overrides(),
+        "setup.schema.json#/$defs/SetupSyncPlanRequest",
+    ));
+    assert_eq!(
+        release_response["error"]["code"],
+        "invalid_native_identity_rebind"
+    );
+
+    let host = HostRoots::new("agent-runner-opencode-rebind-evidence-change");
+    let prior = FakeToolchain::new();
+    write_native_runtime_identity(host.data_root(), &prior, "opencode3");
+    let planned = native_identity_rebind_step(&host, setup_sync_rebind_params());
+    let planned = native_identity_rebind_component(&planned, "native_runtime");
+    let sealed = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": planned["next_request"]
+        }),
+    );
+    let sealed = native_identity_rebind_component(&sealed, "native_runtime");
+    let mut rollback = sealed["next_request"].clone();
+    rollback["disposition"] = json!("rolled_back");
+    let observed = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": rollback
+        }),
+    );
+    let observed = native_identity_rebind_component(&observed, "native_runtime");
+    assert_eq!(observed["phase"], "awaiting_host_release");
+    let release = observed["next_request"].clone();
+
+    let changed = FakeToolchain::new();
+    write_native_runtime_identity(host.data_root(), &changed, "opencode3");
+    let rejected = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": release
+        }),
+    );
+    assert_eq!(
+        native_identity_rebind_component(&rejected, "native_runtime")["phase"],
+        "rejected"
+    );
+
+    write_native_runtime_identity(host.data_root(), &prior, "opencode3");
+    let released = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": release
+        }),
+    );
+    let released = native_identity_rebind_component(&released, "native_runtime").clone();
+    assert_eq!(released["phase"], "rolled_back");
+
+    write_native_runtime_identity(host.data_root(), &changed, "opencode3");
+    let replayed = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": release
+        }),
+    );
+    assert_eq!(
+        native_identity_rebind_component(&replayed, "native_runtime"),
+        &released,
+        "a durably terminal release must replay without consulting later component state"
+    );
+}
+
+fn native_identity_rebind_step(host: &HostRoots, params: Value) -> Value {
+    success_result(
+        invoke_validated_with_host(
+            "setup.sync_plan",
+            params,
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    )
+}
+
+fn native_identity_rebind_component<'a>(result: &'a Value, component: &str) -> &'a Value {
+    result["operations"]
+        .as_array()
+        .expect("sync operations")
+        .iter()
+        .find(|operation| {
+            operation["kind"] == "native_identity_rebind" && operation["component"] == component
+        })
+        .expect("component-scoped native identity rebind operation")
+}
+
+fn native_identity_rebind_release_request(observation: &Value) -> Value {
+    json!({
+        "protocol": "opencode.native-identity-rebind/v1",
+        "action": "release",
+        "operation_id": observation["operation_id"],
+        "observation_id": observation["observation_id"],
+        "profile": observation["profile"],
+        "component": observation["component"],
+        "prior_evidence": observation["prior_evidence"],
+        "observed_evidence": observation["observed_evidence"],
+        "disposition": observation["disposition"],
+        "host_handoff": { "ordinary_admission_reopened": true }
+    })
+}
+
+fn write_native_runtime_identity(
+    data_root: &std::path::Path,
+    tools: &FakeToolchain,
+    profile: &str,
+) {
+    let program =
+        std::fs::canonicalize(tools.dir().join(profile)).expect("canonical native runtime fixture");
+    let program_sha256 = file_sha256(&program);
+    let execution_env = json!({});
+    let identity_sha256 = sha256_hex(
+        json!({
+            "account_wrapper": profile,
+            "program": program.to_string_lossy(),
+            "program_sha256": program_sha256,
+            "execution_env": execution_env,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let record = json!({
+        "schema_version": 1,
+        "account_wrapper": profile,
+        "program": program.to_string_lossy(),
+        "program_sha256": program_sha256,
+        "execution_env": execution_env,
+        "identity_sha256": identity_sha256,
+    });
+    let root = data_root.join("provider-state/opencode/native-runtimes");
+    std::fs::create_dir_all(&root).expect("create native runtime fixture root");
+    std::fs::write(
+        root.join(format!("{profile}.json")),
+        serde_json::to_vec_pretty(&record).expect("serialize native runtime fixture"),
+    )
+    .expect("write native runtime fixture");
 }
 
 fn assert_native_identity_rebind_schema(schema: &Value, definition: &str, value: &Value) {

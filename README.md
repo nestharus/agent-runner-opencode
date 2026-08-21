@@ -502,12 +502,17 @@ request with a named identity-lock result rather than waiting indefinitely.
 6. While ordinary admission is still blocked, the host sends the plan-bound
    `observe` request and attests that the selected validation capability completed.
    The provider validates the operation ID and both named current evidence layers. A valid
-   commit or rollback returns `awaiting_host_release`, an observation-bound
-   release request, and not a terminal success.
+   commit or rollback is durably admitted in one bounded component-scoped
+   observation record, then returns `awaiting_host_release`, an observation-bound
+   release request, and not a terminal success. Rejected observations do not
+   acquire release authority.
 7. The host reopens ordinary admission and sends that exact `release` request.
-   The provider checks the observation identity and unchanged current evidence pair,
-   then returns `completed` or `rolled_back`. A false release assertion or a
-   changed binding returns `rejected`.
+   The provider requires the exact admitted observation, checks the observation
+   identity, unchanged current evidence pair, and disposition predicate, then
+   returns `completed` or `rolled_back`. Exact release replay returns the same
+   terminal result. A skipped or rejected observation or invalid disposition
+   fails admission; a false release assertion or changed binding returns
+   `rejected`.
 
 Private state paths are included only as implementation evidence, not as the
 protocol's meaning. A component commit reaches release only when its semantic
