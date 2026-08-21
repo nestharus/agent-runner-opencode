@@ -1927,13 +1927,33 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
     assert_eq!(observed["phase"], "awaiting_host_release");
     assert_eq!(observed["next_request"]["action"], "release");
     assert_eq!(
-        observed["next_request"]["host_handoff"]["ordinary_admission_reopened"],
+        observed["next_request"]["host_handoff"]["ordinary_admission_blocked"],
         true
     );
     assert_native_identity_rebind_schema(&protocol, "Operation", observed);
     assert_native_identity_rebind_schema(&protocol, "Request", &observed["next_request"]);
 
     let release_request = observed["next_request"].clone();
+    let mut reopened_too_early = release_request.clone();
+    reopened_too_early["host_handoff"]["ordinary_admission_blocked"] = json!(false);
+    let rejected_release = success_result(
+        invoke_validated(
+            "setup.sync_plan",
+            json!({
+                "settings_schema_id": "opencode.settings/v1",
+                "desired_profiles": ["opencode3"],
+                "native_identity_rebind": reopened_too_early
+            }),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    let rejected_release = native_identity_rebind_component(&rejected_release, "native_runtime");
+    assert_eq!(rejected_release["phase"], "rejected");
+    assert!(rejected_release.get("release_authorization").is_none());
+    assert_native_identity_rebind_schema(&protocol, "Operation", rejected_release);
+
     let released = success_result(
         invoke_validated(
             "setup.sync_plan",
@@ -1956,6 +1976,10 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
     assert_eq!(released["operation_id"], rebind["operation_id"]);
     assert_eq!(released["observation_id"], observed["observation_id"]);
     assert_eq!(released["phase"], "rolled_back");
+    assert_eq!(
+        released["release_authorization"]["ordinary_admission_may_reopen"],
+        true
+    );
     assert_native_identity_rebind_schema(&protocol, "Operation", released);
 
     let replayed = success_result(
@@ -2126,6 +2150,11 @@ fn contract_native_identity_rebind_rejects_false_rollback_and_changed_evidence()
         native_identity_rebind_component(&rejected, "native_runtime")["phase"],
         "rejected"
     );
+    assert!(
+        native_identity_rebind_component(&rejected, "native_runtime")
+            .get("release_authorization")
+            .is_none()
+    );
 
     write_native_runtime_identity(host.data_root(), &prior, "opencode3");
     let released = native_identity_rebind_step(
@@ -2138,6 +2167,10 @@ fn contract_native_identity_rebind_rejects_false_rollback_and_changed_evidence()
     );
     let released = native_identity_rebind_component(&released, "native_runtime").clone();
     assert_eq!(released["phase"], "rolled_back");
+    assert_eq!(
+        released["release_authorization"]["ordinary_admission_may_reopen"],
+        true
+    );
 
     write_native_runtime_identity(host.data_root(), &changed, "opencode3");
     let replayed = native_identity_rebind_step(
@@ -2293,7 +2326,7 @@ fn native_identity_rebind_release_request(observation: &Value) -> Value {
         "prior_evidence": observation["prior_evidence"],
         "observed_evidence": observation["observed_evidence"],
         "disposition": observation["disposition"],
-        "host_handoff": { "ordinary_admission_reopened": true }
+        "host_handoff": { "ordinary_admission_blocked": true }
     })
 }
 

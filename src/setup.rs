@@ -117,7 +117,7 @@ struct NativeIdentityRebindObservationHandoff {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeIdentityRebindReleaseHandoff {
-    ordinary_admission_reopened: bool,
+    ordinary_admission_blocked: bool,
 }
 
 struct NativeIdentityRebindOperationView<'a> {
@@ -1084,7 +1084,7 @@ fn native_identity_rebind_operations(
                     "release does not match the provider-admitted awaiting_host_release observation",
                 ));
             }
-            if !host_handoff.ordinary_admission_reopened {
+            if !host_handoff.ordinary_admission_blocked {
                 return Ok(vec![native_identity_rebind_operation(
                     account.opencode_wrapper,
                     NativeIdentityRebindOperationView {
@@ -1094,7 +1094,7 @@ fn native_identity_rebind_operations(
                         observed_evidence: &observed_evidence,
                         phase: "rejected",
                         diagnostic: Some(
-                            "release acknowledgment requires the host to reopen ordinary admission",
+                            "release settlement requires ordinary admission to remain blocked until the provider returns a terminal authorization",
                         ),
                         disposition: Some(disposition),
                         next_action: None,
@@ -1123,7 +1123,7 @@ fn native_identity_rebind_operations(
             let (phase, diagnostic) = if current_evidence != observed_evidence {
                 (
                     "rejected",
-                    Some("selected provider identity changed after observation and before host release acknowledgment"),
+                    Some("selected provider identity changed after observation and before provider release settlement"),
                 )
             } else if !native_identity_rebind_disposition_matches(
                 disposition,
@@ -1230,8 +1230,8 @@ fn native_identity_rebind_operation(
         "responsibilities": [
             {
                 "actor": "host",
-                "action": format!("block ordinary capability admission that consumes the selected {} identity, bound in-flight consumers to the drain interval, and keep ordinary admission blocked through provider observation", component.as_str()),
-                "completion": "seal and observe assert host_handoff.ordinary_admission_blocked=true"
+                "action": format!("block ordinary capability admission that consumes the selected {} identity, bound in-flight consumers to the drain interval, and keep ordinary admission blocked through provider release settlement", component.as_str()),
+                "completion": "seal, observe, and release assert host_handoff.ordinary_admission_blocked=true"
             },
             {
                 "actor": "operator",
@@ -1240,8 +1240,8 @@ fn native_identity_rebind_operation(
             },
             {
                 "actor": "host",
-                "action": format!("while ordinary admission remains blocked, authorize exactly one operation-bound {validation_capability}, then reopen ordinary admission only after provider observation"),
-                "completion": "observe asserts the selected validation capability completed; release asserts ordinary admission reopened"
+                "action": format!("while ordinary admission remains blocked, authorize exactly one operation-bound {validation_capability}, then reopen ordinary admission only after a terminal provider release authorization"),
+                "completion": "observe asserts the selected validation capability completed; completed or rolled_back returns release_authorization.ordinary_admission_may_reopen=true"
             },
             {
                 "actor": "operator",
@@ -1251,7 +1251,7 @@ fn native_identity_rebind_operation(
             {
                 "actor": "provider",
                 "action": "bind the request to the component-scoped plan identity and observe that provider-owned identity record",
-                "completion": "observation emits an observation-bound release request; release returns completed, rolled_back, or rejected"
+                "completion": "observation emits an observation-bound release request; release durably settles completed or rolled_back before authorizing host admission to reopen"
             }
         ],
         "implementation_evidence": {
@@ -1311,7 +1311,7 @@ fn native_identity_rebind_operation(
                 "observed_evidence": observed_evidence,
                 "disposition": disposition.as_str(),
                 "host_handoff": {
-                    "ordinary_admission_reopened": true
+                    "ordinary_admission_blocked": true
                 }
             });
         }
@@ -1323,6 +1323,11 @@ fn native_identity_rebind_operation(
             native_identity_rebind_observation_id(&operation_id, observed_evidence, disposition);
         operation["observation_id"] = json!(observation_id);
         operation["disposition"] = json!(disposition.as_str());
+    }
+    if phase == "completed" || phase == "rolled_back" {
+        operation["release_authorization"] = json!({
+            "ordinary_admission_may_reopen": true
+        });
     }
     if let Some(diagnostic) = diagnostic {
         operation["diagnostic"] = json!(diagnostic);

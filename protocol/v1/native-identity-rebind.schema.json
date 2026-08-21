@@ -90,9 +90,17 @@
     "ReleaseHandoff": {
       "type": "object",
       "properties": {
-        "ordinary_admission_reopened": { "type": "boolean" }
+        "ordinary_admission_blocked": { "type": "boolean" }
       },
-      "required": ["ordinary_admission_reopened"],
+      "required": ["ordinary_admission_blocked"],
+      "additionalProperties": false
+    },
+    "ReleaseAuthorization": {
+      "type": "object",
+      "properties": {
+        "ordinary_admission_may_reopen": { "const": true }
+      },
+      "required": ["ordinary_admission_may_reopen"],
       "additionalProperties": false
     },
     "SealRequest": {
@@ -184,6 +192,7 @@
           "items": { "$ref": "#/$defs/Responsibility" }
         },
         "next_request": { "$ref": "#/$defs/Request" },
+        "release_authorization": { "$ref": "#/$defs/ReleaseAuthorization" },
         "diagnostic": { "type": "string", "minLength": 1 },
         "implementation_evidence": {
           "type": "object",
@@ -222,10 +231,22 @@
           }
         },
         {
-          "if": { "properties": { "phase": { "enum": ["completed", "rolled_back", "rejected"] } } },
+          "if": { "properties": { "phase": { "enum": ["completed", "rolled_back"] } } },
+          "then": {
+            "required": ["observation_id", "disposition", "release_authorization"],
+            "not": { "required": ["next_request"] }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "rejected" } } },
           "then": {
             "required": ["observation_id", "disposition"],
-            "not": { "required": ["next_request"] }
+            "not": {
+              "anyOf": [
+                { "required": ["next_request"] },
+                { "required": ["release_authorization"] }
+              ]
+            }
           }
         }
       ],

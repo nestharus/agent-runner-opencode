@@ -584,13 +584,18 @@ request with a named identity-lock result rather than waiting indefinitely.
    record, then returns `awaiting_host_release`, an observation-bound
    release request, and not a terminal success. Rejected observations do not
    acquire release authority.
-7. The host reopens ordinary admission and sends that exact `release` request.
-   The provider requires the exact admitted observation, checks the observation
-   identity, unchanged current evidence pair, and disposition predicate, then
-   returns `completed` or `rolled_back`. Exact release replay returns the same
-   terminal result. A skipped or rejected observation or invalid disposition
-   fails admission; a false release assertion or changed binding returns
-   `rejected`.
+7. Ordinary admission remains blocked while the host sends that exact `release`
+   request. The provider requires the exact admitted observation, checks the
+   observation identity, unchanged current evidence pair, and disposition
+   predicate, then durably writes `completed` or `rolled_back`. Only that terminal
+   response carries `release_authorization.ordinary_admission_may_reopen=true`.
+   A skipped or rejected observation or invalid disposition fails admission; a
+   false blocked-admission assertion or changed binding returns `rejected` without
+   release authority.
+8. The host reopens ordinary admission only after receiving the terminal release
+   authorization. Response loss leaves admission blocked; an exact `release`
+   retry replays the durable terminal result and the same authorization without
+   consulting later component state.
 
 Each profile/component retains at most 64 cycle records for a 24-hour replay
 window. An exact retry retains its original plan-derived cycle identity and
@@ -603,9 +608,10 @@ Private state paths are included only as implementation evidence, not as the
 protocol's meaning. A component commit reaches release only when its semantic
 implementation identity changes and the validated state record carries it, while
 rollback reaches release only when both prior semantic identity and persistence
-revision are restored. The host exclusively owns the distinction between blocked ordinary
-traffic and the component's cutover-validation exception, and the typed release
-acknowledgment owns the transition back to ordinary admission.
+revision are restored. The host exclusively owns the distinction between blocked
+ordinary traffic and the component's cutover-validation exception. The provider's
+durable terminal release authorization owns the transition back to ordinary
+admission.
 
 After obligations are settled, the declared cutover bound is one
 20-second admission interval; rollback is the same bounded two-file maintenance
