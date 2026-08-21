@@ -32,7 +32,11 @@ pub fn setup_sync_rebind_params() -> Value {
     json!({
         "settings_schema_id": "opencode.settings/v1",
         "desired_profiles": ["opencode3"],
-        "rebind_profiles": ["opencode3"]
+        "native_identity_rebind": {
+            "protocol": "opencode.native-identity-rebind/v1",
+            "action": "plan",
+            "profiles": ["opencode3"]
+        }
     })
 }
 

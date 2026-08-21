@@ -59,6 +59,36 @@ pub fn resolve(
     Ok(context)
 }
 
+pub(crate) fn persisted_state_sha256(
+    host: &HostContext,
+    account: &AccountProfile,
+    request_id: &str,
+) -> Result<Option<String>, ProviderFailure> {
+    let path = observer_context_path(host, account, request_id)?;
+    match durable_fs::read_file_bounded(&path, MAX_QUOTA_OBSERVER_STATE_BYTES) {
+        Ok(bytes) => Ok(Some(sha256_hex(&bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(quota_observer_failure(request_id, error)),
+    }
+}
+
+pub(crate) fn validated_persisted_state_sha256(
+    host: &HostContext,
+    account: &AccountProfile,
+    request_id: &str,
+) -> Result<Option<String>, ProviderFailure> {
+    let path = observer_context_path(host, account, request_id)?;
+    let bytes = match durable_fs::read_file_bounded(&path, MAX_QUOTA_OBSERVER_STATE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(quota_observer_failure(request_id, error)),
+    };
+    let context = serde_json::from_slice(&bytes)
+        .map_err(|error| quota_observer_failure(request_id, error))?;
+    validate_observer_context(&context, account, request_id)?;
+    Ok(Some(sha256_hex(&bytes)))
+}
+
 impl QuotaObserverContext {
     pub fn command(&self) -> Command {
         let mut command = Command::new(&self.program);

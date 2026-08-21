@@ -27,6 +27,67 @@ fn schema_response_conforms_and_returns_opencode_settings_v1() {
 }
 
 #[test]
+fn schema_response_exposes_native_identity_rebind_protocol() {
+    let output = invoke(
+        "schema",
+        json!({ "schema_id": "opencode.native-identity-rebind/v1" }),
+    );
+    assert_success(&output, "native identity rebind schema");
+    let response = json_stdout(&output);
+    assert_valid(&response, "schema.schema.json#/$defs/SchemaResponse");
+    assert_eq!(
+        response["result"]["schema_id"],
+        "opencode.native-identity-rebind/v1"
+    );
+    assert_eq!(
+        response["result"]["schema"]["$id"],
+        "https://schemas.oulipoly.dev/opencode/native-identity-rebind/v1"
+    );
+    assert_eq!(
+        response["result"]["schema"]["x-protocol"],
+        "opencode.native-identity-rebind/v1"
+    );
+    assert!(response["result"].get("ui").is_none());
+}
+
+#[test]
+fn pinned_contract_snapshot_matches_every_recorded_upstream_digest() {
+    let mut checked = 0;
+    for line in include_str!("../contract/v1/UPSTREAM.md").lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 2 || !fields[1].ends_with(".schema.json") {
+            continue;
+        }
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("contract/v1")
+                .join(fields[1]),
+        )
+        .expect("read pinned contract schema");
+        assert_eq!(
+            agent_runner_opencode::encoding::sha256_hex(&bytes),
+            fields[0],
+            "{} diverged from the recorded Agent Runner snapshot",
+            fields[1]
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 13, "all pinned contract schemas must be checked");
+    let schema_count =
+        std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("contract/v1"))
+            .expect("read pinned contract directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".schema.json"))
+            })
+            .count();
+    assert_eq!(schema_count, checked, "unrecorded contract schema found");
+}
+
+#[test]
 fn every_advertised_model_settings_value_is_semantically_valid() {
     for values in schema_valid_settings_examples() {
         let output = invoke("settings.validate", json!({ "values": values }));

@@ -10,14 +10,7 @@
         "settings_id": { "type": "string", "minLength": 1 },
         "mode": { "type": "string", "minLength": 1 },
         "model": { "$ref": "common.schema.json#/$defs/ProviderModelRequest" },
-        "launch": {
-          "type": "object",
-          "properties": {
-            "system_prompt_override": { "type": "string" },
-            "tool_restrictions": { "type": "object" }
-          },
-          "additionalProperties": true
-        }
+        "launch": { "type": "object", "additionalProperties": true }
       },
       "required": ["settings_id", "mode", "model", "launch"],
       "additionalProperties": false

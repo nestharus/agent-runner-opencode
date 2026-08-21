@@ -149,8 +149,9 @@ child is terminated and reaped, the admitted operation becomes
 `reconciliation_required`, and the credential-effect lane is released for an authorized
 follow-up instead of remaining monopolized by the stalled process.
 That authorized follow-up reuses the original request and adds
-`params.reconciliation` with the `accept_current_credentials` disposition and
-the lowercase SHA-256 of the current bound credential file. The provider
+`params.context.reconciliation` with the `accept_current_credentials`
+disposition and the lowercase SHA-256 of the current bound credential file.
+The provider
 verifies that exact source under the account lock, records the resolution on
 the original operation, and commits a terminal result without invoking native
 auth again. A stale source digest fails closed and leaves the obligation open.
@@ -428,27 +429,45 @@ every later reuse.
 ### Native dependency identity upgrades
 
 Wrapper and quota-observer files must not be replaced in place while their
-identity is admitted. `setup.sync_plan` accepts `rebind_profiles` and emits the
-exact per-profile binding files plus this bounded maintenance procedure:
+identity is admitted. This provider owns the separately versioned
+`opencode.native-identity-rebind/v1` maintenance protocol; its exact JSON Schema
+is available through `schema`. `setup.sync_plan` accepts that protocol under
+`params.native_identity_rebind` and emits operations carrying the same protocol,
+schema ID, content-bound operation ID, actor responsibilities, prior identity
+evidence, and a typed completion-observation request. The authoritative
+`oulipoly.provider/v1` setup schema remains an unchanged Agent Runner snapshot;
+its intentionally open setup objects carry this explicitly named provider
+extension rather than silently redefining the shared contract.
 
 Wrapper and quota-observer identity state reads and writes are capped at 1 MiB, executable
 identity hashing is capped at 64 MiB, and their per-account lock admission is
 bounded by the earlier host deadline or five seconds. A lock timeout fails the
 request with a named identity-lock result rather than waiting indefinitely.
 
-1. Stop new admission for the selected profile. Give every in-flight provider
-   request a deadline of at most 20 seconds and wait one such drain interval.
-2. Reconcile every nonterminal launch, rotation, and quota-refresh record. If
+1. The host stops new admission for the selected profile. It gives every in-flight provider
+   request a deadline of at most 20 seconds and waits one such drain interval.
+2. The operator reconciles every nonterminal launch, rotation, and quota-refresh record. If
    any effect remains ambiguous, abort the rollout and retain the old binding;
    the cutover interval does not begin until obligations are settled.
-3. Stage the new wrapper and `curl` implementation without altering the files
+3. The host submits the plan's typed `seal` request while admission remains
+   blocked. The provider rejects sealing if either host assertion is false or
+   either provider identity record changed during drain; a successful seal
+   binds the exact pre-cutover record digests into the operation ID.
+4. The operator stages the new wrapper and `curl` implementation without altering the files
    named by the old binding. Back up and remove only
    `native-runtimes/<profile>.json` and
    `quota-observers/<profile>.json` under the provider state root.
-4. Restore admission and run one quota probe and one launch under the intended
+5. The operator restores admission and runs one quota probe and one launch under the intended
    `PATH` and stable environment. They durably admit the new identities. If
    either admission fails, restore the two binding backups and the old staged
    dependencies.
+
+The operator then sends the plan-bound `observe` request. The provider validates
+the operation ID and both current identity records and returns exactly one of
+`completed`, `rolled_back`, or `rejected`; private state paths are included only
+as implementation evidence, not as the protocol's meaning. A commit closes only
+when both identities are newly admitted, while rollback closes only when both
+prior record digests are restored.
 
 After obligations are settled, the declared cutover bound is one
 20-second admission interval; rollback is the same bounded two-file maintenance

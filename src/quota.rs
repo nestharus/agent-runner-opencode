@@ -48,13 +48,28 @@ struct QuotaBaseParams {
 #[derive(Deserialize)]
 struct QuotaRefreshAuthParams {
     settings_id: String,
+    context: Option<QuotaRefreshAuthContext>,
+}
+
+#[derive(Deserialize)]
+struct QuotaRefreshAuthContext {
     reconciliation: Option<QuotaRefreshAuthReconciliation>,
+    #[serde(flatten)]
+    _extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Deserialize)]
 struct QuotaRefreshAuthReconciliation {
     disposition: String,
     credential_source_sha256: String,
+}
+
+impl QuotaRefreshAuthParams {
+    fn reconciliation(&self) -> Option<&QuotaRefreshAuthReconciliation> {
+        self.context
+            .as_ref()
+            .and_then(|context| context.reconciliation.as_ref())
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -211,7 +226,7 @@ pub fn refresh_auth_params(
                         ));
                     }
                     QuotaRefreshOperationPhase::ReconciliationRequired => {
-                        if let Some(reconciliation) = parsed.reconciliation.as_ref() {
+                        if let Some(reconciliation) = parsed.reconciliation() {
                             return reconcile_quota_refresh_operation(
                                 host,
                                 operation,
@@ -224,7 +239,7 @@ pub fn refresh_auth_params(
                         ));
                     }
                     QuotaRefreshOperationPhase::Prepared => {
-                        if parsed.reconciliation.is_some() {
+                        if parsed.reconciliation().is_some() {
                             return Err(quota_refresh_reconciliation_not_required(request_id));
                         }
                     }
@@ -236,7 +251,7 @@ pub fn refresh_auth_params(
                 (operation, account, runtime, observer, auth_path)
             }
             None => {
-                if parsed.reconciliation.is_some() {
+                if parsed.reconciliation().is_some() {
                     return Err(quota_refresh_reconciliation_not_required(request_id));
                 }
                 let selection = resolve_runtime_selection(host, &parsed.settings_id, request_id)?;
@@ -310,8 +325,20 @@ pub fn refresh_auth_params(
 
 fn quota_refresh_binding_params_sha256(params: &Value) -> String {
     let mut binding_params = params.clone();
-    if let Some(object) = binding_params.as_object_mut() {
-        object.remove("reconciliation");
+    let remove_empty_context = if let Some(context) = binding_params
+        .get_mut("context")
+        .and_then(Value::as_object_mut)
+    {
+        context.remove("reconciliation");
+        context.is_empty()
+    } else {
+        false
+    };
+    if remove_empty_context {
+        binding_params
+            .as_object_mut()
+            .expect("quota refresh params are validated as an object")
+            .remove("context");
     }
     sha256_hex(binding_params.to_string().as_bytes())
 }
@@ -997,7 +1024,7 @@ fn quota_refresh_reconciliation_required(
             "account": operation.binding["account"],
             "auth_source_path": operation.binding["auth_source_path"],
             "reconciliation_evidence": operation.reconciliation,
-            "recovery": "inspect the bound credential source, then retry this original request with params.reconciliation.disposition=accept_current_credentials and params.reconciliation.credential_source_sha256 set to the lowercase SHA-256 of the credential file you accepted",
+            "recovery": "inspect the bound credential source, then retry this original request with params.context.reconciliation.disposition=accept_current_credentials and params.context.reconciliation.credential_source_sha256 set to the lowercase SHA-256 of the credential file you accepted",
         }),
     )
 }

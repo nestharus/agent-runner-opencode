@@ -5,6 +5,7 @@ mod cluster_d;
 mod support;
 
 use cluster_d::*;
+use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Value};
 use std::fs;
 use std::fs::OpenOptions;
@@ -1622,24 +1623,105 @@ fn contract_setup_sync_plans_bounded_identity_rebind() {
         .as_array()
         .expect("sync operations")
         .iter()
-        .find(|operation| operation["kind"] == "rebind_native_identity")
+        .find(|operation| operation["kind"] == "native_identity_rebind")
         .expect("identity rebind operation");
     assert_eq!(rebind["profile"], "opencode3");
+    assert_eq!(rebind["protocol"], "opencode.native-identity-rebind/v1");
+    assert_eq!(rebind["schema_id"], "opencode.native-identity-rebind/v1");
+    assert_eq!(
+        rebind["operation_id"]
+            .as_str()
+            .expect("rebind operation identity")
+            .len(),
+        64
+    );
+    assert_eq!(rebind["phase"], "awaiting_host_drain");
     assert_eq!(rebind["maximum_drain_ms"], 20_000);
-    assert!(rebind["state_files"]
+    assert!(rebind["responsibilities"]
         .as_array()
-        .expect("rebind state files")
+        .expect("typed actor responsibilities")
         .iter()
-        .any(|path| path
-            .as_str()
-            .is_some_and(|path| path.contains("native-runtimes/opencode3.json"))));
-    assert!(rebind["state_files"]
+        .any(|responsibility| responsibility["actor"] == "host"));
+    assert_eq!(rebind["next_request"]["action"], "seal");
+
+    let protocol = success_result(
+        invoke(
+            "schema",
+            json!({ "schema_id": "opencode.native-identity-rebind/v1" }),
+        ),
+        "schema.schema.json#/$defs/SchemaResponse",
+        "schema.schema.json#/$defs/SchemaResult",
+    )["schema"]
+        .clone();
+    assert_native_identity_rebind_schema(&protocol, "Operation", rebind);
+    assert_native_identity_rebind_schema(&protocol, "Request", &rebind["next_request"]);
+
+    let sealed = success_result(
+        invoke_validated(
+            "setup.sync_plan",
+            json!({
+                "settings_schema_id": "opencode.settings/v1",
+                "desired_profiles": ["opencode3"],
+                "native_identity_rebind": rebind["next_request"]
+            }),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    let sealed = sealed["operations"]
         .as_array()
-        .expect("rebind state files")
+        .expect("sync operations")
         .iter()
-        .any(|path| path
-            .as_str()
-            .is_some_and(|path| path.contains("quota-observers/opencode3.json"))));
+        .find(|operation| operation["kind"] == "native_identity_rebind")
+        .expect("sealed identity rebind operation");
+    assert_eq!(sealed["phase"], "awaiting_cutover");
+    assert_eq!(sealed["next_request"]["action"], "observe");
+    assert_native_identity_rebind_schema(&protocol, "Operation", sealed);
+    assert_native_identity_rebind_schema(&protocol, "Request", &sealed["next_request"]);
+
+    let mut rollback_observation = sealed["next_request"].clone();
+    rollback_observation["disposition"] = json!("rolled_back");
+    let rollback = success_result(
+        invoke_validated(
+            "setup.sync_plan",
+            json!({
+                "settings_schema_id": "opencode.settings/v1",
+                "desired_profiles": ["opencode3"],
+                "native_identity_rebind": rollback_observation
+            }),
+            "setup.schema.json#/$defs/SetupSyncPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    let observed = rollback["operations"]
+        .as_array()
+        .expect("sync operations")
+        .iter()
+        .find(|operation| operation["kind"] == "native_identity_rebind")
+        .expect("identity rebind observation");
+    assert_eq!(observed["operation_id"], rebind["operation_id"]);
+    assert_eq!(observed["phase"], "rolled_back");
+    assert_native_identity_rebind_schema(&protocol, "Operation", observed);
+}
+
+fn assert_native_identity_rebind_schema(schema: &Value, definition: &str, value: &Value) {
+    let mut root = schema.clone();
+    root["$ref"] = json!(format!("#/$defs/{definition}"));
+    let compiled = JSONSchema::options()
+        .with_draft(Draft::Draft202012)
+        .compile(&root)
+        .expect("compile native identity rebind schema");
+    if let Err(errors) = compiled.validate(value) {
+        panic!(
+            "native identity rebind {definition} failed its advertised schema: {}; value={value}",
+            errors
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    };
 }
 
 #[test]
@@ -1787,11 +1869,7 @@ fn contract_setup_blocks_cutover_above_predecessor_transition_envelope() {
         "setup.schema.json#/$defs/SetupDetectResult",
     );
     assert_eq!(detect["installed"], false);
-    assert_eq!(detect["settings_store"]["ready"], false);
-    assert_eq!(
-        detect["settings_store"]["code"],
-        "settings_store_capacity_unsupported"
-    );
+    assert!(detect.get("settings_store").is_none());
     assert!(detect["warnings"]
         .as_array()
         .expect("setup warnings")

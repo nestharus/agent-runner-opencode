@@ -669,7 +669,7 @@ fn assert_changed_auth_requires_reconciliation(
     );
     if reconcile {
         let mut stale_reconciliation_request = request.clone();
-        stale_reconciliation_request["params"]["reconciliation"] = json!({
+        stale_reconciliation_request["params"]["context"]["reconciliation"] = json!({
             "disposition": "accept_current_credentials",
             "credential_source_sha256": "0".repeat(64),
         });
@@ -690,7 +690,7 @@ fn assert_changed_auth_requires_reconciliation(
         );
 
         let mut reconciliation_request = request.clone();
-        reconciliation_request["params"]["reconciliation"] = json!({
+        reconciliation_request["params"]["context"]["reconciliation"] = json!({
             "disposition": "accept_current_credentials",
             "credential_source_sha256": file_sha256(&auth_path),
         });

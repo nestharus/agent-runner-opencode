@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub const SETTINGS_SCHEMA_ID: &str = "opencode.settings/v1";
+pub const NATIVE_IDENTITY_REBIND_SCHEMA_ID: &str = "opencode.native-identity-rebind/v1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,7 +17,7 @@ pub struct SchemaParams {
 pub fn schema_result_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
     let params = parse_schema_params(params, request_id)?;
     validate_schema_id(request_id, &params.schema_id)?;
-    Ok(schema_result())
+    Ok(schema_result(&params.schema_id))
 }
 
 pub fn validate_schema_id(request_id: &str, schema_id: &str) -> Result<(), ProviderFailure> {
@@ -65,12 +66,22 @@ fn parse_schema_params(params: Value, request_id: &str) -> Result<SchemaParams, 
     serde_json::from_value(params).map_err(|err| invalid_schema_params_failure(request_id, err))
 }
 
-fn schema_result() -> Value {
-    json!({
-        "schema_id": SETTINGS_SCHEMA_ID,
-        "schema": opencode_settings_schema(),
-        "ui": settings_schema_ui(),
-    })
+fn schema_result(schema_id: &str) -> Value {
+    match schema_id {
+        SETTINGS_SCHEMA_ID => json!({
+            "schema_id": SETTINGS_SCHEMA_ID,
+            "schema": opencode_settings_schema(),
+            "ui": settings_schema_ui(),
+        }),
+        NATIVE_IDENTITY_REBIND_SCHEMA_ID => json!({
+            "schema_id": NATIVE_IDENTITY_REBIND_SCHEMA_ID,
+            "schema": serde_json::from_str::<Value>(include_str!(
+                "../protocol/v1/native-identity-rebind.schema.json"
+            ))
+            .expect("native identity rebind schema must be valid JSON"),
+        }),
+        _ => unreachable!("schema id was validated before projection"),
+    }
 }
 
 fn settings_schema_ui() -> Value {
@@ -91,7 +102,10 @@ fn settings_schema_ui() -> Value {
 }
 
 fn is_supported_schema_id(schema_id: &str) -> bool {
-    schema_id == SETTINGS_SCHEMA_ID
+    matches!(
+        schema_id,
+        SETTINGS_SCHEMA_ID | NATIVE_IDENTITY_REBIND_SCHEMA_ID
+    )
 }
 
 fn unknown_schema_failure(request_id: &str, schema_id: &str) -> ProviderFailure {
