@@ -17,7 +17,7 @@ use crate::native_process::{
 };
 use crate::native_runtime::NativeRuntimeContext;
 use crate::shell::ShellOutput;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(unix)]
@@ -98,20 +98,39 @@ pub struct OpencodeExportInfo {
     pub model: Option<OpencodeModelIdentity>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
+/// One native message whose model route has already been canonicalized.
+///
+/// Deserialization is invariant-bearing: simultaneous top-level and nested
+/// route representations must agree as complete aggregates.
 pub struct OpencodeMessage {
     pub info: OpencodeMessageInfo,
-    #[serde(default)]
     pub parts: Vec<Value>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct OpencodeMessageInfo {
     pub id: String,
     pub role: String,
-    #[serde(rename = "sessionID")]
     pub session_id: Option<String>,
     pub time: Option<OpencodeMessageTime>,
+    canonical_model_identity: OpencodeMessageModelIdentity,
+}
+
+#[derive(Deserialize)]
+struct RawOpencodeMessage {
+    info: RawOpencodeMessageInfo,
+    #[serde(default)]
+    parts: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct RawOpencodeMessageInfo {
+    id: String,
+    role: String,
+    #[serde(rename = "sessionID")]
+    session_id: Option<String>,
+    time: Option<OpencodeMessageTime>,
     #[serde(default)]
     model: Option<OpencodeModelIdentity>,
     #[serde(rename = "modelID")]
@@ -119,8 +138,6 @@ pub struct OpencodeMessageInfo {
     #[serde(rename = "providerID")]
     provider_id: Option<String>,
     variant: Option<String>,
-    #[serde(skip)]
-    canonical_model_identity: OpencodeMessageModelIdentity,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -142,6 +159,58 @@ pub struct OpencodeMessageModelIdentity {
 impl OpencodeMessageInfo {
     pub fn model_identity(&self) -> &OpencodeMessageModelIdentity {
         &self.canonical_model_identity
+    }
+}
+
+impl<'de> Deserialize<'de> for OpencodeMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawOpencodeMessage::deserialize(deserializer)?;
+        let canonical_model_identity =
+            canonical_message_model_identity(&raw.info).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            info: OpencodeMessageInfo {
+                id: raw.info.id,
+                role: raw.info.role,
+                session_id: raw.info.session_id,
+                time: raw.info.time,
+                canonical_model_identity,
+            },
+            parts: raw.parts,
+        })
+    }
+}
+
+fn canonical_message_model_identity(
+    info: &RawOpencodeMessageInfo,
+) -> Result<OpencodeMessageModelIdentity, String> {
+    let top_level = OpencodeMessageModelIdentity {
+        provider_id: info.provider_id.clone(),
+        model_id: info.model_id.clone(),
+        variant: info.variant.clone(),
+    };
+    let top_level_present = top_level.provider_id.is_some()
+        || top_level.model_id.is_some()
+        || top_level.variant.is_some();
+    let nested = info
+        .model
+        .as_ref()
+        .map(|model| OpencodeMessageModelIdentity {
+            provider_id: model.provider_id.clone(),
+            model_id: model.id.clone(),
+            variant: model.variant.clone(),
+        });
+    match (top_level_present, nested) {
+        (false, None) => Ok(OpencodeMessageModelIdentity::default()),
+        (true, None) => Ok(top_level),
+        (false, Some(nested)) => Ok(nested),
+        (true, Some(nested)) if top_level == nested => Ok(top_level),
+        (true, Some(_)) => Err(format!(
+            "message {} has conflicting top-level and nested model identities",
+            info.id
+        )),
     }
 }
 
@@ -926,50 +995,13 @@ fn session_list_json_start(stdout: &[u8]) -> Result<usize, OpencodeSessionListEr
 
 fn parse_export_json(bytes: &[u8]) -> Result<OpencodeExport, OpencodeExportError> {
     let native_json: Value = serde_json::from_slice(bytes).map_err(invalid_export_json_error)?;
-    let mut parsed: ParsedOpencodeExport =
+    let parsed: ParsedOpencodeExport =
         serde_json::from_value(native_json.clone()).map_err(invalid_export_json_error)?;
-    canonicalize_export_message_model_identities(&mut parsed.messages)?;
     Ok(OpencodeExport {
         info: parsed.info,
         messages: parsed.messages,
         native_json,
     })
-}
-
-fn canonicalize_export_message_model_identities(
-    messages: &mut [OpencodeMessage],
-) -> Result<(), OpencodeExportError> {
-    for (index, message) in messages.iter_mut().enumerate() {
-        let top_level = OpencodeMessageModelIdentity {
-            provider_id: message.info.provider_id.clone(),
-            model_id: message.info.model_id.clone(),
-            variant: message.info.variant.clone(),
-        };
-        let top_level_present = top_level.provider_id.is_some()
-            || top_level.model_id.is_some()
-            || top_level.variant.is_some();
-        let nested = message
-            .info
-            .model
-            .as_ref()
-            .map(|model| OpencodeMessageModelIdentity {
-                provider_id: model.provider_id.clone(),
-                model_id: model.id.clone(),
-                variant: model.variant.clone(),
-            });
-        message.info.canonical_model_identity = match (top_level_present, nested) {
-            (false, None) => OpencodeMessageModelIdentity::default(),
-            (true, None) => top_level,
-            (false, Some(nested)) => nested,
-            (true, Some(nested)) if top_level == nested => top_level,
-            (true, Some(_)) => {
-                return Err(OpencodeExportError::InvalidJson(format!(
-                    "message {index} has conflicting top-level and nested model identities"
-                )))
-            }
-        };
-    }
-    Ok(())
 }
 
 fn parse_session_list_json(
@@ -1209,7 +1241,7 @@ fn pinned_native_event(event: OpencodeEventMetadata) -> Option<OpencodeEventMeta
 mod tests {
     use super::{
         credential_snapshot, parse_export_stdout, parse_import_stdout, parse_session_list_stdout,
-        EventParser, OpencodeAuthEffect, OpencodeExportError, OpencodeImportError,
+        EventParser, OpencodeAuthEffect, OpencodeExportError, OpencodeImportError, OpencodeMessage,
         OpencodeSessionDirectory, OpencodeSessionListError, OpencodeSessionListRow,
         PendingOpencodeAuthObservation, ShellOutput, MAX_NATIVE_EVENT_LINE_BYTES,
     };
@@ -1319,6 +1351,50 @@ mod tests {
         assert_eq!(identity.provider_id(), Some("openai"));
         assert_eq!(identity.model_id(), Some("gpt-5.6-luna"));
         assert_eq!(identity.variant(), Some("low"));
+    }
+
+    #[test]
+    fn standalone_message_deserialization_is_always_canonical() {
+        let message: OpencodeMessage = serde_json::from_value(serde_json::json!({
+            "info": {
+                "id": "msg-standalone",
+                "role": "assistant",
+                "model": {
+                    "providerID": "openai",
+                    "modelID": "gpt-5.6-luna",
+                    "variant": "low"
+                }
+            }
+        }))
+        .expect("standalone public message deserialization canonicalizes identity");
+        let identity = message.info.model_identity();
+
+        assert_eq!(identity.provider_id(), Some("openai"));
+        assert_eq!(identity.model_id(), Some("gpt-5.6-luna"));
+        assert_eq!(identity.variant(), Some("low"));
+    }
+
+    #[test]
+    fn standalone_message_deserialization_rejects_conflicting_identity() {
+        let result = serde_json::from_value::<OpencodeMessage>(serde_json::json!({
+            "info": {
+                "id": "msg-standalone-conflict",
+                "role": "assistant",
+                "providerID": "anthropic",
+                "modelID": "gpt-5.6-luna",
+                "variant": "low",
+                "model": {
+                    "providerID": "openai",
+                    "modelID": "gpt-5.6-luna",
+                    "variant": "low"
+                }
+            }
+        }));
+
+        assert!(result
+            .expect_err("standalone public message must reject conflicting identity")
+            .to_string()
+            .contains("conflicting top-level and nested model identities"));
     }
 
     #[test]

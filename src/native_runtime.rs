@@ -66,8 +66,18 @@ const TRANSIENT_ENV_KEYS: &[&str] = &[
     "OULIPOLY_PARENT_INVOCATION",
 ];
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone)]
+/// An admitted executable capability for one account's pinned native runtime.
+///
+/// The persisted JSON representation is private and cannot be deserialized
+/// directly into this effectful type. Public callers obtain a context only
+/// through the validating resolvers in this module.
 pub struct NativeRuntimeContext {
+    record: NativeRuntimeRecord,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct NativeRuntimeRecord {
     schema_version: u32,
     account_wrapper: String,
     program: String,
@@ -120,8 +130,8 @@ pub(crate) fn resolve_for_account_with_timeout(
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
     let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
-    if let Some(context) = read_runtime_context(host, account, request_id)? {
-        return activate_runtime_context(host, account, context, request_id);
+    if let Some(record) = read_runtime_record(host, account, request_id)? {
+        return activate_runtime_record(host, account, record, request_id);
     }
     let context = candidate_context(account, ambient_stable_environment(), request_id)?;
     write_runtime_context(host, account, &context, request_id)?;
@@ -133,11 +143,11 @@ pub fn resolve_existing_for_account(
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<Option<NativeRuntimeContext>, ProviderFailure> {
-    let Some(context) = read_runtime_context(host, account, request_id)? else {
+    let Some(record) = read_runtime_record(host, account, request_id)? else {
         return Ok(None);
     };
-    validate_runtime_context(&context, account, request_id)?;
-    Ok(Some(context))
+    validate_runtime_record(&record, account, request_id)?;
+    Ok(Some(NativeRuntimeContext { record }))
 }
 
 pub(crate) fn resolve_existing_for_setup(
@@ -146,10 +156,10 @@ pub(crate) fn resolve_existing_for_setup(
     request_id: &str,
 ) -> Result<Option<NativeRuntimeContext>, ProviderFailure> {
     let _lock = acquire_runtime_lock(host, account, Duration::ZERO, request_id)?;
-    let Some(context) = read_runtime_context(host, account, request_id)? else {
+    let Some(record) = read_runtime_record(host, account, request_id)? else {
         return Ok(None);
     };
-    preview_runtime_context_activation(account, context, request_id).map(Some)
+    preview_runtime_record_activation(account, record, request_id).map(Some)
 }
 
 pub(crate) fn persisted_identity_evidence(
@@ -180,13 +190,13 @@ fn read_persisted_identity_evidence(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(native_runtime_failure(request_id, error)),
     };
-    let context = serde_json::from_slice(&bytes)
+    let record = serde_json::from_slice::<NativeRuntimeRecord>(&bytes)
         .map_err(|error| native_runtime_failure(request_id, error))?;
-    validate_runtime_record_identity(&context, account, request_id)?;
+    validate_runtime_record_identity(&record, account, request_id)?;
     if require_current_implementation {
-        validate_runtime_context(&context, account, request_id)?;
+        validate_runtime_record(&record, account, request_id)?;
     }
-    Ok(Some((context.identity_sha256, sha256_hex(&bytes))))
+    Ok(Some((record.identity_sha256, sha256_hex(&bytes))))
 }
 
 pub fn resolve_for_launch(
@@ -222,10 +232,10 @@ pub fn resolve_for_launch(
         operation_bounds::remaining_timeout(host.deadline_unix_ms, NATIVE_RUNTIME_LOCK_TIMEOUT)
             .unwrap_or(Duration::ZERO);
     let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
-    if let Some(context) = read_runtime_context(host, account, request_id)? {
-        let context = activate_runtime_context(host, account, context, request_id)?;
-        if Path::new(&context.program) != requested_program
-            || context.execution_env != requested_environment
+    if let Some(record) = read_runtime_record(host, account, request_id)? {
+        let context = activate_runtime_record(host, account, record, request_id)?;
+        if Path::new(context.program()) != requested_program
+            || context.stable_execution_env() != &requested_environment
         {
             return Err(ProviderFailure::conflict(
                 request_id,
@@ -237,7 +247,7 @@ pub fn resolve_for_launch(
                 json!({
                     "account": account.opencode_wrapper,
                     "attempted_program": requested_program,
-                    "bound_runtime_identity_sha256": context.identity_sha256,
+                    "bound_runtime_identity_sha256": context.identity_sha256(),
                 }),
             ));
         }
@@ -250,9 +260,9 @@ pub fn resolve_for_launch(
 
 impl NativeRuntimeContext {
     pub fn command(&self) -> Command {
-        let mut command = Command::new(&self.program);
+        let mut command = Command::new(&self.record.program);
         command
-            .args(&self.fixed_args)
+            .args(&self.record.fixed_args)
             .env_clear()
             .envs(self.execution_environment(&BTreeMap::new()));
         command
@@ -262,7 +272,7 @@ impl NativeRuntimeContext {
         &self,
         declared_env: &BTreeMap<String, String>,
     ) -> BTreeMap<String, String> {
-        let mut environment = self.execution_env.clone();
+        let mut environment = self.record.execution_env.clone();
         for key in TRANSIENT_ENV_KEYS {
             if let Some(value) = declared_env
                 .get(*key)
@@ -276,43 +286,46 @@ impl NativeRuntimeContext {
     }
 
     pub fn program(&self) -> &str {
-        &self.program
+        &self.record.program
     }
 
     pub(crate) fn fixed_args(&self) -> &[String] {
-        &self.fixed_args
+        &self.record.fixed_args
     }
 
     pub(crate) fn program_sha256(&self) -> &str {
-        &self.program_sha256
+        &self.record.program_sha256
     }
 
     pub(crate) fn native_contract_id(&self) -> &str {
-        &self.native_contract_id
+        &self.record.native_contract_id
     }
 
     pub(crate) fn implementation_manifest_id(&self) -> &str {
-        &self.implementation_manifest_id
+        &self.record.implementation_manifest_id
     }
 
     pub(crate) fn implementation_version(&self) -> &str {
-        &self.implementation_version
+        &self.record.implementation_version
     }
 
     pub(crate) fn program_stamp(&self) -> &NativeProgramStamp {
-        &self.program_stamp
+        &self.record.program_stamp
     }
 
     pub fn stable_execution_env(&self) -> &BTreeMap<String, String> {
-        &self.execution_env
+        &self.record.execution_env
     }
 
     pub fn identity_sha256(&self) -> &str {
-        &self.identity_sha256
+        &self.record.identity_sha256
     }
 
     pub fn expand_path(&self, path: &str) -> PathBuf {
-        match (path.strip_prefix("~/"), self.execution_env.get("HOME")) {
+        match (
+            path.strip_prefix("~/"),
+            self.record.execution_env.get("HOME"),
+        ) {
             (Some(relative), Some(home)) => Path::new(home).join(relative),
             _ => PathBuf::from(path),
         }
@@ -407,17 +420,19 @@ fn candidate_context(
         (&approved.id, &approved.version),
     );
     Ok(NativeRuntimeContext {
-        schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
-        account_wrapper: account.opencode_wrapper.to_string(),
-        program: program.to_string(),
-        program_sha256,
-        execution_env,
-        native_contract_id: OPENCODE_NATIVE_CONTRACT_ID.to_string(),
-        fixed_args,
-        implementation_manifest_id: approved.id,
-        implementation_version: approved.version,
-        program_stamp,
-        identity_sha256,
+        record: NativeRuntimeRecord {
+            schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
+            account_wrapper: account.opencode_wrapper.to_string(),
+            program: program.to_string(),
+            program_sha256,
+            execution_env,
+            native_contract_id: OPENCODE_NATIVE_CONTRACT_ID.to_string(),
+            fixed_args,
+            implementation_manifest_id: approved.id,
+            implementation_version: approved.version,
+            program_stamp,
+            identity_sha256,
+        },
     })
 }
 
@@ -562,77 +577,77 @@ fn runtime_identity_sha256(
     )
 }
 
-fn validate_runtime_context(
-    context: &NativeRuntimeContext,
+fn validate_runtime_record(
+    record: &NativeRuntimeRecord,
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    validate_runtime_record_identity(context, account, request_id)?;
-    if context.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
-        validate_current_runtime_implementation(context, account, request_id)
+    validate_runtime_record_identity(record, account, request_id)?;
+    if record.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
+        validate_current_runtime_implementation(record, account, request_id)
     } else {
-        validate_predecessor_runtime_implementation(context, account, request_id).map(|_| ())
+        validate_predecessor_runtime_implementation(record, account, request_id).map(|_| ())
     }
 }
 
 fn validate_runtime_record_identity(
-    context: &NativeRuntimeContext,
+    record: &NativeRuntimeRecord,
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let identity_sha256 = match context.schema_version {
+    let identity_sha256 = match record.schema_version {
         NATIVE_RUNTIME_SCHEMA_VERSION => runtime_identity_sha256(
-            &context.account_wrapper,
-            &context.program,
-            &context.program_sha256,
-            &context.execution_env,
-            &context.native_contract_id,
-            &context.fixed_args,
+            &record.account_wrapper,
+            &record.program,
+            &record.program_sha256,
+            &record.execution_env,
+            &record.native_contract_id,
+            &record.fixed_args,
             (
-                &context.implementation_manifest_id,
-                &context.implementation_version,
+                &record.implementation_manifest_id,
+                &record.implementation_version,
             ),
         ),
         MANIFEST_NATIVE_RUNTIME_SCHEMA_VERSION => manifest_runtime_identity_sha256(
-            &context.account_wrapper,
-            &context.program,
-            &context.program_sha256,
-            &context.execution_env,
-            &context.native_contract_id,
-            &context.fixed_args,
+            &record.account_wrapper,
+            &record.program,
+            &record.program_sha256,
+            &record.execution_env,
+            &record.native_contract_id,
+            &record.fixed_args,
             (
-                &context.implementation_manifest_id,
-                &context.implementation_version,
+                &record.implementation_manifest_id,
+                &record.implementation_version,
             ),
         ),
         DIRECT_NATIVE_RUNTIME_SCHEMA_VERSION => direct_runtime_identity_sha256(
-            &context.account_wrapper,
-            &context.program,
-            &context.program_sha256,
-            &context.execution_env,
-            &context.native_contract_id,
-            &context.fixed_args,
+            &record.account_wrapper,
+            &record.program,
+            &record.program_sha256,
+            &record.execution_env,
+            &record.native_contract_id,
+            &record.fixed_args,
         ),
         WRAPPER_NATIVE_RUNTIME_SCHEMA_VERSION => predecessor_runtime_identity_sha256(
-            &context.account_wrapper,
-            &context.program,
-            &context.program_sha256,
-            &context.execution_env,
+            &record.account_wrapper,
+            &record.program,
+            &record.program_sha256,
+            &record.execution_env,
         ),
         _ => String::new(),
     };
-    if context.account_wrapper != account.opencode_wrapper
-        || context.identity_sha256 != identity_sha256
-        || (context.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION
-            && (context.native_contract_id != OPENCODE_NATIVE_CONTRACT_ID
-                || context.fixed_args
+    if record.account_wrapper != account.opencode_wrapper
+        || record.identity_sha256 != identity_sha256
+        || (record.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION
+            && (record.native_contract_id != OPENCODE_NATIVE_CONTRACT_ID
+                || record.fixed_args
                     != OPENCODE_NATIVE_FIXED_ARGS
                         .iter()
                         .map(|value| (*value).to_string())
                         .collect::<Vec<_>>()
-                || context.implementation_manifest_id.trim().is_empty()
-                || context.implementation_version.trim().is_empty()
-                || !context.program_stamp.is_complete()))
+                || record.implementation_manifest_id.trim().is_empty()
+                || record.implementation_version.trim().is_empty()
+                || !record.program_stamp.is_complete()))
     {
         return Err(native_runtime_failure(
             request_id,
@@ -708,50 +723,50 @@ fn predecessor_runtime_identity_sha256(
     )
 }
 
-fn activate_runtime_context(
+fn activate_runtime_record(
     host: &HostContext,
     account: &AccountProfile,
-    context: NativeRuntimeContext,
+    record: NativeRuntimeRecord,
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
-    let prior_schema_version = context.schema_version;
-    let activated = preview_runtime_context_activation(account, context, request_id)?;
+    let prior_schema_version = record.schema_version;
+    let activated = preview_runtime_record_activation(account, record, request_id)?;
     if prior_schema_version != NATIVE_RUNTIME_SCHEMA_VERSION {
         write_runtime_context(host, account, &activated, request_id)?;
     }
     Ok(activated)
 }
 
-fn preview_runtime_context_activation(
+fn preview_runtime_record_activation(
     account: &AccountProfile,
-    context: NativeRuntimeContext,
+    record: NativeRuntimeRecord,
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
-    validate_runtime_record_identity(&context, account, request_id)?;
-    if context.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
-        validate_current_runtime_implementation(&context, account, request_id)?;
-        return Ok(context);
+    validate_runtime_record_identity(&record, account, request_id)?;
+    if record.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
+        validate_current_runtime_implementation(&record, account, request_id)?;
+        return Ok(NativeRuntimeContext { record });
     }
-    if context.schema_version == WRAPPER_NATIVE_RUNTIME_SCHEMA_VERSION {
-        validate_predecessor_runtime_implementation(&context, account, request_id)?;
-        return candidate_context(account, context.execution_env, request_id);
+    if record.schema_version == WRAPPER_NATIVE_RUNTIME_SCHEMA_VERSION {
+        validate_predecessor_runtime_implementation(&record, account, request_id)?;
+        return candidate_context(account, record.execution_env, request_id);
     }
-    let admitted = validate_predecessor_runtime_implementation(&context, account, request_id)?;
-    let selected_program = resolve_program(OPENCODE_NATIVE_PROGRAM, &context.execution_env)
+    let admitted = validate_predecessor_runtime_implementation(&record, account, request_id)?;
+    let selected_program = resolve_program(OPENCODE_NATIVE_PROGRAM, &record.execution_env)
         .ok_or_else(|| {
             native_runtime_failure(
                 request_id,
                 "the selected direct OpenCode implementation is unavailable during runtime identity upgrade",
             )
         })?;
-    if selected_program != Path::new(&context.program) {
+    if selected_program != Path::new(&record.program) {
         return Err(ProviderFailure::conflict(
             request_id,
             "native_runtime_context_conflict",
             "the selected direct OpenCode implementation changed before runtime identity upgrade",
             json!({
                 "account": account.opencode_wrapper,
-                "recorded_program": context.program,
+                "recorded_program": record.program,
                 "selected_program": selected_program,
             }),
         ));
@@ -768,25 +783,27 @@ fn preview_runtime_context_activation(
         .collect::<Vec<_>>();
     let identity_sha256 = runtime_identity_sha256(
         account.opencode_wrapper,
-        &context.program,
-        &context.program_sha256,
-        &context.execution_env,
+        &record.program,
+        &record.program_sha256,
+        &record.execution_env,
         OPENCODE_NATIVE_CONTRACT_ID,
         &fixed_args,
         (&approved.id, &approved.version),
     );
     Ok(NativeRuntimeContext {
-        schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
-        account_wrapper: account.opencode_wrapper.to_string(),
-        program: context.program,
-        program_sha256: context.program_sha256,
-        execution_env: context.execution_env,
-        native_contract_id: OPENCODE_NATIVE_CONTRACT_ID.to_string(),
-        fixed_args,
-        implementation_manifest_id: approved.id,
-        implementation_version: approved.version,
-        program_stamp: admitted.program_stamp,
-        identity_sha256,
+        record: NativeRuntimeRecord {
+            schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
+            account_wrapper: account.opencode_wrapper.to_string(),
+            program: record.program,
+            program_sha256: record.program_sha256,
+            execution_env: record.execution_env,
+            native_contract_id: OPENCODE_NATIVE_CONTRACT_ID.to_string(),
+            fixed_args,
+            implementation_manifest_id: approved.id,
+            implementation_version: approved.version,
+            program_stamp: admitted.program_stamp,
+            identity_sha256,
+        },
     })
 }
 
@@ -796,11 +813,11 @@ struct PredecessorImplementationAdmission {
 }
 
 fn validate_predecessor_runtime_implementation(
-    context: &NativeRuntimeContext,
+    record: &NativeRuntimeRecord,
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<PredecessorImplementationAdmission, ProviderFailure> {
-    if !durable_fs::is_executable_file(Path::new(&context.program))
+    if !durable_fs::is_executable_file(Path::new(&record.program))
         .map_err(|error| native_runtime_failure(request_id, error))?
     {
         return Err(native_runtime_failure(
@@ -811,7 +828,7 @@ fn validate_predecessor_runtime_implementation(
             ),
         ));
     }
-    let program = Path::new(&context.program);
+    let program = Path::new(&record.program);
     let program_stamp =
         native_program_stamp(program).map_err(|error| native_runtime_failure(request_id, error))?;
     let (program_sha256, program_bytes) =
@@ -819,7 +836,7 @@ fn validate_predecessor_runtime_implementation(
             .map_err(|error| native_runtime_failure(request_id, error))?;
     let observed_stamp =
         native_program_stamp(program).map_err(|error| native_runtime_failure(request_id, error))?;
-    if program_sha256 != context.program_sha256
+    if program_sha256 != record.program_sha256
         || observed_stamp != program_stamp
         || observed_stamp.byte_length != program_bytes as u64
     {
@@ -832,16 +849,16 @@ fn validate_predecessor_runtime_implementation(
             ),
             json!({
                 "account": account.opencode_wrapper,
-                "runtime_identity_sha256": context.identity_sha256,
-                "program": context.program,
+                "runtime_identity_sha256": record.identity_sha256,
+                "program": record.program,
             }),
         ));
     }
-    if context.schema_version == WRAPPER_NATIVE_RUNTIME_SCHEMA_VERSION {
+    if record.schema_version == WRAPPER_NATIVE_RUNTIME_SCHEMA_VERSION {
         // The predecessor wrapper is retained only as authenticated transition
         // evidence. It is never executed by this provider; candidate_context
         // must independently admit the reviewed direct implementation before
-        // activate_runtime_context publishes the schema-v4 successor.
+        // activate_runtime_record publishes the schema-v4 successor.
         return Ok(PredecessorImplementationAdmission {
             program_stamp,
             approved: None,
@@ -849,7 +866,7 @@ fn validate_predecessor_runtime_implementation(
     }
     let approved = native_implementation_manifest::approved_implementation(
         OPENCODE_NATIVE_PROGRAM,
-        &context.program_sha256,
+        &record.program_sha256,
         program_bytes,
     )
     .map_err(|error| native_runtime_failure(request_id, error))?
@@ -863,9 +880,9 @@ fn validate_predecessor_runtime_implementation(
             ),
             json!({
                 "account": account.opencode_wrapper,
-                "runtime_identity_sha256": context.identity_sha256,
-                "program": context.program,
-                "program_sha256": context.program_sha256,
+                "runtime_identity_sha256": record.identity_sha256,
+                "program": record.program,
+                "program_sha256": record.program_sha256,
                 "program_bytes": program_bytes,
                 "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
             }),
@@ -877,9 +894,9 @@ fn validate_predecessor_runtime_implementation(
             "the reviewed OpenCode implementation has the wrong semantic contract",
         ));
     }
-    if context.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION
-        && (context.implementation_manifest_id != approved.id
-            || context.implementation_version != approved.version)
+    if record.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION
+        && (record.implementation_manifest_id != approved.id
+            || record.implementation_version != approved.version)
     {
         return Err(native_runtime_failure(
             request_id,
@@ -893,17 +910,17 @@ fn validate_predecessor_runtime_implementation(
 }
 
 fn validate_current_runtime_implementation(
-    context: &NativeRuntimeContext,
+    record: &NativeRuntimeRecord,
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     validate_pinned_program(
-        Path::new(&context.program),
-        &context.program_sha256,
-        &context.implementation_manifest_id,
-        &context.implementation_version,
-        &context.native_contract_id,
-        &context.program_stamp,
+        Path::new(&record.program),
+        &record.program_sha256,
+        &record.implementation_manifest_id,
+        &record.implementation_version,
+        &record.native_contract_id,
+        &record.program_stamp,
     )
     .map_err(|error| {
         ProviderFailure::conflict(
@@ -915,8 +932,8 @@ fn validate_current_runtime_implementation(
             ),
             json!({
                 "account": account.opencode_wrapper,
-                "runtime_identity_sha256": context.identity_sha256,
-                "program": context.program,
+                "runtime_identity_sha256": record.identity_sha256,
+                "program": record.program,
             }),
         )
     })
@@ -1033,18 +1050,18 @@ fn runtime_lock_timeout(host: &HostContext, request_id: &str) -> Result<Duration
         .ok_or_else(|| native_runtime_lock_timeout(request_id))
 }
 
-fn read_runtime_context(
+fn read_runtime_record(
     host: &HostContext,
     account: &AccountProfile,
     request_id: &str,
-) -> Result<Option<NativeRuntimeContext>, ProviderFailure> {
+) -> Result<Option<NativeRuntimeRecord>, ProviderFailure> {
     let path = runtime_context_path(host, account, request_id)?;
     let bytes = match durable_fs::read_file_bounded(&path, MAX_NATIVE_RUNTIME_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(native_runtime_failure(request_id, error)),
     };
-    serde_json::from_slice(&bytes)
+    serde_json::from_slice::<NativeRuntimeRecord>(&bytes)
         .map(Some)
         .map_err(|error| native_runtime_failure(request_id, error))
 }
@@ -1061,7 +1078,7 @@ fn write_runtime_context(
         .expect("native runtime context path always has a parent");
     durable_fs::create_private_directories(parent)
         .map_err(|error| native_runtime_failure(request_id, error))?;
-    let bytes = serde_json::to_vec_pretty(context)
+    let bytes = serde_json::to_vec_pretty(&context.record)
         .map_err(|error| native_runtime_failure(request_id, error))?;
     if bytes.len() > MAX_NATIVE_RUNTIME_STATE_BYTES {
         return Err(native_runtime_state_capacity(request_id, bytes.len()));
