@@ -729,6 +729,12 @@ fn attach_launch_delivery_marker(
     mut stdin: Option<String>,
     delivery_nonce: &str,
 ) -> (Vec<String>, Option<String>) {
+    // Product decision: the pinned native boundary has no out-of-band,
+    // crash-surviving request identity. Every admitted payload therefore
+    // carries this provider-authored item so response-loss recovery can remain
+    // request-local and at-most-once. It is intentionally model-visible and is
+    // not claimed to preserve byte-exact caller-payload semantics; README and
+    // the native-state contract define the affected actors and fidelity cost.
     let marker = resume_observation::delivery_marker(delivery_nonce);
     if stdin
         .as_ref()

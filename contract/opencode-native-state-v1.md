@@ -66,6 +66,17 @@ edge:
 - `run --format json` may create or advance one session in the bound namespace.
   JSON events are transport observations, while durable provider custody and
   later list/export reconciliation own ambiguous response or process failure.
+  OpenCode exposes no out-of-band request-local identity that both survives
+  provider loss and distinguishes identical sibling turns. The provider
+  therefore deliberately appends one reserved, provider-authored
+  `[OULIPOLY-DELIVERY <64-lowercase-hex-digest>]` item to every actual child
+  payload. This chooses crash-safe at-most-once recovery over byte-exact
+  caller-payload fidelity: the model may observe the item, it is not claimed to
+  be semantically neutral, and native/session exports preserve it inside the
+  native `role=user` transport message without claiming human authorship.
+  There is no opt-out because an unmarked launch cannot provide the same
+  request-local recovery proof; exact-complete-payload workloads are outside
+  this adapter's launch-fidelity contract.
 - `session list --format json` is the bounded set of sessions visible in the
   bound namespace at that invocation. The native edge translates every row
   once into a typed provider observation with one canonical non-empty session

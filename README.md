@@ -291,6 +291,25 @@ most 2 MiB of list output, and shares one five-second/host-deadline budget acros
 listing and candidate exports.
 Non-Unix builds do not admit native launch because they cannot provide this
 process-group custody contract.
+
+The embedded delivery identity is an explicit provider product tradeoff, not a
+claim of byte-exact prompt fidelity. The provider chooses crash-safe,
+request-local at-most-once recovery over preserving the exact caller payload at
+the native model boundary: every admitted launch appends one reserved
+`[OULIPOLY-DELIVERY <64-lowercase-hex-digest>]` item, including launches that
+never need recovery. The caller's bytes remain an unmodified prefix, but the
+model can observe the appended provider-authored item and the provider does not
+claim that it is semantically neutral. OpenCode records the item inside its
+native `role=user` message; that role names the native transport role and does
+not mean the item was authored by the human caller. `session.read_turns` and
+canonical export deliberately preserve that native history, so transcript
+consumers that need a human-authored-only view must recognize the reserved
+provider item rather than attributing it to the caller. There is no fidelity
+opt-out: omitting the identity would make response-loss recovery unable to
+distinguish identical sibling submissions. Workloads requiring the exact
+caller payload to be the complete model-visible or exported user text are
+therefore outside this provider's launch-fidelity contract.
+
 Reusing the request ID with different launch inputs is rejected as a conflict.
 Launch records also retain a settings-independent digest of the original host
 app and complete request parameters. Exact retries inspect that immutable
@@ -326,7 +345,9 @@ session, route, payload digest, provider-authored delivery nonce, observation
 timestamp, and original recovery-command context. The same nonce is embedded
 in the actual child payload and is required for transcript recovery, so
 identical sibling prompts cannot become request-local submission or completion
-evidence. Legacy durable records without that identity remain unresolved.
+evidence. This resumed-turn path has the same explicit recovery-over-fidelity
+decision and reserved provider authorship described above. Legacy durable
+records without that identity remain unresolved.
 Post-spawn run events remain withheld until
 the corresponding observation is durable. Recovery of a prepared, legacy
 terminal, submission-observed, or unresolved record may perform one bounded
