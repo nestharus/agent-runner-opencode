@@ -10,6 +10,28 @@ file and queried through the ChatGPT usage endpoint with a durably bound
 in-process HTTPS adapter; Codex configuration and credentials are neither read
 nor modified.
 
+## Capability map
+
+Each row names one maintainer-facing reasoning boundary. Capability sections
+below own their local decisions and invariants; shared custody and filesystem
+sections own only the mechanisms reused across capabilities.
+
+| Capability or shared boundary | Primary source owner |
+| --- | --- |
+| Account and settings identity, transactions, and migration | `src/account.rs`, `src/settings.rs`, `src/settings_definition.rs`, `src/migration.rs` |
+| Model catalog, runtime selection, and launch policy | `src/models.rs`, `src/runtime_selection.rs`, `src/policy.rs` |
+| Launch, new-session recovery, and resumed-turn recovery | `src/launch.rs`, `src/resume_observation.rs`, `src/terminal.rs` |
+| Session capture, canonical projection, and enumeration | `src/session.rs`, `src/opencode.rs` |
+| Quota observation and credential refresh settlement | `src/quota.rs`, `src/quota_adapter.rs`, `src/quota_observer.rs` |
+| Rotation assessment and materialization | `src/rotation.rs` |
+| Setup readiness and native-identity rebind | `src/setup.rs`, `src/native_runtime.rs`, `src/quota_observer.rs` |
+| Shared request/effect custody and native child ownership | `src/request_custody.rs`, `src/native_process.rs`, `src/child_custody.rs` |
+| Shared filesystem confinement and durable publication | `src/path_guard.rs`, `src/durable_fs.rs` |
+| Operational activity evidence | `src/activity.rs` |
+| External envelope, dispatch, and schemas | `src/envelope.rs`, `src/dispatch.rs`, `src/schema.rs` |
+
+## Account and settings identities
+
 The provider recognizes five account-pinned wrappers, `opencode1` through
 `opencode5`. The selected settings record, logical wrapper command, session commands,
 auth path, quota probe, refresh command, and rotation target must resolve to
@@ -36,6 +58,9 @@ IDs returned by `settings.create`. A record carries its ID, version, account,
 and either an exact stored route or the explicit
 `model.selection=requested` policy.
 Policy evidence publishes that record identity and its effective account.
+
+## Rotation binding identity
+
 Rotation preserves `source_provider` and `target_provider` as opaque host
 provider-instance identities. Provider-local `source_account` and
 `target_account` parameters are resolved separately, and the decision receipt
@@ -47,8 +72,11 @@ assessment to an exact record ID, version, and account for the target account.
 The provider authorization returns that `settings_selection`; materialization
 must echo its `settings_version` and `settings_account`, and the binding,
 operation, decision receipt, and materialization receipt retain the same
-selection. The host plan hash-binds the decision artifact. Stores written
-by the prior schema are
+selection. The host plan hash-binds the decision artifact.
+
+## Settings compatibility and installed-base cutover
+
+Stores written by the prior schema are
 compatibility-projected to the current OpenCode-owned account, quota, and model
 shape while preserving record IDs and versions; the next mutation writes the
 upgraded store schema. A predecessor-produced store above the current 4 MiB or
@@ -70,6 +98,9 @@ that cannot be routed remains listable with a `repair_required` migration
 summary instead of rejecting the shared store; selecting that record fails with
 its settings diagnostics, while its preserved ID and version allow an in-band
 update or delete. Unrelated projected records remain fully usable.
+
+## Setup readiness and caller activation
+
 `setup.detect` runs this same bounded, parsed-schema transition preflight
 against the exact `host.config_root` store. A predecessor store above the
 current 256-record/4 MiB envelope is reported as
@@ -94,12 +125,15 @@ one account.
 This prevents cutover from removing every settings-selected route before its
 required reducer has run or declaring an installation ready while established
 provider-name callers still lack exact records.
+
+## Rotation authorization admission
+
 Rotation assessment and materialization share one provider-state lock, so a
 decision cannot race native materialization. A denied assessment durably removes
 any earlier binding-matched authorization—including parent-directory
 synchronization on an already-absent retry—before reporting denial.
 
-## Model routes
+## Model catalog and launch policy
 
 One catalog in `src/models.rs` owns alias matching and every public or launch
 projection. The current routes are:
@@ -145,6 +179,19 @@ so policy retains their presence and rejects the launch as
 `unsupported_system_prompt_override` or `unsupported_tool_restrictions`
 instead of silently discarding owner-selected launch policy.
 
+## Shared request and native-effect custody
+
+`src/request_custody.rs` owns the bounded active/replay admission algorithm used
+by launch and `quota.refresh_auth`; `src/native_process.rs` and
+`src/child_custody.rs` own native actor publication, termination, and reaping.
+Those shared mechanisms do not own a capability's route, session, credential,
+or terminal meaning. The quota and launch sections below define their separate
+bindings, observations, reconciliation rules, and replay results.
+
+## Quota observation and credential refresh
+
+### Quota observation
+
 Quota probing likewise converges on a typed `QuotaObservation`. The native
 adapter translates authenticated WHAM HTTP responses directly into that type.
 Source-aware failures retain whether auth-file parsing or WHAM
@@ -156,6 +203,8 @@ failures project actionable advice to call the separately durable
 lifecycle. Refresh availability is decided from the typed probe, and the quota
 command projects the observation or failure once into the public result.
 
+### Credential-change settlement
+
 The OpenCode auth crossing does not equate a zero-exit `auth list` with a
 refresh. It returns a typed observation that distinguishes command success from
 an observed before/after change in the selected credential source. The public
@@ -166,6 +215,8 @@ durably preserves that partial effect as `reconciliation_required` instead of
 publishing `refreshed: false`. Post-spawn observation failures and an
 unobservable credential state use the same fail-closed handoff; failures proven
 to occur before child effect capability may settle as no refresh.
+
+### Durable refresh custody and reconciliation
 
 `quota.refresh_auth` also takes durable custody of each request before admitting
 the native auth command. The request binding includes the complete parameter
@@ -229,7 +280,7 @@ lose their active reserve. Each record is capped at 256 KiB. The selected auth f
 through a 1 MiB bound, access tokens and account IDs have explicit field bounds,
 and the in-process WHAM response is limited to 512 KiB and 20 seconds.
 
-## Invocation and lifecycle
+## Invocation framing and child supervision
 
 The one-shot invocation form is:
 
@@ -264,6 +315,10 @@ Independent stdout and stderr pipes are sequenced in
 provider receipt order; the provider makes no
 claim about an unknowable pre-receipt cross-pipe emission order.
 
+## Launch and recovery
+
+### New-session custody and recovery
+
 Before a new-session child is spawned, launch stages its complete stdin and
 durably binds the request ID to the accepted route and prompt digest. The route
 event must also be handed off before spawn; a failed pre-spawn handoff durably
@@ -292,6 +347,8 @@ listing and candidate exports.
 Non-Unix builds do not admit native launch because they cannot provide this
 process-group custody contract.
 
+### Delivery identity and transcript fidelity
+
 The embedded delivery identity is an explicit provider product tradeoff, not a
 claim of byte-exact prompt fidelity. The provider chooses crash-safe,
 request-local at-most-once recovery over preserving the exact caller payload at
@@ -309,6 +366,8 @@ opt-out: omitting the identity would make response-loss recovery unable to
 distinguish identical sibling submissions. Workloads requiring the exact
 caller payload to be the complete model-visible or exported user text are
 therefore outside this provider's launch-fidelity contract.
+
+### Launch request custody and replay
 
 Reusing the request ID with different launch inputs is rejected as a conflict.
 Launch records also retain a settings-independent digest of the original host
@@ -334,6 +393,8 @@ completed history cannot consume its admission reserve or make admission work
 proportional to active payload volume or replay history. Shared replay pins
 prevent cyclic eviction while an exact caller crosses from capacity admission
 to its request lock.
+
+### Resumed-turn custody and recovery
 
 For resumed sessions, model switching is allowed per turn. During the normal
 launch, matching bounded `opencode run --format json` `step_start` and successful
@@ -368,11 +429,15 @@ If a lingering OpenCode process is terminated after response confirmation,
 the exit event retains the real process signal while a separate marker records
 the confirmed application response.
 
+## Session capture
+
 `session.capture` accepts several compatibility-era evidence carriers at its
 external boundary. It translates every non-empty carrier into one typed
 candidate set with provenance and rejects the request if any simultaneously
 supplied session identities disagree; priority never erases conflicting launch,
 lifecycle, pinned-target, bare, or live-report evidence.
+
+## Rotation assessment and materialization
 
 Generic canonical `session.replace` remains unsupported: OpenCode has no
 stable canonical-transcript replacement API. Rotation's native full-session
@@ -425,6 +490,8 @@ settled settings selections. Before applying the host plan, the host reads that
 referenced artifact, verifies its advertised schema and digest, and confirms that
 the settled record ID/version/account remains current.
 
+## Session enumeration and canonical projection
+
 `session.enumerate` materializes one bounded, request-bound private snapshot on
 the first page, including an empty or otherwise terminal first page, instead of
 relisting the native population during response recovery or for every cursor.
@@ -475,7 +542,7 @@ successful provider-local flush; expiry maintenance retires it. This preserves
 consumer recovery without adding an unbounded result population.
 An above-bound native population fails explicitly.
 
-## State, evidence, and authority
+## Settings transactions and migration
 
 Settings are stored under `host.config_root/agent-runner-opencode` using an
 interprocess lock and atomic file transactions. The same transaction records a
@@ -508,6 +575,8 @@ summaries with a 30-day retention window.
 `opencode.settings/v1` JSON schema and its executable domain validation;
 `schema` projects that definition and `settings` owns record lifecycle.
 
+## Operational activity evidence
+
 When `host.data_root` is present, a redacted hash-chained activity ledger is
 written under `provider-state/opencode/activity`. It joins requests across
 policy, launch, session, quota, settings, migration, and rotation without
@@ -527,6 +596,14 @@ at 4,096 events or 8 MiB without rereading and rewriting the full history on
 every invocation. The head's first sequence and predecessor digest expose the
 retention boundary. Activity-target deduplication uses a hash set, so a settings
 list does not perform quadratic scans as identities accumulate.
+
+Activity evidence is operational and explicitly best-effort. A directory,
+lock, write, or chain-validation failure is emitted as a stderr warning but
+does not deny or change the capability result. The recorder never appends past
+a malformed chain; operators must repair or archive that ledger to restore
+continuous evidence.
+
+## Shared filesystem confinement and durable publication
 
 Settings, migration, activity, and rotation all pass every provider-owned
 filesystem target through the same lexical and canonical confinement guard
@@ -551,6 +628,8 @@ lock. Both steady-state relationships are therefore independent of
 caller-selected host path depth, and activity loss still never changes a
 capability result.
 
+## Native runtime identity and admission
+
 Every native effect also passes through one durable runtime context per
 numbered account under `host.data_root/provider-state/opencode/native-runtimes`.
 The context privately records the canonical absolute `opencode` implementation,
@@ -574,6 +653,8 @@ stable environment or changed direct implementation is rejected
 before another native effect rather than silently addressing a second state
 namespace with the same account/session labels.
 
+### Runtime timeout policy
+
 The provider owns a finite `2000000000` millisecond (about 23.1 days) fallback
 for OpenCode's per-Bash default timeout so long-running agent work is not
 prematurely terminated by a shorter native default. An explicit
@@ -582,6 +663,8 @@ takes precedence and is bound into the durable runtime identity. The optional
 host deadline remains the outer operation limit; when it is absent, the
 provider deliberately favors completion over the corresponding longer resource
 occupancy, with the finite per-Bash fallback as the ceiling.
+
+### Predecessor runtime upgrades
 
 Predecessor schema-v1 wrapper, schema-v2 direct runtime, and schema-v3
 manifest-bound runtime records are validated against their recorded bytes, then
@@ -602,6 +685,8 @@ without a metadata stamp perform the bounded content check during exceptional
 recovery; records without complete manifest evidence are retained for terminal
 reconciliation but never execute an unbound recovery program.
 
+## Quota-observer identity and transport
+
 Quota probes use a separate durable implementation context under
 `host.data_root/provider-state/opencode/quota-observers`. The first probe for an
 account records a source-included in-process transport identity derived from the
@@ -615,6 +700,8 @@ supplies credentials only as fixed request headers, and accepts no
 environment-selected transport branch. Auth refresh binds both
 the native OpenCode runtime identity and this quota-observer identity before it
 admits a credential mutation.
+
+## Setup dependency readiness
 
 `setup.detect` reports provider-wide `installed=true` only after every logical
 account agrees with the identities its effect paths will use. When an account
@@ -635,7 +722,7 @@ readiness. Native runtime admission enforces executable-file status;
 quota-observer admission instead validates the source-included adapter and
 dependency-lock identity before reuse.
 
-### Native dependency identity upgrades
+## Native dependency identity rebind
 
 Native-runtime implementations and quota-observer provider builds must not be
 replaced while their identity is admitted. This provider owns the separately versioned
@@ -654,15 +741,21 @@ is implicitly replaced with the other. The authoritative
 its intentionally open setup objects carry this explicitly named provider
 extension rather than silently redefining the shared contract.
 
+### Provider extension schemas
+
 The provider-owned `opencode.rotation-decision/v1` schema similarly defines the
 hash-bound decision artifact referenced by the unchanged shared rotation host
 plan. It keeps settings-route settlement detail in a separately named provider
 protocol instead of adding fields to the pinned Agent Runner rotation schema.
 
+### Rebind resource bounds
+
 Native-runtime and quota-observer identity state reads and writes are capped at 1 MiB, executable
 identity hashing is streamed and capped at 256 MiB, and their per-account lock admission is
 bounded by the earlier host deadline or five seconds. A lock timeout fails the
 request with a named identity-lock result rather than waiting indefinitely.
+
+### Rebind choreography
 
 1. The host stops ordinary admission for capabilities that consume the selected
    profile/component identity. It gives every affected in-flight provider request
@@ -712,6 +805,8 @@ request with a named identity-lock result rather than waiting indefinitely.
    retry replays the durable terminal result and the same authorization without
    consulting later component state.
 
+### Rebind replay and retention
+
 Each profile/component retains at most 64 cycle records. Plan publication
 durably records `awaiting_host_drain`; an exact Plan retry reconstructs its
 operation and Seal request from that stored record before consulting mutable
@@ -725,6 +820,8 @@ that cycle. A later plan request receives a new cycle identity even when its
 prior and observed component evidence are byte-identical, and therefore must
 complete its own observation and host-release handoff. An expired terminal
 replay fails closed and must restart from a new plan request.
+
+### Rebind settlement authority
 
 Private state paths are included only as implementation evidence, not as the
 protocol's meaning. A component commit reaches release only when its semantic
@@ -740,6 +837,8 @@ After obligations are settled, the declared cutover bound is one
 operation. This drain/reconcile/reset boundary preserves the old identities for
 recovery while giving wrapper and observer upgrades an explicit restoration
 path.
+
+## Rotation capacity, concurrency, and retention
 
 Rotation assessment and materialization use 64 deterministic binding-lock
 stripes, so the full native interval serializes only identical bindings (plus a
@@ -772,11 +871,7 @@ operation record, while prepared/imported operations remain until safely
 finalized. Artifact and decision collections are capped at 128 records, so
 crash-orphaned publications cannot grow without bound.
 
-Activity evidence is operational and explicitly best-effort. A directory,
-lock, write, or chain-validation failure is emitted as a stderr warning but
-does not deny or change the capability result. The recorder never appends past
-a malformed chain; operators must repair or archive that ledger to restore
-continuous evidence.
+## Host principal and delegation boundary
 
 The v1 host envelope supplies a request ID and optional provider instance ID,
 but no authenticated human/service principal or delegation. The provider
