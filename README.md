@@ -247,9 +247,12 @@ return until a successful wait discharges it. Drain queues and terminal-capture
 tails are bounded. Native event framing consumes each received byte once and
 retains at most 1 MiB for an incomplete metadata line; an over-bound line is
 reported as an integrity failure and skipped through its next newline while
-the raw stream continues unchanged. Pipe read failures, malformed native
-events, and capture truncation are emitted as explicit evidence markers. Independent stdout and
-stderr pipes are sequenced in provider receipt order; the provider makes no
+the raw stream continues unchanged. Launch retains at most 32 representative
+integrity failures of 512 bytes each for its full lifetime, counts later
+omissions, and caps the encoded terminal integrity marker at 32 KiB. Pipe read
+failures, malformed native events, and capture truncation are emitted as
+explicit evidence markers. Independent stdout and stderr pipes are sequenced in
+provider receipt order; the provider makes no
 claim about an unknowable pre-receipt cross-pipe emission order.
 
 Before a new-session child is spawned, launch stages its complete stdin and

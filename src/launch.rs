@@ -47,6 +47,9 @@ const DRAIN_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 const DRAIN_CHANNEL_CAPACITY: usize = 32;
 const TERMINAL_CAPTURE_LIMIT: usize = 1024 * 1024;
 const DEFERRED_EVENT_LIMIT: usize = 1024 * 1024;
+const MAX_LAUNCH_INTEGRITY_FAILURES: usize = 32;
+const MAX_LAUNCH_INTEGRITY_FAILURE_DETAIL_BYTES: usize = 512;
+const MAX_LAUNCH_INTEGRITY_EVIDENCE_BYTES: usize = 32 * 1024;
 const LAUNCH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LAUNCH_RECOVERY_SESSIONS: usize = 256;
 const MAX_LAUNCH_RECOVERY_CANDIDATES: usize = 8;
@@ -2595,6 +2598,7 @@ struct LaunchState {
     stdout_truncated: bool,
     stderr_truncated: bool,
     integrity_failures: Vec<String>,
+    integrity_failures_omitted: u64,
     parser: EventParser,
     last_opencode_event: Option<OpencodeEventMetadata>,
     completed_resume_at: Option<Instant>,
@@ -2633,6 +2637,7 @@ impl LaunchState {
             stdout_truncated: false,
             stderr_truncated: false,
             integrity_failures: Vec::new(),
+            integrity_failures_omitted: 0,
             parser: EventParser::default(),
             last_opencode_event: None,
             completed_resume_at: None,
@@ -2683,7 +2688,7 @@ impl LaunchState {
                 } else {
                     self.stderr_done = true;
                 }
-                self.integrity_failures.push(format!(
+                self.record_integrity_failure(format!(
                     "{} pipe read failed: {message}",
                     if stdout { "stdout" } else { "stderr" }
                 ));
@@ -2881,12 +2886,39 @@ impl LaunchState {
     }
 
     fn record_parser_errors(&mut self) {
-        self.integrity_failures.extend(
-            self.parser
-                .take_errors()
-                .into_iter()
-                .map(|error| format!("native event parse failed: {error}")),
-        );
+        for error in self.parser.take_errors() {
+            self.record_integrity_failure(format!("native event parse failed: {error}"));
+        }
+    }
+
+    fn record_integrity_failure(&mut self, failure: String) {
+        if self.integrity_failures.len() >= MAX_LAUNCH_INTEGRITY_FAILURES {
+            self.integrity_failures_omitted = self.integrity_failures_omitted.saturating_add(1);
+            return;
+        }
+        self.integrity_failures
+            .push(bounded_integrity_failure_detail(failure));
+    }
+
+    fn integrity_evidence_value(&self) -> Option<Value> {
+        if self.integrity_failures.is_empty() && self.integrity_failures_omitted == 0 {
+            return None;
+        }
+        let evidence = json!({
+            "failures": self.integrity_failures,
+            "retained_failure_count": self.integrity_failures.len(),
+            "omitted_failure_count": self.integrity_failures_omitted,
+        });
+        if evidence.to_string().len() <= MAX_LAUNCH_INTEGRITY_EVIDENCE_BYTES {
+            return Some(evidence);
+        }
+        Some(json!({
+            "failures": ["launch integrity evidence exceeded its encoded bound"],
+            "retained_failure_count": 0,
+            "omitted_failure_count": self
+                .integrity_failures_omitted
+                .saturating_add(self.integrity_failures.len() as u64),
+        }))
     }
 
     fn completed_resume_grace_elapsed(&self) -> bool {
@@ -3123,8 +3155,9 @@ impl LaunchState {
                 .iter()
                 .any(|failure| failure == "pre-session event projection buffer exhausted")
             {
-                self.integrity_failures
-                    .push("pre-session event projection buffer exhausted".to_string());
+                self.record_integrity_failure(
+                    "pre-session event projection buffer exhausted".to_string(),
+                );
             }
             return Ok(());
         }
@@ -3203,10 +3236,10 @@ impl LaunchState {
                 writer,
             )?;
         }
-        if !self.integrity_failures.is_empty() {
+        if let Some(evidence) = self.integrity_evidence_value() {
             self.marker_with_value(
                 "oulipoly.launch_evidence_loss".to_string(),
-                json!({ "failures": self.integrity_failures.clone() }),
+                evidence,
                 writer,
             )?;
         }
@@ -3224,6 +3257,19 @@ impl LaunchState {
         self.stdout_done = true;
         self.stderr_done = true;
     }
+}
+
+fn bounded_integrity_failure_detail(mut failure: String) -> String {
+    if failure.len() <= MAX_LAUNCH_INTEGRITY_FAILURE_DETAIL_BYTES {
+        return failure;
+    }
+    let mut end = MAX_LAUNCH_INTEGRITY_FAILURE_DETAIL_BYTES.saturating_sub(3);
+    while !failure.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    failure.truncate(end);
+    failure.push_str("...");
+    failure
 }
 
 fn invalid_launch_params_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
@@ -3481,6 +3527,43 @@ fn json_write_failure(request_id: &str, err: serde_json::Error) -> ProviderFailu
         "launch_write_error",
         format!("failed to write launch event: {err}"),
     )
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[test]
+    fn launch_integrity_evidence_has_lifetime_count_detail_and_encoding_bounds() {
+        let mut state = LaunchState::new("request-integrity", None, None, json!({}), None);
+        for index in 0..MAX_LAUNCH_INTEGRITY_FAILURES + 17 {
+            state.record_integrity_failure(format!("{index}:{}", "é".repeat(1024)));
+        }
+
+        assert_eq!(
+            state.integrity_failures.len(),
+            MAX_LAUNCH_INTEGRITY_FAILURES
+        );
+        assert_eq!(state.integrity_failures_omitted, 17);
+        assert!(state
+            .integrity_failures
+            .iter()
+            .all(|failure| failure.len() <= MAX_LAUNCH_INTEGRITY_FAILURE_DETAIL_BYTES));
+        let evidence = state
+            .integrity_evidence_value()
+            .expect("bounded integrity evidence");
+        assert_eq!(
+            evidence["retained_failure_count"],
+            MAX_LAUNCH_INTEGRITY_FAILURES
+        );
+        assert_eq!(evidence["omitted_failure_count"], 17);
+        assert!(
+            serde_json::to_vec(&evidence)
+                .expect("encode integrity evidence")
+                .len()
+                <= MAX_LAUNCH_INTEGRITY_EVIDENCE_BYTES
+        );
+    }
 }
 
 #[cfg(test)]
