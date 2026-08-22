@@ -246,11 +246,15 @@ fn contract_session_enumerate_packs_the_maximum_snapshot_population() {
         "data_root": data_root.to_string_lossy()
     });
 
+    let first_request = support::request_envelope(
+        "session.enumerate",
+        session_enumerate_limit_params(1),
+        host.clone(),
+    );
     let first = success_result(
-        invoke_with_host_and_env(
+        support::invoke_with_request_and_env(
             "session.enumerate",
-            session_enumerate_limit_params(1),
-            host,
+            first_request.clone(),
             &[("PATH", path.as_str())],
         ),
         "session.schema.json#/$defs/SessionEnumerateResponse",
@@ -259,6 +263,17 @@ fn contract_session_enumerate_packs_the_maximum_snapshot_population() {
     assert_eq!(first["sessions"].as_array().map(Vec::len), Some(1));
     assert_eq!(first["complete"], false);
 
+    let exact_first_retry = success_result(
+        support::invoke_with_request_and_env(
+            "session.enumerate",
+            first_request,
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_eq!(exact_first_retry, first);
+
     let snapshot_root = data_root.join("provider-state/opencode/session-enumeration-snapshots");
     let snapshot_directories = fs::read_dir(&snapshot_root)
         .expect("read packed snapshot root")
@@ -266,7 +281,8 @@ fn contract_session_enumerate_packs_the_maximum_snapshot_population() {
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .collect::<Vec<_>>();
     assert_eq!(snapshot_directories.len(), 1);
-    let mut snapshot_files = fs::read_dir(snapshot_directories[0].path())
+    let snapshot_directory = snapshot_directories[0].path();
+    let mut snapshot_files = fs::read_dir(&snapshot_directory)
         .expect("read packed snapshot")
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
@@ -276,6 +292,52 @@ fn contract_session_enumerate_packs_the_maximum_snapshot_population() {
         snapshot_files,
         vec!["manifest.json", "rows.bin", "warnings.json"],
         "the maximum admitted population must use a fixed file count"
+    );
+    let manifest_bytes = fs::metadata(snapshot_directory.join("manifest.json"))
+        .expect("read maximum-population manifest metadata")
+        .len();
+    assert!(
+        manifest_bytes > 16 * 1024 && manifest_bytes <= 32 * 1024,
+        "the maximum-population manifest must fit its authored read/write envelope: {manifest_bytes}"
+    );
+
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("maximum-population first-page cursor");
+    let terminal = success_result(
+        invoke_with_host_and_env(
+            "session.enumerate",
+            session_enumerate_cursor_params(255, cursor),
+            host,
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    let terminal_sessions = terminal["sessions"]
+        .as_array()
+        .expect("maximum-population terminal sessions");
+    assert_eq!(terminal_sessions.len(), 255);
+    assert_eq!(
+        terminal_sessions[0]["provider_session_id"],
+        "ses-packed-001"
+    );
+    assert_eq!(
+        terminal_sessions[254]["provider_session_id"],
+        "ses-packed-255"
+    );
+    assert_eq!(terminal["complete"], true);
+    assert!(terminal["next_cursor"].is_null());
+
+    let snapshot_directories = fs::read_dir(&snapshot_root)
+        .expect("read packed snapshot root")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshot_directories.len(),
+        0,
+        "the maximum admitted population must remain readable through terminal handoff and retire after response flush"
     );
 
     fs::remove_dir_all(&data_root).expect("remove packed session snapshot data root");

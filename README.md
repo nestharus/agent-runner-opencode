@@ -400,9 +400,12 @@ admitted population are each capped at 256, list capture at 2 MiB, each row at
 64 KiB, and each snapshot at 4 MiB. At most 32
 abandoned snapshots are retained for 15 minutes; continuation cursors read only
 the requested rows from one packed row file using manifest-bound offsets and
-per-row hashes. Snapshot publication has a fixed three-file shape and one
-directory synchronization regardless of row count, rather than one durable
-file transaction per row. A terminal snapshot is retired only after the complete
+per-row hashes. Snapshot manifests have one shared 32 KiB publication/read
+ceiling, large enough for the complete 256-row offset and hash population, and
+publication rejects an over-ceiling manifest before returning a cursor.
+Snapshot publication has a fixed three-file shape and one directory
+synchronization regardless of row count, rather than one durable file
+transaction per row. A terminal snapshot is retired only after the complete
 response is successfully written and flushed; a failed write or flush preserves
 the cursor for an exact retry. Before the terminal page is exposed, its manifest
 durably claims that handoff for the continuation request; a different terminal

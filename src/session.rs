@@ -53,7 +53,7 @@ const MAX_ENUMERATION_PAGE_SIZE: usize = 256;
 const MAX_ENUMERATION_SNAPSHOTS: usize = 32;
 const MAX_ENUMERATION_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENUMERATION_ENTRY_BYTES: usize = 64 * 1024;
-const MAX_ENUMERATION_MANIFEST_BYTES: usize = 16 * 1024;
+const MAX_ENUMERATION_MANIFEST_BYTES: usize = 32 * 1024;
 const MAX_ENUMERATION_WARNINGS_BYTES: usize = 256 * 1024;
 const MAX_ENUMERATION_WARNINGS: usize = 32;
 
@@ -941,8 +941,7 @@ fn persist_enumeration_snapshot(
         last_page_claim_end: Some(first_page_end),
         terminal_claim_request_sha256: complete.then_some(initial_request_sha256.clone()),
     };
-    let bytes = serde_json::to_vec(&manifest)
-        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    let bytes = encode_enumeration_snapshot_manifest(&manifest, request_id)?;
     write_enumeration_snapshot_file(&snapshot_root.join("manifest.json"), &bytes)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
     Ok(EnumeratePage {
@@ -1043,8 +1042,7 @@ fn load_enumeration_snapshot_page(
         }
     }
     if advances_cursor {
-        let bytes = serde_json::to_vec(&manifest)
-            .map_err(|error| session_snapshot_failure(request_id, error))?;
+        let bytes = encode_enumeration_snapshot_manifest(&manifest, request_id)?;
         write_enumeration_snapshot_file(&snapshot_root.join("manifest.json"), &bytes)
             .map_err(|error| session_snapshot_failure(request_id, error))?;
     }
@@ -1330,6 +1328,21 @@ fn snapshot_manifest(
     )
     .map_err(|error| session_snapshot_failure(request_id, error))?;
     serde_json::from_slice(&bytes).map_err(|error| session_snapshot_failure(request_id, error))
+}
+
+fn encode_enumeration_snapshot_manifest(
+    manifest: &EnumerationSnapshotManifest,
+    request_id: &str,
+) -> Result<Vec<u8>, ProviderFailure> {
+    let bytes = serde_json::to_vec(manifest)
+        .map_err(|error| session_snapshot_failure(request_id, error))?;
+    if bytes.len() > MAX_ENUMERATION_MANIFEST_BYTES {
+        return Err(session_snapshot_capacity_failure(
+            request_id,
+            "the session snapshot manifest exceeds its supported encoded-size bound",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn write_enumeration_snapshot_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
