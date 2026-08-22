@@ -1501,6 +1501,9 @@ fn admit_and_observe_import(
     })?;
     publish_rotation_import_actor(host, binding, operation, prepared.actor(), request_id)?;
     let observed = prepared.observe(import_timeout);
+    if let Ok(target_session_id) = observed.as_deref() {
+        preserve_import_candidate(host, binding, operation, target_session_id, request_id)?;
+    }
     require_rotation_import_actor_terminal(operation, request_id)?;
     if let Err(error) = write_rotation_operation(host, binding, operation, request_id) {
         return Err(rotation_recovery_required(
@@ -1533,7 +1536,7 @@ fn admit_and_observe_import(
         target_runtime,
         operation,
         &target_session_id,
-        true,
+        false,
         budget,
         request_id,
     )

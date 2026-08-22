@@ -171,8 +171,8 @@ impl RotationOpencodeFixture {
         Self::configured(false, Some(target_session_id), false, false, true, false, 0)
     }
 
-    pub fn with_live_import_descendant() -> Self {
-        Self::configured(false, None, false, false, false, true, 0)
+    pub fn with_live_import_descendant_and_target_id(target_session_id: &str) -> Self {
+        Self::configured(false, Some(target_session_id), false, false, false, true, 0)
     }
 
     pub fn with_oversized_export() -> Self {

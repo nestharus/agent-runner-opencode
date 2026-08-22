@@ -3370,7 +3370,9 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
 #[test]
 fn contract_rotation_waits_for_descendants_after_import_leader_exit() {
     let host = HostRoots::new("agent-runner-opencode-rotation-import-descendant");
-    let opencode = RotationOpencodeFixture::with_live_import_descendant();
+    let target_session_id = "ses_descendant_target_contract_d";
+    let opencode =
+        RotationOpencodeFixture::with_live_import_descendant_and_target_id(target_session_id);
     let _ = success_result(
         invoke_validated_with_host(
             "rotation.assess",
@@ -3416,6 +3418,10 @@ fn contract_rotation_waits_for_descendants_after_import_leader_exit() {
     .expect("parse descendant-bound rotation operation");
     assert_eq!(operation["phase"], "prepared");
     assert!(operation["import_actor_terminal_at_unix_ms"].is_null());
+    assert_eq!(
+        operation["import_candidate_session_id"], target_session_id,
+        "the leader's parsed target identity must survive while descendants remain live"
+    );
 
     let blocked = support::invoke_with_request_and_env(
         "rotation.materialize",
@@ -3456,7 +3462,11 @@ fn contract_rotation_waits_for_descendants_after_import_leader_exit() {
         );
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
-    assert_rotation_materialized(&materialized);
+    assert_eq!(materialized["changed"], true);
+    assert_eq!(
+        materialized["target_provider_session_id"],
+        target_session_id
+    );
     assert_rotation_decision_protocol(&materialized);
     assert_eq!(opencode.import_count(), 1, "recovery must not reimport");
 }
