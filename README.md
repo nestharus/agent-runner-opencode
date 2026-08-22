@@ -631,10 +631,12 @@ request with a named identity-lock result rather than waiting indefinitely.
    component. If any effect remains ambiguous, abort the rollout and retain the
    old identity; the cutover interval does not begin until obligations are settled.
 3. The host submits the plan's typed `seal` request while admission remains
-   blocked. The provider rejects sealing if either host assertion is false or
-   the selected provider identity record changed during drain; a successful seal
-   binds its plan-request cycle, exact pre-cutover semantic identity,
-   state-record digest, and component into the operation ID.
+   blocked. The provider requires the exact durable `awaiting_host_drain` plan
+   predecessor and rejects sealing if either host assertion is false or the
+   selected provider identity record changed during drain; a successful seal
+   advances that record to `awaiting_cutover` and binds its plan-request cycle,
+   exact pre-cutover semantic identity, state-record digest, and component into
+   the operation ID.
 4. A native-runtime replacement must already have a reviewed target-specific
    entry in `contract/native-implementation-manifest-v1.json`. A quota-observer
    replacement is a reviewed provider build whose adapter source and complete
@@ -651,9 +653,10 @@ request with a named identity-lock result rather than waiting indefinitely.
    runs the same validation capability against the restored identity.
 6. While ordinary admission is still blocked, the host sends the plan-bound
    `observe` request and attests that the selected validation capability completed.
-   The provider validates the operation ID and both named current evidence layers. A valid
-   commit or rollback is durably admitted in one bounded per-cycle observation
-   record, then returns `awaiting_host_release`, an observation-bound
+   The provider requires the exact durable `awaiting_cutover` predecessor and
+   validates the operation ID and both named current evidence layers. A valid
+   commit or rollback advances that bounded per-cycle record to
+   `awaiting_host_release`, then returns an observation-bound
    release request, and not a terminal success. Rejected observations do not
    acquire release authority.
 7. Ordinary admission remains blocked while the host sends that exact `release`
@@ -669,10 +672,12 @@ request with a named identity-lock result rather than waiting indefinitely.
    retry replays the durable terminal result and the same authorization without
    consulting later component state.
 
-Each profile/component retains at most 64 cycle records. A nonterminal
-`awaiting_host_release` record remains active until its exact release or rollback
-durably settles; capacity rejects a new cycle rather than retiring that active
-obligation. Completed and rolled-back records have a 24-hour replay window. An
+Each profile/component retains at most 64 cycle records. Plan publication
+durably records `awaiting_host_drain`; that pre-obligation phase and terminal
+records have a 24-hour replay window. A nonterminal `awaiting_cutover` or
+`awaiting_host_release` record remains active until its exact successor durably
+advances or settles it; capacity rejects a new cycle rather than retiring that
+active obligation. An
 exact retry retains its original plan-derived cycle identity and replays only
 that cycle. A later plan request receives a new cycle identity even when its
 prior and observed component evidence are byte-identical, and therefore must

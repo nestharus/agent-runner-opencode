@@ -2174,6 +2174,79 @@ fn contract_native_identity_rebind_rejects_unadmitted_release_authority() {
 }
 
 #[test]
+fn contract_native_identity_rebind_rejects_observe_without_sealed_predecessor() {
+    let host = HostRoots::new("agent-runner-opencode-rebind-skipped-seal");
+    let planned = native_identity_rebind_step(&host, setup_sync_rebind_params());
+    let planned = native_identity_rebind_component(&planned, "native_runtime");
+
+    let unplanned_host = HostRoots::new("agent-runner-opencode-rebind-skipped-plan");
+    let response = error_response(invoke_validated_with_host(
+        "setup.sync_plan",
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": planned["next_request"]
+        }),
+        unplanned_host.overrides(),
+        "setup.schema.json#/$defs/SetupSyncPlanRequest",
+    ));
+    assert_eq!(response["error"]["code"], "invalid_native_identity_rebind");
+    assert!(response["error"]["message"]
+        .as_str()
+        .expect("native rebind error message")
+        .contains("provider-admitted awaiting_host_drain predecessor"));
+
+    let mut skipped_seal = planned["next_request"].clone();
+    skipped_seal["action"] = json!("observe");
+    skipped_seal["disposition"] = json!("rolled_back");
+    skipped_seal["host_handoff"] = json!({
+        "ordinary_admission_blocked": true,
+        "validation_capability_completed": true
+    });
+
+    let response = error_response(invoke_validated_with_host(
+        "setup.sync_plan",
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": skipped_seal
+        }),
+        host.overrides(),
+        "setup.schema.json#/$defs/SetupSyncPlanRequest",
+    ));
+    assert_eq!(response["error"]["code"], "invalid_native_identity_rebind");
+    assert!(response["error"]["message"]
+        .as_str()
+        .expect("native rebind error message")
+        .contains("provider-sealed awaiting_cutover predecessor"));
+
+    let sealed = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": planned["next_request"]
+        }),
+    );
+    let sealed = native_identity_rebind_component(&sealed, "native_runtime");
+    assert_eq!(sealed["phase"], "awaiting_cutover");
+    let mut rollback = sealed["next_request"].clone();
+    rollback["disposition"] = json!("rolled_back");
+    let observed = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": rollback
+        }),
+    );
+    assert_eq!(
+        native_identity_rebind_component(&observed, "native_runtime")["phase"],
+        "awaiting_host_release"
+    );
+}
+
+#[test]
 fn contract_native_identity_rebind_rejects_false_rollback_and_changed_evidence() {
     let rejected_host = HostRoots::new("agent-runner-opencode-rebind-false-rollback");
     let planned = native_identity_rebind_step(&rejected_host, setup_sync_rebind_params());
