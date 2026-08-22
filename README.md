@@ -247,7 +247,10 @@ Launch children run in a provider-owned process group, while export and quota
 helpers remain direct children. One custody boundary is installed immediately
 after every manual spawn and owns termination and reaping on every fallible
 return until a successful wait discharges it. Drain queues and terminal-capture
-tails are bounded. Native event framing consumes each received byte once and
+tails are bounded. Each tail is a capped double-ended buffer, so retaining the
+last 1 MiB removes only the bytes displaced by new input; an optional contiguous
+terminal projection is paid once rather than compacting the full tail per pipe
+chunk. Native event framing consumes each received byte once and
 retains at most 1 MiB for an incomplete metadata line; an over-bound line is
 reported as an integrity failure and skipped through its next newline while
 the raw stream continues unchanged. Launch retains at most 32 representative

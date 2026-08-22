@@ -35,7 +35,7 @@ use crate::resume_observation::{
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -1001,22 +1001,41 @@ fn drain_reader<R: Read>(mut reader: R, sender: SyncSender<DrainMessage>, stdout
     let _ = sender.send(done);
 }
 
-fn retain_terminal_tail(target: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
-    if bytes.len() >= TERMINAL_CAPTURE_LIMIT {
-        target.clear();
-        target.extend_from_slice(&bytes[bytes.len() - TERMINAL_CAPTURE_LIMIT..]);
-        *truncated = true;
-        return;
+#[derive(Default)]
+struct TerminalTail {
+    bytes: VecDeque<u8>,
+    truncated: bool,
+}
+
+impl TerminalTail {
+    fn retain(&mut self, bytes: &[u8]) {
+        if bytes.len() >= TERMINAL_CAPTURE_LIMIT {
+            self.bytes.clear();
+            self.bytes.extend(
+                bytes[bytes.len() - TERMINAL_CAPTURE_LIMIT..]
+                    .iter()
+                    .copied(),
+            );
+            self.truncated = true;
+            return;
+        }
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(TERMINAL_CAPTURE_LIMIT);
+        if overflow > 0 {
+            for _ in 0..overflow {
+                let _ = self.bytes.pop_front();
+            }
+            self.truncated = true;
+        }
+        self.bytes.extend(bytes.iter().copied());
     }
-    let overflow = target
-        .len()
-        .saturating_add(bytes.len())
-        .saturating_sub(TERMINAL_CAPTURE_LIMIT);
-    if overflow > 0 {
-        target.drain(..overflow);
-        *truncated = true;
+
+    fn contiguous_projection(&self) -> Vec<u8> {
+        self.bytes.iter().copied().collect()
     }
-    target.extend_from_slice(bytes);
 }
 
 fn run_supervision_loop<W: Write>(
@@ -2595,10 +2614,8 @@ struct LaunchState {
     final_status: Option<ProcessStatus>,
     child_exit_at: Option<Instant>,
     forced_exit_status: Option<ProcessStatus>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    stdout_truncated: bool,
-    stderr_truncated: bool,
+    stdout: TerminalTail,
+    stderr: TerminalTail,
     integrity_failures: Vec<String>,
     integrity_failures_omitted: u64,
     parser: EventParser,
@@ -2634,10 +2651,8 @@ impl LaunchState {
             final_status: None,
             child_exit_at: None,
             forced_exit_status: None,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
+            stdout: TerminalTail::default(),
+            stderr: TerminalTail::default(),
             integrity_failures: Vec::new(),
             integrity_failures_omitted: 0,
             parser: EventParser::default(),
@@ -2721,11 +2736,11 @@ impl LaunchState {
     }
 
     fn record_stdout(&mut self, bytes: &[u8]) {
-        retain_terminal_tail(&mut self.stdout, bytes, &mut self.stdout_truncated);
+        self.stdout.retain(bytes);
     }
 
     fn record_stderr(&mut self, bytes: &[u8]) {
-        retain_terminal_tail(&mut self.stderr, bytes, &mut self.stderr_truncated);
+        self.stderr.retain(bytes);
     }
 
     fn project_stdout_bytes<W: Write>(
@@ -3128,7 +3143,9 @@ impl LaunchState {
         if let Some(signal) = self.final_opencode_error_signal(status) {
             return signal;
         }
-        classify(&self.stdout, &self.stderr, status, now_unix_ms())
+        let stdout = self.stdout.contiguous_projection();
+        let stderr = self.stderr.contiguous_projection();
+        classify(&stdout, &stderr, status, now_unix_ms())
     }
 
     fn final_opencode_error_signal(&self, status: &ProcessStatus) -> Option<Value> {
@@ -3233,12 +3250,12 @@ impl LaunchState {
     }
 
     fn emit_integrity_evidence<W: Write>(&mut self, writer: &mut W) -> Result<(), ProviderFailure> {
-        if self.stdout_truncated || self.stderr_truncated {
+        if self.stdout.truncated || self.stderr.truncated {
             self.marker_with_value(
                 "oulipoly.terminal_capture_truncated".to_string(),
                 json!({
-                    "stdout": self.stdout_truncated,
-                    "stderr": self.stderr_truncated,
+                    "stdout": self.stdout.truncated,
+                    "stderr": self.stderr.truncated,
                     "retained_tail_bytes_per_stream": TERMINAL_CAPTURE_LIMIT,
                 }),
                 writer,
@@ -3540,6 +3557,24 @@ fn json_write_failure(request_id: &str, err: serde_json::Error) -> ProviderFailu
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    #[test]
+    fn terminal_tail_retains_the_exact_suffix_across_small_saturated_writes() {
+        let input: Vec<u8> = (0..TERMINAL_CAPTURE_LIMIT + 257)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut tail = TerminalTail::default();
+        for chunk in input.chunks(7) {
+            tail.retain(chunk);
+        }
+
+        assert!(tail.truncated);
+        assert_eq!(tail.bytes.len(), TERMINAL_CAPTURE_LIMIT);
+        assert_eq!(
+            tail.contiguous_projection(),
+            input[input.len() - TERMINAL_CAPTURE_LIMIT..]
+        );
+    }
 
     #[test]
     fn launch_integrity_evidence_has_lifetime_count_detail_and_encoding_bounds() {
