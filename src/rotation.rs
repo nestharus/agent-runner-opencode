@@ -265,6 +265,7 @@ pub fn materialize_params(
         prepared_at_unix_ms: now_unix_ms(),
         phase: RotationOperationPhase::Prepared,
         target_session_id: None,
+        import_candidate_session_id: None,
         imported_at_unix_ms: None,
     };
     let operation_capacity_lock = acquire_rotation_capacity_lock(host, &budget, request_id)?;
@@ -298,7 +299,7 @@ pub fn materialize_params(
         &target_runtime,
         &mut operation,
         &target_session_id,
-        Some(&target_session_id),
+        true,
         &budget,
         request_id,
     )?;
@@ -486,6 +487,8 @@ struct RotationOperation {
     phase: RotationOperationPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_candidate_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     imported_at_unix_ms: Option<u64>,
 }
@@ -708,7 +711,10 @@ fn settle_rotation_settings_selection(
         ));
     }
     let expected_target_session_id = match operation.phase {
-        RotationOperationPhase::Prepared => optional_string(params, "recovery_target_session_id")
+        RotationOperationPhase::Prepared => operation
+            .import_candidate_session_id
+            .as_deref()
+            .or_else(|| optional_string(params, "recovery_target_session_id"))
             .unwrap_or(&binding.source_session_id),
         RotationOperationPhase::Imported => operation
             .target_session_id
@@ -1365,13 +1371,19 @@ fn validate_rotation_operation(
 ) -> Result<(), ProviderFailure> {
     let phase_valid = match operation.phase {
         RotationOperationPhase::Prepared => {
-            operation.target_session_id.is_none() && operation.imported_at_unix_ms.is_none()
+            operation.target_session_id.is_none()
+                && operation.imported_at_unix_ms.is_none()
+                && operation
+                    .import_candidate_session_id
+                    .as_deref()
+                    .is_none_or(|value| !value.trim().is_empty())
         }
         RotationOperationPhase::Imported => {
             operation
                 .target_session_id
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
+                && operation.import_candidate_session_id.is_none()
                 && operation.imported_at_unix_ms.is_some()
         }
     };
@@ -1435,14 +1447,34 @@ fn reconcile_prepared_operation(
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     let supplied_target = optional_string(params, "recovery_target_session_id");
-    let candidate_session_id = supplied_target.unwrap_or(&binding.source_session_id);
+    let durable_candidate = operation.import_candidate_session_id.clone();
+    if durable_candidate.is_some()
+        && supplied_target.is_some()
+        && durable_candidate.as_deref() != supplied_target
+    {
+        return Err(rotation_recovery_required(
+            request_id,
+            binding,
+            operation,
+            durable_candidate.as_deref(),
+            Some(
+                "supplied recovery target does not match the durable native import observation"
+                    .to_string(),
+            ),
+        ));
+    }
+    let candidate_session_id = durable_candidate
+        .as_deref()
+        .or(supplied_target)
+        .unwrap_or(&binding.source_session_id);
+    let authoritative_candidate = durable_candidate.is_some() || supplied_target.is_some();
     validate_and_record_imported_target(
         host,
         binding,
         target_runtime,
         operation,
         candidate_session_id,
-        supplied_target,
+        authoritative_candidate,
         budget,
         request_id,
     )
@@ -1455,10 +1487,13 @@ fn validate_and_record_imported_target(
     target_runtime: &native_runtime::NativeRuntimeContext,
     operation: &mut RotationOperation,
     candidate_session_id: &str,
-    recovery_target: Option<&str>,
+    authoritative_candidate: bool,
     budget: &RotationBudget,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
+    if authoritative_candidate {
+        preserve_import_candidate(host, binding, operation, candidate_session_id, request_id)?;
+    }
     let verification_timeout = match budget.remaining(request_id) {
         Ok(timeout) => timeout,
         Err(_) => {
@@ -1466,7 +1501,7 @@ fn validate_and_record_imported_target(
                 request_id,
                 binding,
                 operation,
-                recovery_target,
+                Some(candidate_session_id),
                 Some("rotation budget expired before target export validation".to_string()),
             ));
         }
@@ -1482,12 +1517,20 @@ fn validate_and_record_imported_target(
                 request_id,
                 binding,
                 operation,
-                recovery_target,
+                Some(candidate_session_id),
                 Some(format!("target export failed: {error:?}")),
             ));
         }
     };
-    budget.checkpoint(request_id)?;
+    if budget.checkpoint(request_id).is_err() {
+        return Err(rotation_recovery_required(
+            request_id,
+            binding,
+            operation,
+            Some(candidate_session_id),
+            Some("rotation budget expired after target export validation".to_string()),
+        ));
+    }
     if target.info.id != candidate_session_id
         || target
             .messages
@@ -1498,7 +1541,7 @@ fn validate_and_record_imported_target(
             request_id,
             binding,
             operation,
-            recovery_target,
+            Some(candidate_session_id),
             Some("target export does not carry the proposed target session identity".to_string()),
         ));
     }
@@ -1512,16 +1555,65 @@ fn validate_and_record_imported_target(
             request_id,
             binding,
             operation,
-            recovery_target,
+            Some(candidate_session_id),
             Some("target export content does not match the prepared source artifact".to_string()),
         ));
     }
-    budget.checkpoint(request_id)?;
     operation.phase = RotationOperationPhase::Imported;
     operation.target_session_id = Some(candidate_session_id.to_string());
+    operation.import_candidate_session_id = None;
     operation.imported_at_unix_ms = Some(now_unix_ms());
-    write_rotation_operation(host, binding, operation, request_id)?;
+    if let Err(error) = write_rotation_operation(host, binding, operation, request_id) {
+        operation.phase = RotationOperationPhase::Prepared;
+        operation.target_session_id = None;
+        operation.import_candidate_session_id = Some(candidate_session_id.to_string());
+        operation.imported_at_unix_ms = None;
+        return Err(rotation_recovery_required(
+            request_id,
+            binding,
+            operation,
+            Some(candidate_session_id),
+            Some(format!(
+                "validated target could not be durably advanced to imported: {error:?}"
+            )),
+        ));
+    }
     budget.checkpoint(request_id)
+}
+
+fn preserve_import_candidate(
+    host: &HostContext,
+    binding: &RotationBinding,
+    operation: &mut RotationOperation,
+    candidate_session_id: &str,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if operation.import_candidate_session_id.as_deref() == Some(candidate_session_id) {
+        return Ok(());
+    }
+    if let Some(existing) = operation.import_candidate_session_id.as_deref() {
+        return Err(rotation_recovery_required(
+            request_id,
+            binding,
+            operation,
+            Some(existing),
+            Some("native import candidate conflicts with durable operation custody".to_string()),
+        ));
+    }
+    operation.import_candidate_session_id = Some(candidate_session_id.to_string());
+    if let Err(error) = write_rotation_operation(host, binding, operation, request_id) {
+        operation.import_candidate_session_id = None;
+        return Err(rotation_recovery_required(
+            request_id,
+            binding,
+            operation,
+            Some(candidate_session_id),
+            Some(format!(
+                "native import candidate could not be durably preserved: {error:?}"
+            )),
+        ));
+    }
+    Ok(())
 }
 
 fn normalized_rotation_session(mut native: Value) -> Value {
@@ -2019,7 +2111,10 @@ fn rotation_settings_reconciliation_required(
             "observed_settings_selection": observed
                 .map_or_else(|failure| json!({ "unavailable": failure }), |selection| rotation_settings_selection_value(Some(selection))),
             "imported_target_account": binding.target_account.opencode_wrapper,
-            "imported_target_provider_session_id": operation.target_session_id,
+            "imported_target_provider_session_id": operation
+                .target_session_id
+                .as_ref()
+                .or(operation.import_candidate_session_id.as_ref()),
             "operation_phase": operation.phase,
             "recovery": "retry the same materialization with settings_reconciliation naming an exact current settings ID/version/account for the imported target account and the imported target session; do not repeat import",
         }),

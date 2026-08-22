@@ -335,10 +335,13 @@ binding-keyed prepared operation before import. A successful
 import durably advances that operation with the observed target session before
 decision and materialization receipts are finalized. Native import stdout is
 strictly decoded, but its reported session ID is only a candidate: the provider
-exports that exact target and verifies its identity and normalized content
-against the prepared artifact before advancing to imported. Missing, malformed,
-unavailable, or mismatched target evidence leaves the operation prepared and
-returns `rotation_recovery_required`; retry never repeats import. A retry resumes
+durably adds that candidate to the prepared operation before any later deadline
+checkpoint, then exports that exact target and verifies its identity and
+normalized content against the prepared artifact before advancing to imported.
+Missing, malformed, unavailable, mismatched, or budget-expired target evidence
+leaves the operation prepared with any known candidate and returns
+`rotation_recovery_required`; exact retry uses the durable candidate and never
+repeats import. A retry resumes
 an imported operation without repeating the effect. If execution stopped in the
 irreducibly ambiguous prepared-to-imported window, the provider first probes the
 expected target session, or the caller supplies `recovery_target_session_id`;
