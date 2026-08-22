@@ -2474,6 +2474,40 @@ fn contract_native_identity_rebind_distinguishes_identical_maintenance_cycles() 
 }
 
 #[test]
+fn contract_native_identity_rebind_replays_lost_plan_after_identity_admission() {
+    let host = HostRoots::new("agent-runner-opencode-rebind-lost-plan-replay");
+    let mut plan_request = support::validated_request_envelope(
+        "setup.sync_plan",
+        setup_sync_rebind_params(),
+        host.overrides(),
+        "setup.schema.json#/$defs/SetupSyncPlanRequest",
+    );
+    plan_request["request_id"] = json!("req-native-rebind-lost-plan-replay");
+
+    let first_plan = success_result(
+        support::invoke_with_request("setup.sync_plan", plan_request.clone()),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    let first_runtime = native_identity_rebind_component(&first_plan, "native_runtime");
+    assert!(first_runtime["prior_evidence"]["component_identity_sha256"].is_null());
+    assert!(first_runtime["prior_evidence"]["state_record_sha256"].is_null());
+
+    let admitted_runtime = FakeToolchain::new();
+    write_native_runtime_identity(host.data_root(), &admitted_runtime, "opencode3");
+
+    let replayed_plan = success_result(
+        support::invoke_with_request("setup.sync_plan", plan_request),
+        "setup.schema.json#/$defs/SetupSyncPlanResponse",
+        "setup.schema.json#/$defs/SetupSyncPlanResult",
+    );
+    assert_eq!(
+        replayed_plan, first_plan,
+        "an exact Plan retry must reconstruct its response from the durable cycle instead of mutable component evidence"
+    );
+}
+
+#[test]
 fn contract_native_identity_rebind_retains_nonterminal_release_custody_past_replay_window() {
     let host = HostRoots::new("agent-runner-opencode-rebind-active-retention");
     let first_observation = awaiting_native_identity_rollback(&host);

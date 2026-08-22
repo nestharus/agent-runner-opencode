@@ -131,13 +131,6 @@ struct NativeIdentityRebindOperationView<'a> {
     next_action: Option<&'a str>,
 }
 
-struct NativeIdentityRebindPlanBinding<'a> {
-    cycle_id: &'a str,
-    profile: &'a str,
-    component: NativeIdentityRebindComponent,
-    prior_evidence: &'a NativeIdentityRebindEvidence,
-}
-
 struct NativeIdentityRebindSealBinding<'a> {
     cycle_id: &'a str,
     profile: &'a str,
@@ -937,21 +930,11 @@ fn native_identity_rebind_operations(
                         account.opencode_wrapper,
                         target.component,
                     );
-                    let prior_evidence = native_identity_evidence(
+                    let planned = persist_native_identity_rebind_plan(
                         host,
+                        &cycle_id,
                         account,
                         target.component,
-                        request_id,
-                        false,
-                    )?;
-                    persist_native_identity_rebind_plan(
-                        host,
-                        NativeIdentityRebindPlanBinding {
-                            cycle_id: &cycle_id,
-                            profile: account.opencode_wrapper,
-                            component: target.component,
-                            prior_evidence: &prior_evidence,
-                        },
                         request_id,
                     )?;
                     Ok(native_identity_rebind_operation(
@@ -959,8 +942,8 @@ fn native_identity_rebind_operations(
                         NativeIdentityRebindOperationView {
                             cycle_id: &cycle_id,
                             component: target.component,
-                            prior_evidence: &prior_evidence,
-                            observed_evidence: &prior_evidence,
+                            prior_evidence: &planned.prior_evidence,
+                            observed_evidence: &planned.prior_evidence,
                             phase: "awaiting_host_drain",
                             diagnostic: None,
                             disposition: None,
@@ -1488,16 +1471,26 @@ fn native_identity_rebind_disposition_matches(
 
 fn persist_native_identity_rebind_plan(
     host: &HostContext,
-    binding: NativeIdentityRebindPlanBinding<'_>,
+    cycle_id: &str,
+    account: &crate::account::AccountProfile,
+    component: NativeIdentityRebindComponent,
     request_id: &str,
-) -> Result<(), ProviderFailure> {
-    let NativeIdentityRebindPlanBinding {
-        cycle_id,
-        profile,
-        component,
-        prior_evidence,
-    } = binding;
+) -> Result<NativeIdentityRebindCycleRecord, ProviderFailure> {
+    let profile = account.opencode_wrapper;
     let _lock = acquire_native_identity_rebind_lock(host, profile, component, request_id)?;
+    prepare_native_identity_rebind_cycle_slot(host, cycle_id, profile, component, request_id)?;
+    if let Some(existing) =
+        read_native_identity_rebind_cycle(host, cycle_id, profile, component, request_id)?
+    {
+        if existing.phase == NativeIdentityRebindCyclePhase::AwaitingHostDrain {
+            return Ok(existing);
+        }
+        return Err(invalid_native_identity_rebind(
+            request_id,
+            "the rebind cycle already advanced beyond or conflicts with this plan request",
+        ));
+    }
+    let prior_evidence = native_identity_evidence(host, account, component, request_id, false)?;
     let planned = NativeIdentityRebindCycleRecord {
         schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
         cycle_id: cycle_id.to_string(),
@@ -1505,32 +1498,19 @@ fn persist_native_identity_rebind_plan(
             cycle_id,
             profile,
             component,
-            prior_evidence,
+            &prior_evidence,
         ),
         observation_id: None,
         profile: profile.to_string(),
         component,
-        prior_evidence: prior_evidence.clone(),
+        prior_evidence,
         observed_evidence: None,
         disposition: None,
         phase: NativeIdentityRebindCyclePhase::AwaitingHostDrain,
         updated_at_unix_ms: now_unix_ms(),
     };
-    prepare_native_identity_rebind_cycle_slot(host, cycle_id, profile, component, request_id)?;
-    if let Some(existing) =
-        read_native_identity_rebind_cycle(host, cycle_id, profile, component, request_id)?
-    {
-        if existing.phase == NativeIdentityRebindCyclePhase::AwaitingHostDrain
-            && native_identity_rebind_cycle_matches(&existing, &planned)
-        {
-            return Ok(());
-        }
-        return Err(invalid_native_identity_rebind(
-            request_id,
-            "the rebind cycle already advanced beyond or conflicts with this plan request",
-        ));
-    }
-    write_native_identity_rebind_cycle(host, &planned, request_id)
+    write_native_identity_rebind_cycle(host, &planned, request_id)?;
+    Ok(planned)
 }
 
 fn persist_native_identity_rebind_seal(

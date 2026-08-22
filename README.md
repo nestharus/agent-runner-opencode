@@ -676,7 +676,9 @@ request with a named identity-lock result rather than waiting indefinitely.
    consulting later component state.
 
 Each profile/component retains at most 64 cycle records. Plan publication
-durably records `awaiting_host_drain`; that pre-obligation phase and terminal
+durably records `awaiting_host_drain`; an exact Plan retry reconstructs its
+operation and Seal request from that stored record before consulting mutable
+component evidence. That pre-obligation phase and terminal
 records have a 24-hour replay window. A nonterminal `awaiting_cutover` or
 `awaiting_host_release` record remains active until its exact successor durably
 advances or settles it; capacity rejects a new cycle rather than retiring that
