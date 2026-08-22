@@ -6,7 +6,7 @@ use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::native_runtime;
-use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
+use crate::opencode::{self, OpencodeExportError};
 use crate::operation_bounds;
 use crate::path_guard;
 use crate::runtime_selection::resolve_runtime_selection;
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AUTHORIZATION_TTL: Duration = Duration::from_secs(10 * 60);
 const ROTATION_REPLAY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
-const ROTATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const ROTATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ROTATION_ARTIFACT_BYTES: usize = opencode::MAX_EXPORT_OUTPUT_BYTES;
 const MAX_ROTATION_STATE_BYTES: usize = 1024 * 1024;
 const MAX_ROTATION_LIVE_RECORDS: usize = 64;
@@ -273,19 +273,35 @@ pub fn materialize_params(
     reservation.disarm();
     drop(operation_capacity_lock);
     budget.checkpoint(request_id)?;
-    let target_session_id = opencode::import_session(
+    let target_session_id = match opencode::import_session(
         &artifact_path,
         &target_runtime,
         working_directory,
         budget.remaining(request_id)?,
-    )
-    .map_err(|error| rotation_import_failure(request_id, &binding.target_provider_id, error))?;
-    budget.checkpoint(request_id)?;
-    operation.phase = RotationOperationPhase::Imported;
-    operation.target_session_id = Some(target_session_id);
-    operation.imported_at_unix_ms = Some(now_unix_ms());
-    write_rotation_operation(host, &binding, &operation, request_id)?;
-    budget.checkpoint(request_id)?;
+    ) {
+        Ok(target_session_id) => target_session_id,
+        Err(error) => {
+            return Err(rotation_recovery_required(
+                request_id,
+                &binding,
+                &operation,
+                None,
+                Some(format!(
+                    "import outcome could not be settled from native output: {error:?}"
+                )),
+            ));
+        }
+    };
+    validate_and_record_imported_target(
+        host,
+        &binding,
+        &target_runtime,
+        &mut operation,
+        &target_session_id,
+        Some(&target_session_id),
+        &budget,
+        request_id,
+    )?;
     finalize_rotation_operation(host, &params, &binding, &operation, &budget, request_id)
 }
 
@@ -1420,10 +1436,45 @@ fn reconcile_prepared_operation(
 ) -> Result<(), ProviderFailure> {
     let supplied_target = optional_string(params, "recovery_target_session_id");
     let candidate_session_id = supplied_target.unwrap_or(&binding.source_session_id);
+    validate_and_record_imported_target(
+        host,
+        binding,
+        target_runtime,
+        operation,
+        candidate_session_id,
+        supplied_target,
+        budget,
+        request_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_and_record_imported_target(
+    host: &HostContext,
+    binding: &RotationBinding,
+    target_runtime: &native_runtime::NativeRuntimeContext,
+    operation: &mut RotationOperation,
+    candidate_session_id: &str,
+    recovery_target: Option<&str>,
+    budget: &RotationBudget,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let verification_timeout = match budget.remaining(request_id) {
+        Ok(timeout) => timeout,
+        Err(_) => {
+            return Err(rotation_recovery_required(
+                request_id,
+                binding,
+                operation,
+                recovery_target,
+                Some("rotation budget expired before target export validation".to_string()),
+            ));
+        }
+    };
     let target = match opencode::export_with_timeout(
         candidate_session_id,
         target_runtime,
-        budget.remaining(request_id)?,
+        verification_timeout,
     ) {
         Ok(target) => target,
         Err(error) => {
@@ -1431,7 +1482,7 @@ fn reconcile_prepared_operation(
                 request_id,
                 binding,
                 operation,
-                supplied_target,
+                recovery_target,
                 Some(format!("target export failed: {error:?}")),
             ));
         }
@@ -1447,7 +1498,7 @@ fn reconcile_prepared_operation(
             request_id,
             binding,
             operation,
-            supplied_target,
+            recovery_target,
             Some("target export does not carry the proposed target session identity".to_string()),
         ));
     }
@@ -1461,7 +1512,7 @@ fn reconcile_prepared_operation(
             request_id,
             binding,
             operation,
-            supplied_target,
+            recovery_target,
             Some("target export content does not match the prepared source artifact".to_string()),
         ));
     }
@@ -2031,31 +2082,6 @@ fn rotation_artifact_failure(request_id: &str, error: impl std::fmt::Display) ->
         request_id,
         "rotation_artifact_failed",
         format!("failed to persist rotation artifact: {error}"),
-    )
-}
-
-fn rotation_import_failure(
-    request_id: &str,
-    target_provider: &str,
-    error: OpencodeImportError,
-) -> ProviderFailure {
-    if let OpencodeImportError::OutputTooLarge {
-        stream,
-        maximum_bytes,
-    } = &error
-    {
-        return ProviderFailure::invalid_request(
-            request_id,
-            "rotation_import_output_capacity_exceeded",
-            format!(
-                "session import into {target_provider} produced {stream} above the supported {maximum_bytes}-byte bound"
-            ),
-        );
-    }
-    ProviderFailure::internal(
-        request_id,
-        "rotation_import_failed",
-        format!("failed to import session into {target_provider}: {error:?}"),
     )
 }
 

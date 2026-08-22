@@ -333,13 +333,18 @@ fresh provider-issued assessment authorization, emits a decision receipt,
 durably publishes the content-addressed source artifact, and then persists a
 binding-keyed prepared operation before import. A successful
 import durably advances that operation with the observed target session before
-decision and materialization receipts are finalized. A retry resumes an
-imported operation without repeating the effect. If execution stopped in the
-irreducibly ambiguous prepared-to-imported window, automatic re-import remains
-blocked: the provider first probes the expected target session, or the caller
-supplies `recovery_target_session_id`; the exported target must match the
-prepared source artifact before finalization. The recovery error retains the
-prepared artifact path for a one-time manual import when no effect occurred.
+decision and materialization receipts are finalized. Native import stdout is
+strictly decoded, but its reported session ID is only a candidate: the provider
+exports that exact target and verifies its identity and normalized content
+against the prepared artifact before advancing to imported. Missing, malformed,
+unavailable, or mismatched target evidence leaves the operation prepared and
+returns `rotation_recovery_required`; retry never repeats import. A retry resumes
+an imported operation without repeating the effect. If execution stopped in the
+irreducibly ambiguous prepared-to-imported window, the provider first probes the
+expected target session, or the caller supplies `recovery_target_session_id`;
+the exported target must match the prepared source artifact before finalization.
+The recovery error retains the prepared artifact path for a one-time manual
+import when no effect occurred.
 Receipt replay and imported-operation finalization run before validating the
 host working directory because neither path uses it. The directory is required
 only before a new native import, so removing or renaming it cannot strand a
@@ -647,7 +652,7 @@ bounded collision domain), not every provider rotation. A provider-wide
 capacity lock covers only bounded collection maintenance, durable admission
 reservation, prepared-operation publication, and final receipt replacement; it
 is released before runtime admission, export, import, and recovery. One
-monotonic budget—the earlier of the host deadline and a 30-second provider
+monotonic budget—the earlier of the host deadline and a 60-second provider
 ceiling—still covers all lock admission and native work. Each phase checks the
 remaining absolute budget, native children are terminated and reaped at expiry,
 artifacts are read back through the same 16 MiB bound, and provider-owned

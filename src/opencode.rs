@@ -208,6 +208,7 @@ pub enum OpencodeImportError {
         status: Option<i32>,
         stderr: String,
     },
+    InvalidUtf8(String),
     MissingSessionId(String),
     OutputTooLarge {
         stream: &'static str,
@@ -583,13 +584,14 @@ pub fn parse_session_list_stdout(
 }
 
 pub fn parse_import_stdout(stdout: &[u8]) -> Result<String, OpencodeImportError> {
-    let text = String::from_utf8_lossy(stdout);
+    let text = std::str::from_utf8(stdout)
+        .map_err(|error| OpencodeImportError::InvalidUtf8(error.to_string()))?;
     text.lines()
         .find_map(|line| line.trim().strip_prefix("Imported session: "))
         .map(str::trim)
         .filter(|session_id| !session_id.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| OpencodeImportError::MissingSessionId(text.into_owned()))
+        .ok_or_else(|| OpencodeImportError::MissingSessionId(text.to_string()))
 }
 
 fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
@@ -1018,9 +1020,17 @@ fn pinned_native_event(event: OpencodeEventMetadata) -> Option<OpencodeEventMeta
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_session_list_stdout, OpencodeSessionDirectory, OpencodeSessionListError,
-        OpencodeSessionListRow,
+        parse_import_stdout, parse_session_list_stdout, OpencodeImportError,
+        OpencodeSessionDirectory, OpencodeSessionListError, OpencodeSessionListRow,
     };
+
+    #[test]
+    fn import_edge_rejects_a_lossily_decodable_session_identity() {
+        let error = parse_import_stdout(b"Imported session: ses-invalid-\xff\n")
+            .expect_err("import identity must be strict UTF-8");
+
+        assert!(matches!(error, OpencodeImportError::InvalidUtf8(_)));
+    }
 
     #[test]
     fn session_list_edge_canonicalizes_identity_and_string_timestamps() {

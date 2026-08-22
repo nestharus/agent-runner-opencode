@@ -3060,7 +3060,7 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
         std::time::Duration::from_secs(20),
     );
     let failed = error_response(failed);
-    assert_eq!(failed["error"]["code"], "rotation_import_failed");
+    assert_eq!(failed["error"]["code"], "rotation_recovery_required");
     assert!(
         bounded_elapsed < std::time::Duration::from_secs(60),
         "a stalled import must be terminated within the request bound"
@@ -3127,7 +3127,7 @@ fn contract_rotation_independent_binding_progresses_during_native_import() {
             "rotation.materialize",
             first_request,
             &[("PATH", first_path.as_str())],
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(60),
         )
         .0
     });
@@ -3163,9 +3163,64 @@ fn contract_rotation_independent_binding_progresses_during_native_import() {
         !worker.is_finished(),
         "independent binding work must not wait for another binding's native import"
     );
+    opencode.release_hanging_import();
 
-    let first = error_response(worker.join().expect("join hanging rotation worker"));
-    assert_eq!(first["error"]["code"], "rotation_import_failed");
+    let first = success_result(
+        worker.join().expect("join released rotation worker"),
+        "rotation.schema.json#/$defs/RotationMaterializeResponse",
+        "rotation.schema.json#/$defs/RotationMaterializeResult",
+    );
+    assert_rotation_materialized(&first);
+}
+
+#[test]
+fn contract_rotation_validates_successful_import_before_terminal_settlement() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-import-validation");
+    let opencode = RotationOpencodeFixture::with_inconsistent_successful_import();
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let path = opencode.path_env();
+    let request = support::validated_request_envelope(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+    );
+
+    let first = error_response(support::invoke_with_request_and_env(
+        "rotation.materialize",
+        request.clone(),
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(first["error"]["code"], "rotation_recovery_required");
+    assert_eq!(
+        first["error"]["details"]["supplied_recovery_target_session_id"],
+        ROTATION_SOURCE_SESSION
+    );
+    assert!(first["error"]["details"]["observation"]
+        .as_str()
+        .is_some_and(|observation| observation.contains("content does not match")));
+    assert_eq!(opencode.import_count(), 1);
+
+    let replay = error_response(support::invoke_with_request_and_env(
+        "rotation.materialize",
+        request,
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(replay["error"]["code"], "rotation_recovery_required");
+    assert_eq!(
+        opencode.import_count(),
+        1,
+        "an unverified successful import must remain prepared and never be repeated"
+    );
 }
 
 fn rotation_binding_test_stripe(params: &Value) -> u8 {
@@ -3357,8 +3412,8 @@ fn contract_rotation_oversized_export_is_bounded_and_releases_global_capability_
     ));
     assert_eq!(failed["error"]["code"], "rotation_export_capacity_exceeded");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(60),
-        "an oversized export must be drained and rejected within the 30-second provider bound plus scheduler tolerance"
+        started.elapsed() < std::time::Duration::from_secs(90),
+        "an oversized export must be drained and rejected within the 60-second provider bound plus scheduler tolerance"
     );
     assert!(!opencode.import_was_attempted());
 
@@ -3405,8 +3460,8 @@ fn contract_rotation_large_supported_artifact_completes_inside_global_lock_budge
     );
     assert_rotation_materialized(&materialized);
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(30),
-        "a supported near-envelope artifact must complete within the provider budget"
+        started.elapsed() < std::time::Duration::from_secs(90),
+        "a supported near-envelope artifact must complete within the 60-second provider bound plus scheduler tolerance"
     );
     let artifact_path = materialized["artifacts"][0]["path"]
         .as_str()
