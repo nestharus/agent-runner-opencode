@@ -88,10 +88,11 @@ edge:
   an ambiguous import window is never blindly repeated.
 - `auth list` may refresh the bound namespace's credential file. The provider
   serializes the canonical credential identity, persists the exact process-group
-  incarnation, observes that exact file before and after the command, and
-  requires whole-group terminal proof before committing or allowing credential
-  reconciliation. It records reconciliation-required rather than attributing an
-  ambiguous change.
+  incarnation, observes that exact file before the command, proves the whole
+  group terminal or recycled, and only then takes the authoritative successor
+  credential snapshot. It requires that ordering before committing or allowing
+  credential reconciliation and records reconciliation-required rather than
+  attributing an ambiguous change.
 
 OpenCode owns its internal database and file synchronization. The provider does
 not infer a committed effect from process exit alone: it combines bounded,

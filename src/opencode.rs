@@ -283,15 +283,22 @@ pub(crate) struct PreparedOpencodeAuthObservation {
     actor: ProcessGroupActor,
 }
 
+pub(crate) struct PendingOpencodeAuthObservation {
+    before: Option<Vec<u8>>,
+    auth_path: PathBuf,
+    output: ShellOutput,
+    output_exceeded_bound: bool,
+}
+
 impl PreparedOpencodeAuthObservation {
     pub(crate) fn actor(&self) -> &ProcessGroupActor {
         &self.actor
     }
 
-    pub(crate) fn observe(
+    pub(crate) fn observe_leader(
         self,
         timeout: Duration,
-    ) -> Result<OpencodeAuthObservation, OpencodeAuthFailure> {
+    ) -> Result<PendingOpencodeAuthObservation, OpencodeAuthFailure> {
         let Self {
             before,
             auth_path,
@@ -316,16 +323,29 @@ impl PreparedOpencodeAuthObservation {
             })?;
         let output_exceeded_bound = output.stdout.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES
             || output.stderr.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES;
-        let after =
-            credential_snapshot(&auth_path).map_err(OpencodeAuthFailure::EffectUnsettled)?;
-        Ok(OpencodeAuthObservation {
+        Ok(PendingOpencodeAuthObservation {
+            before,
+            auth_path,
             output: ShellOutput {
                 stdout: output.stdout,
                 stderr: output.stderr,
                 status: output.status.code().unwrap_or(1),
             },
-            effect: observed_auth_effect(before, after),
             output_exceeded_bound,
+        })
+    }
+}
+
+impl PendingOpencodeAuthObservation {
+    pub(crate) fn observe_terminal_credentials(
+        self,
+    ) -> Result<OpencodeAuthObservation, OpencodeAuthFailure> {
+        let after =
+            credential_snapshot(&self.auth_path).map_err(OpencodeAuthFailure::EffectUnsettled)?;
+        Ok(OpencodeAuthObservation {
+            output: self.output,
+            effect: observed_auth_effect(self.before, after),
+            output_exceeded_bound: self.output_exceeded_bound,
         })
     }
 }
@@ -1142,9 +1162,10 @@ fn pinned_native_event(event: OpencodeEventMetadata) -> Option<OpencodeEventMeta
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_import_stdout, parse_session_list_stdout, EventParser, OpencodeImportError,
-        OpencodeSessionDirectory, OpencodeSessionListError, OpencodeSessionListRow,
-        MAX_NATIVE_EVENT_LINE_BYTES,
+        credential_snapshot, parse_import_stdout, parse_session_list_stdout, EventParser,
+        OpencodeAuthEffect, OpencodeImportError, OpencodeSessionDirectory,
+        OpencodeSessionListError, OpencodeSessionListRow, PendingOpencodeAuthObservation,
+        ShellOutput, MAX_NATIVE_EVENT_LINE_BYTES,
     };
 
     #[test]
@@ -1215,6 +1236,34 @@ mod tests {
             .expect_err("import identity must be strict UTF-8");
 
         assert!(matches!(error, OpencodeImportError::InvalidUtf8(_)));
+    }
+
+    #[test]
+    fn auth_effect_uses_the_terminal_successor_credential_snapshot() {
+        let directory = tempfile::tempdir().expect("auth observation fixture");
+        let auth_path = directory.path().join("auth.json");
+        std::fs::write(&auth_path, b"original").expect("write original credential");
+        let before = credential_snapshot(&auth_path).expect("capture pre-effect credential");
+        std::fs::write(&auth_path, b"leader-provisional")
+            .expect("write provisional leader credential");
+        let pending = PendingOpencodeAuthObservation {
+            before,
+            auth_path: auth_path.clone(),
+            output: ShellOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: 0,
+            },
+            output_exceeded_bound: false,
+        };
+
+        std::fs::write(&auth_path, b"original").expect("descendant restores terminal credential");
+        let terminal = pending
+            .observe_terminal_credentials()
+            .expect("observe terminal credential successor");
+
+        assert_eq!(terminal.effect, OpencodeAuthEffect::CredentialsUnchanged);
+        assert!(terminal.observation_succeeded());
     }
 
     #[test]

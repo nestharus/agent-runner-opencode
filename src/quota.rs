@@ -306,9 +306,16 @@ pub fn refresh_auth_params(
     let refresh = match prepare_account_auth_refresh(&runtime, &auth_path) {
         Ok(prepared) => {
             publish_quota_refresh_actor(host, &mut operation, prepared.actor(), request_id)?;
-            let refresh = prepared.observe(native_timeout);
-            require_quota_refresh_actor_terminal(&mut operation, request_id)?;
-            refresh
+            match prepared.observe_leader(native_timeout) {
+                Ok(pending) => {
+                    require_quota_refresh_actor_terminal(&mut operation, request_id)?;
+                    pending.observe_terminal_credentials()
+                }
+                Err(error) => {
+                    require_quota_refresh_actor_terminal(&mut operation, request_id)?;
+                    Err(error)
+                }
+            }
         }
         Err(error) => Err(error),
     };

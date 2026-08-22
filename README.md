@@ -199,7 +199,8 @@ numeric ID is proven recycled. This makes the post-effect credential snapshot
 a successor to terminal actor custody rather than a competing observation of a
 still-running mutator. The same whole-group proof is required after an ordinary
 direct-leader return: successful leader status and closed output pipes alone do
-not publish terminal custody while a same-group descendant remains live.
+not publish terminal custody while a same-group descendant remains live, and
+the authoritative successor credential snapshot is taken only after that proof.
 That authorized follow-up reuses the original request and adds
 `params.context.reconciliation` with the `accept_current_credentials`
 disposition and the lowercase SHA-256 of the current bound credential file.
