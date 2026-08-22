@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const MAX_BOUND_EXECUTABLE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
+const MAX_PROVIDER_DIRECTORY_SYNC_LEVELS: usize = 8;
 
 pub(crate) fn create_directories(path: &Path) -> std::io::Result<()> {
     create_directory_chain(path, false)
@@ -186,7 +187,7 @@ where
     if private {
         set_private_directory_permissions(path)?;
     }
-    sync_directory_lineage(path, sync)
+    sync_directory_publication_suffix(path, sync)
 }
 
 fn prepare_best_effort_private_directory_with_sync<F>(
@@ -212,11 +213,15 @@ where
     }
 }
 
-fn sync_directory_lineage<F>(path: &Path, mut sync: F) -> std::io::Result<()>
+fn sync_directory_publication_suffix<F>(path: &Path, mut sync: F) -> std::io::Result<()>
 where
     F: FnMut(&Path) -> std::io::Result<()>,
 {
-    for directory in path.ancestors().filter(|path| !path.as_os_str().is_empty()) {
+    for directory in path
+        .ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+        .take(MAX_PROVIDER_DIRECTORY_SYNC_LEVELS)
+    {
         let metadata = fs::metadata(directory)?;
         if !metadata.is_dir() {
             return Err(Error::new(
@@ -281,6 +286,31 @@ mod tests {
         assert!(target.is_dir());
         assert!(retry_syncs.iter().any(|path| path == &first_directory));
         assert!(retry_syncs.iter().any(|path| path == temporary.path()));
+    }
+
+    #[test]
+    fn existing_material_directory_sync_is_bounded_to_the_publication_suffix() {
+        let temporary = tempfile::tempdir().expect("create material directory test root");
+        let target = (0..64).fold(temporary.path().to_path_buf(), |path, index| {
+            path.join(format!("depth-{index}"))
+        });
+        fs::create_dir_all(&target).expect("create deep existing material lineage");
+
+        let mut syncs = Vec::new();
+        create_directory_chain_with_sync(&target, true, |directory| {
+            syncs.push(directory.to_path_buf());
+            Ok(())
+        })
+        .expect("prepare existing material directory");
+
+        assert_eq!(syncs.len(), MAX_PROVIDER_DIRECTORY_SYNC_LEVELS);
+        assert_eq!(syncs.first(), Some(&target));
+        assert_eq!(
+            syncs.last().map(PathBuf::as_path),
+            target
+                .ancestors()
+                .nth(MAX_PROVIDER_DIRECTORY_SYNC_LEVELS - 1)
+        );
     }
 
     #[test]

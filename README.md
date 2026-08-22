@@ -508,15 +508,19 @@ rules after admission: settings and activity keep their interprocess locks,
 and migration and rotation keep their content-addressed atomic publication.
 One shared filesystem boundary durably publishes every settings, migration,
 launch-state, rotation-artifact, and rotation-state directory link before a
-dependent file write or irreversible native import may proceed. Every retry
-re-synchronizes the complete directory lineage, including links already visible
-after an earlier parent-sync failure. A readable material provider file can
-satisfy a retry only after that boundary re-syncs its parent, so a prior
+dependent file write or irreversible native import may proceed. Directory
+creation synchronizes every new link and its parent immediately. A retry then
+re-synchronizes the nearest eight directory levels: this covers every authored
+provider suffix (the deepest uses six components below its existing host root),
+the host-root publication boundary, and any link already visible after an
+earlier parent-sync failure without walking caller-owned ancestors to the
+filesystem root. A readable material provider file can satisfy a retry only
+after that bounded publication suffix re-syncs its parent, so a prior
 post-rename sync failure remains an error until durability completes. Ancillary
-best-effort activity evidence pays that complete lineage publication only while
-its root is absent; once the root exists, each attempted event verifies private
-directory ownership and synchronizes only the activity root before its zero-wait
-ledger lock. Its steady-state coordination cost is therefore independent of
+best-effort activity evidence uses the same bounded publication while its root
+is absent; once the root exists, each attempted event verifies private directory
+ownership and synchronizes only the activity root before its zero-wait ledger
+lock. Both steady-state relationships are therefore independent of
 caller-selected host path depth, and activity loss still never changes a
 capability result.
 
