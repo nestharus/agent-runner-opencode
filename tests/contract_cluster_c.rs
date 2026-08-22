@@ -999,6 +999,104 @@ fn contract_quota_refresh_auth_does_not_repeat_an_unsettled_native_effect() {
 }
 
 #[test]
+fn contract_quota_refresh_waits_for_descendants_after_auth_leader_exit() {
+    let runtime = IsolatedQuotaSettings::new();
+    let home = HomeFixture::new("agent-runner-opencode-quota-descendant-home");
+    let auth_path =
+        home.write_paired_auth(opencode_auth_json("refresh-sentinel", "acct").as_bytes());
+    let release_marker = home.path.join("release-auth-descendant");
+    let usage_log = home.path.join("quota-descendant.log");
+    let fake_curl = FakeNativeCurl::transport_failure(17, "probe remains unavailable");
+    let fake_auth = FakeOpencodeAuth::with_script(
+        "opencode3",
+        fake_opencode_auth_rewrite_with_live_descendant_script(&release_marker, &auth_path),
+    );
+    let path = prepend_paths(&[fake_auth.dir(), &fake_curl.dir]);
+    let env = [
+        ("HOME", home.path_str()),
+        ("PATH", path.as_str()),
+        (
+            "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
+            usage_log.to_str().expect("quota descendant log UTF-8"),
+        ),
+    ];
+    let request = support::validated_request_envelope(
+        "quota.refresh_auth",
+        quota_refresh_auth_params(),
+        runtime.host_overrides(),
+        "quota.schema.json#/$defs/QuotaRefreshAuthRequest",
+    );
+    let request_id = request["request_id"].as_str().expect("quota request id");
+    let operation_path = request["host"]["data_root"]
+        .as_str()
+        .map(std::path::Path::new)
+        .expect("quota data root")
+        .join("provider-state/opencode/quota/auth-refresh/requests")
+        .join(format!(
+            "{}.json",
+            agent_runner_opencode::encoding::sha256_hex(request_id.as_bytes())
+        ));
+
+    let first = support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &env);
+    assert!(matches!(first.status.code(), Some(1 | 2)));
+    let first_response = json_stdout(&first);
+    support::assert_valid(
+        &first_response,
+        "quota.schema.json#/$defs/QuotaRefreshAuthErrorResponse",
+    );
+    assert!(matches!(
+        first_response["error"]["code"].as_str(),
+        Some("quota_refresh_actor_active" | "quota_refresh_actor_unverifiable")
+    ));
+    let admitted: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&operation_path).expect("read descendant-bound quota operation"),
+    )
+    .expect("parse descendant-bound quota operation");
+    assert_eq!(admitted["phase"], "native_effect_admitted");
+    assert!(admitted["actor_terminal_at_unix_ms"].is_null());
+    assert_eq!(
+        optional_usage_log(&usage_log)
+            .matches("auth argv=auth list")
+            .count(),
+        1
+    );
+
+    std::fs::write(&release_marker, b"release\n").expect("release auth descendant");
+    let started = std::time::Instant::now();
+    let settled = loop {
+        let retry =
+            support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &env);
+        let response = json_stdout(&retry);
+        match response["error"]["code"].as_str() {
+            Some("quota_refresh_reconciliation_required") => break response,
+            Some("quota_refresh_actor_active" | "quota_refresh_actor_unverifiable")
+                if started.elapsed() < std::time::Duration::from_secs(5) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            other => panic!("unexpected descendant-settlement response: {other:?}: {response}"),
+        }
+    };
+    support::assert_valid(
+        &settled,
+        "quota.schema.json#/$defs/QuotaRefreshAuthErrorResponse",
+    );
+    let unresolved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&operation_path).expect("read settled descendant quota operation"),
+    )
+    .expect("parse settled descendant quota operation");
+    assert_eq!(unresolved["phase"], "reconciliation_required");
+    assert!(unresolved["actor_terminal_at_unix_ms"].is_number());
+    assert_eq!(
+        optional_usage_log(&usage_log)
+            .matches("auth argv=auth list")
+            .count(),
+        1,
+        "descendant settlement must not repeat native auth"
+    );
+}
+
+#[test]
 fn contract_auth_list_without_credential_change_is_not_reported_as_refresh() {
     let home = HomeFixture::new("agent-runner-opencode-quota-list-only-home");
     home.write_paired_auth(opencode_auth_json("sentinel", "acct").as_bytes());

@@ -740,6 +740,24 @@ exit 0\n",
     )
 }
 
+pub fn fake_opencode_auth_rewrite_with_live_descendant_script(
+    release_marker: &Path,
+    auth_path: &Path,
+) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ -n \"${{AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG:-}}\" ]; then\n\
+  printf 'auth argv=%s\\n' \"$*\" >> \"$AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG\"\n\
+fi\n\
+(while [ ! -e {} ]; do /bin/sleep 0.05; done) </dev/null >/dev/null 2>&1 &\n\
+printf '%s' {} > {}\n\
+exit 0\n",
+        shell_single_quote(&release_marker.to_string_lossy()),
+        shell_single_quote(&opencode_auth_json("sentinel-refreshed", "acct")),
+        shell_single_quote(&auth_path.to_string_lossy()),
+    )
+}
+
 pub fn optional_usage_log(log_path: &Path) -> String {
     fs::read_to_string(log_path).unwrap_or_default()
 }

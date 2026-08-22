@@ -307,7 +307,7 @@ pub fn refresh_auth_params(
         Ok(prepared) => {
             publish_quota_refresh_actor(host, &mut operation, prepared.actor(), request_id)?;
             let refresh = prepared.observe(native_timeout);
-            operation.actor_terminal_at_unix_ms = Some(now_unix_ms());
+            require_quota_refresh_actor_terminal(&mut operation, request_id)?;
             refresh
         }
         Err(error) => Err(error),
@@ -1620,7 +1620,7 @@ fn epoch_ms(rfc3339: &str) -> i64 {
 mod custody_tests {
     use super::*;
     use crate::native_process::{actor_for_child, configure_process_group};
-    use std::process::Command as ProcessCommand;
+    use std::process::{Command as ProcessCommand, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1647,6 +1647,44 @@ mod custody_tests {
         require_quota_refresh_actor_terminal(&mut operation, "request-1")
             .expect("terminal actor permits credential reconciliation");
         assert!(operation.actor_terminal_at_unix_ms.is_some());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn quota_does_not_treat_leader_exit_as_group_terminality() {
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let child = command.spawn().expect("spawn quota group leader");
+        let actor = actor_for_child(&child).expect("identify quota process group");
+        let output = child
+            .wait_with_output()
+            .expect("observe successful direct leader exit");
+        assert!(output.status.success());
+        let descendant_pid = String::from_utf8(output.stdout)
+            .expect("descendant pid output")
+            .trim()
+            .parse::<i32>()
+            .expect("descendant pid");
+        let mut operation =
+            quota_custody_operation(1, QuotaRefreshOperationPhase::NativeEffectAdmitted);
+        operation.actor_process_group_id = Some(actor.process_group_id);
+        operation.actor_process_group_incarnation = Some(actor.incarnation);
+        operation.actor_terminal_at_unix_ms = None;
+
+        let unsettled = require_quota_refresh_actor_terminal(&mut operation, "request-1")
+            .expect_err("a live same-group descendant must block credential settlement");
+        unsafe {
+            libc::kill(descendant_pid, libc::SIGKILL);
+        }
+        assert!(matches!(
+            unsettled.code,
+            "quota_refresh_actor_active" | "quota_refresh_actor_unverifiable"
+        ));
+        assert!(operation.actor_terminal_at_unix_ms.is_none());
     }
 
     #[test]

@@ -17,6 +17,9 @@ struct RejectFlush {
     accepted: Vec<u8>,
 }
 
+#[derive(Default)]
+struct AcceptAndDiscard;
+
 struct InvokeDuringFlush {
     accepted: Vec<u8>,
     args: Vec<String>,
@@ -25,7 +28,7 @@ struct InvokeDuringFlush {
     competing_stdout: Vec<u8>,
 }
 
-struct RecreateSnapshotDuringTerminalFlush {
+struct RetrySnapshotDuringTerminalFlush {
     accepted: Vec<u8>,
     args: Vec<String>,
     terminal_retry: Vec<u8>,
@@ -50,6 +53,16 @@ impl std::io::Write for RejectFlush {
     }
 }
 
+impl std::io::Write for AcceptAndDiscard {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl std::io::Write for InvokeDuringFlush {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.accepted.extend_from_slice(buffer);
@@ -68,7 +81,7 @@ impl std::io::Write for InvokeDuringFlush {
     }
 }
 
-impl std::io::Write for RecreateSnapshotDuringTerminalFlush {
+impl std::io::Write for RetrySnapshotDuringTerminalFlush {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.accepted.extend_from_slice(buffer);
         Ok(buffer.len())
@@ -336,8 +349,8 @@ fn contract_session_enumerate_packs_the_maximum_snapshot_population() {
         .collect::<Vec<_>>();
     assert_eq!(
         snapshot_directories.len(),
-        0,
-        "the maximum admitted population must remain readable through terminal handoff and retire after response flush"
+        1,
+        "the maximum admitted population must remain available for bounded exact terminal replay after response flush"
     );
 
     fs::remove_dir_all(&data_root).expect("remove packed session snapshot data root");
@@ -345,7 +358,7 @@ fn contract_session_enumerate_packs_the_maximum_snapshot_population() {
 }
 
 #[test]
-fn contract_session_enumerate_retires_consumed_snapshot() {
+fn contract_session_enumerate_terminal_claim_rejects_a_different_request() {
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
     let data_root = unique_temp_dir("agent-runner-opencode-consumed-session-snapshot");
@@ -384,8 +397,8 @@ fn contract_session_enumerate_retires_consumed_snapshot() {
         &[("PATH", path.as_str())],
     ));
     assert_eq!(
-        consumed["error"]["code"], "invalid_session_enumerate_cursor",
-        "a consumed cursor must be retired immediately"
+        consumed["error"]["code"], "session_enumeration_snapshot_terminal_handoff_in_progress",
+        "a terminal cursor remains bound to its exact request during bounded replay retention"
     );
     fs::remove_dir_all(&data_root).expect("remove isolated session snapshot data root");
 }
@@ -555,7 +568,7 @@ fn contract_session_enumerate_exact_initial_retry_replays_claimed_native_populat
 }
 
 #[test]
-fn contract_session_enumerate_terminal_initial_retry_replays_after_flush_loss() {
+fn contract_session_enumerate_terminal_initial_retry_replays_after_successful_flush_loss() {
     let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_multiple_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
@@ -581,25 +594,12 @@ fn contract_session_enumerate_terminal_initial_retry_replays_after_flush_loss() 
     ];
     let prior_path = std::env::var_os("PATH");
     std::env::set_var("PATH", &path);
-    let mut rejected_flush = RejectFlush::default();
+    let mut discarded_response = AcceptAndDiscard;
     assert_eq!(
-        agent_runner_opencode::write_invocation(&args, &request_bytes, &mut rejected_flush),
-        1,
-        "the terminal first-page response must remain owned after flush loss"
+        agent_runner_opencode::write_invocation(&args, &request_bytes, &mut discarded_response),
+        0,
+        "provider-local write and flush succeed even though the simulated consumer discards the response"
     );
-    let lost_response: Value = serde_json::Deserializer::from_slice(&rejected_flush.accepted)
-        .into_iter()
-        .next()
-        .expect("accepted terminal first-page response")
-        .expect("parse accepted terminal first-page response bytes");
-    support::assert_valid(
-        &lost_response,
-        "session.schema.json#/$defs/SessionEnumerateResponse",
-    );
-    assert!(lost_response["result"]["complete"]
-        .as_bool()
-        .unwrap_or(false));
-    assert!(lost_response["result"]["next_cursor"].is_null());
     fs::remove_file(fake_opencode.log_path()).expect("clear first native-list evidence");
     fake_opencode.replace_output("[]", "", 0);
 
@@ -610,10 +610,7 @@ fn contract_session_enumerate_terminal_initial_retry_replays_after_flush_loss() 
     );
     let retry_response: Value =
         serde_json::from_slice(&retry_stdout).expect("parse terminal initial retry response");
-    assert_eq!(
-        retry_response["result"], lost_response["result"],
-        "exact retry must replay the accepted terminal result after native rows change"
-    );
+    assert_multiple_enumerate_result(&retry_response["result"]);
     assert!(
         !fake_opencode.log_path().exists(),
         "terminal exact retry must consult durable request custody before native relisting"
@@ -623,9 +620,20 @@ fn contract_session_enumerate_terminal_initial_retry_replays_after_flush_loss() 
         fs::read_dir(&snapshot_root)
             .expect("enumeration snapshot root")
             .filter_map(Result::ok)
-            .all(|entry| !entry.file_type().is_ok_and(|kind| kind.is_dir())),
-        "successful response flush must retire the matching terminal snapshot"
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count()
+            == 1,
+        "successful local flush cannot retire terminal replay without consumer acknowledgement"
     );
+
+    let mut second_retry_stdout = Vec::new();
+    assert_eq!(
+        agent_runner_opencode::write_invocation(&args, &request_bytes, &mut second_retry_stdout),
+        0
+    );
+    let second_retry: Value = serde_json::from_slice(&second_retry_stdout)
+        .expect("parse second terminal initial retry response");
+    assert_eq!(second_retry["result"], retry_response["result"]);
 
     match prior_path {
         Some(value) => std::env::set_var("PATH", value),
@@ -636,7 +644,108 @@ fn contract_session_enumerate_terminal_initial_retry_replays_after_flush_loss() 
 }
 
 #[test]
-fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_handoff() {
+fn contract_terminal_snapshot_replay_is_bounded_and_expiry_reclaims_capacity() {
+    let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
+    let fake_opencode = FakeOpencodeSessionList::with_output("[]", "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-terminal-snapshot-capacity");
+    let config_root = support::isolated_test_config_root("terminal-snapshot-capacity");
+    fs::create_dir_all(&data_root).expect("create terminal snapshot capacity data root");
+    let host = json!({
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy()
+    });
+    let env = [("PATH", path.as_str())];
+    let mut first_request = None;
+    for _ in 0..32 {
+        let request = support::validated_request_envelope(
+            "session.enumerate",
+            session_enumerate_params(),
+            host.clone(),
+            "session.schema.json#/$defs/SessionEnumerateRequest",
+        );
+        support::ensure_default_runtime_settings(&request);
+        let result = success_result(
+            support::invoke_with_request_and_env("session.enumerate", request.clone(), &env),
+            "session.schema.json#/$defs/SessionEnumerateResponse",
+            "session.schema.json#/$defs/SessionEnumerateResult",
+        );
+        assert_empty_enumerate_result(&result);
+        first_request.get_or_insert(request);
+    }
+    let overflow_request = support::validated_request_envelope(
+        "session.enumerate",
+        session_enumerate_params(),
+        host.clone(),
+        "session.schema.json#/$defs/SessionEnumerateRequest",
+    );
+    support::ensure_default_runtime_settings(&overflow_request);
+    let overflow = assert_error_envelope(support::invoke_with_request_and_env(
+        "session.enumerate",
+        overflow_request.clone(),
+        &env,
+    ));
+    assert_eq!(
+        overflow["error"]["code"],
+        "session_enumeration_snapshot_capacity_exceeded"
+    );
+
+    fs::remove_file(fake_opencode.log_path()).expect("clear capacity native-list evidence");
+    let exact_replay = success_result(
+        support::invoke_with_request_and_env(
+            "session.enumerate",
+            first_request.expect("first terminal request"),
+            &env,
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_empty_enumerate_result(&exact_replay);
+    assert!(
+        !fake_opencode.log_path().exists(),
+        "capacity saturation must not deny or relist an exact retained terminal request"
+    );
+
+    let snapshot_root = data_root.join("provider-state/opencode/session-enumeration-snapshots");
+    let expired_snapshot = fs::read_dir(&snapshot_root)
+        .expect("read terminal snapshot capacity root")
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .expect("retained terminal snapshot")
+        .path();
+    let manifest_path = expired_snapshot.join("manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read terminal snapshot manifest"))
+            .expect("parse terminal snapshot manifest");
+    manifest["expires_at_unix_ms"] = json!(0);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("encode expired terminal snapshot manifest"),
+    )
+    .expect("expire one terminal snapshot");
+
+    let reclaimed = success_result(
+        support::invoke_with_request_and_env("session.enumerate", overflow_request, &env),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_empty_enumerate_result(&reclaimed);
+    assert_eq!(
+        fs::read_dir(&snapshot_root)
+            .expect("read reclaimed snapshot capacity root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count(),
+        32,
+        "expiry must reclaim one slot before admitting the waiting terminal request"
+    );
+
+    fs::remove_dir_all(&data_root).expect("remove terminal snapshot capacity data root");
+    fs::remove_dir_all(&config_root).expect("remove terminal snapshot capacity config root");
+}
+
+#[test]
+fn contract_session_enumerate_terminal_continuation_replays_after_successful_flush_loss() {
     let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
@@ -688,21 +797,15 @@ fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_hand
         &request,
         "session.schema.json#/$defs/SessionEnumerateRequest",
     );
-    let mut rejected_flush = RejectFlush::default();
+    let mut discarded_response = AcceptAndDiscard;
     let lost_exit = agent_runner_opencode::write_invocation(
         &args,
         &serde_json::to_vec(&request).expect("serialize enumeration request"),
-        &mut rejected_flush,
+        &mut discarded_response,
     );
     assert_eq!(
-        lost_exit,
-        1,
-        "failed buffered response handoff must fail the invocation; accepted={}",
-        String::from_utf8_lossy(&rejected_flush.accepted),
-    );
-    assert!(
-        !rejected_flush.accepted.is_empty(),
-        "the response bytes must be accepted before the simulated flush failure"
+        lost_exit, 0,
+        "provider-local write and flush succeed even though the terminal page is discarded"
     );
 
     let mut retry_stdout = Vec::new();
@@ -726,28 +829,28 @@ fn contract_session_enumerate_retires_snapshot_only_after_terminal_response_hand
     );
     assert_second_enumerate_page(&retry_response["result"]);
 
-    let mut consumed_stdout = Vec::new();
+    let mut replay_stdout = Vec::new();
     assert_eq!(
         agent_runner_opencode::write_invocation(
             &args,
-            &serde_json::to_vec(&request).expect("serialize consumed enumeration cursor"),
-            &mut consumed_stdout,
+            &serde_json::to_vec(&request).expect("serialize repeated terminal enumeration retry"),
+            &mut replay_stdout,
         ),
-        2
+        0
     );
     match prior_path {
         Some(value) => std::env::set_var("PATH", value),
         None => std::env::remove_var("PATH"),
     }
-    let consumed: Value =
-        serde_json::from_slice(&consumed_stdout).expect("parse consumed cursor response");
+    let replay: Value =
+        serde_json::from_slice(&replay_stdout).expect("parse repeated terminal cursor response");
     support::assert_valid(
-        &consumed,
-        "session.schema.json#/$defs/SessionEnumerateErrorResponse",
+        &replay,
+        "session.schema.json#/$defs/SessionEnumerateResponse",
     );
     assert_eq!(
-        consumed["error"]["code"],
-        "invalid_session_enumerate_cursor"
+        replay["result"], retry_response["result"],
+        "the exact terminal continuation remains replayable for the bounded retention window"
     );
     fs::remove_dir_all(&data_root).expect("remove isolated session snapshot data root");
     fs::remove_dir_all(&config_root).expect("remove isolated session snapshot config root");
@@ -993,7 +1096,7 @@ fn contract_terminal_claim_blocks_older_cursor_during_response_handoff() {
 }
 
 #[test]
-fn contract_stale_terminal_cleanup_cannot_delete_recreated_snapshot() {
+fn contract_terminal_snapshot_retention_survives_nested_successful_flushes() {
     let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
     let path = prepend_path(fake_opencode.dir());
@@ -1033,7 +1136,7 @@ fn contract_stale_terminal_cleanup_cannot_delete_recreated_snapshot() {
     terminal_request["request_id"] = json!("req-session-enumerate-cleanup-generation-terminal");
     terminal_request["params"] = session_enumerate_cursor_params(2, terminal_cursor);
     let terminal_bytes = serde_json::to_vec(&terminal_request).expect("serialize terminal request");
-    let mut interleaving = RecreateSnapshotDuringTerminalFlush {
+    let mut interleaving = RetrySnapshotDuringTerminalFlush {
         accepted: Vec::new(),
         args: args.clone(),
         terminal_retry: terminal_bytes.clone(),
@@ -1052,33 +1155,29 @@ fn contract_stale_terminal_cleanup_cannot_delete_recreated_snapshot() {
     assert_eq!(interleaving.terminal_retry_exit, Some(0));
     assert_eq!(
         interleaving.initial_retry_exit,
-        Some(0),
-        "recreated initial retry failed: {}",
+        Some(2),
+        "a competing initial request must remain blocked by terminal ownership: {}",
         String::from_utf8_lossy(&interleaving.initial_retry_stdout)
     );
-    let replacement: Value = serde_json::from_slice(&interleaving.initial_retry_stdout)
-        .expect("parse recreated initial response");
-    let replacement_cursor = replacement["result"]["next_cursor"]
-        .as_str()
-        .expect("replacement cursor");
-    let mut replacement_continuation = initial_request;
-    replacement_continuation["request_id"] =
-        json!("req-session-enumerate-cleanup-generation-replacement-terminal");
-    replacement_continuation["params"] = session_enumerate_cursor_params(2, replacement_cursor);
-    let mut replacement_terminal_stdout = Vec::new();
+    let competing: Value = serde_json::from_slice(&interleaving.initial_retry_stdout)
+        .expect("parse competing initial response");
+    assert_eq!(
+        competing["error"]["code"],
+        "session_enumeration_snapshot_terminal_handoff_in_progress"
+    );
+    let mut retained_terminal_stdout = Vec::new();
     assert_eq!(
         agent_runner_opencode::write_invocation(
             &args,
-            &serde_json::to_vec(&replacement_continuation)
-                .expect("serialize replacement continuation"),
-            &mut replacement_terminal_stdout,
+            &terminal_bytes,
+            &mut retained_terminal_stdout,
         ),
         0,
-        "stale cleanup must not delete the replacement snapshot"
+        "nested successful flushes must retain exact terminal replay"
     );
-    let replacement_terminal: Value = serde_json::from_slice(&replacement_terminal_stdout)
-        .expect("parse replacement terminal response");
-    assert_eq!(replacement_terminal["result"]["complete"], true);
+    let retained_terminal: Value = serde_json::from_slice(&retained_terminal_stdout)
+        .expect("parse retained terminal response");
+    assert_eq!(retained_terminal["result"]["complete"], true);
 
     match prior_path {
         Some(value) => std::env::set_var("PATH", value),

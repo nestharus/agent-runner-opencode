@@ -197,7 +197,9 @@ request in `native_effect_admitted` while that exact incarnation is live and
 will not accept a credential digest until the group is proven terminal or its
 numeric ID is proven recycled. This makes the post-effect credential snapshot
 a successor to terminal actor custody rather than a competing observation of a
-still-running mutator.
+still-running mutator. The same whole-group proof is required after an ordinary
+direct-leader return: successful leader status and closed output pipes alone do
+not publish terminal custody while a same-group descendant remains live.
 That authorized follow-up reuses the original request and adds
 `params.context.reconciliation` with the `accept_current_credentials`
 disposition and the lowercase SHA-256 of the current bound credential file.
@@ -363,7 +365,9 @@ strictly decoded. Import execution starts behind the provider exec gate: the
 prepared operation durably binds the exact process-group incarnation before the
 gate is released, and recovery must prove that actor terminal or recycled before
 it may treat any target export as stable or finalize a receipt. Thus provider
-loss cannot leave a still-live import actor outside the shared result. The
+loss cannot leave a still-live import actor outside the shared result. Ordinary
+leader completion uses that same whole-group proof, so a descendant cannot keep
+import authority after the provider publishes terminal custody. The
 reported session ID is only a candidate: the provider
 durably adds that candidate to the prepared operation before any later deadline
 checkpoint, then exports that exact target and verifies its identity and
@@ -418,25 +422,23 @@ exact page retry can replay that claim until its successor is admitted, while a
 different request using the consumed or older cursor is rejected instead of
 publishing a successor that another terminal handoff can retire. Page size and
 admitted population are each capped at 256, list capture at 2 MiB, each row at
-64 KiB, and each snapshot at 4 MiB. At most 32
-abandoned snapshots are retained for 15 minutes; continuation cursors read only
+64 KiB, and each snapshot at 4 MiB. At most 32 active or terminal-replay
+snapshots are retained for 15 minutes; continuation cursors read only
 the requested rows from one packed row file using manifest-bound offsets and
 per-row hashes. Snapshot manifests have one shared 32 KiB publication/read
 ceiling, large enough for the complete 256-row offset and hash population, and
 publication rejects an over-ceiling manifest before returning a cursor.
 Snapshot publication has a fixed three-file shape and one directory
 synchronization regardless of row count, rather than one durable file
-transaction per row. A terminal snapshot is retired only after the complete
-response is successfully written and flushed; a failed write or flush preserves
-the cursor for an exact retry. Before the terminal page is exposed, its manifest
-durably claims that handoff for the continuation request; a different terminal
+transaction per row. Before the terminal page is exposed, its manifest durably
+claims that handoff for the exact continuation request; a different terminal
 consumer, older cursor, or initial retry cannot reuse the snapshot while that
-claim is live. Deferred cleanup carries the snapshot's unique durable instance
-identity and terminal claim, reacquires the snapshot lock, and retires the path
-only when the current manifest still matches both. A delayed cleanup from an
-exact terminal retry is therefore a no-op if the deterministic path has since
-been recreated for a new pagination instance.
-A cleanup failure falls back to the existing 15-minute expiry.
+claim is live. The one-way provider invocation has no consumer receipt
+acknowledgement, so local response write and flush do not retire the terminal
+snapshot. The exact terminal request can replay its immutable result throughout
+the bounded 15-minute window, including when the response was lost after a
+successful provider-local flush; expiry maintenance retires it. This preserves
+consumer recovery without adding an unbounded result population.
 An above-bound native population fails explicitly.
 
 ## State, evidence, and authority

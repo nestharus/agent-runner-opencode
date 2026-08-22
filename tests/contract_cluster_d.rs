@@ -3261,6 +3261,100 @@ fn contract_rotation_hanging_import_releases_global_capability_lock() {
 }
 
 #[test]
+fn contract_rotation_waits_for_descendants_after_import_leader_exit() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-import-descendant");
+    let opencode = RotationOpencodeFixture::with_live_import_descendant();
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let path = opencode.path_env();
+    let request = support::validated_request_envelope(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+    );
+
+    let first = support::invoke_with_request_and_env(
+        "rotation.materialize",
+        request.clone(),
+        &[("PATH", path.as_str())],
+    );
+    assert!(matches!(first.status.code(), Some(1 | 2)));
+    let first = error_response(first);
+    assert!(matches!(
+        first["error"]["code"].as_str(),
+        Some("rotation_import_actor_active" | "rotation_import_actor_unverifiable")
+    ));
+    assert_eq!(opencode.import_count(), 1);
+    let operation_root = host
+        .data_root()
+        .join("provider-state/opencode/rotation/operations");
+    let operation_path = fs::read_dir(&operation_root)
+        .expect("read descendant-bound rotation operations")
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .expect("descendant-bound rotation operation")
+        .path();
+    let operation: Value = serde_json::from_slice(
+        &fs::read(&operation_path).expect("read descendant-bound rotation operation"),
+    )
+    .expect("parse descendant-bound rotation operation");
+    assert_eq!(operation["phase"], "prepared");
+    assert!(operation["import_actor_terminal_at_unix_ms"].is_null());
+
+    let blocked = support::invoke_with_request_and_env(
+        "rotation.materialize",
+        request.clone(),
+        &[("PATH", path.as_str())],
+    );
+    assert!(matches!(blocked.status.code(), Some(1 | 2)));
+    let blocked = error_response(blocked);
+    assert!(matches!(
+        blocked["error"]["code"].as_str(),
+        Some("rotation_import_actor_active" | "rotation_import_actor_unverifiable")
+    ));
+    assert_eq!(opencode.import_count(), 1);
+
+    opencode.release_import_descendant();
+    let started = std::time::Instant::now();
+    let materialized = loop {
+        let retry = support::invoke_with_request_and_env(
+            "rotation.materialize",
+            request.clone(),
+            &[("PATH", path.as_str())],
+        );
+        if retry.status.success() {
+            break success_result(
+                retry,
+                "rotation.schema.json#/$defs/RotationMaterializeResponse",
+                "rotation.schema.json#/$defs/RotationMaterializeResult",
+            );
+        }
+        let response = error_response(retry);
+        assert!(matches!(
+            response["error"]["code"].as_str(),
+            Some("rotation_import_actor_active" | "rotation_import_actor_unverifiable")
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "released import descendant did not settle: {response}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    assert_rotation_materialized(&materialized);
+    assert_rotation_decision_protocol(&materialized);
+    assert_eq!(opencode.import_count(), 1, "recovery must not reimport");
+}
+
+#[test]
 fn contract_rotation_independent_binding_progresses_during_native_import() {
     let _io_guard = lock_io_intensive_contract();
     let host = HostRoots::new("agent-runner-opencode-rotation-independent-overlap");

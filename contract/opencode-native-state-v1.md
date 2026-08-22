@@ -82,13 +82,16 @@ edge:
   visible session at the observation point. The provider validates all embedded
   session identities before using it for turns, completion, or recovery.
 - `import <artifact>` may create one session from the supplied native artifact.
-  Rotation persists its operation before import and validates the resulting
-  session by exact export before terminalization; an ambiguous import window is
-  never blindly repeated.
+  Rotation persists its operation and exact process-group incarnation before
+  import, proves the whole group terminal or recycled after direct-leader exit,
+  and validates the resulting session by exact export before terminalization;
+  an ambiguous import window is never blindly repeated.
 - `auth list` may refresh the bound namespace's credential file. The provider
-  serializes the canonical credential identity, observes that exact file before
-  and after the command, and records reconciliation-required rather than
-  attributing an ambiguous change.
+  serializes the canonical credential identity, persists the exact process-group
+  incarnation, observes that exact file before and after the command, and
+  requires whole-group terminal proof before committing or allowing credential
+  reconciliation. It records reconciliation-required rather than attributing an
+  ambiguous change.
 
 OpenCode owns its internal database and file synchronization. The provider does
 not infer a committed effect from process exit alone: it combines bounded,

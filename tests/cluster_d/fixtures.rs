@@ -138,6 +138,7 @@ pub struct RotationOpencodeFixture {
     import_cwd_record: PathBuf,
     import_count_record: PathBuf,
     import_release_marker: PathBuf,
+    import_descendant_release_marker: PathBuf,
     target_export_block_marker: PathBuf,
     #[cfg_attr(not(unix), allow(dead_code))]
     finalization_fault_marker: Option<PathBuf>,
@@ -145,37 +146,41 @@ pub struct RotationOpencodeFixture {
 
 impl RotationOpencodeFixture {
     pub fn new() -> Self {
-        Self::configured(false, None, false, false, false, 0)
+        Self::configured(false, None, false, false, false, false, 0)
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn with_post_import_finalization_fault() -> Self {
-        Self::configured(true, None, false, false, false, 0)
+        Self::configured(true, None, false, false, false, false, 0)
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn with_post_import_finalization_fault_and_target_id(target_session_id: &str) -> Self {
-        Self::configured(true, Some(target_session_id), false, false, false, 0)
+        Self::configured(true, Some(target_session_id), false, false, false, false, 0)
     }
 
     pub fn with_hanging_import() -> Self {
-        Self::configured(false, None, true, false, false, 0)
+        Self::configured(false, None, true, false, false, false, 0)
     }
 
     pub fn with_inconsistent_successful_import() -> Self {
-        Self::configured(false, None, false, true, false, 0)
+        Self::configured(false, None, false, true, false, false, 0)
     }
 
     pub fn with_temporarily_unavailable_rekeyed_target(target_session_id: &str) -> Self {
-        Self::configured(false, Some(target_session_id), false, false, true, 0)
+        Self::configured(false, Some(target_session_id), false, false, true, false, 0)
+    }
+
+    pub fn with_live_import_descendant() -> Self {
+        Self::configured(false, None, false, false, false, true, 0)
     }
 
     pub fn with_oversized_export() -> Self {
-        Self::configured(false, None, false, false, false, 16 * 1024 * 1024)
+        Self::configured(false, None, false, false, false, false, 16 * 1024 * 1024)
     }
 
     pub fn with_large_export() -> Self {
-        Self::configured(false, None, false, false, false, 15 * 1024 * 1024)
+        Self::configured(false, None, false, false, false, false, 15 * 1024 * 1024)
     }
 
     fn configured(
@@ -184,6 +189,7 @@ impl RotationOpencodeFixture {
         hang_import: bool,
         corrupt_imported_content: bool,
         block_target_export: bool,
+        spawn_import_descendant: bool,
         export_payload_bytes: usize,
     ) -> Self {
         let root = unique_temp_dir("agent-runner-opencode-rotation-native");
@@ -192,6 +198,7 @@ impl RotationOpencodeFixture {
         let import_cwd_record = root.join("imported-session.cwd");
         let import_count_record = root.join("imported-session.count");
         let import_release_marker = root.join("release-hanging-import");
+        let import_descendant_release_marker = root.join("release-import-descendant");
         let target_export_block_marker = root.join("block-target-export");
         if block_target_export {
             fs::write(&target_export_block_marker, b"blocked\n")
@@ -213,11 +220,13 @@ impl RotationOpencodeFixture {
                 &import_cwd_record,
                 &import_count_record,
                 &import_release_marker,
+                &import_descendant_release_marker,
                 &target_export_block_marker,
                 finalization_fault_marker.as_deref(),
                 target_session_id,
                 hang_import,
                 corrupt_imported_content,
+                spawn_import_descendant,
             ),
         );
         crate::support::write_fake_opencode_dispatcher(&root);
@@ -227,6 +236,7 @@ impl RotationOpencodeFixture {
             import_cwd_record,
             import_count_record,
             import_release_marker,
+            import_descendant_release_marker,
             target_export_block_marker,
             finalization_fault_marker,
         }
@@ -264,6 +274,11 @@ impl RotationOpencodeFixture {
     pub fn release_hanging_import(&self) {
         fs::write(&self.import_release_marker, b"release\n")
             .expect("release the synthetic hanging import");
+    }
+
+    pub fn release_import_descendant(&self) {
+        fs::write(&self.import_descendant_release_marker, b"release\n")
+            .expect("release the synthetic import descendant");
     }
 
     pub fn restore_target_export(&self) {
@@ -340,11 +355,13 @@ fn rotation_target_script(
     import_cwd_record: &Path,
     import_count_record: &Path,
     import_release_marker: &Path,
+    import_descendant_release_marker: &Path,
     target_export_block_marker: &Path,
     finalization_fault_marker: Option<&Path>,
     target_session_id: Option<&str>,
     hang_import: bool,
     corrupt_imported_content: bool,
+    spawn_import_descendant: bool,
 ) -> String {
     let fault_marker = finalization_fault_marker
         .map(path_string)
@@ -353,6 +370,7 @@ fn rotation_target_script(
         r#"#!/usr/bin/python3
 import json
 import pathlib
+import subprocess
 import sys
 import time
 
@@ -386,6 +404,14 @@ pathlib.Path({cwd_record}).write_text(str(pathlib.Path.cwd()))
 count_path = pathlib.Path({count_record})
 count = int(count_path.read_text()) if count_path.exists() else 0
 count_path.write_text(str(count + 1))
+if {spawn_import_descendant}:
+    subprocess.Popen(
+        [sys.executable, "-c", "import pathlib,sys,time; marker=pathlib.Path(sys.argv[1]);\nwhile not marker.exists(): time.sleep(0.05)", {descendant_release_marker}],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
 fault_marker = pathlib.Path({fault_marker}) if {fault_enabled} else None
 if fault_marker is not None and fault_marker.exists():
     operation_root = pathlib.Path(sys.argv[2]).parents[3] / "provider-state" / "opencode" / "rotation" / "operations"
@@ -401,6 +427,9 @@ print("Imported session: " + native["info"]["id"])
             .expect("count record path JSON"),
         release_marker = serde_json::to_string(&path_string(import_release_marker))
             .expect("release marker path JSON"),
+        descendant_release_marker =
+            serde_json::to_string(&path_string(import_descendant_release_marker))
+                .expect("descendant release marker path JSON"),
         export_block_marker = serde_json::to_string(&path_string(target_export_block_marker))
             .expect("target export block marker path JSON"),
         fault_marker = serde_json::to_string(&fault_marker).expect("fault marker path JSON"),
@@ -413,6 +442,11 @@ print("Imported session: " + native["info"]["id"])
             serde_json::to_string(target_session_id.unwrap_or("")).expect("target session id JSON"),
         hang_import = if hang_import { "True" } else { "False" },
         corrupt_imported_content = if corrupt_imported_content {
+            "True"
+        } else {
+            "False"
+        },
+        spawn_import_descendant = if spawn_import_descendant {
             "True"
         } else {
             "False"

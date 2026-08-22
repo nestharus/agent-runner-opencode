@@ -1501,7 +1501,7 @@ fn admit_and_observe_import(
     })?;
     publish_rotation_import_actor(host, binding, operation, prepared.actor(), request_id)?;
     let observed = prepared.observe(import_timeout);
-    operation.import_actor_terminal_at_unix_ms = Some(now_unix_ms());
+    require_rotation_import_actor_terminal(operation, request_id)?;
     if let Err(error) = write_rotation_operation(host, binding, operation, request_id) {
         return Err(rotation_recovery_required(
             request_id,
@@ -2447,7 +2447,7 @@ fn rotation_boundary_missing(request_id: &str, source_session_id: &str) -> Provi
 mod tests {
     use super::*;
     use crate::native_process::{actor_for_child, configure_process_group};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     #[test]
     fn rotation_rejects_message_without_source_session_identity() {
@@ -2507,5 +2507,57 @@ mod tests {
         require_rotation_import_actor_terminal(&mut operation, "request-test")
             .expect("terminal import actor permits rotation recovery");
         assert!(operation.import_actor_terminal_at_unix_ms.is_some());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rotation_does_not_treat_leader_exit_as_group_terminality() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let child = command.spawn().expect("spawn rotation group leader");
+        let actor = actor_for_child(&child).expect("identify rotation process group");
+        let output = child
+            .wait_with_output()
+            .expect("observe successful direct leader exit");
+        assert!(output.status.success());
+        let descendant_pid = String::from_utf8(output.stdout)
+            .expect("descendant pid output")
+            .trim()
+            .parse::<i32>()
+            .expect("descendant pid");
+        let mut operation = RotationOperation {
+            schema_version: ROTATION_OPERATION_SCHEMA_VERSION,
+            binding_sha256: "binding".to_string(),
+            binding: json!({}),
+            authorization_id: "authorization".to_string(),
+            assessment_request_id: "assessment".to_string(),
+            materialization_request_id: "materialization".to_string(),
+            artifact_path: "/tmp/artifact".to_string(),
+            artifact_sha256: "artifact".to_string(),
+            boundary: "boundary".to_string(),
+            prepared_at_unix_ms: 1,
+            phase: RotationOperationPhase::Prepared,
+            import_actor_process_group_id: Some(actor.process_group_id),
+            import_actor_process_group_incarnation: Some(actor.incarnation),
+            import_actor_terminal_at_unix_ms: None,
+            target_session_id: None,
+            import_candidate_session_id: None,
+            imported_at_unix_ms: None,
+        };
+
+        let unsettled = require_rotation_import_actor_terminal(&mut operation, "request-test")
+            .expect_err("a live same-group descendant must block rotation settlement");
+        unsafe {
+            libc::kill(descendant_pid, libc::SIGKILL);
+        }
+        assert!(matches!(
+            unsettled.code,
+            "rotation_import_actor_active" | "rotation_import_actor_unverifiable"
+        ));
+        assert!(operation.import_actor_terminal_at_unix_ms.is_none());
     }
 }

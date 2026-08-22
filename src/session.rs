@@ -163,59 +163,11 @@ pub(crate) enum Command {
 
 pub(crate) struct SessionOutcome {
     pub result: Value,
-    pub post_write: Option<SessionPostWrite>,
-}
-
-pub(crate) struct SessionPostWrite {
-    root: PathBuf,
-    snapshot_root: PathBuf,
-    snapshot_instance_sha256: String,
-    terminal_claim_request_sha256: String,
-}
-
-impl SessionPostWrite {
-    pub fn complete(self) -> Result<(), std::io::Error> {
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.root.join(".snapshots.lock"))?;
-        if !operation_bounds::lock_exclusive_for(&lock, SESSION_ENUMERATION_LOCK_TIMEOUT)? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "session enumeration snapshot cleanup lock timed out",
-            ));
-        }
-        let bytes = match durable_fs::read_file_bounded(
-            &self.snapshot_root.join("manifest.json"),
-            MAX_ENUMERATION_MANIFEST_BYTES,
-        ) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let manifest: EnumerationSnapshotManifest = serde_json::from_slice(&bytes)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        if manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
-            || manifest.snapshot_instance_sha256 != self.snapshot_instance_sha256
-            || manifest.terminal_claim_request_sha256.as_deref()
-                != Some(self.terminal_claim_request_sha256.as_str())
-        {
-            return Ok(());
-        }
-        match fs::remove_dir_all(&self.snapshot_root) {
-            Ok(()) => durable_fs::sync_directory(&self.root),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
 }
 
 impl SessionOutcome {
     fn new(result: Value) -> Self {
-        Self {
-            result,
-            post_write: None,
-        }
+        Self { result }
     }
 }
 
@@ -620,7 +572,6 @@ struct EnumeratePage {
     warnings: Vec<String>,
     complete: bool,
     next_cursor: Option<String>,
-    post_write: Option<SessionPostWrite>,
 }
 
 fn enumerate_sessions(
@@ -814,12 +765,6 @@ fn claimed_initial_snapshot_page_locked(
                 &identity_sha256,
             )
         }),
-        post_write: complete.then_some(SessionPostWrite {
-            root: root.to_path_buf(),
-            snapshot_root,
-            snapshot_instance_sha256: manifest.snapshot_instance_sha256,
-            terminal_claim_request_sha256: initial_request_sha256.to_string(),
-        }),
     }))
 }
 
@@ -956,12 +901,6 @@ fn persist_enumeration_snapshot(
                 &identity_sha256,
             )
         }),
-        post_write: complete.then_some(SessionPostWrite {
-            root,
-            snapshot_root,
-            snapshot_instance_sha256: manifest.snapshot_instance_sha256,
-            terminal_claim_request_sha256: initial_request_sha256,
-        }),
     })
 }
 
@@ -1052,12 +991,6 @@ fn load_enumeration_snapshot_page(
         complete,
         next_cursor: (!complete)
             .then(|| enumeration_cursor(&snapshot_id, end, total, &expected_identity)),
-        post_write: complete.then_some(SessionPostWrite {
-            root,
-            snapshot_root,
-            snapshot_instance_sha256: manifest.snapshot_instance_sha256,
-            terminal_claim_request_sha256: request_sha256,
-        }),
     })
 }
 
@@ -1864,7 +1797,6 @@ fn enumerate_result(page: EnumeratePage) -> SessionOutcome {
             "next_cursor": page.next_cursor,
             "warnings": page.warnings,
         }),
-        post_write: page.post_write,
     }
 }
 

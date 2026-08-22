@@ -51,7 +51,6 @@ enum Operation {
 struct EnvelopedOutcome {
     result: Value,
     activity_targets: ActivityTargets,
-    post_write: Option<session::SessionPostWrite>,
 }
 
 impl EnvelopedOutcome {
@@ -59,7 +58,6 @@ impl EnvelopedOutcome {
         Self {
             result,
             activity_targets: ActivityTargets::default(),
-            post_write: None,
         }
     }
 
@@ -67,7 +65,6 @@ impl EnvelopedOutcome {
         Self {
             result,
             activity_targets,
-            post_write: None,
         }
     }
 
@@ -75,7 +72,6 @@ impl EnvelopedOutcome {
         Self {
             result: outcome.result,
             activity_targets: ActivityTargets::default(),
-            post_write: outcome.post_write,
         }
     }
 }
@@ -376,11 +372,6 @@ where
         .write_all(&canonical_json_bytes(&response))
         .map_err(stdout_write_failure)?;
     writer.flush().map_err(stdout_write_failure)?;
-    if let Some(post_write) = outcome.post_write {
-        if let Err(error) = post_write.complete() {
-            eprintln!("provider post-response session cleanup warning: {error}");
-        }
-    }
     Ok(0)
 }
 
