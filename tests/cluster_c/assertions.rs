@@ -434,10 +434,7 @@ pub struct FakeNativeCurl {
 
 impl FakeNativeCurl {
     pub fn new() -> Self {
-        Self::with_response(
-            200,
-            r#"{"rate_limit":{"secondary_window":{"used_percent":4,"reset_at":1781159045},"primary_window":{"used_percent":25,"reset_at":1780572245}}}"#,
-        )
+        Self::with_response(200, native_wham_usage_fixture())
     }
 
     pub fn http_failure(status: u16, body: &str) -> Self {
@@ -515,10 +512,26 @@ exit {exit_code}\n",
 }
 
 pub fn native_wham_expected_windows() -> Vec<RawUsageWindow> {
-    vec![
-        raw_usage_window(4.0, "2026-06-11T06:24:05Z"),
-        raw_usage_window(25.0, "2026-06-04T11:24:05Z"),
-    ]
+    let response: Value = serde_json::from_str(native_wham_usage_fixture())
+        .expect("parse authoritative WHAM usage fixture");
+    ["secondary_window", "primary_window"]
+        .into_iter()
+        .map(|name| {
+            let window = &response["rate_limit"][name];
+            let used_percent = window["used_percent"]
+                .as_f64()
+                .expect("WHAM fixture used_percent");
+            let reset_at = window["reset_at"].as_i64().expect("WHAM fixture reset_at");
+            let resets_at = chrono::DateTime::<chrono::Utc>::from_timestamp(reset_at, 0)
+                .expect("WHAM fixture reset timestamp")
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            raw_usage_window(used_percent, &resets_at)
+        })
+        .collect()
+}
+
+fn native_wham_usage_fixture() -> &'static str {
+    include_str!("../fixtures/chatgpt_wham_usage.json")
 }
 
 impl Drop for FakeNativeCurl {
