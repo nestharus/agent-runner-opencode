@@ -267,12 +267,12 @@ impl NativeRuntimeContext {
         &self.program
     }
 
-    pub(crate) fn program_sha256(&self) -> &str {
-        &self.program_sha256
-    }
-
     pub(crate) fn fixed_args(&self) -> &[String] {
         &self.fixed_args
+    }
+
+    pub(crate) fn program_sha256(&self) -> &str {
+        &self.program_sha256
     }
 
     pub(crate) fn native_contract_id(&self) -> &str {

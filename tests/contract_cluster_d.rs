@@ -3277,6 +3277,82 @@ fn contract_rotation_preserves_rekeyed_import_candidate_until_target_is_observab
     );
 }
 
+#[test]
+fn contract_rotation_validates_an_explicit_alternate_to_an_unverified_import_report() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-alternate-import-candidate");
+    let actual_target_session_id = "ses_actual_target_contract_d";
+    let reported_target_session_id = "ses_incorrect_report_contract_d";
+    let opencode = RotationOpencodeFixture::with_temporarily_unavailable_rekeyed_target(
+        actual_target_session_id,
+    );
+    let _ = success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            rotation_assess_alias_params(true),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    );
+    let path = opencode.path_env();
+    let mut request = support::validated_request_envelope(
+        "rotation.materialize",
+        rotation_materialize_params(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+    );
+
+    let first = error_response(support::invoke_with_request_and_env(
+        "rotation.materialize",
+        request.clone(),
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(first["error"]["code"], "rotation_recovery_required");
+    assert_eq!(opencode.import_count(), 1);
+
+    let operation_root = host
+        .data_root()
+        .join("provider-state/opencode/rotation/operations");
+    let operation_path = fs::read_dir(operation_root)
+        .expect("rotation operation directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("prepared rotation operation");
+    let mut operation: Value = serde_json::from_slice(
+        &fs::read(&operation_path).expect("read prepared rotation operation"),
+    )
+    .expect("prepared rotation operation JSON");
+    operation["import_candidate_session_id"] = json!(reported_target_session_id);
+    fs::write(
+        &operation_path,
+        serde_json::to_vec_pretty(&operation).expect("encode incorrect import report"),
+    )
+    .expect("simulate a durable but incorrect import-reported identity");
+
+    opencode.restore_target_export();
+    request["params"]["recovery_target_session_id"] = json!(actual_target_session_id);
+    let recovered = success_result(
+        support::invoke_with_request_and_env(
+            "rotation.materialize",
+            request,
+            &[("PATH", path.as_str())],
+        ),
+        "rotation.schema.json#/$defs/RotationMaterializeResponse",
+        "rotation.schema.json#/$defs/RotationMaterializeResult",
+    );
+    assert_eq!(
+        recovered["target_provider_session_id"],
+        actual_target_session_id
+    );
+    assert_eq!(
+        opencode.import_count(),
+        1,
+        "validating an explicit alternate must not repeat native import"
+    );
+}
+
 fn rotation_binding_test_stripe(params: &Value) -> u8 {
     let source_account = match params["source_account"].as_str() {
         Some("opencode") => "opencode1",

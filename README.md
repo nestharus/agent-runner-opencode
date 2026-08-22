@@ -182,6 +182,15 @@ earlier of `host.deadline_unix_ms` and a 20-second provider ceiling. A timed-out
 child is terminated and reaped, the admitted operation becomes
 `reconciliation_required`, and the credential-effect lane is released for an authorized
 follow-up instead of remaining monopolized by the stalled process.
+The auth command uses the same gated process-group custody as launch: the
+provider durably records the group leader and its boot/process incarnation
+before releasing native execution, and Linux additionally kills the group when
+its provider parent dies. After provider interruption, an exact retry keeps the
+request in `native_effect_admitted` while that exact incarnation is live and
+will not accept a credential digest until the group is proven terminal or its
+numeric ID is proven recycled. This makes the post-effect credential snapshot
+a successor to terminal actor custody rather than a competing observation of a
+still-running mutator.
 That authorized follow-up reuses the original request and adds
 `params.context.reconciliation` with the `accept_current_credentials`
 disposition and the lowercase SHA-256 of the current bound credential file.

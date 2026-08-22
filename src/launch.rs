@@ -15,6 +15,11 @@ use crate::child_custody::ChildCustody;
 use crate::durable_fs;
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
+use crate::native_process::{
+    process_group_incarnation as launch_process_incarnation,
+    process_group_is_live as launch_process_group_is_live,
+    terminate_process_group_child as terminate_child, ExecGate as LaunchExecGate, GatedCommand,
+};
 use crate::native_runtime;
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
 use crate::operation_bounds;
@@ -32,17 +37,11 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::process::Command;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
-#[cfg(unix)]
-use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
-#[cfg(unix)]
-const TERMINATION_GRACE: Duration = Duration::from_millis(100);
 const COMPLETED_RESUME_GRACE: Duration = Duration::from_millis(500);
 const DRAIN_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 const DRAIN_CHANNEL_CAPACITY: usize = 32;
@@ -67,10 +66,6 @@ const LAUNCH_STATE_SCHEMA_VERSION: u32 = 10;
 const MAX_ACTIVE_LAUNCH_REQUEST_RECORDS: usize = 64;
 const MAX_LAUNCH_REPLAY_RECORDS: usize = 4096;
 const MAX_LAUNCH_STATE_BYTES: usize = 256 * 1024;
-#[cfg(unix)]
-const LAUNCH_EXEC_GATE_ARG: &str = "__launch_exec_gate";
-#[cfg(unix)]
-const LAUNCH_EXEC_GATE_FD_ENV: &str = "AGENT_RUNNER_OPENCODE_LAUNCH_GATE_FD";
 pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -105,11 +100,6 @@ enum DrainMessage {
     StdoutDone,
     StderrDone,
     ReadError { stdout: bool, message: String },
-}
-
-struct LaunchExecGate {
-    #[cfg(unix)]
-    writer: UnixStream,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -905,23 +895,19 @@ fn spawn_child(
     env: &BTreeMap<String, String>,
     stdin: Stdio,
 ) -> std::io::Result<(Child, Option<LaunchExecGate>)> {
-    let (mut command, launch_exec_gate) = child_command(argv, working_directory, stdin)?;
-    command.env_clear().envs(env);
-    configure_process_group(&mut command);
+    let (program, args) = argv.split_first().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "launch argv is empty")
+    })?;
+    let mut command = GatedCommand::new(program, args)?;
     command
-        .env(
-            LAUNCH_EXEC_GATE_FD_ENV,
-            launch_exec_gate.1.as_raw_fd().to_string(),
-        )
-        .spawn()
-        .map(|child| {
-            (
-                child,
-                Some(LaunchExecGate {
-                    writer: launch_exec_gate.0,
-                }),
-            )
-        })
+        .command_mut()
+        .current_dir(working_directory)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(stdin)
+        .env_clear()
+        .envs(env);
+    command.spawn().map(|(child, gate)| (child, Some(gate)))
 }
 
 #[cfg(not(unix))]
@@ -935,80 +921,6 @@ fn spawn_child(
         std::io::ErrorKind::Unsupported,
         "native launch requires Unix process-group custody",
     ))
-}
-
-#[cfg(unix)]
-fn child_command(
-    argv: &[String],
-    working_directory: &str,
-    stdin: Stdio,
-) -> std::io::Result<(Command, (UnixStream, UnixStream))> {
-    use std::os::unix::process::CommandExt;
-
-    let gate_program = launch_exec_gate_program()?;
-    let launch_exec_gate = UnixStream::pair()?;
-    let inherited_gate_fd = launch_exec_gate.1.as_raw_fd();
-    let inherited_gate = launch_exec_gate.1.try_clone()?;
-    let mut command = Command::new(gate_program);
-    command
-        .arg(LAUNCH_EXEC_GATE_ARG)
-        .args(argv)
-        .current_dir(working_directory)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(stdin);
-    unsafe {
-        command.pre_exec(move || {
-            let _keep_gate_open = &inherited_gate;
-            let flags = libc::fcntl(inherited_gate_fd, libc::F_GETFD);
-            if flags == -1
-                || libc::fcntl(inherited_gate_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    Ok((command, launch_exec_gate))
-}
-
-#[cfg(unix)]
-fn launch_exec_gate_program() -> std::io::Result<PathBuf> {
-    let current = std::env::current_exe()?;
-    let binary_name = "agent-runner-opencode";
-    if current.file_name().and_then(|name| name.to_str()) == Some(binary_name) {
-        return Ok(current);
-    }
-    let Some(parent) = current.parent() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "provider executable has no containing directory",
-        ));
-    };
-    let candidate = if parent.file_name().and_then(|name| name.to_str()) == Some("deps") {
-        parent.parent().unwrap_or(parent).join(binary_name)
-    } else {
-        parent.join(binary_name)
-    };
-    candidate.is_file().then_some(candidate).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "could not locate the provider launch-gate executable",
-        )
-    })
-}
-
-impl LaunchExecGate {
-    #[cfg(unix)]
-    fn release(mut self) -> std::io::Result<()> {
-        self.writer.write_all(&[1])?;
-        self.writer.flush()
-    }
-
-    #[cfg(not(unix))]
-    fn release(self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 fn prepared_child_stdin(stdin: Option<&[u8]>) -> std::io::Result<Stdio> {
@@ -3571,208 +3483,6 @@ fn json_write_failure(request_id: &str, err: serde_json::Error) -> ProviderFailu
     )
 }
 
-#[cfg(target_os = "linux")]
-fn configure_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    let parent_pid = unsafe { getpid() };
-    unsafe {
-        command.pre_exec(move || set_current_process_group_with_parent_death(parent_pid));
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn set_current_process_group_with_parent_death(parent_pid: i32) -> std::io::Result<()> {
-    set_current_process_group()?;
-    if unsafe { prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) } == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { getppid() } != parent_pid {
-        return Err(std::io::Error::other(
-            "provider parent exited before child custody was established",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn configure_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    unsafe {
-        command.pre_exec(set_current_process_group);
-    }
-}
-
-#[cfg(unix)]
-fn set_current_process_group() -> std::io::Result<()> {
-    if process_group_setup_failed(unsafe { setpgid(0, 0) }) {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn process_group_setup_failed(result: i32) -> bool {
-    result == -1
-}
-
-#[cfg(target_os = "linux")]
-fn launch_process_incarnation(process_id: u32) -> std::io::Result<String> {
-    let stat = fs::read_to_string(format!("/proc/{process_id}/stat"))?;
-    let command_end = stat.rfind(')').ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "process stat has no command terminator",
-        )
-    })?;
-    let start_ticks = stat[command_end + 1..]
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "process stat has no start-time field",
-            )
-        })?
-        .parse::<u64>()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-    let boot_id = boot_id.trim();
-    if boot_id.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "kernel boot identity is empty",
-        ));
-    }
-    Ok(format!("linux:{boot_id}:{start_ticks}"))
-}
-
-#[cfg(target_os = "macos")]
-fn launch_process_incarnation(process_id: u32) -> std::io::Result<String> {
-    let process_id = i32::try_from(process_id).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "process identity exceeds the platform pid range",
-        )
-    })?;
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let info_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "process identity structure exceeds the platform query range",
-        )
-    })?;
-    let read_size = unsafe {
-        libc::proc_pidinfo(
-            process_id,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            info_size,
-        )
-    };
-    if read_size <= 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if read_size != info_size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "process identity query returned a partial record",
-        ));
-    }
-    let info = unsafe { info.assume_init() };
-    if info.pbi_pid != process_id as u32 || info.pbi_pgid != process_id as u32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "launch actor is not the leader of its registered process group",
-        ));
-    }
-    Ok(format!(
-        "macos:{}:{}",
-        info.pbi_start_tvsec, info.pbi_start_tvusec
-    ))
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn launch_process_incarnation(_process_id: u32) -> std::io::Result<String> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "durable launch actor incarnation is unsupported on this Unix platform",
-    ))
-}
-
-#[cfg(not(unix))]
-fn launch_process_incarnation(_process_id: u32) -> std::io::Result<String> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "durable launch actor incarnation requires Unix process custody",
-    ))
-}
-
-#[cfg(unix)]
-fn launch_process_group_is_live(process_group_id: u32) -> bool {
-    let Ok(process_group_id) = i32::try_from(process_group_id) else {
-        return true;
-    };
-    if unsafe { kill(-process_group_id, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(not(unix))]
-fn launch_process_group_is_live(_process_group_id: u32) -> bool {
-    true
-}
-
-#[cfg(unix)]
-fn terminate_child(child: &mut Child) -> Option<ExitStatus> {
-    let pgid = child_process_group_id(child);
-    send_process_group_signal(pgid, SIGTERM);
-    std::thread::sleep(TERMINATION_GRACE);
-    send_process_group_signal(pgid, SIGKILL);
-    child.wait().ok()
-}
-
-#[cfg(unix)]
-fn child_process_group_id(child: &Child) -> i32 {
-    -(child.id() as i32)
-}
-
-#[cfg(unix)]
-fn send_process_group_signal(pgid: i32, signal: i32) {
-    unsafe {
-        let _ = kill(pgid, signal);
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_child(child: &mut Child) -> Option<ExitStatus> {
-    let _ = child.kill();
-    child.wait().ok()
-}
-
-#[cfg(unix)]
-const SIGTERM: i32 = 15;
-
-#[cfg(unix)]
-const SIGKILL: i32 = 9;
-
-#[cfg(target_os = "linux")]
-const PR_SET_PDEATHSIG: i32 = 1;
-
-#[cfg(unix)]
-extern "C" {
-    fn setpgid(pid: i32, pgid: i32) -> i32;
-    fn kill(pid: i32, sig: i32) -> i32;
-}
-
-#[cfg(target_os = "linux")]
-extern "C" {
-    fn getpid() -> i32;
-    fn getppid() -> i32;
-    fn prctl(option: i32, arg2: i32, arg3: usize, arg4: usize, arg5: usize) -> i32;
-}
-
 #[cfg(test)]
 mod custody_tests {
     use super::*;
@@ -4042,6 +3752,8 @@ mod custody_tests {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+    use crate::native_process::configure_process_group;
+    use std::process::Command;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

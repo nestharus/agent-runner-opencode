@@ -27,6 +27,10 @@ impl ChildCustody {
         self.child.as_mut().expect("child custody is active")
     }
 
+    pub(crate) fn child_ref(&self) -> Option<&Child> {
+        self.child.as_ref()
+    }
+
     pub(crate) fn wait_with_output_timeout(
         mut self,
         timeout: Duration,
@@ -78,10 +82,7 @@ impl ChildCustody {
             .take()
             .map(|reader| spawn_bounded_drain(reader, maximum_stderr_bytes));
         let status = match self.child_mut().wait_timeout(timeout) {
-            Ok(Some(status)) => {
-                self.child.take();
-                Some(status)
-            }
+            Ok(Some(status)) => Some(status),
             Ok(None) => {
                 self.cleanup_now();
                 return Ok(None);
@@ -92,11 +93,14 @@ impl ChildCustody {
             }
         };
         let Some(stdout) = join_drain_before(stdout, started, timeout)? else {
+            self.cleanup_now();
             return Ok(None);
         };
         let Some(stderr) = join_drain_before(stderr, started, timeout)? else {
+            self.cleanup_now();
             return Ok(None);
         };
+        self.child.take();
         Ok(status.map(|status| Output {
             status,
             stdout,

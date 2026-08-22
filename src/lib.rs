@@ -12,6 +12,7 @@ pub mod launch;
 pub mod migration;
 pub mod models;
 mod native_implementation_manifest;
+mod native_process;
 pub mod native_runtime;
 pub mod opencode;
 mod operation_bounds;

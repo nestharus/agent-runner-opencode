@@ -962,6 +962,10 @@ fn contract_quota_refresh_auth_does_not_repeat_an_unsettled_native_effect() {
         .as_object_mut()
         .expect("quota operation object")
         .remove("result");
+    operation
+        .as_object_mut()
+        .expect("quota operation object")
+        .remove("actor_terminal_at_unix_ms");
     std::fs::write(
         &operation_path,
         serde_json::to_vec_pretty(&operation).expect("serialize unsettled quota operation"),

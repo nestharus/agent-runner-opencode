@@ -12,6 +12,9 @@
 
 use crate::child_custody::ChildCustody;
 use crate::durable_fs;
+use crate::native_process::{
+    actor_for_child, terminate_process_group_child, ExecGate, GatedCommand, ProcessGroupActor,
+};
 use crate::native_runtime::NativeRuntimeContext;
 use crate::shell::ShellOutput;
 use serde::Deserialize;
@@ -19,7 +22,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -229,6 +232,61 @@ pub struct OpencodeAuthObservation {
     pub output: ShellOutput,
     pub effect: OpencodeAuthEffect,
     pub output_exceeded_bound: bool,
+}
+
+pub(crate) struct PreparedOpencodeAuthObservation {
+    before: Option<Vec<u8>>,
+    auth_path: PathBuf,
+    custody: ChildCustody,
+    gate: ExecGate,
+    actor: ProcessGroupActor,
+}
+
+impl PreparedOpencodeAuthObservation {
+    pub(crate) fn actor(&self) -> &ProcessGroupActor {
+        &self.actor
+    }
+
+    pub(crate) fn observe(
+        self,
+        timeout: Duration,
+    ) -> Result<OpencodeAuthObservation, OpencodeAuthFailure> {
+        let Self {
+            before,
+            auth_path,
+            custody,
+            gate,
+            actor: _,
+        } = self;
+        gate.release()
+            .map_err(OpencodeAuthFailure::EffectUnsettled)?;
+        let output = custody
+            .wait_with_bounded_output_timeout(
+                timeout,
+                MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+                MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+            )
+            .map_err(OpencodeAuthFailure::EffectUnsettled)?
+            .ok_or_else(|| {
+                OpencodeAuthFailure::EffectUnsettled(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "opencode auth list timed out",
+                ))
+            })?;
+        let output_exceeded_bound = output.stdout.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES
+            || output.stderr.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES;
+        let after =
+            credential_snapshot(&auth_path).map_err(OpencodeAuthFailure::EffectUnsettled)?;
+        Ok(OpencodeAuthObservation {
+            output: ShellOutput {
+                stdout: output.stdout,
+                stderr: output.stderr,
+                status: output.status.code().unwrap_or(1),
+            },
+            effect: observed_auth_effect(before, after),
+            output_exceeded_bound,
+        })
+    }
 }
 
 impl OpencodeAuthObservation {
@@ -514,43 +572,37 @@ pub fn import_session(
     parse_import_stdout(&output.stdout)
 }
 
-pub fn observe_auth_list(
+pub(crate) fn prepare_auth_list(
     runtime: &NativeRuntimeContext,
     auth_path: &Path,
-    timeout: Duration,
-) -> Result<OpencodeAuthObservation, OpencodeAuthFailure> {
+) -> Result<PreparedOpencodeAuthObservation, OpencodeAuthFailure> {
     let before = credential_snapshot(auth_path).map_err(OpencodeAuthFailure::BeforeEffect)?;
-    let mut command = runtime.command();
+    let mut command = GatedCommand::new(runtime.program(), runtime.fixed_args())
+        .map_err(OpencodeAuthFailure::BeforeEffect)?;
     command
+        .command_mut()
         .arg("auth")
         .arg("list")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = command.spawn().map_err(OpencodeAuthFailure::BeforeEffect)?;
-    let output = ChildCustody::new(child)
-        .wait_with_bounded_output_timeout(
-            timeout,
-            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
-            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
-        )
-        .map_err(OpencodeAuthFailure::EffectUnsettled)?
-        .ok_or_else(|| {
-            OpencodeAuthFailure::EffectUnsettled(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "opencode auth list timed out",
-            ))
-        })?;
-    let output_exceeded_bound = output.stdout.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES
-        || output.stderr.len() > MAX_NATIVE_COMMAND_OUTPUT_BYTES;
-    let after = credential_snapshot(auth_path).map_err(OpencodeAuthFailure::EffectUnsettled)?;
-    Ok(OpencodeAuthObservation {
-        output: ShellOutput {
-            stdout: output.stdout,
-            stderr: output.stderr,
-            status: output.status.code().unwrap_or(1),
-        },
-        effect: observed_auth_effect(before, after),
-        output_exceeded_bound,
+        .stderr(Stdio::piped())
+        .env_clear()
+        .envs(runtime.execution_environment(&BTreeMap::new()));
+    let (child, gate) = command.spawn().map_err(OpencodeAuthFailure::BeforeEffect)?;
+    let custody = ChildCustody::with_cleanup(child, |child| {
+        let _ = terminate_process_group_child(child);
+    });
+    let actor = actor_for_child(
+        custody
+            .child_ref()
+            .expect("prepared auth-list child custody is active"),
+    )
+    .map_err(OpencodeAuthFailure::BeforeEffect)?;
+    Ok(PreparedOpencodeAuthObservation {
+        before,
+        auth_path: auth_path.to_path_buf(),
+        custody,
+        gate,
+        actor,
     })
 }
 

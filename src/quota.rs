@@ -12,8 +12,12 @@ use crate::activity::ActivityTargets;
 use crate::durable_fs;
 use crate::encoding::{bounded_text_bytes, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
+use crate::native_process::{actor_is_terminal_or_recycled, ProcessGroupActor};
 use crate::native_runtime::{self, NativeRuntimeContext};
-use crate::opencode::{OpencodeAuthEffect, OpencodeAuthFailure, OpencodeAuthObservation};
+use crate::opencode::{
+    OpencodeAuthEffect, OpencodeAuthFailure, OpencodeAuthObservation,
+    PreparedOpencodeAuthObservation,
+};
 use crate::operation_bounds;
 use crate::path_guard;
 use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
@@ -83,6 +87,12 @@ struct QuotaRefreshOperation {
     prepared_at_unix_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_effect_admitted_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor_process_group_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor_process_group_incarnation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor_terminal_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     committed_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,7 +200,7 @@ pub fn refresh_auth_params(
     let _request_lock = acquire_quota_refresh_request_lock(host, request_id)?;
     let (mut operation, account, runtime, observer, auth_path) =
         match read_quota_refresh_operation(host, request_id)? {
-            Some(operation) => {
+            Some(mut operation) => {
                 validate_quota_refresh_operation(&operation, request_id)?;
                 if !quota_refresh_attempt_matches(
                     &operation,
@@ -213,6 +223,7 @@ pub fn refresh_auth_params(
                     }
                     QuotaRefreshOperationPhase::NativeEffectAdmitted => {
                         let mut unresolved = operation;
+                        require_quota_refresh_actor_terminal(&mut unresolved, request_id)?;
                         require_quota_refresh_reconciliation(
                             &mut unresolved,
                             "provider_interrupted_after_effect_admission",
@@ -226,6 +237,7 @@ pub fn refresh_auth_params(
                         ));
                     }
                     QuotaRefreshOperationPhase::ReconciliationRequired => {
+                        require_quota_refresh_actor_terminal(&mut operation, request_id)?;
                         if let Some(reconciliation) = parsed.reconciliation() {
                             return reconcile_quota_refresh_operation(
                                 host,
@@ -277,6 +289,9 @@ pub fn refresh_auth_params(
                     phase: QuotaRefreshOperationPhase::Prepared,
                     prepared_at_unix_ms: now_unix_ms(),
                     native_effect_admitted_at_unix_ms: None,
+                    actor_process_group_id: None,
+                    actor_process_group_incarnation: None,
+                    actor_terminal_at_unix_ms: None,
                     committed_at_unix_ms: None,
                     result: None,
                     reconciliation: None,
@@ -287,11 +302,16 @@ pub fn refresh_auth_params(
         };
     let _effect_lock = acquire_quota_refresh_effect_lock(host, &auth_path, request_id)?;
     let native_timeout = quota_refresh_operation_timeout(host, request_id)?;
-    operation.phase = QuotaRefreshOperationPhase::NativeEffectAdmitted;
-    operation.native_effect_admitted_at_unix_ms = Some(now_unix_ms());
-    write_quota_refresh_operation(host, &operation, request_id)?;
     let checked_at_unix_ms = now_unix_ms();
-    let refresh = run_account_auth_refresh(&runtime, &auth_path, native_timeout);
+    let refresh = match prepare_account_auth_refresh(&runtime, &auth_path) {
+        Ok(prepared) => {
+            publish_quota_refresh_actor(host, &mut operation, prepared.actor(), request_id)?;
+            let refresh = prepared.observe(native_timeout);
+            operation.actor_terminal_at_unix_ms = Some(now_unix_ms());
+            refresh
+        }
+        Err(error) => Err(error),
+    };
     if let Some(reconciliation) = refresh_reconciliation(&refresh) {
         require_quota_refresh_reconciliation(
             &mut operation,
@@ -876,6 +896,21 @@ fn validate_quota_refresh_operation(
     operation: &QuotaRefreshOperation,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
+    let actor_absent = operation.actor_process_group_id.is_none()
+        && operation.actor_process_group_incarnation.is_none()
+        && operation.actor_terminal_at_unix_ms.is_none();
+    let actor_live_or_unsettled = operation.actor_process_group_id.is_some_and(|id| id > 0)
+        && operation
+            .actor_process_group_incarnation
+            .as_ref()
+            .is_some_and(|incarnation| !incarnation.trim().is_empty())
+        && operation.actor_terminal_at_unix_ms.is_none();
+    let actor_terminal = operation.actor_process_group_id.is_some_and(|id| id > 0)
+        && operation
+            .actor_process_group_incarnation
+            .as_ref()
+            .is_some_and(|incarnation| !incarnation.trim().is_empty())
+        && operation.actor_terminal_at_unix_ms.is_some();
     let reconciliation_valid = operation
         .reconciliation
         .as_ref()
@@ -883,18 +918,21 @@ fn validate_quota_refresh_operation(
     let phase_valid = match operation.phase {
         QuotaRefreshOperationPhase::Prepared => {
             operation.native_effect_admitted_at_unix_ms.is_none()
+                && actor_absent
                 && operation.committed_at_unix_ms.is_none()
                 && operation.result.is_none()
                 && operation.reconciliation.is_none()
         }
         QuotaRefreshOperationPhase::NativeEffectAdmitted => {
             operation.native_effect_admitted_at_unix_ms.is_some()
+                && actor_live_or_unsettled
                 && operation.committed_at_unix_ms.is_none()
                 && operation.result.is_none()
                 && operation.reconciliation.is_none()
         }
         QuotaRefreshOperationPhase::ReconciliationRequired => {
             operation.native_effect_admitted_at_unix_ms.is_some()
+                && actor_terminal
                 && operation.committed_at_unix_ms.is_none()
                 && operation.result.is_none()
                 && operation
@@ -903,7 +941,8 @@ fn validate_quota_refresh_operation(
                     .is_none_or(|evidence| evidence.get("resolution").is_none())
         }
         QuotaRefreshOperationPhase::Committed => {
-            operation.native_effect_admitted_at_unix_ms.is_some()
+            ((operation.native_effect_admitted_at_unix_ms.is_some() && actor_terminal)
+                || (operation.native_effect_admitted_at_unix_ms.is_none() && actor_absent))
                 && operation.committed_at_unix_ms.is_some()
                 && operation.result.is_some()
                 && operation.reconciliation.as_ref().is_none_or(|evidence| {
@@ -1045,6 +1084,42 @@ fn quota_refresh_reconciliation_not_required(request_id: &str) -> ProviderFailur
         "quota_refresh_reconciliation_not_required",
         "quota.refresh_auth reconciliation is accepted only for the original reconciliation-required request",
         json!({}),
+    )
+}
+
+fn quota_refresh_actor_active(
+    request_id: &str,
+    operation: &QuotaRefreshOperation,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "quota_refresh_actor_active",
+        "the previously admitted native auth actor is still running; credential reconciliation is not yet safe",
+        json!({
+            "binding_sha256": operation.binding_sha256,
+            "actor_process_group_id": operation.actor_process_group_id,
+            "actor_process_group_incarnation": operation.actor_process_group_incarnation,
+            "recovery": "wait for the exact native actor incarnation to become terminal, then retry the original request before reconciling credentials",
+        }),
+    )
+}
+
+fn quota_refresh_actor_unverifiable(
+    request_id: &str,
+    operation: &QuotaRefreshOperation,
+    error: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "quota_refresh_actor_unverifiable",
+        "the provider cannot prove that the previously admitted native auth actor is terminal",
+        json!({
+            "binding_sha256": operation.binding_sha256,
+            "actor_process_group_id": operation.actor_process_group_id,
+            "actor_process_group_incarnation": operation.actor_process_group_incarnation,
+            "failure": error.to_string(),
+            "recovery": "restore process-incarnation observation and retry; do not accept credential state while the admitted actor may still run",
+        }),
     )
 }
 
@@ -1327,12 +1402,57 @@ fn quota_observation_without_refresh(
     run_probe(&resolved_auth_path(account, runtime), observer)
 }
 
-fn run_account_auth_refresh(
+fn prepare_account_auth_refresh(
     runtime: &NativeRuntimeContext,
     auth_path: &Path,
-    timeout: Duration,
-) -> Result<OpencodeAuthObservation, OpencodeAuthFailure> {
-    crate::opencode::observe_auth_list(runtime, auth_path, timeout)
+) -> Result<PreparedOpencodeAuthObservation, OpencodeAuthFailure> {
+    crate::opencode::prepare_auth_list(runtime, auth_path)
+}
+
+fn publish_quota_refresh_actor(
+    host: &HostContext,
+    operation: &mut QuotaRefreshOperation,
+    actor: &ProcessGroupActor,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    operation.phase = QuotaRefreshOperationPhase::NativeEffectAdmitted;
+    operation.native_effect_admitted_at_unix_ms = Some(now_unix_ms());
+    operation.actor_process_group_id = Some(actor.process_group_id);
+    operation.actor_process_group_incarnation = Some(actor.incarnation.clone());
+    operation.actor_terminal_at_unix_ms = None;
+    write_quota_refresh_operation(host, operation, request_id)
+}
+
+fn require_quota_refresh_actor_terminal(
+    operation: &mut QuotaRefreshOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if operation.actor_terminal_at_unix_ms.is_some() {
+        return Ok(());
+    }
+    let (Some(process_group_id), Some(incarnation)) = (
+        operation.actor_process_group_id,
+        operation.actor_process_group_incarnation.as_ref(),
+    ) else {
+        return Err(quota_refresh_operation_invalid(
+            request_id,
+            "an effect-admitted quota refresh has no durable native actor incarnation",
+        ));
+    };
+    let actor = ProcessGroupActor {
+        process_group_id,
+        incarnation: incarnation.clone(),
+    };
+    match actor_is_terminal_or_recycled(&actor) {
+        Ok(true) => {
+            operation.actor_terminal_at_unix_ms = Some(now_unix_ms());
+            Ok(())
+        }
+        Ok(false) => Err(quota_refresh_actor_active(request_id, operation)),
+        Err(error) => Err(quota_refresh_actor_unverifiable(
+            request_id, operation, error,
+        )),
+    }
 }
 
 fn refresh_succeeded(refresh: &Result<OpencodeAuthObservation, OpencodeAuthFailure>) -> bool {
@@ -1499,7 +1619,35 @@ fn epoch_ms(rfc3339: &str) -> i64 {
 #[cfg(test)]
 mod custody_tests {
     use super::*;
+    use crate::native_process::{actor_for_child, configure_process_group};
+    use std::process::Command as ProcessCommand;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn credential_reconciliation_waits_for_the_exact_native_actor() {
+        let mut command = ProcessCommand::new("/bin/sleep");
+        command.arg("30");
+        configure_process_group(&mut command);
+        let mut actor_child = command.spawn().expect("spawn quota actor");
+        let actor = actor_for_child(&actor_child).expect("identify quota actor");
+        let mut operation =
+            quota_custody_operation(1, QuotaRefreshOperationPhase::NativeEffectAdmitted);
+        operation.actor_process_group_id = Some(actor.process_group_id);
+        operation.actor_process_group_incarnation = Some(actor.incarnation);
+        operation.actor_terminal_at_unix_ms = None;
+
+        let active = require_quota_refresh_actor_terminal(&mut operation, "request-1")
+            .expect_err("live actor must block credential reconciliation");
+        assert_eq!(active.code, "quota_refresh_actor_active");
+        assert!(operation.actor_terminal_at_unix_ms.is_none());
+
+        actor_child.kill().expect("terminate quota actor");
+        actor_child.wait().expect("reap quota actor");
+        require_quota_refresh_actor_terminal(&mut operation, "request-1")
+            .expect("terminal actor permits credential reconciliation");
+        assert!(operation.actor_terminal_at_unix_ms.is_some());
+    }
 
     #[test]
     fn committed_history_does_not_consume_active_refresh_capacity() {
@@ -1533,6 +1681,9 @@ mod custody_tests {
                 phase: QuotaRefreshOperationPhase::Committed,
                 prepared_at_unix_ms: 1,
                 native_effect_admitted_at_unix_ms: Some(2),
+                actor_process_group_id: Some(123),
+                actor_process_group_incarnation: Some("test:actor:1".to_string()),
+                actor_terminal_at_unix_ms: Some(3),
                 committed_at_unix_ms: Some(3),
                 result: Some(json!({"available": true})),
                 reconciliation: None,
@@ -1690,6 +1841,8 @@ mod custody_tests {
         index: usize,
         phase: QuotaRefreshOperationPhase,
     ) -> QuotaRefreshOperation {
+        let effect_admitted = phase != QuotaRefreshOperationPhase::Prepared;
+        let actor_terminal = phase == QuotaRefreshOperationPhase::Committed;
         QuotaRefreshOperation {
             schema_version: QUOTA_REFRESH_SCHEMA_VERSION,
             operation: "quota.refresh_auth".to_string(),
@@ -1698,7 +1851,10 @@ mod custody_tests {
             binding: json!({}),
             phase,
             prepared_at_unix_ms: 1,
-            native_effect_admitted_at_unix_ms: Some(2),
+            native_effect_admitted_at_unix_ms: effect_admitted.then_some(2),
+            actor_process_group_id: effect_admitted.then_some(123),
+            actor_process_group_incarnation: effect_admitted.then(|| format!("test:actor:{index}")),
+            actor_terminal_at_unix_ms: actor_terminal.then_some(3),
             committed_at_unix_ms: (phase == QuotaRefreshOperationPhase::Committed).then_some(3),
             result: (phase == QuotaRefreshOperationPhase::Committed)
                 .then(|| json!({"available": true})),

@@ -711,10 +711,8 @@ fn settle_rotation_settings_selection(
         ));
     }
     let expected_target_session_id = match operation.phase {
-        RotationOperationPhase::Prepared => operation
-            .import_candidate_session_id
-            .as_deref()
-            .or_else(|| optional_string(params, "recovery_target_session_id"))
+        RotationOperationPhase::Prepared => optional_string(params, "recovery_target_session_id")
+            .or(operation.import_candidate_session_id.as_deref())
             .unwrap_or(&binding.source_session_id),
         RotationOperationPhase::Imported => operation
             .target_session_id
@@ -1448,33 +1446,17 @@ fn reconcile_prepared_operation(
 ) -> Result<(), ProviderFailure> {
     let supplied_target = optional_string(params, "recovery_target_session_id");
     let durable_candidate = operation.import_candidate_session_id.clone();
-    if durable_candidate.is_some()
-        && supplied_target.is_some()
-        && durable_candidate.as_deref() != supplied_target
-    {
-        return Err(rotation_recovery_required(
-            request_id,
-            binding,
-            operation,
-            durable_candidate.as_deref(),
-            Some(
-                "supplied recovery target does not match the durable native import observation"
-                    .to_string(),
-            ),
-        ));
-    }
-    let candidate_session_id = durable_candidate
-        .as_deref()
-        .or(supplied_target)
+    let candidate_session_id = supplied_target
+        .or(durable_candidate.as_deref())
         .unwrap_or(&binding.source_session_id);
-    let authoritative_candidate = durable_candidate.is_some() || supplied_target.is_some();
+    let preserve_candidate = durable_candidate.is_none() && supplied_target.is_some();
     validate_and_record_imported_target(
         host,
         binding,
         target_runtime,
         operation,
         candidate_session_id,
-        authoritative_candidate,
+        preserve_candidate,
         budget,
         request_id,
     )
@@ -1487,11 +1469,11 @@ fn validate_and_record_imported_target(
     target_runtime: &native_runtime::NativeRuntimeContext,
     operation: &mut RotationOperation,
     candidate_session_id: &str,
-    authoritative_candidate: bool,
+    preserve_candidate: bool,
     budget: &RotationBudget,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    if authoritative_candidate {
+    if preserve_candidate {
         preserve_import_candidate(host, binding, operation, candidate_session_id, request_id)?;
     }
     let verification_timeout = match budget.remaining(request_id) {
