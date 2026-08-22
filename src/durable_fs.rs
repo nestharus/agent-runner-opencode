@@ -23,6 +23,10 @@ pub(crate) fn create_private_directories(path: &Path) -> std::io::Result<()> {
     create_directory_chain(path, true)
 }
 
+pub(crate) fn prepare_best_effort_private_directory(path: &Path) -> std::io::Result<()> {
+    prepare_best_effort_private_directory_with_sync(path, sync_directory)
+}
+
 pub(crate) fn is_executable_file(path: &Path) -> std::io::Result<bool> {
     let metadata = fs::metadata(path)?;
     if !metadata.is_file() {
@@ -185,6 +189,29 @@ where
     sync_directory_lineage(path, sync)
 }
 
+fn prepare_best_effort_private_directory_with_sync<F>(
+    path: &Path,
+    mut sync: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            set_private_directory_permissions(path)?;
+            sync(path)
+        }
+        Ok(_) => Err(Error::new(
+            ErrorKind::NotADirectory,
+            "best-effort evidence root is not a directory",
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            create_directory_chain_with_sync(path, true, sync)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn sync_directory_lineage<F>(path: &Path, mut sync: F) -> std::io::Result<()>
 where
     F: FnMut(&Path) -> std::io::Result<()>,
@@ -254,6 +281,24 @@ mod tests {
         assert!(target.is_dir());
         assert!(retry_syncs.iter().any(|path| path == &first_directory));
         assert!(retry_syncs.iter().any(|path| path == temporary.path()));
+    }
+
+    #[test]
+    fn best_effort_existing_directory_sync_cost_is_independent_of_lineage_depth() {
+        let temporary = tempfile::tempdir().expect("create best-effort directory test root");
+        let target = (0..64).fold(temporary.path().to_path_buf(), |path, index| {
+            path.join(format!("depth-{index}"))
+        });
+        fs::create_dir_all(&target).expect("create deep existing directory lineage");
+
+        let mut syncs = Vec::new();
+        prepare_best_effort_private_directory_with_sync(&target, |directory| {
+            syncs.push(directory.to_path_buf());
+            Ok(())
+        })
+        .expect("prepare existing best-effort directory");
+
+        assert_eq!(syncs, vec![target]);
     }
 
     #[test]

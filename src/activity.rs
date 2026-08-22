@@ -236,7 +236,7 @@ fn write_activity(
     path_guard::confined_target(data_root, root)?;
     let lock_path = path_guard::confined_target(data_root, &root.join(ACTIVITY_LOCK))?;
     let path = path_guard::confined_target(data_root, &root.join(ACTIVITY_FILE))?;
-    durable_fs::create_private_directories(root)?;
+    durable_fs::prepare_best_effort_private_directory(root)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)

@@ -507,12 +507,18 @@ before creating a directory or file. Each subsystem retains its own lifecycle
 rules after admission: settings and activity keep their interprocess locks,
 and migration and rotation keep their content-addressed atomic publication.
 One shared filesystem boundary durably publishes every settings, migration,
-activity, launch-state, rotation-artifact, and rotation-state directory link
-before a dependent file write or irreversible native import may proceed. Every
-retry re-synchronizes the complete directory lineage, including links already
-visible after an earlier parent-sync failure. A readable provider file can
+launch-state, rotation-artifact, and rotation-state directory link before a
+dependent file write or irreversible native import may proceed. Every retry
+re-synchronizes the complete directory lineage, including links already visible
+after an earlier parent-sync failure. A readable material provider file can
 satisfy a retry only after that boundary re-syncs its parent, so a prior
-post-rename sync failure remains an error until durability completes.
+post-rename sync failure remains an error until durability completes. Ancillary
+best-effort activity evidence pays that complete lineage publication only while
+its root is absent; once the root exists, each attempted event verifies private
+directory ownership and synchronizes only the activity root before its zero-wait
+ledger lock. Its steady-state coordination cost is therefore independent of
+caller-selected host path depth, and activity loss still never changes a
+capability result.
 
 Every native effect also passes through one durable runtime context per
 numbered account under `host.data_root/provider-state/opencode/native-runtimes`.
