@@ -188,6 +188,22 @@ Those shared mechanisms do not own a capability's route, session, credential,
 or terminal meaning. The quota and launch sections below define their separate
 bindings, observations, reconciliation rules, and replay results.
 
+The active-index marker is itself a durable pre-state custody phase and binds
+both the request digest and the capability's complete attempted-input identity.
+Admission holds the capability capacity lock from maintenance through marker
+publication and creation of the request lock. An exact retry matches its
+existing marker before applying the active-capacity rejection and can resume
+even when every active slot is occupied; changed inputs conflict before they can
+inherit the reservation. If the reserving provider stops before creating either
+request state or its request lock, a successor holding the capacity lock can
+prove that no process still owns that pre-effect handoff and retire the marker;
+the exact request's current marker is preserved for that retry. Any marker with
+durable state, a live/young request lock, or replay ownership continues through
+the capability's normal reconciliation or retention rules and is never retired
+by this state-less pre-lock path. Schema-v3 active indexes upgrade in place;
+an unbound legacy marker can acquire a binding only when both state and request
+lock are absent under the capacity lock.
+
 ## Quota observation and credential refresh
 
 ### Quota observation

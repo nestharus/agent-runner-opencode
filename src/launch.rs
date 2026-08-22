@@ -27,7 +27,7 @@ use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata
 use crate::operation_bounds;
 use crate::path_guard;
 use crate::policy;
-use crate::request_custody::{CustodyError, RequestCustody};
+use crate::request_custody::{ActiveReservation, CustodyError, RequestCustody};
 use crate::resume_observation::{
     self, DurableResumeObservationRequest, ResumeObservation, ResumeObservationRequest,
     RouteIdentity as ResumeRouteIdentity,
@@ -1114,7 +1114,14 @@ fn preflight_existing_launch_replay(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(launch_state_failure(request_id, error)),
     }
-    let lock = acquire_launch_request_lock(host, &root, &state_path, false, request_id)?;
+    let lock = acquire_launch_request_lock(
+        host,
+        &root,
+        &state_path,
+        false,
+        request_identity_sha256,
+        request_id,
+    )?;
     let bytes = durable_fs::read_file_bounded(&state_path, MAX_LAUNCH_STATE_BYTES)
         .map_err(|error| launch_state_failure(request_id, error))?;
     let expected_kind = if new_session {
@@ -1331,7 +1338,14 @@ impl LaunchRequestGuard {
         let key = sha256_hex(request_id.as_bytes());
         let state_path =
             confined_launch_state_target(host, &root.join(format!("{key}.json")), request_id)?;
-        let lock = acquire_launch_request_lock(host, &root, &state_path, true, request_id)?;
+        let lock = acquire_launch_request_lock(
+            host,
+            &root,
+            &state_path,
+            true,
+            &request_identity_sha256,
+            request_id,
+        )?;
         match durable_fs::read_file_bounded(&state_path, MAX_LAUNCH_STATE_BYTES) {
             Ok(bytes) => {
                 validate_launch_operation_kind(
@@ -1458,7 +1472,14 @@ impl ResumeLaunchRequestGuard {
         let key = sha256_hex(request_id.as_bytes());
         let state_path =
             confined_launch_state_target(host, &root.join(format!("{key}.json")), request_id)?;
-        let lock = acquire_launch_request_lock(host, &root, &state_path, true, request_id)?;
+        let lock = acquire_launch_request_lock(
+            host,
+            &root,
+            &state_path,
+            true,
+            &request_identity_sha256,
+            request_id,
+        )?;
         match durable_fs::read_file_bounded(&state_path, MAX_LAUNCH_STATE_BYTES) {
             Ok(bytes) => {
                 validate_launch_operation_kind(
@@ -2028,24 +2049,52 @@ fn acquire_launch_request_lock(
     root: &Path,
     state_path: &Path,
     admit_new: bool,
+    reservation_binding_sha256: &str,
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
     let capacity_lock = acquire_launch_capacity_lock(root, host, request_id)?;
     let lock_path = state_path.with_extension("lock");
     let custody = launch_request_custody(root);
-    let observed_existing = lock_path.exists()
-        || state_path.exists()
-        || custody
-            .replay_owner_exists(state_path)
-            .map_err(|error| launch_custody_failure(request_id, error))?;
+    let lock_exists = lock_path.exists();
+    let state_exists = state_path.exists();
+    let replay_owner_exists = custody
+        .replay_owner_exists(state_path)
+        .map_err(|error| launch_custody_failure(request_id, error))?;
     let active = maintain_launch_request_capacity(&custody, &lock_path, request_id)?;
+    let mut active_reservation = custody
+        .active_reservation(state_path, reservation_binding_sha256)
+        .map_err(|error| launch_custody_failure(request_id, error))?;
+    if active_reservation == ActiveReservation::Unbound
+        && admit_new
+        && !lock_exists
+        && !state_exists
+        && !replay_owner_exists
+    {
+        custody
+            .bind_unbound_active(state_path, reservation_binding_sha256)
+            .map_err(|error| launch_custody_failure(request_id, error))?;
+        active_reservation = ActiveReservation::Matching;
+    }
+    if active_reservation == ActiveReservation::Conflicting {
+        return Err(launch_state_invalid(
+            request_id,
+            "the active request reservation belongs to different launch inputs",
+        ));
+    }
+    let active_marker_exists = active_reservation != ActiveReservation::Absent;
+    let resumes_pre_state_reservation = admit_new
+        && active_reservation == ActiveReservation::Matching
+        && !state_exists
+        && !replay_owner_exists;
+    let observed_existing =
+        lock_exists || state_exists || replay_owner_exists || active_marker_exists;
     let reserved = admit_new && !observed_existing;
     if reserved && active >= MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
         return Err(launch_state_capacity_exceeded(request_id));
     }
     if reserved {
         custody
-            .reserve_active(state_path)
+            .reserve_active(state_path, reservation_binding_sha256)
             .map_err(|error| launch_custody_failure(request_id, error))?;
     }
     let replay_pin = if observed_existing {
@@ -2091,7 +2140,7 @@ fn acquire_launch_request_lock(
     custody
         .release_pin_after_lock(state_path)
         .map_err(|error| launch_custody_failure(request_id, error))?;
-    if observed_existing && !state_path.exists() {
+    if observed_existing && !resumes_pre_state_reservation && !state_path.exists() {
         return Err(launch_state_invalid(
             request_id,
             "an observed request replay is still retiring its durable state",
@@ -3555,6 +3604,67 @@ mod custody_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn exact_retry_resumes_pre_lock_reservation_at_active_capacity() {
+        let directory = tempfile::tempdir().expect("launch custody directory");
+        let custody = launch_request_custody(directory.path());
+        assert_eq!(
+            custody
+                .maintain(
+                    &directory.path().join("initialize.lock"),
+                    launch_request_bytes_are_replay,
+                )
+                .expect("initialize launch custody"),
+            0
+        );
+        let target_binding = format!("{:064x}", 1);
+        let target_state = directory.path().join(format!("{:064x}.json", 1));
+        for index in 1..=MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
+            let binding = format!("{index:064x}");
+            custody
+                .reserve_active(
+                    &directory.path().join(format!("{index:064x}.json")),
+                    &binding,
+                )
+                .expect("fill launch active reservations");
+        }
+        let overflow_binding = format!("{:064x}", MAX_ACTIVE_LAUNCH_REQUEST_RECORDS + 1);
+        assert!(matches!(
+            custody.reserve_active(
+                &directory.path().join(format!(
+                    "{:064x}.json",
+                    MAX_ACTIVE_LAUNCH_REQUEST_RECORDS + 1
+                )),
+                &overflow_binding,
+            ),
+            Err(CustodyError::Capacity)
+        ));
+        let host = HostContext {
+            app: "test".to_string(),
+            app_version: None,
+            platform: None,
+            working_directory: None,
+            config_root: None,
+            data_root: None,
+            env: None,
+            deadline_unix_ms: None,
+        };
+
+        let lock = acquire_launch_request_lock(
+            &host,
+            directory.path(),
+            &target_state,
+            true,
+            &target_binding,
+            "request-exact-retry",
+        )
+        .expect("exact retry resumes its pre-lock reservation at capacity");
+        assert!(!target_state.exists());
+        drop(lock);
+        retire_orphan_launch_request_lock(&target_state, "request-exact-retry")
+            .expect("retire resumed pre-state launch reservation");
+    }
+
+    #[test]
     fn completed_history_does_not_consume_active_launch_capacity() {
         let directory = tempfile::tempdir().expect("launch custody directory");
         let completed_records = 2;
@@ -3670,7 +3780,7 @@ mod custody_tests {
             fs::write(&state, br#"{"phase":"session_observed"}"#)
                 .expect("later completed launch state");
             custody
-                .reserve_active(&state)
+                .reserve_active(&state, &stem)
                 .expect("reserve later launch request");
             assert_eq!(
                 custody
@@ -3780,7 +3890,7 @@ mod custody_tests {
             .expect("second replay lock");
         fs::write(&second_state, br#"{"phase":"session_observed"}"#).expect("second replay state");
         custody
-            .reserve_active(&second_state)
+            .reserve_active(&second_state, &second)
             .expect("reserve second completion");
         assert_eq!(
             custody

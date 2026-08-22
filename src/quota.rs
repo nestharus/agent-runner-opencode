@@ -22,7 +22,7 @@ use crate::operation_bounds;
 use crate::path_guard;
 use crate::quota_adapter::{self, QuotaObservation, QuotaObservationFailure, QuotaWindow};
 use crate::quota_observer::{self, QuotaObserverContext};
-use crate::request_custody::{CustodyError, RequestCustody};
+use crate::request_custody::{ActiveReservation, CustodyError, RequestCustody};
 use crate::runtime_selection::{
     append_resolved_activity_targets, resolve_runtime_selection, RuntimeSelection,
 };
@@ -197,7 +197,8 @@ pub fn refresh_auth_params(
         provider_instance_id,
         &host.app,
     );
-    let _request_lock = acquire_quota_refresh_request_lock(host, request_id)?;
+    let _request_lock =
+        acquire_quota_refresh_request_lock(host, &attempted_identity_sha256, request_id)?;
     let (mut operation, account, runtime, observer, auth_path) =
         match read_quota_refresh_operation(host, request_id)? {
             Some(mut operation) => {
@@ -590,6 +591,7 @@ fn quota_refresh_binding_sha256(binding: &Value) -> String {
 
 fn acquire_quota_refresh_request_lock(
     host: &HostContext,
+    reservation_binding_sha256: &str,
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
     let name = sha256_hex(request_id.as_bytes());
@@ -603,19 +605,43 @@ fn acquire_quota_refresh_request_lock(
     let lock_path = lock_root.join(format!("{name}.lock"));
     let state_path = quota_refresh_operation_path(host, request_id)?;
     let custody = quota_refresh_custody(host, &root, &lock_root, request_id)?;
-    let observed_existing = lock_path.exists()
-        || state_path.exists()
-        || custody
-            .replay_owner_exists(&state_path)
-            .map_err(|error| quota_refresh_custody_failure(request_id, error))?;
+    let lock_exists = lock_path.exists();
+    let state_exists = state_path.exists();
+    let replay_owner_exists = custody
+        .replay_owner_exists(&state_path)
+        .map_err(|error| quota_refresh_custody_failure(request_id, error))?;
     let active = maintain_quota_refresh_capacity(&custody, &lock_path, request_id)?;
+    let mut active_reservation = custody
+        .active_reservation(&state_path, reservation_binding_sha256)
+        .map_err(|error| quota_refresh_custody_failure(request_id, error))?;
+    if active_reservation == ActiveReservation::Unbound
+        && !lock_exists
+        && !state_exists
+        && !replay_owner_exists
+    {
+        custody
+            .bind_unbound_active(&state_path, reservation_binding_sha256)
+            .map_err(|error| quota_refresh_custody_failure(request_id, error))?;
+        active_reservation = ActiveReservation::Matching;
+    }
+    if active_reservation == ActiveReservation::Conflicting {
+        return Err(quota_refresh_operation_invalid(
+            request_id,
+            "the active request reservation belongs to different quota.refresh_auth inputs",
+        ));
+    }
+    let active_marker_exists = active_reservation != ActiveReservation::Absent;
+    let resumes_pre_state_reservation =
+        active_reservation == ActiveReservation::Matching && !state_exists && !replay_owner_exists;
+    let observed_existing =
+        lock_exists || state_exists || replay_owner_exists || active_marker_exists;
     let reserved = !observed_existing;
     if reserved && active >= MAX_ACTIVE_QUOTA_REFRESH_REQUEST_RECORDS {
         return Err(quota_refresh_state_capacity_exceeded(request_id));
     }
     if reserved {
         custody
-            .reserve_active(&state_path)
+            .reserve_active(&state_path, reservation_binding_sha256)
             .map_err(|error| quota_refresh_custody_failure(request_id, error))?;
     }
     let replay_pin = if observed_existing {
@@ -656,7 +682,7 @@ fn acquire_quota_refresh_request_lock(
     custody
         .release_pin_after_lock(&state_path)
         .map_err(|error| quota_refresh_custody_failure(request_id, error))?;
-    if observed_existing && !state_path.exists() {
+    if observed_existing && !resumes_pre_state_reservation && !state_path.exists() {
         return Err(quota_refresh_operation_invalid(
             request_id,
             "an observed request replay is still retiring its durable state",
@@ -1630,6 +1656,75 @@ mod custody_tests {
     use std::process::{Command as ProcessCommand, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn exact_refresh_retry_resumes_pre_lock_reservation_at_active_capacity() {
+        let directory = tempfile::tempdir().expect("quota custody directory");
+        let host = HostContext {
+            app: "test".to_string(),
+            app_version: None,
+            platform: None,
+            working_directory: None,
+            config_root: None,
+            data_root: Some(directory.path().to_string_lossy().into_owned()),
+            env: None,
+            deadline_unix_ms: None,
+        };
+        let request_id = "request-exact-retry";
+        let root = quota_refresh_state_root(&host, request_id).expect("quota state root");
+        let request_root = root.join("requests");
+        let lock_root = root.join("locks/requests");
+        fs::create_dir_all(&request_root).expect("quota request root");
+        fs::create_dir_all(&lock_root).expect("quota lock root");
+        let custody = quota_refresh_custody(&host, &root, &lock_root, request_id)
+            .expect("quota request custody");
+        assert_eq!(
+            custody
+                .maintain(
+                    &lock_root.join("initialize.lock"),
+                    quota_refresh_bytes_are_replay,
+                )
+                .expect("initialize quota custody"),
+            0
+        );
+        let target_stem = sha256_hex(request_id.as_bytes());
+        let reservation_binding = sha256_hex(b"quota exact retry inputs");
+        let target_state = request_root.join(format!("{target_stem}.json"));
+        custody
+            .reserve_active(&target_state, &reservation_binding)
+            .expect("reserve exact quota request first");
+        for index in 1..MAX_ACTIVE_QUOTA_REFRESH_REQUEST_RECORDS {
+            let binding = format!("{index:064x}");
+            custody
+                .reserve_active(&request_root.join(format!("{index:064x}.json")), &binding)
+                .expect("fill quota active reservations");
+        }
+        let overflow_binding = format!("{:064x}", MAX_ACTIVE_QUOTA_REFRESH_REQUEST_RECORDS + 1);
+        assert!(matches!(
+            custody.reserve_active(
+                &request_root.join(format!(
+                    "{:064x}.json",
+                    MAX_ACTIVE_QUOTA_REFRESH_REQUEST_RECORDS + 1
+                )),
+                &overflow_binding,
+            ),
+            Err(CustodyError::Capacity)
+        ));
+
+        let lock = acquire_quota_refresh_request_lock(&host, &reservation_binding, request_id)
+            .expect("exact refresh retry resumes its pre-lock reservation at capacity");
+        assert!(!target_state.exists());
+        drop(lock);
+        let target_lock = lock_root.join(format!("{target_stem}.lock"));
+        retire_orphan_quota_refresh_request(
+            &custody,
+            &lock_root,
+            &target_state,
+            &target_lock,
+            request_id,
+        )
+        .expect("retire resumed pre-state quota reservation");
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn credential_reconciliation_waits_for_the_exact_native_actor() {
@@ -1855,7 +1950,7 @@ mod custody_tests {
             )
             .expect("later terminal quota state");
             custody
-                .reserve_active(&state)
+                .reserve_active(&state, &stem)
                 .expect("reserve later quota request");
             assert_eq!(
                 custody

@@ -9,7 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const INDEX_SCHEMA_VERSION: u64 = 3;
+const INDEX_SCHEMA_VERSION: u64 = 4;
+const UNBOUND_ACTIVE_INDEX_SCHEMA_VERSION: u64 = 3;
 const PREDECESSOR_INDEX_SCHEMA_VERSION: u64 = 2;
 const MAX_INDEX_RECORD_BYTES: usize = 1024;
 const MAX_ACTIVE_INDEX_BYTES: usize = 16 * 1024;
@@ -21,6 +22,8 @@ const EMPTY_ACTIVE_DIGEST: &str =
 struct ActiveSlot {
     occupied: u8,
     request_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding_sha256: Option<String>,
 }
 
 impl ActiveSlot {
@@ -28,8 +31,17 @@ impl ActiveSlot {
         Self {
             occupied: 0,
             request_sha256: EMPTY_ACTIVE_DIGEST.to_string(),
+            binding_sha256: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActiveReservation {
+    Absent,
+    Matching,
+    Unbound,
+    Conflicting,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -95,6 +107,11 @@ impl ActiveIndex {
                 !matches!(slot.occupied, 0 | 1)
                     || !valid_digest(&slot.request_sha256)
                     || (slot.occupied == 0 && slot.request_sha256 != EMPTY_ACTIVE_DIGEST)
+                    || (slot.occupied == 0 && slot.binding_sha256.is_some())
+                    || slot
+                        .binding_sha256
+                        .as_deref()
+                        .is_some_and(|binding| !valid_digest(binding))
             })
         {
             return Err(CustodyError::Invalid(
@@ -125,12 +142,50 @@ impl ActiveIndex {
             .any(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
     }
 
-    fn reserve(&mut self, stem: String) -> Result<(), CustodyError> {
-        if self
+    fn reservation(&self, stem: &str, binding_sha256: &str) -> ActiveReservation {
+        let Some(slot) = self
             .slots
             .iter()
-            .any(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
-        {
+            .find(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
+        else {
+            return ActiveReservation::Absent;
+        };
+        match slot.binding_sha256.as_deref() {
+            Some(binding) if binding == binding_sha256 => ActiveReservation::Matching,
+            Some(_) => ActiveReservation::Conflicting,
+            None => ActiveReservation::Unbound,
+        }
+    }
+
+    fn reserve(&mut self, stem: String, binding_sha256: String) -> Result<(), CustodyError> {
+        if !valid_digest(&binding_sha256) {
+            return Err(CustodyError::Invalid(
+                "request custody active reservation binding is invalid".to_string(),
+            ));
+        }
+        match self.reservation(&stem, &binding_sha256) {
+            ActiveReservation::Matching => return Ok(()),
+            ActiveReservation::Unbound | ActiveReservation::Conflicting => {
+                return Err(CustodyError::Invalid(
+                    "request custody active reservation conflicts with the attempted binding"
+                        .to_string(),
+                ))
+            }
+            ActiveReservation::Absent => {}
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.occupied == 0)
+            .ok_or(CustodyError::Capacity)?;
+        slot.occupied = 1;
+        slot.request_sha256 = stem;
+        slot.binding_sha256 = Some(binding_sha256);
+        Ok(())
+    }
+
+    fn reserve_unbound(&mut self, stem: String) -> Result<(), CustodyError> {
+        if self.contains(&stem) {
             return Ok(());
         }
         let slot = self
@@ -140,7 +195,36 @@ impl ActiveIndex {
             .ok_or(CustodyError::Capacity)?;
         slot.occupied = 1;
         slot.request_sha256 = stem;
+        slot.binding_sha256 = None;
         Ok(())
+    }
+
+    fn bind_unbound(&mut self, stem: &str, binding_sha256: &str) -> Result<(), CustodyError> {
+        if !valid_digest(binding_sha256) {
+            return Err(CustodyError::Invalid(
+                "request custody active reservation binding is invalid".to_string(),
+            ));
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
+            .ok_or_else(|| {
+                CustodyError::Invalid(
+                    "request custody active reservation disappeared before binding".to_string(),
+                )
+            })?;
+        match slot.binding_sha256.as_deref() {
+            Some(binding) if binding == binding_sha256 => Ok(()),
+            Some(_) => Err(CustodyError::Invalid(
+                "request custody active reservation conflicts with the attempted binding"
+                    .to_string(),
+            )),
+            None => {
+                slot.binding_sha256 = Some(binding_sha256.to_string());
+                Ok(())
+            }
+        }
     }
 
     fn remove(&mut self, stem: &str) -> bool {
@@ -237,6 +321,9 @@ impl RequestCustody {
         }
     }
 
+    /// Advance bounded custody maintenance while the capability's capacity
+    /// lock is held. The caller must retain that lock until any newly reserved
+    /// request marker has been followed by creation of its request-lock file.
     pub(crate) fn maintain(
         &self,
         current_lock_path: &Path,
@@ -260,7 +347,16 @@ impl RequestCustody {
                         index.retry_next(&stem);
                     }
                 }
-            } else if record_expired(&lock_path, self.orphan_retention)
+            // Callers hold the capability's capacity lock from before this
+            // maintenance pass until after a newly reserved request lock has
+            // been created. A state-less marker with no lock therefore proves
+            // that its reserving process ended before transferring custody.
+            // Preserve the exact caller's marker so that it can resume even at
+            // the active bound; any other successor may retire the abandoned
+            // pre-effect reservation immediately. Once a lock exists, retain
+            // the prior age-and-exclusive-lock rule.
+            } else if self.read_replay_owner(&stem)?.is_none()
+                && (!lock_path.exists() || record_expired(&lock_path, self.orphan_retention))
                 && self.remove_abandoned_active(&stem, &lock_path, current_lock_path)?
             {
                 index.remove(&stem);
@@ -270,10 +366,47 @@ impl RequestCustody {
         Ok(index.active())
     }
 
-    pub(crate) fn reserve_active(&self, state_path: &Path) -> Result<(), CustodyError> {
+    pub(crate) fn reserve_active(
+        &self,
+        state_path: &Path,
+        binding_sha256: &str,
+    ) -> Result<(), CustodyError> {
         let stem = required_digest_stem(state_path)?;
         let mut index = self.read_active_index()?;
-        index.reserve(stem)?;
+        index.reserve(stem, binding_sha256.to_string())?;
+        self.write_active_index(&index)
+    }
+
+    /// Report how the active index owns this exact request and attempt.
+    ///
+    /// Callers use this after `maintain` while still holding their capacity
+    /// lock, so a pre-state reservation can resume without being classified as
+    /// unrelated new work at the active bound.
+    pub(crate) fn active_reservation(
+        &self,
+        state_path: &Path,
+        binding_sha256: &str,
+    ) -> Result<ActiveReservation, CustodyError> {
+        let stem = required_digest_stem(state_path)?;
+        if !valid_digest(binding_sha256) {
+            return Err(CustodyError::Invalid(
+                "request custody active reservation binding is invalid".to_string(),
+            ));
+        }
+        Ok(self.read_active_index()?.reservation(&stem, binding_sha256))
+    }
+
+    /// Claim an unbound schema-v3 reservation only after the caller proves,
+    /// under the capacity lock, that neither request state nor a request lock
+    /// exists. Current-schema reservations are bound when first published.
+    pub(crate) fn bind_unbound_active(
+        &self,
+        state_path: &Path,
+        binding_sha256: &str,
+    ) -> Result<(), CustodyError> {
+        let stem = required_digest_stem(state_path)?;
+        let mut index = self.read_active_index()?;
+        index.bind_unbound(&stem, binding_sha256)?;
         self.write_active_index(&index)
     }
 
@@ -359,6 +492,9 @@ impl RequestCustody {
                         self.require_index_directory(&self.replay_root())?;
                         self.require_index_directory(&self.owner_root())?;
                     }
+                    Some(UNBOUND_ACTIVE_INDEX_SCHEMA_VERSION) => {
+                        self.upgrade_unbound_active_index(&schema_path)?;
+                    }
                     Some(PREDECESSOR_INDEX_SCHEMA_VERSION) => {
                         self.upgrade_predecessor_index(&schema_path)?;
                     }
@@ -429,7 +565,7 @@ impl RequestCustody {
             if replay {
                 replay_candidates.push((record_modified(&state_path, &lock_path), stem));
             } else {
-                active_index.reserve(stem)?;
+                active_index.reserve_unbound(stem)?;
             }
         }
         replay_candidates.sort_by_key(|candidate| candidate.0);
@@ -448,6 +584,22 @@ impl RequestCustody {
             }),
         )?;
         Ok(())
+    }
+
+    fn upgrade_unbound_active_index(&self, schema_path: &Path) -> Result<(), CustodyError> {
+        self.require_index_directory(&self.replay_root())?;
+        self.require_index_directory(&self.owner_root())?;
+        self.prepare_temporary_root()?;
+        let active = self.read_active_index()?;
+        self.write_active_index(&active)?;
+        self.write_json_atomic(
+            schema_path,
+            &json!({
+                "schema_version": INDEX_SCHEMA_VERSION,
+                "active_limit": self.active_limit,
+                "replay_slots": self.replay_slots,
+            }),
+        )
     }
 
     fn upgrade_predecessor_index(&self, schema_path: &Path) -> Result<(), CustodyError> {
@@ -1118,6 +1270,137 @@ mod tests {
     use super::*;
 
     #[test]
+    fn state_less_marker_preserves_exact_retry_and_is_reclaimable_by_a_successor() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            directory.path().join(".custody-v2"),
+            1024,
+            2,
+            2,
+            Duration::from_secs(60),
+        );
+        let first_binding = format!("{:064x}", 101);
+        let second_binding = format!("{:064x}", 102);
+        let first = directory.path().join(format!("{:064x}.json", 1));
+        let second = directory.path().join(format!("{:064x}.json", 2));
+        assert_eq!(
+            custody
+                .maintain(&directory.path().join("initialize.lock"), |_| Ok(false))
+                .expect("initialize request custody"),
+            0
+        );
+        custody
+            .reserve_active(&first, &first_binding)
+            .expect("reserve first pre-state request");
+        custody
+            .reserve_active(&second, &second_binding)
+            .expect("reserve second pre-state request");
+
+        assert_eq!(
+            custody
+                .maintain(&first.with_extension("lock"), |_| Ok(false))
+                .expect("preserve the exact pre-state reservation"),
+            2
+        );
+        assert_eq!(
+            custody
+                .active_reservation(&first, &first_binding)
+                .expect("first active marker"),
+            ActiveReservation::Matching
+        );
+        assert_eq!(
+            custody
+                .active_reservation(&first, &second_binding)
+                .expect("conflicting first active marker"),
+            ActiveReservation::Conflicting
+        );
+
+        assert_eq!(
+            custody
+                .maintain(&directory.path().join("unrelated.lock"), |_| Ok(false))
+                .expect("retire an abandoned pre-state reservation"),
+            1
+        );
+        assert_eq!(
+            custody
+                .active_reservation(&second, &second_binding)
+                .expect("second active marker was retired"),
+            ActiveReservation::Absent
+        );
+    }
+
+    #[test]
+    fn schema_v3_active_index_upgrades_to_an_explicit_unbound_reservation() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let index_root = directory.path().join(".custody-v2");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            index_root.clone(),
+            1024,
+            1,
+            1,
+            Duration::from_secs(60),
+        );
+        let state = directory.path().join(format!("{:064x}.json", 1));
+        let binding = format!("{:064x}", 101);
+        custody
+            .maintain(&directory.path().join("initialize.lock"), |_| Ok(false))
+            .expect("initialize current custody");
+        custody
+            .reserve_active(&state, &binding)
+            .expect("reserve current active marker");
+
+        let mut active: Value = serde_json::from_slice(
+            &fs::read(index_root.join("active.json")).expect("current active index"),
+        )
+        .expect("parse current active index");
+        active["slots"][0]
+            .as_object_mut()
+            .expect("active slot")
+            .remove("binding_sha256");
+        fs::write(
+            index_root.join("active.json"),
+            serde_json::to_vec(&active).expect("serialize schema-v3 active index"),
+        )
+        .expect("schema-v3 active index");
+        fs::write(
+            index_root.join("schema.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": UNBOUND_ACTIVE_INDEX_SCHEMA_VERSION,
+                "active_limit": 1,
+                "replay_slots": 1,
+            }))
+            .expect("serialize schema-v3 custody"),
+        )
+        .expect("schema-v3 custody");
+
+        assert_eq!(
+            custody
+                .maintain(&state.with_extension("lock"), |_| Ok(false))
+                .expect("upgrade schema-v3 custody"),
+            1
+        );
+        assert_eq!(
+            custody
+                .active_reservation(&state, &binding)
+                .expect("upgraded unbound reservation"),
+            ActiveReservation::Unbound
+        );
+        custody
+            .bind_unbound_active(&state, &binding)
+            .expect("bind upgraded pre-state reservation");
+        assert_eq!(
+            custody
+                .active_reservation(&state, &binding)
+                .expect("bound upgraded reservation"),
+            ActiveReservation::Matching
+        );
+    }
+
+    #[test]
     fn predecessor_upgrade_deduplicates_interrupted_replay_handoff() {
         let directory = tempfile::tempdir().expect("request custody directory");
         let index_root = directory.path().join(".custody-v2");
@@ -1240,7 +1523,7 @@ mod tests {
             .expect("second request lock");
         fs::write(&second_state, br#"{"terminal":true}"#).expect("second terminal request");
         custody
-            .reserve_active(&second_state)
+            .reserve_active(&second_state, &second)
             .expect("reserve second request");
         assert!(custody
             .publish_replay_without_retiring_active(
@@ -1310,7 +1593,9 @@ mod tests {
             fs::write(directory.path().join(format!("{stem}.lock")), b"")
                 .expect("completed request lock");
             fs::write(&state, br#"{"terminal":true}"#).expect("completed request state");
-            custody.reserve_active(&state).expect("reserve completion");
+            custody
+                .reserve_active(&state, &stem)
+                .expect("reserve completion");
             assert_eq!(
                 custody
                     .maintain(&current_lock, |_| Ok(true))
@@ -1325,7 +1610,7 @@ mod tests {
             .expect("current request lock");
         fs::write(&current_state, br#"{"terminal":true}"#).expect("current terminal state");
         custody
-            .reserve_active(&current_state)
+            .reserve_active(&current_state, &current)
             .expect("reserve current request");
         assert!(custody
             .reserve_replay_owner_without_advancing_head(&current_state, &current_lock)
