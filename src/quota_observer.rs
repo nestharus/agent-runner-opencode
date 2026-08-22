@@ -50,8 +50,17 @@ const IN_PROCESS_TRANSPORT_SOURCE: &str = include_str!("quota_adapter.rs");
 ))]
 const IN_PROCESS_DEPENDENCY_LOCK: &str = include_str!("../Cargo.lock");
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone)]
+/// A quota-observer capability admitted for one account and provider build.
+///
+/// The persisted JSON representation is private. Public callers obtain this
+/// context only through the validating resolver in this module.
 pub struct QuotaObserverContext {
+    record: QuotaObserverRecord,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct QuotaObserverRecord {
     schema_version: u32,
     observer_contract: String,
     #[serde(default)]
@@ -76,8 +85,8 @@ pub fn resolve(
         operation_bounds::remaining_timeout(host.deadline_unix_ms, QUOTA_OBSERVER_LOCK_TIMEOUT)
             .ok_or_else(|| quota_observer_lock_timeout(request_id))?;
     let _lock = acquire_observer_lock(host, account, timeout, request_id)?;
-    if let Some(context) = read_observer_context(host, account, request_id)? {
-        return activate_observer_context(host, account, context, request_id);
+    if let Some(record) = read_observer_record(host, account, request_id)? {
+        return activate_observer_record(host, account, record, request_id);
     }
     let context = candidate_context(account, ambient_observer_environment(), request_id)?;
     write_observer_context(host, account, &context, request_id)?;
@@ -155,11 +164,11 @@ pub(crate) fn resolve_existing_for_setup(
     request_id: &str,
 ) -> Result<Option<String>, ProviderFailure> {
     let _lock = acquire_observer_lock(host, account, Duration::ZERO, request_id)?;
-    let Some(context) = read_observer_context(host, account, request_id)? else {
+    let Some(record) = read_observer_record(host, account, request_id)? else {
         return Ok(None);
     };
-    preview_observer_context_activation(account, context, request_id)
-        .map(|context| Some(context.identity_sha256))
+    preview_observer_record_activation(account, record, request_id)
+        .map(|context| Some(context.identity_sha256().to_string()))
 }
 
 fn read_persisted_identity_evidence(
@@ -174,25 +183,25 @@ fn read_persisted_identity_evidence(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(quota_observer_failure(request_id, error)),
     };
-    let context = serde_json::from_slice(&bytes)
+    let record = serde_json::from_slice::<QuotaObserverRecord>(&bytes)
         .map_err(|error| quota_observer_failure(request_id, error))?;
-    validate_observer_record_identity(&context, account, request_id)?;
+    validate_observer_record_identity(&record, account, request_id)?;
     if require_current_implementation {
-        validate_observer_implementation(&context, account, request_id)?;
+        validate_observer_implementation(&record, account, request_id)?;
     }
-    Ok(Some((context.identity_sha256, sha256_hex(&bytes))))
+    Ok(Some((record.identity_sha256, sha256_hex(&bytes))))
 }
 
 impl QuotaObserverContext {
     #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
     pub fn command(&self) -> Command {
-        let mut command = Command::new(&self.program);
-        command.env_clear().envs(&self.execution_env);
+        let mut command = Command::new(&self.record.program);
+        command.env_clear().envs(&self.record.execution_env);
         command
     }
 
     pub fn identity_sha256(&self) -> &str {
-        &self.identity_sha256
+        &self.record.identity_sha256
     }
 }
 
@@ -236,16 +245,18 @@ fn candidate_context(
             &implementation_version,
         );
         Ok(QuotaObserverContext {
-            schema_version: QUOTA_OBSERVER_SCHEMA_VERSION,
-            observer_contract: QUOTA_OBSERVER_CONTRACT.to_string(),
-            transport_kind: IN_PROCESS_TRANSPORT_KIND.to_string(),
-            account_wrapper: account.opencode_wrapper.to_string(),
-            program: program.to_string(),
-            program_sha256,
-            execution_env,
-            implementation_manifest_id,
-            implementation_version,
-            identity_sha256,
+            record: QuotaObserverRecord {
+                schema_version: QUOTA_OBSERVER_SCHEMA_VERSION,
+                observer_contract: QUOTA_OBSERVER_CONTRACT.to_string(),
+                transport_kind: IN_PROCESS_TRANSPORT_KIND.to_string(),
+                account_wrapper: account.opencode_wrapper.to_string(),
+                program: program.to_string(),
+                program_sha256,
+                execution_env,
+                implementation_manifest_id,
+                implementation_version,
+                identity_sha256,
+            },
         })
     }
 
@@ -310,16 +321,18 @@ fn candidate_external_fixture_context(
         &approved.version,
     );
     Ok(QuotaObserverContext {
-        schema_version: QUOTA_OBSERVER_SCHEMA_VERSION,
-        observer_contract: QUOTA_OBSERVER_CONTRACT.to_string(),
-        transport_kind: CONTRACT_FIXTURE_TRANSPORT_KIND.to_string(),
-        account_wrapper: account.opencode_wrapper.to_string(),
-        program: program.to_string(),
-        program_sha256,
-        execution_env,
-        implementation_manifest_id: approved.id,
-        implementation_version: approved.version,
-        identity_sha256,
+        record: QuotaObserverRecord {
+            schema_version: QUOTA_OBSERVER_SCHEMA_VERSION,
+            observer_contract: QUOTA_OBSERVER_CONTRACT.to_string(),
+            transport_kind: CONTRACT_FIXTURE_TRANSPORT_KIND.to_string(),
+            account_wrapper: account.opencode_wrapper.to_string(),
+            program: program.to_string(),
+            program_sha256,
+            execution_env,
+            implementation_manifest_id: approved.id,
+            implementation_version: approved.version,
+            identity_sha256,
+        },
     })
 }
 
@@ -381,57 +394,57 @@ fn observer_identity_sha256(
     )
 }
 
-fn validate_observer_context(
-    context: &QuotaObserverContext,
+fn validate_observer_record(
+    record: &QuotaObserverRecord,
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    validate_observer_record_identity(context, account, request_id)?;
-    validate_observer_implementation(context, account, request_id)
+    validate_observer_record_identity(record, account, request_id)?;
+    validate_observer_implementation(record, account, request_id)
 }
 
 fn validate_observer_record_identity(
-    context: &QuotaObserverContext,
+    record: &QuotaObserverRecord,
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let identity_sha256 = match context.schema_version {
+    let identity_sha256 = match record.schema_version {
         QUOTA_OBSERVER_SCHEMA_VERSION => observer_identity_sha256(
-            &context.account_wrapper,
-            &context.transport_kind,
-            &context.program,
-            &context.program_sha256,
-            &context.execution_env,
-            &context.implementation_manifest_id,
-            &context.implementation_version,
+            &record.account_wrapper,
+            &record.transport_kind,
+            &record.program,
+            &record.program_sha256,
+            &record.execution_env,
+            &record.implementation_manifest_id,
+            &record.implementation_version,
         ),
         MANIFEST_QUOTA_OBSERVER_SCHEMA_VERSION => manifest_observer_identity_sha256(
-            &context.account_wrapper,
-            &context.program,
-            &context.program_sha256,
-            &context.execution_env,
-            &context.implementation_manifest_id,
-            &context.implementation_version,
+            &record.account_wrapper,
+            &record.program,
+            &record.program_sha256,
+            &record.execution_env,
+            &record.implementation_manifest_id,
+            &record.implementation_version,
         ),
         PREDECESSOR_QUOTA_OBSERVER_SCHEMA_VERSION => predecessor_observer_identity_sha256(
-            &context.account_wrapper,
-            &context.program,
-            &context.program_sha256,
-            &context.execution_env,
+            &record.account_wrapper,
+            &record.program,
+            &record.program_sha256,
+            &record.execution_env,
         ),
         _ => String::new(),
     };
-    if context.account_wrapper != account.opencode_wrapper
-        || context.identity_sha256 != identity_sha256
-        || (context.schema_version == QUOTA_OBSERVER_SCHEMA_VERSION
-            && (context.observer_contract != QUOTA_OBSERVER_CONTRACT
-                || context.transport_kind.trim().is_empty()
-                || context.implementation_manifest_id.trim().is_empty()
-                || context.implementation_version.trim().is_empty()))
-        || (context.schema_version == MANIFEST_QUOTA_OBSERVER_SCHEMA_VERSION
-            && context.observer_contract != "agent-runner-opencode.chatgpt-wham-curl/v1")
-        || (context.schema_version == PREDECESSOR_QUOTA_OBSERVER_SCHEMA_VERSION
-            && context.observer_contract != PREDECESSOR_QUOTA_OBSERVER_CONTRACT)
+    if record.account_wrapper != account.opencode_wrapper
+        || record.identity_sha256 != identity_sha256
+        || (record.schema_version == QUOTA_OBSERVER_SCHEMA_VERSION
+            && (record.observer_contract != QUOTA_OBSERVER_CONTRACT
+                || record.transport_kind.trim().is_empty()
+                || record.implementation_manifest_id.trim().is_empty()
+                || record.implementation_version.trim().is_empty()))
+        || (record.schema_version == MANIFEST_QUOTA_OBSERVER_SCHEMA_VERSION
+            && record.observer_contract != "agent-runner-opencode.chatgpt-wham-curl/v1")
+        || (record.schema_version == PREDECESSOR_QUOTA_OBSERVER_SCHEMA_VERSION
+            && record.observer_contract != PREDECESSOR_QUOTA_OBSERVER_CONTRACT)
     {
         return Err(quota_observer_failure(
             request_id,
@@ -483,43 +496,43 @@ fn predecessor_observer_identity_sha256(
     )
 }
 
-fn activate_observer_context(
+fn activate_observer_record(
     host: &HostContext,
     account: &AccountProfile,
-    context: QuotaObserverContext,
+    record: QuotaObserverRecord,
     request_id: &str,
 ) -> Result<QuotaObserverContext, ProviderFailure> {
-    let prior_schema_version = context.schema_version;
-    let activated = preview_observer_context_activation(account, context, request_id)?;
+    let prior_schema_version = record.schema_version;
+    let activated = preview_observer_record_activation(account, record, request_id)?;
     if prior_schema_version != QUOTA_OBSERVER_SCHEMA_VERSION {
         write_observer_context(host, account, &activated, request_id)?;
     }
     Ok(activated)
 }
 
-fn preview_observer_context_activation(
+fn preview_observer_record_activation(
     account: &AccountProfile,
-    context: QuotaObserverContext,
+    record: QuotaObserverRecord,
     request_id: &str,
 ) -> Result<QuotaObserverContext, ProviderFailure> {
-    validate_observer_context(&context, account, request_id)?;
-    if context.schema_version == QUOTA_OBSERVER_SCHEMA_VERSION {
-        return Ok(context);
+    validate_observer_record(&record, account, request_id)?;
+    if record.schema_version == QUOTA_OBSERVER_SCHEMA_VERSION {
+        return Ok(QuotaObserverContext { record });
     }
     candidate_context(account, BTreeMap::new(), request_id)
 }
 
 fn validate_observer_implementation(
-    context: &QuotaObserverContext,
+    record: &QuotaObserverRecord,
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    if context.schema_version < QUOTA_OBSERVER_SCHEMA_VERSION {
+    if record.schema_version < QUOTA_OBSERVER_SCHEMA_VERSION {
         return Ok(());
     }
-    if context.transport_kind == IN_PROCESS_TRANSPORT_KIND {
+    if record.transport_kind == IN_PROCESS_TRANSPORT_KIND {
         let candidate = candidate_context(account, BTreeMap::new(), request_id)?;
-        if candidate.identity_sha256 == context.identity_sha256 {
+        if candidate.identity_sha256() == record.identity_sha256 {
             return Ok(());
         }
         return Err(quota_observer_failure(
@@ -536,18 +549,18 @@ fn validate_observer_implementation(
     }
     #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
     {
-        validate_external_fixture_implementation(context, account, request_id)
+        validate_external_fixture_implementation(record, account, request_id)
     }
 }
 
 #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 fn validate_external_fixture_implementation(
-    context: &QuotaObserverContext,
+    record: &QuotaObserverRecord,
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    if context.transport_kind != CONTRACT_FIXTURE_TRANSPORT_KIND
-        || !durable_fs::is_executable_file(Path::new(&context.program))
+    if record.transport_kind != CONTRACT_FIXTURE_TRANSPORT_KIND
+        || !durable_fs::is_executable_file(Path::new(&record.program))
             .map_err(|error| quota_observer_failure(request_id, error))?
     {
         return Err(quota_observer_failure(
@@ -556,11 +569,11 @@ fn validate_external_fixture_implementation(
         ));
     }
     let (program_sha256, program_bytes) = durable_fs::sha256_file_bounded(
-        Path::new(&context.program),
+        Path::new(&record.program),
         durable_fs::MAX_BOUND_EXECUTABLE_BYTES,
     )
     .map_err(|error| quota_observer_failure(request_id, error))?;
-    if program_sha256 != context.program_sha256 {
+    if program_sha256 != record.program_sha256 {
         return Err(ProviderFailure::conflict(
             request_id,
             "quota_observer_implementation_changed",
@@ -570,22 +583,22 @@ fn validate_external_fixture_implementation(
             ),
             json!({
                 "account": account.opencode_wrapper,
-                "quota_observer_identity_sha256": context.identity_sha256,
-                "program": context.program,
+                "quota_observer_identity_sha256": record.identity_sha256,
+                "program": record.program,
             }),
         ));
     }
     let approved = native_implementation_manifest::approved_implementation(
         "curl",
-        &context.program_sha256,
+        &record.program_sha256,
         program_bytes,
     )
     .map_err(|error| quota_observer_failure(request_id, error))?
     .ok_or_else(|| {
         quota_observer_failure(request_id, "contract-test curl is no longer admitted")
     })?;
-    if context.implementation_manifest_id != approved.id
-        || context.implementation_version != approved.version
+    if record.implementation_manifest_id != approved.id
+        || record.implementation_version != approved.version
     {
         return Err(quota_observer_failure(
             request_id,
@@ -627,18 +640,18 @@ fn acquire_observer_lock(
     Ok(lock)
 }
 
-fn read_observer_context(
+fn read_observer_record(
     host: &HostContext,
     account: &AccountProfile,
     request_id: &str,
-) -> Result<Option<QuotaObserverContext>, ProviderFailure> {
+) -> Result<Option<QuotaObserverRecord>, ProviderFailure> {
     let path = observer_context_path(host, account, request_id)?;
     let bytes = match durable_fs::read_file_bounded(&path, MAX_QUOTA_OBSERVER_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(quota_observer_failure(request_id, error)),
     };
-    serde_json::from_slice(&bytes)
+    serde_json::from_slice::<QuotaObserverRecord>(&bytes)
         .map(Some)
         .map_err(|error| quota_observer_failure(request_id, error))
 }
@@ -655,7 +668,7 @@ fn write_observer_context(
         .expect("quota observer context path always has a parent");
     durable_fs::create_private_directories(parent)
         .map_err(|error| quota_observer_failure(request_id, error))?;
-    let bytes = serde_json::to_vec_pretty(context)
+    let bytes = serde_json::to_vec_pretty(&context.record)
         .map_err(|error| quota_observer_failure(request_id, error))?;
     if bytes.len() > MAX_QUOTA_OBSERVER_STATE_BYTES {
         return Err(quota_observer_state_capacity(request_id, bytes.len()));
@@ -755,13 +768,13 @@ mod tests {
     fn production_observer_identity_is_source_included_and_has_no_external_program() {
         let context = candidate_context(&ACCOUNTS[0], BTreeMap::new(), "observer-unit")
             .expect("construct in-process observer identity");
-        assert_eq!(context.schema_version, QUOTA_OBSERVER_SCHEMA_VERSION);
-        assert_eq!(context.transport_kind, IN_PROCESS_TRANSPORT_KIND);
-        assert!(context.program.starts_with("in-process:"));
-        assert!(context.execution_env.is_empty());
-        assert!(!context.program_sha256.is_empty());
-        assert!(!context.implementation_manifest_id.is_empty());
-        validate_observer_context(&context, &ACCOUNTS[0], "observer-unit")
+        assert_eq!(context.record.schema_version, QUOTA_OBSERVER_SCHEMA_VERSION);
+        assert_eq!(context.record.transport_kind, IN_PROCESS_TRANSPORT_KIND);
+        assert!(context.record.program.starts_with("in-process:"));
+        assert!(context.record.execution_env.is_empty());
+        assert!(!context.record.program_sha256.is_empty());
+        assert!(!context.record.implementation_manifest_id.is_empty());
+        validate_observer_record(&context.record, &ACCOUNTS[0], "observer-unit")
             .expect("validate source-included observer identity");
     }
 }
