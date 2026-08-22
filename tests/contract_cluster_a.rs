@@ -1232,8 +1232,9 @@ fn contract_launch_rejects_user_native_controls_before_durable_admission() {
 
 #[test]
 fn contract_launch_malformed_native_event_prevents_clean_terminal_claim() {
+    let malformed_events = "not-json\n".repeat(9);
     let fake_wrapper = FakeOpencodeWrapper::with_script(
-        fake_opencode_script_with_output_and_status("not-json\n", "", 0),
+        fake_opencode_script_with_output_and_status(&malformed_events, "", 0),
     );
     let path = prepend_path(fake_wrapper.dir());
     let output = invoke_with_env(
@@ -1254,13 +1255,20 @@ fn contract_launch_malformed_native_event_prevents_clean_terminal_claim() {
     let events = launch_events_from_output(&output, "malformed native event launch stdout");
     let final_event = final_launch_event(&events);
     assert_eq!(final_event["status"]["kind"], "unknown");
-    assert!(events.iter().any(|event| {
-        event["kind"] == "marker"
-            && event["name"] == "oulipoly.launch_evidence_loss"
-            && event["value"]
-                .to_string()
-                .contains("native event parse failed")
-    }));
+    let evidence = events
+        .iter()
+        .find(|event| event["kind"] == "marker" && event["name"] == "oulipoly.launch_evidence_loss")
+        .expect("launch integrity evidence marker");
+    assert!(evidence["value"]
+        .to_string()
+        .contains("native event parse failed"));
+    let retained = evidence["value"]["retained_failure_count"]
+        .as_u64()
+        .expect("retained failure count");
+    let omitted = evidence["value"]["omitted_failure_count"]
+        .as_u64()
+        .expect("omitted failure count");
+    assert_eq!(retained + omitted, 9);
 }
 
 #[test]

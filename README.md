@@ -251,7 +251,10 @@ the raw stream continues unchanged. Launch retains at most 32 representative
 integrity failures of 512 bytes each for its full lifetime, counts later
 omissions, and caps the encoded terminal integrity marker at 32 KiB. Pipe read
 failures, malformed native events, and capture truncation are emitted as
-explicit evidence markers. Independent stdout and stderr pipes are sequenced in
+explicit evidence markers. The native event edge may retain only representative
+failure details per parser batch, but its typed handoff carries the exact omitted
+count so launch remains the sole lifetime retention and public evidence owner.
+Independent stdout and stderr pipes are sequenced in
 provider receipt order; the provider makes no
 claim about an unknowable pre-receipt cross-pipe emission order.
 

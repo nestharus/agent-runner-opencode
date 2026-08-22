@@ -30,13 +30,20 @@ pub const MAX_EXPORT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SESSION_LIST_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_NATIVE_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_NATIVE_EVENT_LINE_BYTES: usize = 1024 * 1024;
+const MAX_NATIVE_EVENT_FAILURE_DETAILS_PER_BATCH: usize = 4;
 const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Default)]
 pub struct EventParser {
     pending: Vec<u8>,
     discarding_oversized_line: bool,
-    errors: Vec<String>,
+    failures: EventParseFailureSummary,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventParseFailureSummary {
+    pub representative_details: Vec<String>,
+    pub omitted_count: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -362,11 +369,9 @@ impl EventParser {
             let content_bytes = newline.unwrap_or(remaining.len());
             if self.pending.len().saturating_add(content_bytes) > MAX_NATIVE_EVENT_LINE_BYTES {
                 self.pending.clear();
-                if self.errors.len() < 4 {
-                    self.errors.push(format!(
-                        "native event line exceeds the {MAX_NATIVE_EVENT_LINE_BYTES}-byte metadata parsing bound"
-                    ));
-                }
+                self.record_failure(format!(
+                    "native event line exceeds the {MAX_NATIVE_EVENT_LINE_BYTES}-byte metadata parsing bound"
+                ));
                 match newline {
                     Some(index) => remaining = &remaining[index + 1..],
                     None => {
@@ -399,25 +404,27 @@ impl EventParser {
         self.parse_lines(&[line])
     }
 
-    pub fn take_errors(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.errors)
+    pub fn take_failure_summary(&mut self) -> EventParseFailureSummary {
+        std::mem::take(&mut self.failures)
     }
 
     fn parse_lines(&mut self, lines: &[Vec<u8>]) -> Vec<OpencodeEventMetadata> {
-        lines
-            .iter()
-            .filter_map(
-                |line| match serde_json::from_slice::<OpencodeEventMetadata>(line) {
-                    Ok(event) => pinned_native_event(event),
-                    Err(error) => {
-                        if self.errors.len() < 4 {
-                            self.errors.push(error.to_string());
-                        }
-                        None
-                    }
-                },
-            )
-            .collect()
+        let mut events = Vec::new();
+        for line in lines {
+            match serde_json::from_slice::<OpencodeEventMetadata>(line) {
+                Ok(event) => events.extend(pinned_native_event(event)),
+                Err(error) => self.record_failure(error.to_string()),
+            }
+        }
+        events
+    }
+
+    fn record_failure(&mut self, detail: String) {
+        if self.failures.representative_details.len() < MAX_NATIVE_EVENT_FAILURE_DETAILS_PER_BATCH {
+            self.failures.representative_details.push(detail);
+        } else {
+            self.failures.omitted_count = self.failures.omitted_count.saturating_add(1);
+        }
     }
 }
 
@@ -1110,7 +1117,9 @@ mod tests {
         assert!(parser.ingest(&oversized).is_empty());
         assert!(parser.pending.is_empty());
         assert!(parser.discarding_oversized_line);
-        assert_eq!(parser.take_errors().len(), 1);
+        let failures = parser.take_failure_summary();
+        assert_eq!(failures.representative_details.len(), 1);
+        assert_eq!(failures.omitted_count, 0);
 
         let valid = br#"{"type":"text","sessionID":"ses-after-oversized","timestamp":1,"part":{}}"#;
         let mut recovery = Vec::with_capacity(valid.len() + 2);
@@ -1144,7 +1153,22 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id.as_deref(), Some("ses-large-event"));
         assert!(parser.pending.is_empty());
-        assert!(parser.take_errors().is_empty());
+        assert!(parser
+            .take_failure_summary()
+            .representative_details
+            .is_empty());
+    }
+
+    #[test]
+    fn event_parser_reports_failure_multiplicity_beyond_local_details() {
+        let mut parser = EventParser::default();
+        let malformed = b"not-json\n".repeat(9);
+
+        assert!(parser.ingest(&malformed).is_empty());
+        let failures = parser.take_failure_summary();
+
+        assert_eq!(failures.representative_details.len(), 4);
+        assert_eq!(failures.omitted_count, 5);
     }
 
     #[test]

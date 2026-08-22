@@ -2886,9 +2886,13 @@ impl LaunchState {
     }
 
     fn record_parser_errors(&mut self) {
-        for error in self.parser.take_errors() {
+        let failures = self.parser.take_failure_summary();
+        for error in failures.representative_details {
             self.record_integrity_failure(format!("native event parse failed: {error}"));
         }
+        self.integrity_failures_omitted = self
+            .integrity_failures_omitted
+            .saturating_add(failures.omitted_count);
     }
 
     fn record_integrity_failure(&mut self, failure: String) {
@@ -3093,7 +3097,9 @@ impl LaunchState {
     fn finished_status(&self) -> ProcessStatus {
         let status = self.final_status.clone().unwrap_or(ProcessStatus::Unknown);
         if is_clean_exit_status(&status)
-            && (!self.integrity_failures.is_empty() || self.unresolved_resume_completion.is_some())
+            && (!self.integrity_failures.is_empty()
+                || self.integrity_failures_omitted > 0
+                || self.unresolved_resume_completion.is_some())
         {
             return ProcessStatus::Unknown;
         }
@@ -3563,6 +3569,23 @@ mod streaming_tests {
                 .len()
                 <= MAX_LAUNCH_INTEGRITY_EVIDENCE_BYTES
         );
+    }
+
+    #[test]
+    fn launch_integrity_evidence_preserves_parser_failure_multiplicity() {
+        let mut state = LaunchState::new("request-parser-integrity", None, None, json!({}), None);
+
+        assert!(state
+            .session_from_stdout(&b"not-json\n".repeat(9))
+            .is_none());
+
+        assert_eq!(state.integrity_failures.len(), 4);
+        assert_eq!(state.integrity_failures_omitted, 5);
+        let evidence = state
+            .integrity_evidence_value()
+            .expect("parser integrity evidence");
+        assert_eq!(evidence["retained_failure_count"], 4);
+        assert_eq!(evidence["omitted_failure_count"], 5);
     }
 }
 
