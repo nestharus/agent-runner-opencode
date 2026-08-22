@@ -20,18 +20,13 @@ pub enum ProcessStatus {
 
 pub fn classify_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
     let params = parse_classify_params(params, request_id)?;
-    let stdout = decode_stream(&params.stdout_base64, request_id, "stdout_base64")?;
-    let stderr = decode_stream(&params.stderr_base64, request_id, "stderr_base64")?;
-    let signal = classify(&stdout, &stderr, &params.status, params.observed_at_unix_ms);
+    let _stdout = decode_stream(&params.stdout_base64, request_id, "stdout_base64")?;
+    let _stderr = decode_stream(&params.stderr_base64, request_id, "stderr_base64")?;
+    let signal = classify(&params.status, params.observed_at_unix_ms);
     Ok(classify_result(signal))
 }
 
-pub fn classify(
-    _stdout: &[u8],
-    _stderr: &[u8],
-    status: &ProcessStatus,
-    observed_at_unix_ms: u64,
-) -> Value {
+pub fn classify(status: &ProcessStatus, observed_at_unix_ms: u64) -> Value {
     terminal_signal(
         signal_kind(status),
         signal_evidence(status),

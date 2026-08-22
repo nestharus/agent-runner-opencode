@@ -246,18 +246,18 @@ one JSON response. `launch` writes NDJSON events ending in an `exit` event.
 Launch children run in a provider-owned process group, while export and quota
 helpers remain direct children. One custody boundary is installed immediately
 after every manual spawn and owns termination and reaping on every fallible
-return until a successful wait discharges it. Drain queues and terminal-capture
-tails are bounded. Each tail is a capped double-ended buffer, so retaining the
-last 1 MiB removes only the bytes displaced by new input; an optional contiguous
-terminal projection is paid once rather than compacting the full tail per pipe
-chunk. Native event framing consumes each received byte once and
+return until a successful wait discharges it. Drain queues are bounded. Raw
+stdout/stderr bytes are projected once and are not separately retained for
+terminal classification, which is intentionally status-only; stdout metadata
+needed for provider session and native-error evidence is parsed on its bounded
+typed path. Native event framing consumes each received byte once and
 retains at most 1 MiB for an incomplete metadata line; an over-bound line is
 reported as an integrity failure and skipped through its next newline while
 the raw stream continues unchanged. Launch retains at most 32 representative
 integrity failures of 512 bytes each for its full lifetime, counts later
 omissions, and caps the encoded terminal integrity marker at 32 KiB. Pipe read
-failures, malformed native events, and capture truncation are emitted as
-explicit evidence markers. The native event edge may retain only representative
+failures and malformed native events are emitted as explicit evidence markers.
+The native event edge may retain only representative
 failure details per parser batch, but its typed handoff carries the exact omitted
 count so launch remains the sole lifetime retention and public evidence owner.
 Independent stdout and stderr pipes are sequenced in
