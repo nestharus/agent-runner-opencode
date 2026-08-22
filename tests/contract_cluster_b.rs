@@ -644,6 +644,108 @@ fn contract_session_enumerate_terminal_initial_retry_replays_after_successful_fl
 }
 
 #[test]
+fn contract_session_enumerate_rejects_cursor_from_expired_recreated_snapshot() {
+    let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
+    let fake_opencode = FakeOpencodeSessionList::with_output(session_list_limit_json(), "", 0);
+    let path = prepend_path(fake_opencode.dir());
+    let data_root = unique_temp_dir("agent-runner-opencode-snapshot-incarnation-cursor");
+    let config_root = support::isolated_test_config_root("snapshot-incarnation-cursor");
+    fs::create_dir_all(&data_root).expect("create snapshot incarnation data root");
+    let host = json!({
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy()
+    });
+    let mut initial_request = support::request_envelope(
+        "session.enumerate",
+        session_enumerate_limit_params(1),
+        host.clone(),
+    );
+    initial_request["request_id"] = json!("req-session-enumerate-snapshot-incarnation");
+    support::ensure_default_runtime_settings(&initial_request);
+    let env = [("PATH", path.as_str())];
+    let first = success_result(
+        support::invoke_with_request_and_env("session.enumerate", initial_request.clone(), &env),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_eq!(first["sessions"][0]["provider_session_id"], "ses_limit_one");
+    let stale_cursor = first["next_cursor"]
+        .as_str()
+        .expect("first snapshot continuation cursor")
+        .to_string();
+
+    let snapshot_root = data_root.join("provider-state/opencode/session-enumeration-snapshots");
+    let snapshot = fs::read_dir(&snapshot_root)
+        .expect("read snapshot incarnation root")
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .expect("first snapshot incarnation")
+        .path();
+    let manifest_path = snapshot.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(
+        &fs::read(&manifest_path).expect("read first snapshot incarnation manifest"),
+    )
+    .expect("parse first snapshot incarnation manifest");
+    manifest["expires_at_unix_ms"] = json!(0);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("encode expired snapshot incarnation manifest"),
+    )
+    .expect("expire first snapshot incarnation");
+
+    fake_opencode.replace_output(changed_session_list_limit_json(), "", 0);
+    let recreated = success_result(
+        support::invoke_with_request_and_env("session.enumerate", initial_request, &env),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_eq!(
+        recreated["sessions"][0]["provider_session_id"],
+        "ses_changed_one"
+    );
+    let recreated_cursor = recreated["next_cursor"]
+        .as_str()
+        .expect("recreated snapshot continuation cursor");
+    assert_ne!(
+        recreated_cursor, stale_cursor,
+        "a fresh snapshot incarnation must issue fresh continuation authority"
+    );
+
+    let stale = assert_error_envelope(support::invoke_with_request_and_env(
+        "session.enumerate",
+        support::request_envelope(
+            "session.enumerate",
+            session_enumerate_cursor_params(2, &stale_cursor),
+            host.clone(),
+        ),
+        &env,
+    ));
+    assert_eq!(stale["error"]["code"], "invalid_session_enumerate_cursor");
+
+    let continuation = success_result(
+        support::invoke_with_request_and_env(
+            "session.enumerate",
+            support::request_envelope(
+                "session.enumerate",
+                session_enumerate_cursor_params(2, recreated_cursor),
+                host,
+            ),
+            &env,
+        ),
+        "session.schema.json#/$defs/SessionEnumerateResponse",
+        "session.schema.json#/$defs/SessionEnumerateResult",
+    );
+    assert_eq!(
+        continuation["sessions"][0]["provider_session_id"],
+        "ses_changed_two"
+    );
+    assert_eq!(continuation["complete"], true);
+
+    fs::remove_dir_all(&data_root).expect("remove snapshot incarnation data root");
+    fs::remove_dir_all(&config_root).expect("remove snapshot incarnation config root");
+}
+
+#[test]
 fn contract_terminal_snapshot_replay_is_bounded_and_expiry_reclaims_capacity() {
     let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output("[]", "", 0);

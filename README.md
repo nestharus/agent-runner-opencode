@@ -420,8 +420,11 @@ The initial request has a stable durable claim independent of the listed row
 bytes. An exact retry consults that claim before native relisting and replays its
 immutable first-page rows, warnings, completion state, and optional cursor;
 distinct requests over identical rows still receive independent owners. A
-snapshot advances one page at a time: before a page is exposed, the manifest
-durably records its exact request claim and the sole next cursor offset. An
+snapshot's cursors bind both its stable request-derived ID and its fresh
+immutable incarnation digest, so a cursor from an expired instance cannot
+advance a later snapshot created for the same request. Each snapshot advances
+one page at a time: before a page is exposed, the manifest durably records its
+exact request claim and the sole next cursor offset. An
 exact page retry can replay that claim until its successor is admitted, while a
 different request using the consumed or older cursor is rejected instead of
 publishing a successor that another terminal handoff can retire. Page size and

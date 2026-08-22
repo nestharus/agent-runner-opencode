@@ -262,7 +262,7 @@ pub fn assert_limited_enumerate_result(result: &Value, limit: usize) {
     assert!(
         result["next_cursor"]
             .as_str()
-            .is_some_and(|cursor| cursor.starts_with("v2:")),
+            .is_some_and(|cursor| cursor.starts_with("v3:")),
         "truncated enumeration must return an opaque continuation cursor: {result}"
     );
 }

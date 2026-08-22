@@ -760,6 +760,7 @@ fn claimed_initial_snapshot_page_locked(
         next_cursor: (!complete).then(|| {
             enumeration_cursor(
                 &snapshot_id,
+                &manifest.snapshot_instance_sha256,
                 manifest.initial_page_end,
                 manifest.total_sessions,
                 &identity_sha256,
@@ -896,6 +897,7 @@ fn persist_enumeration_snapshot(
         next_cursor: (!complete).then(|| {
             enumeration_cursor(
                 &snapshot_id,
+                &manifest.snapshot_instance_sha256,
                 first_page_end,
                 manifest.total_sessions,
                 &identity_sha256,
@@ -910,7 +912,7 @@ fn load_enumeration_snapshot_page(
     cursor: &str,
     request_id: &str,
 ) -> Result<EnumeratePage, ProviderFailure> {
-    let (snapshot_id, start, total, cursor_identity) =
+    let (snapshot_id, cursor_snapshot_instance, start, total, cursor_identity) =
         parse_enumeration_cursor(cursor, request_id)?;
     let expected_identity = enumeration_request_identity(params);
     if cursor_identity != expected_identity {
@@ -929,6 +931,7 @@ fn load_enumeration_snapshot_page(
     if manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
         || manifest.snapshot_id != snapshot_id
         || !is_sha256_hex(&manifest.snapshot_instance_sha256)
+        || manifest.snapshot_instance_sha256 != cursor_snapshot_instance
         || manifest.identity_sha256 != expected_identity
         || manifest.total_sessions != total
         || manifest.expires_at_unix_ms < now_unix_ms()
@@ -989,8 +992,15 @@ fn load_enumeration_snapshot_page(
         sessions,
         warnings: Vec::new(),
         complete,
-        next_cursor: (!complete)
-            .then(|| enumeration_cursor(&snapshot_id, end, total, &expected_identity)),
+        next_cursor: (!complete).then(|| {
+            enumeration_cursor(
+                &snapshot_id,
+                &manifest.snapshot_instance_sha256,
+                end,
+                total,
+                &expected_identity,
+            )
+        }),
     })
 }
 
@@ -1107,32 +1117,34 @@ fn enumeration_page_request_sha256(params: &SessionEnumerateParams, request_id: 
 
 fn enumeration_cursor(
     snapshot_id: &str,
+    snapshot_instance_sha256: &str,
     offset: usize,
     total: usize,
     identity_sha256: &str,
 ) -> String {
-    format!("v2:{snapshot_id}:{offset}:{total}:{identity_sha256}")
+    format!("v3:{snapshot_id}:{snapshot_instance_sha256}:{offset}:{total}:{identity_sha256}")
 }
 
 fn parse_enumeration_cursor(
     cursor: &str,
     request_id: &str,
-) -> Result<(String, usize, usize, String), ProviderFailure> {
+) -> Result<(String, String, usize, usize, String), ProviderFailure> {
     let fields = cursor.split(':').collect::<Vec<_>>();
-    if fields.len() != 5
-        || fields[0] != "v2"
+    if fields.len() != 6
+        || fields[0] != "v3"
         || !is_sha256_hex(fields[1])
-        || !is_sha256_hex(fields[4])
+        || !is_sha256_hex(fields[2])
+        || !is_sha256_hex(fields[5])
     {
         return Err(invalid_session_enumerate_cursor_failure(
             request_id,
             "cursor is malformed",
         ));
     }
-    let offset = fields[2].parse::<usize>().map_err(|_| {
+    let offset = fields[3].parse::<usize>().map_err(|_| {
         invalid_session_enumerate_cursor_failure(request_id, "cursor offset is not an integer")
     })?;
-    let total = fields[3].parse::<usize>().map_err(|_| {
+    let total = fields[4].parse::<usize>().map_err(|_| {
         invalid_session_enumerate_cursor_failure(request_id, "cursor total is not an integer")
     })?;
     if total > MAX_ENUMERATED_SESSIONS || offset >= total {
@@ -1141,7 +1153,13 @@ fn parse_enumeration_cursor(
             "cursor range is outside the supported session population",
         ));
     }
-    Ok((fields[1].to_string(), offset, total, fields[4].to_string()))
+    Ok((
+        fields[1].to_string(),
+        fields[2].to_string(),
+        offset,
+        total,
+        fields[5].to_string(),
+    ))
 }
 
 fn is_sha256_hex(value: &str) -> bool {
