@@ -1567,10 +1567,6 @@ fn prepare_native_identity_rebind_cycle_slot(
         {
             continue;
         }
-        retained = retained.saturating_add(1);
-        if retained > MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT {
-            return Err(native_identity_rebind_capacity_failure(request_id));
-        }
         let retained_cycle_id = entry
             .path()
             .file_stem()
@@ -1600,13 +1596,14 @@ fn prepare_native_identity_rebind_cycle_slot(
                 .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
             durable_fs::sync_directory(&root)
                 .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
-            retained = retained.saturating_sub(1);
             if retained_cycle_id == cycle_id {
                 return Err(invalid_native_identity_rebind(
                     request_id,
                     "the rebind cycle replay window expired; begin a new plan request",
                 ));
             }
+        } else {
+            retained = retained.saturating_add(1);
         }
     }
     let target =
@@ -1621,10 +1618,11 @@ fn native_identity_rebind_observation_expired(
     observation: &NativeIdentityRebindObservationRecord,
     now: u64,
 ) -> bool {
-    observation
-        .updated_at_unix_ms
-        .saturating_add(NATIVE_IDENTITY_REBIND_REPLAY_WINDOW_MS)
-        < now
+    observation.phase != NativeIdentityRebindObservationPhase::AwaitingHostRelease
+        && observation
+            .updated_at_unix_ms
+            .saturating_add(NATIVE_IDENTITY_REBIND_REPLAY_WINDOW_MS)
+            < now
 }
 
 fn acquire_native_identity_rebind_lock(
@@ -1751,7 +1749,7 @@ fn native_identity_rebind_capacity_failure(request_id: &str) -> ProviderFailure 
         request_id,
         "native_identity_rebind_cycle_capacity",
         format!(
-            "native identity rebind retains at most {MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT} cycles per profile/component for its bounded replay window"
+            "native identity rebind retains at most {MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT} active obligations and terminal replays per profile/component; terminal replays expire after the bounded replay window"
         ),
         json!({
             "maximum_cycles_per_component": MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT,

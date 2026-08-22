@@ -636,12 +636,15 @@ request with a named identity-lock result rather than waiting indefinitely.
    retry replays the durable terminal result and the same authorization without
    consulting later component state.
 
-Each profile/component retains at most 64 cycle records for a 24-hour replay
-window. An exact retry retains its original plan-derived cycle identity and
-replays only that cycle. A later plan request receives a new cycle identity even
-when its prior and observed component evidence are byte-identical, and therefore
-must complete its own observation and host-release handoff. Expired cycles fail
-closed and must restart from a new plan request.
+Each profile/component retains at most 64 cycle records. A nonterminal
+`awaiting_host_release` record remains active until its exact release or rollback
+durably settles; capacity rejects a new cycle rather than retiring that active
+obligation. Completed and rolled-back records have a 24-hour replay window. An
+exact retry retains its original plan-derived cycle identity and replays only
+that cycle. A later plan request receives a new cycle identity even when its
+prior and observed component evidence are byte-identical, and therefore must
+complete its own observation and host-release handoff. An expired terminal
+replay fails closed and must restart from a new plan request.
 
 Private state paths are included only as implementation evidence, not as the
 protocol's meaning. A component commit reaches release only when its semantic

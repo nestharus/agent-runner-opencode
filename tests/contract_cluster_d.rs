@@ -2302,6 +2302,80 @@ fn contract_native_identity_rebind_distinguishes_identical_maintenance_cycles() 
     );
 }
 
+#[test]
+fn contract_native_identity_rebind_retains_nonterminal_release_custody_past_replay_window() {
+    let host = HostRoots::new("agent-runner-opencode-rebind-active-retention");
+    let first_observation = awaiting_native_identity_rollback(&host);
+    let first_release = first_observation["next_request"].clone();
+    let first_cycle_id = first_observation["cycle_id"]
+        .as_str()
+        .expect("first rebind cycle identity");
+    let first_record = host
+        .data_root()
+        .join("provider-state/opencode/native-identity-rebind")
+        .join("opencode3-native_runtime")
+        .join(format!("{first_cycle_id}.json"));
+    let mut stale: Value =
+        serde_json::from_slice(&fs::read(&first_record).expect("read pending rebind observation"))
+            .expect("pending rebind observation JSON");
+    stale["updated_at_unix_ms"] = json!(1);
+    fs::write(
+        &first_record,
+        serde_json::to_vec_pretty(&stale).expect("encode stale pending observation"),
+    )
+    .expect("age pending rebind observation past terminal replay window");
+
+    let second_observation = awaiting_native_identity_rollback(&host);
+    assert_ne!(
+        second_observation["cycle_id"], first_observation["cycle_id"],
+        "a later plan must retain a distinct cycle identity"
+    );
+    assert!(
+        first_record.exists(),
+        "admission of another cycle must not expire a nonterminal release obligation"
+    );
+
+    let released = native_identity_rebind_step(
+        &host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": first_release
+        }),
+    );
+    let released = native_identity_rebind_component(&released, "native_runtime");
+    assert_eq!(released["phase"], "rolled_back");
+    assert_eq!(
+        released["release_authorization"]["ordinary_admission_may_reopen"],
+        true
+    );
+}
+
+fn awaiting_native_identity_rollback(host: &HostRoots) -> Value {
+    let planned = native_identity_rebind_step(host, setup_sync_rebind_params());
+    let planned = native_identity_rebind_component(&planned, "native_runtime");
+    let sealed = native_identity_rebind_step(
+        host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": planned["next_request"]
+        }),
+    );
+    let sealed = native_identity_rebind_component(&sealed, "native_runtime");
+    let mut rollback = sealed["next_request"].clone();
+    rollback["disposition"] = json!("rolled_back");
+    let observed = native_identity_rebind_step(
+        host,
+        json!({
+            "settings_schema_id": "opencode.settings/v1",
+            "desired_profiles": ["opencode3"],
+            "native_identity_rebind": rollback
+        }),
+    );
+    native_identity_rebind_component(&observed, "native_runtime").clone()
+}
+
 fn native_identity_rebind_step(host: &HostRoots, params: Value) -> Value {
     success_result(
         invoke_validated_with_host(
