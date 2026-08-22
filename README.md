@@ -42,8 +42,12 @@ provider-instance identities. Provider-local `source_account` and
 referenced by the durable host plan binds both identity domains. Account aliases
 are canonicalized while the binding is constructed, so eligibility,
 authorization hashes, receipts, and native export/import all use the same
-numbered account identity. Its optional
-`settings_id` must be a persisted record for the target account. Stores written
+numbered account identity. Its optional `settings_id` is resolved during
+assessment to an exact record ID, version, and account for the target account.
+The provider authorization returns that `settings_selection`; materialization
+must echo its `settings_version` and `settings_account`, and the binding,
+operation, decision receipt, and materialization receipt retain the same
+selection. The host plan hash-binds the decision artifact. Stores written
 by the prior schema are
 compatibility-projected to the current OpenCode-owned account, quota, and model
 shape while preserving record IDs and versions; the next mutation writes the
@@ -340,6 +344,19 @@ Receipt replay and imported-operation finalization run before validating the
 host working directory because neither path uses it. The directory is required
 only before a new native import, so removing or renaming it cannot strand a
 completed materialization.
+When rotation is settings-bound, materialization revalidates the exact assessed
+record before native work and again under the settings-store lock while publishing
+the terminal receipt. An update or deletion before effect fails with
+`rotation_settings_selection_changed`. A change after a prepared/imported effect
+retains the operation and returns `rotation_settings_reconciliation_required`
+with the imported account/session evidence. After the host repairs or creates a
+current route to that target account, it retries the same operation with an exact
+`settings_reconciliation`; the provider validates that current record and target
+session and finalizes without re-import. The hash-bound decision artifact conforms
+to provider schema `opencode.rotation-decision/v1` and carries both authorized and
+settled settings selections. Before applying the host plan, the host reads that
+referenced artifact, verifies its advertised schema and digest, and confirms that
+the settled record ID/version/account remains current.
 
 `session.enumerate` materializes one bounded, request-bound private snapshot on
 the first page, including an empty or otherwise terminal first page, instead of
@@ -547,6 +564,11 @@ is implicitly replaced with the other. The authoritative
 its intentionally open setup objects carry this explicitly named provider
 extension rather than silently redefining the shared contract.
 
+The provider-owned `opencode.rotation-decision/v1` schema similarly defines the
+hash-bound decision artifact referenced by the unchanged shared rotation host
+plan. It keeps settings-route settlement detail in a separately named provider
+protocol instead of adding fields to the pinned Agent Runner rotation schema.
+
 Native-runtime and quota-observer identity state reads and writes are capped at 1 MiB, executable
 identity hashing is streamed and capped at 256 MiB, and their per-account lock admission is
 bounded by the earlier host deadline or five seconds. A lock timeout fails the
@@ -633,6 +655,11 @@ rotation state records are capped at 1 MiB. Every deadline path releases its
 binding lane while retaining any prepared/imported record needed for
 identity-safe reconciliation, and independent binding stripes retain useful
 overlap.
+The settings-store lock is not held across runtime admission, export, import, or
+recovery. It is acquired only for bounded selection checks and the final small
+decision/materialization receipt transaction, preventing a route mutation from
+racing terminal settlement without serializing unrelated settings work across
+the native interval.
 Authorizations are capped at 64 records, while pre-effect reservations,
 unresolved operations, and materialization receipts share one 64-record
 lifecycle cap so every admitted operation has capacity to become its replay

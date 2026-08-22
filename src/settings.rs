@@ -352,6 +352,35 @@ pub(crate) fn resolve_persisted_runtime_record(
     })
 }
 
+pub(crate) fn acquire_store_lock(
+    host: &HostContext,
+    request_id: &str,
+) -> Result<std::fs::File, ProviderFailure> {
+    let config_root = config_root(host, request_id)?;
+    let path = store_path_from_root(&config_root);
+    let parent = path.parent().expect("settings store always has parent");
+    ensure_store_path_contained(parent, &config_root, request_id)?;
+    durable_fs::create_directories(parent)
+        .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
+    let lock_path = parent.join(STORE_LOCK_FILE);
+    ensure_store_path_contained(&lock_path, &config_root, request_id)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| store_io_failure(request_id, "settings_store_lock_open_failed", err))?;
+    let timeout = operation_bounds::remaining_timeout(host.deadline_unix_ms, SETTINGS_LOCK_TIMEOUT)
+        .ok_or_else(|| settings_lock_timeout(request_id))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|err| store_io_failure(request_id, "settings_store_lock_failed", err))?
+    {
+        return Err(settings_lock_timeout(request_id));
+    }
+    Ok(lock)
+}
+
 pub fn list_params(host: &HostContext, request_id: &str) -> Result<Value, ProviderFailure> {
     let store = read_store(host, request_id)?;
     Ok(settings_list_result(&store.records))
@@ -727,25 +756,8 @@ fn mutate_store(
     let path = store_path_from_root(&config_root);
     let parent = path.parent().expect("settings store always has parent");
     ensure_store_path_contained(parent, &config_root, request_id)?;
-    durable_fs::create_directories(parent)
-        .map_err(|err| store_io_failure(request_id, "settings_store_create_dir_failed", err))?;
-    let lock_path = parent.join(STORE_LOCK_FILE);
-    ensure_store_path_contained(&lock_path, &config_root, request_id)?;
     ensure_store_path_contained(&path, &config_root, request_id)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|err| store_io_failure(request_id, "settings_store_lock_open_failed", err))?;
-    let timeout = operation_bounds::remaining_timeout(host.deadline_unix_ms, SETTINGS_LOCK_TIMEOUT)
-        .ok_or_else(|| settings_lock_timeout(request_id))?;
-    if !operation_bounds::lock_exclusive_for(&lock, timeout)
-        .map_err(|err| store_io_failure(request_id, "settings_store_lock_failed", err))?
-    {
-        return Err(settings_lock_timeout(request_id));
-    }
+    let _lock = acquire_store_lock(host, request_id)?;
     let mut store = read_store_path(&path, request_id)?;
     let predecessor_capacity_recovery = store.predecessor_capacity_recovery;
     let predecessor_projected_bytes = predecessor_capacity_recovery

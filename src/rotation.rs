@@ -10,6 +10,8 @@ use crate::opencode::{self, OpencodeExportError, OpencodeImportError};
 use crate::operation_bounds;
 use crate::path_guard;
 use crate::runtime_selection::resolve_runtime_selection;
+use crate::schema::ROTATION_DECISION_SCHEMA_ID;
+use crate::settings;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -103,8 +105,7 @@ pub fn assess_params(
     let requirements = requirements(&params);
     let met = requirements_met(&requirements);
     let facts_allow = facts_allow_rotation(&params);
-    let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
-    validate_rotation_accounts(host, &binding, request_id)?;
+    let binding = assessment_rotation_binding(&params, host, provider_instance_id, request_id)?;
     let allowed = met
         && facts_allow
         && binding.source_provider_id != binding.target_provider_id
@@ -140,7 +141,8 @@ pub fn materialize_params(
     provider_instance_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let budget = RotationBudget::new(host);
-    let binding = rotation_binding(&params, host, provider_instance_id, request_id)?;
+    let binding =
+        materialization_rotation_binding(&params, host, provider_instance_id, request_id)?;
     let _binding_lock = acquire_rotation_binding_lock(host, &binding, &budget, request_id)?;
     let capacity_lock = acquire_rotation_capacity_lock(host, &budget, request_id)?;
     budget.checkpoint(request_id)?;
@@ -153,6 +155,7 @@ pub fn materialize_params(
     if let Some(mut operation) = read_rotation_operation(host, &binding, request_id)? {
         drop(capacity_lock);
         budget.checkpoint(request_id)?;
+        validate_rotation_settings_for_operation(host, &params, &binding, &operation, request_id)?;
         if operation.phase == RotationOperationPhase::Prepared {
             let target_runtime = native_runtime::resolve_for_account_with_timeout(
                 host,
@@ -170,7 +173,9 @@ pub fn materialize_params(
                 request_id,
             )?;
         }
-        return finalize_rotation_operation(host, &binding, &operation, &budget, request_id);
+        return finalize_rotation_operation(
+            host, &params, &binding, &operation, &budget, request_id,
+        );
     }
     let reservation_path = rotation_reservation_path(host, &binding, request_id)?;
     let reservation_exists = reservation_path.exists();
@@ -198,6 +203,7 @@ pub fn materialize_params(
         ));
     }
     let authorization = require_fresh_authorization(host, &binding, request_id)?;
+    validate_rotation_settings_before_effect(host, &binding, request_id)?;
     let mut reservation =
         persist_rotation_reservation(&reservation_path, &binding, request_id, reservation_exists)?;
     drop(capacity_lock);
@@ -280,7 +286,7 @@ pub fn materialize_params(
     operation.imported_at_unix_ms = Some(now_unix_ms());
     write_rotation_operation(host, &binding, &operation, request_id)?;
     budget.checkpoint(request_id)?;
-    finalize_rotation_operation(host, &binding, &operation, &budget, request_id)
+    finalize_rotation_operation(host, &params, &binding, &operation, &budget, request_id)
 }
 
 pub(crate) fn activity_targets(params: &Value, result: Option<&Value>) -> ActivityTargets {
@@ -427,10 +433,26 @@ struct RotationBinding {
     target_account: &'static AccountProfile,
     source_session_id: String,
     model_name: String,
-    settings_record_id: String,
+    settings_selection: Option<RotationSettingsSelection>,
     transition_reason: String,
     provider_instance_id: String,
     host_app: String,
+}
+
+#[derive(Clone)]
+struct RotationSettingsSelection {
+    record_id: String,
+    record_version: String,
+    account: &'static AccountProfile,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotationSettingsReconciliation {
+    settings_id: String,
+    settings_version: String,
+    settings_account: String,
+    target_provider_session_id: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -479,13 +501,61 @@ fn rotation_binding(
         model_name: optional_string(params, "model_name")
             .unwrap_or("")
             .to_string(),
-        settings_record_id: optional_string(params, "settings_id")
-            .unwrap_or("")
-            .to_string(),
+        settings_selection: None,
         transition_reason: transition_reason(params).to_string(),
         provider_instance_id: provider_instance_id.to_string(),
         host_app: host.app.clone(),
     })
+}
+
+fn assessment_rotation_binding(
+    params: &Value,
+    host: &HostContext,
+    provider_instance_id: &str,
+    request_id: &str,
+) -> Result<RotationBinding, ProviderFailure> {
+    let mut binding = rotation_binding(params, host, provider_instance_id, request_id)?;
+    if let Some(settings_id) = optional_string(params, "settings_id") {
+        let selection = resolve_runtime_selection(host, settings_id, request_id)?;
+        binding.settings_selection = Some(RotationSettingsSelection {
+            record_id: selection.settings_id,
+            record_version: selection.settings_version,
+            account: selection.account,
+        });
+    }
+    validate_rotation_accounts(&binding, request_id)?;
+    Ok(binding)
+}
+
+fn materialization_rotation_binding(
+    params: &Value,
+    host: &HostContext,
+    provider_instance_id: &str,
+    request_id: &str,
+) -> Result<RotationBinding, ProviderFailure> {
+    let mut binding = rotation_binding(params, host, provider_instance_id, request_id)?;
+    if let Some(settings_id) = optional_string(params, "settings_id") {
+        let settings_version = required_string(params, "settings_version", request_id)?;
+        let settings_account = rotation_account(
+            required_string(params, "settings_account", request_id)?,
+            request_id,
+            "settings",
+        )?;
+        binding.settings_selection = Some(RotationSettingsSelection {
+            record_id: settings_id.to_string(),
+            record_version: settings_version.to_string(),
+            account: settings_account,
+        });
+    } else if optional_string(params, "settings_version").is_some()
+        || optional_string(params, "settings_account").is_some()
+    {
+        return Err(rotation_settings_binding_invalid(
+            request_id,
+            "settings_version and settings_account require settings_id",
+        ));
+    }
+    validate_rotation_accounts(&binding, request_id)?;
+    Ok(binding)
 }
 
 fn optional_string<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
@@ -504,10 +574,20 @@ fn binding_value(binding: &RotationBinding) -> Value {
         "target_account": binding.target_account.opencode_wrapper,
         "source_session_id": binding.source_session_id,
         "model_name": binding.model_name,
-        "settings_id": binding.settings_record_id,
+        "settings_selection": rotation_settings_selection_value(binding.settings_selection.as_ref()),
         "transition_reason": binding.transition_reason,
         "provider_instance_id": binding.provider_instance_id,
         "host_app": binding.host_app,
+    })
+}
+
+fn rotation_settings_selection_value(selection: Option<&RotationSettingsSelection>) -> Value {
+    selection.map_or(Value::Null, |selection| {
+        json!({
+            "settings_id": selection.record_id,
+            "settings_version": selection.record_version,
+            "settings_account": selection.account.opencode_wrapper,
+        })
     })
 }
 
@@ -516,20 +596,172 @@ fn binding_digest(binding: &RotationBinding) -> String {
 }
 
 fn validate_rotation_accounts(
-    host: &HostContext,
     binding: &RotationBinding,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     if binding.target_provider_id != binding.provider_instance_id {
         return Err(rotation_target_provider_mismatch(request_id));
     }
-    if !binding.settings_record_id.is_empty() {
-        let selection = resolve_runtime_selection(host, &binding.settings_record_id, request_id)?;
+    if let Some(selection) = &binding.settings_selection {
         if selection.account.opencode_wrapper != binding.target_account.opencode_wrapper {
             return Err(rotation_settings_account_mismatch(request_id));
         }
     }
     Ok(())
+}
+
+fn validate_rotation_settings_before_effect(
+    host: &HostContext,
+    binding: &RotationBinding,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let Some(expected) = binding.settings_selection.as_ref() else {
+        return Ok(());
+    };
+    let _settings_lock = settings::acquire_store_lock(host, request_id)?;
+    match observe_rotation_settings_selection(host, expected, request_id) {
+        Ok(observed) if rotation_settings_selection_matches(expected, &observed) => Ok(()),
+        observed => Err(rotation_settings_selection_changed(
+            request_id, binding, observed,
+        )),
+    }
+}
+
+fn validate_rotation_settings_for_operation(
+    host: &HostContext,
+    params: &Value,
+    binding: &RotationBinding,
+    operation: &RotationOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let (settings_lock, _) =
+        settle_rotation_settings_selection(host, params, binding, operation, request_id)?;
+    drop(settings_lock);
+    Ok(())
+}
+
+fn settle_rotation_settings_selection(
+    host: &HostContext,
+    params: &Value,
+    binding: &RotationBinding,
+    operation: &RotationOperation,
+    request_id: &str,
+) -> Result<(Option<fs::File>, Option<RotationSettingsSelection>), ProviderFailure> {
+    let Some(expected) = binding.settings_selection.as_ref() else {
+        if params.get("settings_reconciliation").is_some() {
+            return Err(rotation_settings_binding_invalid(
+                request_id,
+                "settings_reconciliation requires an assessment-bound settings selection",
+            ));
+        }
+        return Ok((None, None));
+    };
+    let settings_lock = settings::acquire_store_lock(host, request_id)?;
+    let observed = observe_rotation_settings_selection(host, expected, request_id);
+    if observed
+        .as_ref()
+        .is_ok_and(|observed| rotation_settings_selection_matches(expected, observed))
+    {
+        return Ok((Some(settings_lock), Some(expected.clone())));
+    }
+    let reconciliation =
+        parse_rotation_settings_reconciliation(params, request_id)?.ok_or_else(|| {
+            rotation_settings_reconciliation_required(
+                request_id,
+                binding,
+                operation,
+                observed.as_ref().map_err(String::as_str),
+            )
+        })?;
+    let reconciliation_account = rotation_account(
+        &reconciliation.settings_account,
+        request_id,
+        "settings reconciliation",
+    )?;
+    let reconciled = RotationSettingsSelection {
+        record_id: reconciliation.settings_id,
+        record_version: reconciliation.settings_version,
+        account: reconciliation_account,
+    };
+    if reconciled.account.opencode_wrapper != binding.target_account.opencode_wrapper {
+        return Err(rotation_settings_reconciliation_required(
+            request_id,
+            binding,
+            operation,
+            observed.as_ref().map_err(String::as_str),
+        ));
+    }
+    let expected_target_session_id = match operation.phase {
+        RotationOperationPhase::Prepared => optional_string(params, "recovery_target_session_id")
+            .unwrap_or(&binding.source_session_id),
+        RotationOperationPhase::Imported => operation
+            .target_session_id
+            .as_deref()
+            .expect("validated imported rotation has a target session id"),
+    };
+    if reconciliation.target_provider_session_id != expected_target_session_id {
+        return Err(rotation_settings_reconciliation_required(
+            request_id,
+            binding,
+            operation,
+            observed.as_ref().map_err(String::as_str),
+        ));
+    }
+    let reconciled_observation = observe_rotation_settings_selection(host, &reconciled, request_id);
+    if !reconciled_observation
+        .as_ref()
+        .is_ok_and(|observed| rotation_settings_selection_matches(&reconciled, observed))
+    {
+        return Err(rotation_settings_reconciliation_required(
+            request_id,
+            binding,
+            operation,
+            reconciled_observation.as_ref().map_err(String::as_str),
+        ));
+    }
+    Ok((Some(settings_lock), Some(reconciled)))
+}
+
+fn parse_rotation_settings_reconciliation(
+    params: &Value,
+    request_id: &str,
+) -> Result<Option<RotationSettingsReconciliation>, ProviderFailure> {
+    params
+        .get("settings_reconciliation")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                rotation_settings_binding_invalid(
+                    request_id,
+                    format!("settings_reconciliation is invalid: {error}"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn observe_rotation_settings_selection(
+    host: &HostContext,
+    expected: &RotationSettingsSelection,
+    request_id: &str,
+) -> Result<RotationSettingsSelection, String> {
+    match resolve_runtime_selection(host, &expected.record_id, request_id) {
+        Ok(selection) => Ok(RotationSettingsSelection {
+            record_id: selection.settings_id,
+            record_version: selection.settings_version,
+            account: selection.account,
+        }),
+        Err(failure) => Err(format!("{}: {}", failure.code, failure.message)),
+    }
+}
+
+fn rotation_settings_selection_matches(
+    expected: &RotationSettingsSelection,
+    observed: &RotationSettingsSelection,
+) -> bool {
+    expected.record_id == observed.record_id
+        && expected.record_version == observed.record_version
+        && expected.account.opencode_wrapper == observed.account.opencode_wrapper
 }
 
 fn rotation_account(
@@ -585,6 +817,7 @@ fn persist_assessment_decision(
         "authorization_id": record["authorization_id"],
         "binding_sha256": record["binding_sha256"],
         "expires_at_unix_ms": record["expires_at_unix_ms"],
+        "settings_selection": rotation_settings_selection_value(binding.settings_selection.as_ref()),
     })))
 }
 
@@ -1273,6 +1506,7 @@ fn normalize_nested_session_ids(value: &mut Value) {
 
 fn finalize_rotation_operation(
     host: &HostContext,
+    params: &Value,
     binding: &RotationBinding,
     operation: &RotationOperation,
     budget: &RotationBudget,
@@ -1293,7 +1527,15 @@ fn finalize_rotation_operation(
     budget.checkpoint(request_id)?;
     let artifact_path = Path::new(&operation.artifact_path);
     let artifact = rotation_artifact(artifact_path, &artifact_bytes);
-    let decision_artifact = write_rotation_decision_receipt(host, binding, operation, request_id)?;
+    let (settings_lock, settled_settings_selection) =
+        settle_rotation_settings_selection(host, params, binding, operation, request_id)?;
+    let decision_artifact = write_rotation_decision_receipt(
+        host,
+        binding,
+        settled_settings_selection.as_ref(),
+        operation,
+        request_id,
+    )?;
     budget.checkpoint(request_id)?;
     let host_state_plan = host_state_plan(HostStatePlanInput {
         chain_id: &binding.chain_id,
@@ -1326,6 +1568,7 @@ fn finalize_rotation_operation(
     )?;
     remove_rotation_record(&authorization_path(host, binding, request_id)?, request_id)?;
     drop(capacity_lock);
+    drop(settings_lock);
     budget.checkpoint(request_id)?;
     Ok(result)
 }
@@ -1356,6 +1599,7 @@ fn write_materialization_receipt(
 fn write_rotation_decision_receipt(
     host: &HostContext,
     binding: &RotationBinding,
+    settled_settings_selection: Option<&RotationSettingsSelection>,
     operation: &RotationOperation,
     request_id: &str,
 ) -> Result<Value, ProviderFailure> {
@@ -1366,9 +1610,12 @@ fn write_rotation_decision_receipt(
     let identity_matched = target_session_id == binding.source_session_id;
     let record = json!({
         "schema_version": 1,
+        "schema_id": ROTATION_DECISION_SCHEMA_ID,
         "operation": "rotation.materialize",
         "binding_sha256": binding_digest(binding),
         "binding": binding_value(binding),
+        "authorized_settings_selection": rotation_settings_selection_value(binding.settings_selection.as_ref()),
+        "settled_settings_selection": rotation_settings_selection_value(settled_settings_selection),
         "authorization_id": operation.authorization_id,
         "assessment_request_id": operation.assessment_request_id,
         "materialization_request_id": operation.materialization_request_id,
@@ -1674,6 +1921,57 @@ fn rotation_settings_account_mismatch(request_id: &str) -> ProviderFailure {
         request_id,
         "rotation_settings_account_mismatch",
         "rotation settings_id must identify a persisted record for target_provider",
+    )
+}
+
+fn rotation_settings_binding_invalid(
+    request_id: &str,
+    message: impl Into<String>,
+) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "rotation_settings_binding_invalid",
+        message.into(),
+    )
+}
+
+fn rotation_settings_selection_changed(
+    request_id: &str,
+    binding: &RotationBinding,
+    observed: Result<RotationSettingsSelection, String>,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "rotation_settings_selection_changed",
+        "the assessment-bound settings selection changed before rotation effect admission; request a new assessment",
+        json!({
+            "authorized_settings_selection": rotation_settings_selection_value(binding.settings_selection.as_ref()),
+            "observed_settings_selection": observed
+                .as_ref()
+                .map_or_else(|failure| json!({ "unavailable": failure }), |selection| rotation_settings_selection_value(Some(selection))),
+        }),
+    )
+}
+
+fn rotation_settings_reconciliation_required(
+    request_id: &str,
+    binding: &RotationBinding,
+    operation: &RotationOperation,
+    observed: Result<&RotationSettingsSelection, &str>,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "rotation_settings_reconciliation_required",
+        "the assessment-bound settings selection changed after rotation effect admission; preserve the imported session and reconcile a current settings route to the imported target account before retrying",
+        json!({
+            "authorized_settings_selection": rotation_settings_selection_value(binding.settings_selection.as_ref()),
+            "observed_settings_selection": observed
+                .map_or_else(|failure| json!({ "unavailable": failure }), |selection| rotation_settings_selection_value(Some(selection))),
+            "imported_target_account": binding.target_account.opencode_wrapper,
+            "imported_target_provider_session_id": operation.target_session_id,
+            "operation_phase": operation.phase,
+            "recovery": "retry the same materialization with settings_reconciliation naming an exact current settings ID/version/account for the imported target account and the imported target session; do not repeat import",
+        }),
     )
 }
 

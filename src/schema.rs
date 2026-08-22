@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 pub const SETTINGS_SCHEMA_ID: &str = "opencode.settings/v1";
 pub const NATIVE_IDENTITY_REBIND_SCHEMA_ID: &str = "opencode.native-identity-rebind/v1";
+pub const ROTATION_DECISION_SCHEMA_ID: &str = "opencode.rotation-decision/v1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +81,13 @@ fn schema_result(schema_id: &str) -> Value {
             ))
             .expect("native identity rebind schema must be valid JSON"),
         }),
+        ROTATION_DECISION_SCHEMA_ID => json!({
+            "schema_id": ROTATION_DECISION_SCHEMA_ID,
+            "schema": serde_json::from_str::<Value>(include_str!(
+                "../protocol/v1/rotation-decision.schema.json"
+            ))
+            .expect("rotation decision schema must be valid JSON"),
+        }),
         _ => unreachable!("schema id was validated before projection"),
     }
 }
@@ -104,7 +112,7 @@ fn settings_schema_ui() -> Value {
 fn is_supported_schema_id(schema_id: &str) -> bool {
     matches!(
         schema_id,
-        SETTINGS_SCHEMA_ID | NATIVE_IDENTITY_REBIND_SCHEMA_ID
+        SETTINGS_SCHEMA_ID | NATIVE_IDENTITY_REBIND_SCHEMA_ID | ROTATION_DECISION_SCHEMA_ID
     )
 }
 

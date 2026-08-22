@@ -51,6 +51,30 @@ fn schema_response_exposes_native_identity_rebind_protocol() {
 }
 
 #[test]
+fn schema_response_exposes_rotation_decision_protocol() {
+    let output = invoke(
+        "schema",
+        json!({ "schema_id": "opencode.rotation-decision/v1" }),
+    );
+    assert_success(&output, "rotation decision schema");
+    let response = json_stdout(&output);
+    assert_valid(&response, "schema.schema.json#/$defs/SchemaResponse");
+    assert_eq!(
+        response["result"]["schema_id"],
+        "opencode.rotation-decision/v1"
+    );
+    assert_eq!(
+        response["result"]["schema"]["$id"],
+        "https://schemas.oulipoly.dev/opencode/rotation-decision/v1"
+    );
+    assert_eq!(
+        response["result"]["schema"]["x-protocol"],
+        "opencode.rotation-decision/v1"
+    );
+    assert!(response["result"].get("ui").is_none());
+}
+
+#[test]
 fn pinned_contract_snapshot_matches_every_recorded_upstream_digest() {
     let mut checked = 0;
     for line in include_str!("../contract/v1/UPSTREAM.md").lines() {

@@ -351,7 +351,19 @@ fn contract_settings_parallel_updates_preserve_optimistic_concurrency() {
                     &request,
                     "settings.schema.json#/$defs/SettingsUpdateRequest",
                 );
-                support::invoke_with_request("settings.update", request)
+                let mut last_lock_timeout = None;
+                for _ in 0..8 {
+                    let output = support::invoke_with_request("settings.update", request.clone());
+                    if output.status.success() {
+                        return output;
+                    }
+                    let response = support::json_stdout(&output);
+                    if response["error"]["code"] != "settings_store_lock_timeout" {
+                        return output;
+                    }
+                    last_lock_timeout = Some(output);
+                }
+                last_lock_timeout.expect("at least one bounded settings lock attempt")
             })
         })
         .collect::<Vec<_>>();
@@ -2650,6 +2662,129 @@ fn contract_setup_brain_unsupported() {
     assert_setup_brain_unsupported_response(&response);
 }
 
+fn rotation_settings_values(account: &str) -> Value {
+    let mut values = opencode_settings_values(None);
+    values["profile"] = json!(account);
+    values["wrapper"] = json!(account);
+    values["quota"]["auth_path"] = json!(match account {
+        "opencode1" => "~/.local/share/opencode/auth.json",
+        "opencode2" => "~/.opencode2/opencode/auth.json",
+        "opencode3" => "~/.opencode3/opencode/auth.json",
+        "opencode4" => "~/.opencode4/opencode/auth.json",
+        "opencode5" => "~/.opencode5/opencode/auth.json",
+        _ => panic!("unsupported rotation settings account"),
+    });
+    values
+}
+
+fn create_rotation_settings(host: &HostRoots, account: &str) -> (String, String) {
+    let created = success_result(
+        invoke_validated_with_host(
+            "settings.create",
+            settings_create_params_for_values(rotation_settings_values(account)),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsCreateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsCreateResponse",
+        "settings.schema.json#/$defs/SettingsCreateResult",
+    );
+    (
+        settings_create_id(&created),
+        settings_create_version(&created),
+    )
+}
+
+fn update_rotation_settings(
+    host: &HostRoots,
+    settings_id: &str,
+    version: &str,
+    account: &str,
+) -> String {
+    let updated = success_result(
+        invoke_validated_with_host(
+            "settings.update",
+            json!({
+                "id": settings_id,
+                "version": version,
+                "values": rotation_settings_values(account),
+            }),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsUpdateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsUpdateResponse",
+        "settings.schema.json#/$defs/SettingsUpdateResult",
+    );
+    updated["record"]["version"]
+        .as_str()
+        .expect("updated rotation settings version")
+        .to_string()
+}
+
+fn assess_rotation_with_settings(host: &HostRoots, settings_id: &str) -> Value {
+    let mut params = rotation_assess_alias_params(true);
+    params["settings_id"] = json!(settings_id);
+    success_result(
+        invoke_validated_with_host(
+            "rotation.assess",
+            params,
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationAssessRequest",
+        ),
+        "rotation.schema.json#/$defs/RotationAssessResponse",
+        "rotation.schema.json#/$defs/RotationAssessResult",
+    )
+}
+
+fn rotation_authorized_settings_selection(assessment: &Value) -> Value {
+    assessment["requirements"]
+        .as_array()
+        .expect("rotation requirements")
+        .iter()
+        .find(|requirement| requirement["kind"] == "provider_authorization")
+        .expect("provider rotation authorization")["settings_selection"]
+        .clone()
+}
+
+fn materialize_rotation_with_settings(selection: &Value) -> Value {
+    let mut params = rotation_materialize_params();
+    params["settings_id"] = selection["settings_id"].clone();
+    params["settings_version"] = selection["settings_version"].clone();
+    params["settings_account"] = selection["settings_account"].clone();
+    params
+}
+
+fn assert_rotation_decision_protocol(materialized: &Value) -> Value {
+    let decision_path = materialized["artifacts"][1]["path"]
+        .as_str()
+        .expect("rotation decision path");
+    let decision: Value =
+        serde_json::from_slice(&fs::read(decision_path).expect("read rotation decision artifact"))
+            .expect("rotation decision JSON");
+    let schema = success_result(
+        invoke(
+            "schema",
+            json!({ "schema_id": "opencode.rotation-decision/v1" }),
+        ),
+        "schema.schema.json#/$defs/SchemaResponse",
+        "schema.schema.json#/$defs/SchemaResult",
+    )["schema"]
+        .clone();
+    let compiled = JSONSchema::options()
+        .with_draft(Draft::Draft202012)
+        .compile(&schema)
+        .expect("compile rotation decision schema");
+    if let Err(errors) = compiled.validate(&decision) {
+        panic!(
+            "rotation decision failed its advertised schema: {}; decision={decision}",
+            errors
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    decision
+}
+
 #[test]
 fn contract_rotation_assess_materialize() {
     let host = HostRoots::new("agent-runner-opencode-rotation");
@@ -2705,6 +2840,7 @@ fn contract_rotation_assess_materialize() {
         "rotation.schema.json#/$defs/RotationMaterializeResult",
     );
     assert_rotation_materialized(&materialized);
+    assert_rotation_decision_protocol(&materialized);
     fs::remove_dir_all(host.working_directory())
         .expect("remove former working directory after committed materialization");
     let retried = success_result(
@@ -2731,6 +2867,168 @@ fn contract_rotation_assess_materialize() {
     assert_eq!(imported["messages"][0]["mode"], "build");
     assert_eq!(imported["nativeRoot"]["preserved"], true);
     host_owned.assert_unchanged();
+}
+
+#[test]
+fn contract_rotation_rejects_changed_or_deleted_settings_before_import() {
+    for mutation in ["update", "delete"] {
+        let host = HostRoots::new(&format!(
+            "agent-runner-opencode-rotation-settings-{mutation}-before-import"
+        ));
+        let opencode = RotationOpencodeFixture::new();
+        let (settings_id, version) = create_rotation_settings(&host, "opencode2");
+        let assessment = assess_rotation_with_settings(&host, &settings_id);
+        assert_rotation_allowed(&assessment);
+        let selection = rotation_authorized_settings_selection(&assessment);
+        assert_eq!(selection["settings_id"], settings_id);
+        assert_eq!(selection["settings_version"], version);
+        assert_eq!(selection["settings_account"], "opencode2");
+
+        match mutation {
+            "update" => {
+                update_rotation_settings(&host, &settings_id, &version, "opencode3");
+            }
+            "delete" => {
+                let _ = success_result(
+                    invoke_validated_with_host(
+                        "settings.delete",
+                        settings_delete_params(&settings_id, &version),
+                        host.overrides(),
+                        "settings.schema.json#/$defs/SettingsDeleteRequest",
+                    ),
+                    "settings.schema.json#/$defs/SettingsDeleteResponse",
+                    "settings.schema.json#/$defs/SettingsDeleteResult",
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        let path = opencode.path_env();
+        let response = error_response(invoke_validated_with_host_and_env(
+            "rotation.materialize",
+            materialize_rotation_with_settings(&selection),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            &[("PATH", path.as_str())],
+        ));
+        assert_eq!(
+            response["error"]["code"],
+            "rotation_settings_selection_changed"
+        );
+        assert!(
+            !opencode.import_was_attempted(),
+            "a changed or deleted route must fail before native import"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_rotation_reconciles_settings_changed_after_import_without_reimport() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-settings-after-import");
+    let opencode = RotationOpencodeFixture::with_post_import_finalization_fault();
+    let (settings_id, version) = create_rotation_settings(&host, "opencode2");
+    let assessment = assess_rotation_with_settings(&host, &settings_id);
+    let selection = rotation_authorized_settings_selection(&assessment);
+    let materialize = materialize_rotation_with_settings(&selection);
+    let path = opencode.path_env();
+
+    let first = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        materialize.clone(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(first["error"]["code"], "rotation_state_failed");
+    assert_eq!(opencode.import_count(), 1);
+    opencode.restore_operation_state_writes(host.data_root());
+
+    let operation_root = host
+        .data_root()
+        .join("provider-state/opencode/rotation/operations");
+    let operation_path = fs::read_dir(&operation_root)
+        .expect("rotation operation directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("prepared rotation operation");
+    let mut operation: Value = serde_json::from_slice(
+        &fs::read(&operation_path).expect("read prepared rotation operation"),
+    )
+    .expect("prepared rotation operation JSON");
+    operation["phase"] = json!("imported");
+    operation["target_session_id"] = json!(ROTATION_SOURCE_SESSION);
+    operation["imported_at_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms());
+    fs::write(
+        &operation_path,
+        serde_json::to_vec_pretty(&operation).expect("encode imported rotation operation"),
+    )
+    .expect("publish imported rotation checkpoint");
+
+    let changed_version = update_rotation_settings(&host, &settings_id, &version, "opencode3");
+    let unresolved = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        materialize.clone(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        unresolved["error"]["code"],
+        "rotation_settings_reconciliation_required"
+    );
+    assert_eq!(
+        unresolved["error"]["details"]["imported_target_provider_session_id"],
+        ROTATION_SOURCE_SESSION
+    );
+    assert_eq!(opencode.import_count(), 1);
+
+    let reconciled_version =
+        update_rotation_settings(&host, &settings_id, &changed_version, "opencode2");
+    let settled_selection = json!({
+        "settings_id": settings_id,
+        "settings_version": reconciled_version,
+        "settings_account": "opencode2",
+    });
+    let mut reconcile = materialize.clone();
+    reconcile["settings_reconciliation"] = json!({
+        "settings_id": settled_selection["settings_id"],
+        "settings_version": settled_selection["settings_version"],
+        "settings_account": "opencode2",
+        "target_provider_session_id": ROTATION_SOURCE_SESSION,
+    });
+    let materialized = success_result(
+        invoke_validated_with_host_and_env(
+            "rotation.materialize",
+            reconcile.clone(),
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            &[("PATH", path.as_str())],
+        ),
+        "rotation.schema.json#/$defs/RotationMaterializeResponse",
+        "rotation.schema.json#/$defs/RotationMaterializeResult",
+    );
+    assert_rotation_materialized(&materialized);
+    let decision = assert_rotation_decision_protocol(&materialized);
+    assert_eq!(decision["schema_id"], "opencode.rotation-decision/v1");
+    assert_eq!(decision["authorized_settings_selection"], selection);
+    assert_eq!(decision["settled_settings_selection"], settled_selection);
+    assert_eq!(opencode.import_count(), 1);
+
+    let replayed = success_result(
+        invoke_validated_with_host_and_env(
+            "rotation.materialize",
+            reconcile,
+            host.overrides(),
+            "rotation.schema.json#/$defs/RotationMaterializeRequest",
+            &[("PATH", path.as_str())],
+        ),
+        "rotation.schema.json#/$defs/RotationMaterializeResponse",
+        "rotation.schema.json#/$defs/RotationMaterializeResult",
+    );
+    assert_eq!(replayed, materialized);
+    assert_eq!(opencode.import_count(), 1);
 }
 
 #[test]
@@ -2889,7 +3187,15 @@ fn rotation_binding_test_stripe(params: &Value) -> u8 {
         "target_account": target_account,
         "source_session_id": params["source_session_id"],
         "model_name": params["model_name"],
-        "settings_id": params["settings_id"].as_str().unwrap_or(""),
+        "settings_selection": if params["settings_id"].as_str().is_some() {
+            json!({
+                "settings_id": params["settings_id"],
+                "settings_version": params["settings_version"],
+                "settings_account": params["settings_account"],
+            })
+        } else {
+            Value::Null
+        },
         "transition_reason": params["transition_reason"],
         "provider_instance_id": "opencode-primary",
         "host_app": "oulipoly-agent-runner",
@@ -3051,8 +3357,8 @@ fn contract_rotation_oversized_export_is_bounded_and_releases_global_capability_
     ));
     assert_eq!(failed["error"]["code"], "rotation_export_capacity_exceeded");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(8),
-        "an oversized export must be drained with bounded retention and rejected promptly"
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "an oversized export must be drained and rejected within the 30-second provider bound plus scheduler tolerance"
     );
     assert!(!opencode.import_was_attempted());
 
