@@ -57,11 +57,13 @@ transition up to a declared 16 MiB and 4,096-record predecessor envelope.
 Reads stop at that byte bound; a larger predecessor store or one with more
 records fails explicitly as `settings_store_capacity_unsupported` and must be
 reduced with the predecessor binary before this provider is installed. Creates
-and other growth are rejected, while a size-reducing update or record-reducing
-delete is committed in predecessor recovery form; each later process can
-continue that in-band reduction, and the first mutation that fits the current
-envelope atomically writes the current schema. Files that claim the current
-schema above 4 MiB are not admitted through this compatibility path. An
+and other growth are rejected. This provider commits a predecessor update or
+delete only when that single atomic mutation lands directly inside the current
+256-record/4 MiB envelope; it never publishes a chain of intermediate
+whole-store recovery rewrites. A predecessor population that needs more than
+one reduction step remains diagnostic/read-only here and must be reduced with
+the predecessor binary before cutover. Files that claim the current schema
+above 4 MiB are not admitted through this compatibility path. An
 otherwise valid predecessor model tuple that omitted `model.name` is projected
 from its exact `provider_model` and `variant`. A residual predecessor record
 that cannot be routed remains listable with a `repair_required` migration
@@ -69,10 +71,13 @@ summary instead of rejecting the shared store; selecting that record fails with
 its settings diagnostics, while its preserved ID and version allow an in-band
 update or delete. Unrelated projected records remain fully usable.
 `setup.detect` runs this same bounded, parsed-schema transition preflight
-against the exact `host.config_root` store. It also requires a valid exact
-record for every caller ID being activated. Readiness validates each parsed
-record once and indexes it by exact ID, so the full 4,096-record/4,096-caller
-transition remains linear rather than cross-scanning both populations.
+against the exact `host.config_root` store. A predecessor store above the
+current 256-record/4 MiB envelope is reported as
+`settings_predecessor_reduction_required` before caller activation work and
+blocks installation until the predecessor provider reduces it. Once the store
+fits the current envelope, readiness requires a valid exact record for every
+caller ID being activated and indexes each parsed record by exact ID rather
+than cross-scanning records and callers.
 `params.settings_id` declares one
 opaque caller ID, `params.settings_ids` declares the complete caller population,
 and their absence selects the installed Agent Runner compatibility population
@@ -81,9 +86,11 @@ and their absence selects the installed Agent Runner compatibility population
 both store compatibility and caller activation to pass; install plans expose
 the exact required and missing IDs as a blocking step, and sync plans emit an
 error diagnostic until migration or explicit record configuration completes.
-The declared caller population is bounded by the same 4,096-record predecessor
-transition envelope as the settings store, independently of the five native
-account profiles; multiple caller records may select one account.
+The declared caller population input is bounded at 4,096 so setup can diagnose
+the complete predecessor population independently of the five native account
+profiles; successful current-provider activation remains bounded by the 256
+persisted records in the current store, and multiple caller records may select
+one account.
 This prevents cutover from removing every settings-selected route before its
 required reducer has run or declaring an installation ready while established
 provider-name callers still lack exact records.
@@ -237,8 +244,11 @@ Launch children run in a provider-owned process group, while export and quota
 helpers remain direct children. One custody boundary is installed immediately
 after every manual spawn and owns termination and reaping on every fallible
 return until a successful wait discharges it. Drain queues and terminal-capture
-tails are bounded. Pipe read failures, malformed native events, and capture
-truncation are emitted as explicit evidence markers. Independent stdout and
+tails are bounded. Native event framing consumes each received byte once and
+retains at most 1 MiB for an incomplete metadata line; an over-bound line is
+reported as an integrity failure and skipped through its next newline while
+the raw stream continues unchanged. Pipe read failures, malformed native
+events, and capture truncation are emitted as explicit evidence markers. Independent stdout and
 stderr pipes are sequenced in provider receipt order; the provider makes no
 claim about an unknowable pre-receipt cross-pipe emission order.
 
@@ -432,15 +442,15 @@ bounded to 256 records, 1,024 retained history events, 4,096 live mutation
 receipts, and 4 MiB encoded; history keeps a hash-linked contiguous tail and
 expired receipts are removed before new admission. Capacity exhaustion rejects
 only a new settings mutation as `settings_capacity_exhausted`; existing bounded
-records remain readable and usable. The predecessor recovery exception is
-non-growing and finite: only the exact schema-less predecessor serialization or
-an intermediate schema-zero recovery transaction can exceed the encoded bound,
-no admitted predecessor/recovery store may exceed 16 MiB or 4,096 records, and
-each admitted recovery mutation must reduce record count or encoded size. The
+records remain readable and usable. The predecessor read exception is finite:
+only the exact schema-less predecessor serialization or a previously published
+schema-zero recovery transaction can exceed the current encoded bound, and no
+such store may exceed 16 MiB or 4,096 records. This provider publishes no new
+intermediate recovery store. A predecessor mutation succeeds only when its
 fully serialized candidate—including upgraded values, history, and mutation
-receipt—is checked against that transition envelope before atomic publication,
-so a successful recovery mutation always leaves a store the next process can
-read.
+receipt—fits the 4 MiB/256-record current envelope in one step; otherwise it is
+rejected before the atomic write and setup continues to require predecessor
+reduction before installation.
 Settings lock admission is bounded by the earlier of the host deadline and five
 seconds. Migration artifacts are content-addressed, atomically published,
 confined to one of the two exact provider-owned roots, and retain hashes for the

@@ -29,11 +29,13 @@ use std::time::Duration;
 pub const MAX_EXPORT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SESSION_LIST_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_NATIVE_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_NATIVE_EVENT_LINE_BYTES: usize = 1024 * 1024;
 const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Default)]
 pub struct EventParser {
     pending: Vec<u8>,
+    discarding_oversized_line: bool,
     errors: Vec<String>,
 }
 
@@ -344,12 +346,52 @@ impl std::error::Error for OpencodeAuthFailure {
 
 impl EventParser {
     pub fn ingest(&mut self, bytes: &[u8]) -> Vec<OpencodeEventMetadata> {
-        self.pending.extend_from_slice(bytes);
-        let lines = drain_complete_lines(&mut self.pending);
+        let mut lines = Vec::new();
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            if self.discarding_oversized_line {
+                let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') else {
+                    break;
+                };
+                self.discarding_oversized_line = false;
+                remaining = &remaining[newline + 1..];
+                continue;
+            }
+
+            let newline = remaining.iter().position(|byte| *byte == b'\n');
+            let content_bytes = newline.unwrap_or(remaining.len());
+            if self.pending.len().saturating_add(content_bytes) > MAX_NATIVE_EVENT_LINE_BYTES {
+                self.pending.clear();
+                if self.errors.len() < 4 {
+                    self.errors.push(format!(
+                        "native event line exceeds the {MAX_NATIVE_EVENT_LINE_BYTES}-byte metadata parsing bound"
+                    ));
+                }
+                match newline {
+                    Some(index) => remaining = &remaining[index + 1..],
+                    None => {
+                        self.discarding_oversized_line = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            let consumed = content_bytes + usize::from(newline.is_some());
+            self.pending.extend_from_slice(&remaining[..consumed]);
+            remaining = &remaining[consumed..];
+            if newline.is_some() {
+                let line = std::mem::take(&mut self.pending);
+                if !line.trim_ascii().is_empty() {
+                    lines.push(line);
+                }
+            }
+        }
         self.parse_lines(&lines)
     }
 
     pub fn finish(&mut self) -> Vec<OpencodeEventMetadata> {
+        self.discarding_oversized_line = false;
         if self.pending.is_empty() {
             return Vec::new();
         }
@@ -644,15 +686,6 @@ pub fn parse_import_stdout(stdout: &[u8]) -> Result<String, OpencodeImportError>
         .filter(|session_id| !session_id.is_empty())
         .map(str::to_string)
         .ok_or_else(|| OpencodeImportError::MissingSessionId(text.to_string()))
-}
-
-fn drain_complete_lines(pending: &mut Vec<u8>) -> Vec<Vec<u8>> {
-    let split_at = match pending.iter().rposition(|byte| *byte == b'\n') {
-        Some(index) => index + 1,
-        None => return Vec::new(),
-    };
-    let drained = pending.drain(..split_at).collect::<Vec<_>>();
-    non_empty_lines(&drained)
 }
 
 fn is_pinned_native_event(event: &OpencodeEventMetadata) -> bool {
@@ -1057,14 +1090,6 @@ fn invalid_session_list_json_error(err: serde_json::Error) -> OpencodeSessionLis
     OpencodeSessionListError::InvalidJson(err.to_string())
 }
 
-fn non_empty_lines(drained: &[u8]) -> Vec<Vec<u8>> {
-    drained
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.trim_ascii().is_empty())
-        .map(Vec::from)
-        .collect()
-}
-
 fn pinned_native_event(event: OpencodeEventMetadata) -> Option<OpencodeEventMetadata> {
     is_pinned_native_event(&event).then_some(event)
 }
@@ -1072,9 +1097,55 @@ fn pinned_native_event(event: OpencodeEventMetadata) -> Option<OpencodeEventMeta
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_import_stdout, parse_session_list_stdout, OpencodeImportError,
+        parse_import_stdout, parse_session_list_stdout, EventParser, OpencodeImportError,
         OpencodeSessionDirectory, OpencodeSessionListError, OpencodeSessionListRow,
+        MAX_NATIVE_EVENT_LINE_BYTES,
     };
+
+    #[test]
+    fn event_parser_bounds_partial_lines_and_recovers_at_the_next_frame() {
+        let mut parser = EventParser::default();
+        let oversized = vec![b'x'; MAX_NATIVE_EVENT_LINE_BYTES + 1];
+
+        assert!(parser.ingest(&oversized).is_empty());
+        assert!(parser.pending.is_empty());
+        assert!(parser.discarding_oversized_line);
+        assert_eq!(parser.take_errors().len(), 1);
+
+        let valid = br#"{"type":"text","sessionID":"ses-after-oversized","timestamp":1,"part":{}}"#;
+        let mut recovery = Vec::with_capacity(valid.len() + 2);
+        recovery.push(b'\n');
+        recovery.extend_from_slice(valid);
+        recovery.push(b'\n');
+        let events = parser.ingest(&recovery);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("ses-after-oversized"));
+        assert!(!parser.discarding_oversized_line);
+        assert!(parser.pending.is_empty());
+    }
+
+    #[test]
+    fn event_parser_accepts_a_large_valid_line_in_fixed_drain_chunks() {
+        let mut line = serde_json::to_vec(&serde_json::json!({
+            "type": "text",
+            "sessionID": "ses-large-event",
+            "timestamp": 1,
+            "part": { "text": "x".repeat(128 * 1024) }
+        }))
+        .expect("serialize large native event");
+        line.push(b'\n');
+        let mut parser = EventParser::default();
+        let events = line
+            .chunks(8 * 1024)
+            .flat_map(|chunk| parser.ingest(chunk))
+            .collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("ses-large-event"));
+        assert!(parser.pending.is_empty());
+        assert!(parser.take_errors().is_empty());
+    }
 
     #[test]
     fn import_edge_rejects_a_lossily_decodable_session_identity() {

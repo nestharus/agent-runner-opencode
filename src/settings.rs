@@ -653,6 +653,23 @@ fn settings_store_readiness(
     byte_count: usize,
     required_settings_ids: &[String],
 ) -> SettingsTransitionReadiness {
+    if store.predecessor_capacity_recovery
+        && (byte_count > MAX_SETTINGS_STORE_BYTES || store.records.len() > MAX_SETTINGS_RECORDS)
+    {
+        return SettingsTransitionReadiness {
+            ready: false,
+            state: "predecessor_reduction_required",
+            code: Some("settings_predecessor_reduction_required".to_string()),
+            message: Some(format!(
+                "the predecessor settings store has {} records and {byte_count} bytes; reduce it to at most {MAX_SETTINGS_RECORDS} records and {MAX_SETTINGS_STORE_BYTES} bytes with the predecessor provider before installing this binary",
+                store.records.len()
+            )),
+            store_bytes: Some(byte_count),
+            record_count: Some(store.records.len()),
+            required_settings_ids: required_settings_ids.to_vec(),
+            missing_settings_ids: Vec::new(),
+        };
+    }
     let valid_records = store
         .records
         .iter()
@@ -760,10 +777,6 @@ fn mutate_store(
     let _lock = acquire_store_lock(host, request_id)?;
     let mut store = read_store_path(&path, request_id)?;
     let predecessor_capacity_recovery = store.predecessor_capacity_recovery;
-    let predecessor_projected_bytes = predecessor_capacity_recovery
-        .then(|| serialize_store(&store, request_id))
-        .transpose()?
-        .map(|bytes| bytes.len());
     if let Some(receipt) = store.mutation_receipts.get(request_id) {
         if receipt.operation == operation && receipt.binding_sha256 == binding_sha256 {
             return Ok(receipt.result.clone());
@@ -808,23 +821,13 @@ fn mutate_store(
         || store.history.len() > MAX_SETTINGS_HISTORY_EVENTS
         || store.mutation_receipts.len() > MAX_SETTINGS_MUTATION_RECEIPTS
         || encoded.len() > MAX_SETTINGS_STORE_BYTES;
-    let reduces_predecessor_capacity = predecessor_capacity_recovery
-        && store.records.len() <= MAX_PREDECESSOR_SETTINGS_RECORDS
-        && encoded.len() <= MAX_PREDECESSOR_SETTINGS_STORE_BYTES
-        && store.records.len() <= before.len()
-        && (store.records.len() < before.len()
-            || predecessor_projected_bytes.is_some_and(|prior| encoded.len() < prior));
-    if exceeds_steady_state_capacity && !reduces_predecessor_capacity {
-        return Err(settings_capacity_failure(
-            request_id,
-            "the mutation does not fit steady-state capacity or reduce a predecessor store toward it",
-        ));
-    }
     if exceeds_steady_state_capacity {
-        // Schema zero is the exact predecessor marker. Keeping it until the
-        // store fits ensures a later process can continue the same monotonic
-        // in-band recovery without admitting oversized current-schema state.
-        store.schema_version = 0;
+        let detail = if predecessor_capacity_recovery {
+            "a predecessor mutation must enter the steady-state 256-record/4-MiB envelope in one atomic step; reduce larger populations with the predecessor provider before installing this binary"
+        } else {
+            "the mutation exceeds the steady-state settings capacity"
+        };
+        return Err(settings_capacity_failure(request_id, detail));
     }
     write_store_path(&path, &config_root, &store, request_id)?;
     Ok(result)
@@ -1808,7 +1811,32 @@ mod tests {
     }
 
     #[test]
-    fn settings_transition_readiness_indexes_the_full_predecessor_population() {
+    fn setup_blocks_a_predecessor_population_that_needs_multiple_reduction_steps() {
+        let store = SettingsStore {
+            records: (0..=MAX_SETTINGS_RECORDS)
+                .map(|index| SettingsRecord {
+                    id: format!("predecessor-{index}"),
+                    display_name: format!("Predecessor {index}"),
+                    version: "predecessor-v1".to_string(),
+                    values: json!({}),
+                })
+                .collect(),
+            predecessor_capacity_recovery: true,
+            ..SettingsStore::default()
+        };
+
+        let readiness = settings_store_readiness(store, MAX_SETTINGS_STORE_BYTES, &[]);
+
+        assert!(!readiness.ready);
+        assert_eq!(readiness.state, "predecessor_reduction_required");
+        assert_eq!(
+            readiness.code.as_deref(),
+            Some("settings_predecessor_reduction_required")
+        );
+    }
+
+    #[test]
+    fn settings_transition_readiness_blocks_the_full_predecessor_population() {
         let records = (0..MAX_SETTINGS_ACTIVATION_IDS)
             .map(|index| SettingsRecord {
                 id: format!("caller-{index:04}"),
@@ -1850,7 +1878,8 @@ mod tests {
             &required,
         );
 
-        assert!(readiness.ready);
+        assert!(!readiness.ready);
+        assert_eq!(readiness.state, "predecessor_reduction_required");
         assert_eq!(readiness.record_count, Some(MAX_SETTINGS_ACTIVATION_IDS));
         assert!(readiness.missing_settings_ids.is_empty());
     }

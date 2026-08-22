@@ -809,7 +809,7 @@ fn contract_oversized_predecessor_store_stays_routable_during_in_band_recovery()
     assert!(predecessor_bytes.len() > 4 * 1024 * 1024);
     assert!(predecessor_bytes.len() < 16 * 1024 * 1024);
     assert!(predecessor_bytes.starts_with(br#"{"records":["#));
-    fs::write(&store_path, predecessor_bytes).expect("write predecessor settings store");
+    fs::write(&store_path, &predecessor_bytes).expect("write predecessor settings store");
 
     let list = success_result(
         invoke_validated_with_host(
@@ -1073,7 +1073,7 @@ fn contract_oversized_current_schema_cannot_use_predecessor_prefix_admission() {
 }
 
 #[test]
-fn contract_record_heavy_predecessor_recovery_continues_across_processes() {
+fn contract_record_heavy_predecessor_recovery_requires_one_step_into_current_capacity() {
     let host = HostRoots::new("agent-runner-opencode-settings-predecessor-record-recovery");
     let store_path = host
         .config_root()
@@ -1094,26 +1094,78 @@ fn contract_record_heavy_predecessor_recovery_continues_across_processes() {
     let predecessor_bytes =
         serde_json::to_vec(&json!({ "records": records })).expect("serialize predecessor store");
     assert!(predecessor_bytes.len() < 4 * 1024 * 1024);
-    fs::write(&store_path, predecessor_bytes).expect("write predecessor settings store");
+    fs::write(&store_path, &predecessor_bytes).expect("write predecessor settings store");
 
-    for id in ["record-heavy-0", "record-heavy-1"] {
-        let _ = success_result(
-            invoke_validated_with_host(
-                "settings.delete",
-                settings_delete_params(id, "predecessor-v1"),
-                host.overrides(),
-                "settings.schema.json#/$defs/SettingsDeleteRequest",
+    let rejected = error_response(invoke_validated_with_host(
+        "settings.delete",
+        settings_delete_params("record-heavy-0", "predecessor-v1"),
+        host.overrides(),
+        "settings.schema.json#/$defs/SettingsDeleteRequest",
+    ));
+    assert_eq!(rejected["error"]["code"], "settings_capacity_exhausted");
+    assert_eq!(
+        fs::read(&store_path).expect("read unchanged record-heavy predecessor store"),
+        predecessor_bytes
+    );
+    let install = success_result(
+        invoke_validated_with_host(
+            "setup.install_plan",
+            setup_install_plan_params(
+                &path_string(host.data_root()),
+                &path_string(host.config_root()),
             ),
-            "settings.schema.json#/$defs/SettingsDeleteResponse",
-            "settings.schema.json#/$defs/SettingsDeleteResult",
-        );
-        let persisted: serde_json::Value = serde_json::from_slice(
-            &fs::read(&store_path).expect("read predecessor recovery store"),
-        )
-        .expect("parse predecessor recovery store");
-        let expected_schema = if id == "record-heavy-0" { 0 } else { 3 };
-        assert_eq!(persisted["schema_version"], expected_schema);
-    }
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupInstallPlanRequest",
+        ),
+        "setup.schema.json#/$defs/SetupInstallPlanResponse",
+        "setup.schema.json#/$defs/SetupInstallPlanResult",
+    );
+    let transition = install["steps"]
+        .as_array()
+        .expect("setup install steps")
+        .iter()
+        .find(|step| step["kind"] == "verify_settings_transition")
+        .expect("settings transition step");
+    assert_eq!(transition["blocking"], true);
+    assert_eq!(
+        transition["settings_store"]["state"],
+        "predecessor_reduction_required"
+    );
+    assert_eq!(
+        transition["settings_store"]["code"],
+        "settings_predecessor_reduction_required"
+    );
+
+    let records = (0..257)
+        .map(|index| {
+            json!({
+                "id": format!("record-heavy-{index}"),
+                "display_name": format!("Record-heavy profile {index}"),
+                "version": "predecessor-v1",
+                "values": values,
+            })
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        &store_path,
+        serde_json::to_vec(&json!({ "records": records }))
+            .expect("serialize one-step predecessor store"),
+    )
+    .expect("write one-step predecessor store");
+    let _ = success_result(
+        invoke_validated_with_host(
+            "settings.delete",
+            settings_delete_params("record-heavy-0", "predecessor-v1"),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsDeleteRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsDeleteResponse",
+        "settings.schema.json#/$defs/SettingsDeleteResult",
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store_path).expect("read one-step recovered store"))
+            .expect("parse one-step recovered store");
+    assert_eq!(persisted["schema_version"], 3);
 
     let list = success_result(
         invoke_validated_with_host(
