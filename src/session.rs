@@ -1532,7 +1532,7 @@ fn user_observation_turn(
 }
 
 fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, ProviderFailure> {
-    let (provider_id, model_id, variant) = message.info.model_identity();
+    let model_identity = message.info.model_identity();
     Ok(json!({
         "session_id": session_id,
         "turn_id": stable_turn_id(message, session_id),
@@ -1544,9 +1544,9 @@ fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, Pro
             "session_id": message.info.session_id,
             "created_unix_ms": message.info.time.as_ref().and_then(|time| time.created),
             "completed_unix_ms": message.info.time.as_ref().and_then(|time| time.completed),
-            "provider_id": provider_id,
-            "model_id": model_id,
-            "variant": variant,
+            "provider_id": model_identity.provider_id(),
+            "model_id": model_identity.model_id(),
+            "variant": model_identity.variant(),
             "parts": message.parts,
         },
     }))
@@ -1595,7 +1595,7 @@ fn canonical_record(
     session_id: &str,
     title: Option<&str>,
 ) -> Result<Value, ProviderFailure> {
-    let (provider_id, model_id, variant) = message.info.model_identity();
+    let model_identity = message.info.model_identity();
     Ok(json!({
         "body": text_parts(message),
         "id": stable_turn_id(message, session_id),
@@ -1603,9 +1603,9 @@ fn canonical_record(
             "native_message_id": message.info.id,
             "native_session_id": message.info.session_id,
             "native_title": title,
-            "provider_id": provider_id,
-            "model_id": model_id,
-            "variant": variant,
+            "provider_id": model_identity.provider_id(),
+            "model_id": model_identity.model_id(),
+            "variant": model_identity.variant(),
             "source_format": NATIVE_FORMAT_ID,
         },
         "role": message.info.role,

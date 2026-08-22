@@ -91,7 +91,13 @@ edge:
   closed.
 - `export <session>` is the authoritative serialized state of that exact
   visible session at the observation point. The provider validates all embedded
-  session identities before using it for turns, completion, or recovery.
+  session identities before using it for turns, completion, or recovery. Each
+  message's top-level and nested provider/model/variant forms are alternative
+  wire representations of one aggregate identity. The native adapter selects a
+  sole present form, accepts simultaneous forms only when their complete
+  aggregates agree exactly, and rejects conflicts or complementary partial
+  forms; downstream launch, resume, and session domains receive only the typed
+  canonical aggregate.
 - `import <artifact>` may create one session from the supplied native artifact.
   Rotation persists its operation and exact process-group incarnation before
   import, proves the whole group terminal or recycled after direct-leader exit,

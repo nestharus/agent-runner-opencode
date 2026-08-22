@@ -1976,12 +1976,12 @@ fn recovered_session_export_matches_request(
     delivery_nonce: &str,
 ) -> bool {
     export.messages.iter().any(|message| {
-        let (provider_id, model_id, effort) = message.info.model_identity();
+        let model_identity = message.info.model_identity();
         message.info.role == "user"
             && message.info.session_id.as_deref() == Some(session_id)
-            && provider_id == Some(state.recovery.provider_id.as_str())
-            && model_id == Some(state.recovery.model_id.as_str())
-            && effort == Some(state.recovery.effort.as_str())
+            && model_identity.provider_id() == Some(state.recovery.provider_id.as_str())
+            && model_identity.model_id() == Some(state.recovery.model_id.as_str())
+            && model_identity.variant() == Some(state.recovery.effort.as_str())
             && message
                 .info
                 .time

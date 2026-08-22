@@ -267,10 +267,10 @@ fn completed_assistant_message(
 }
 
 fn message_model_matches(message: &OpencodeMessage, identity: &ResumeMatchIdentity<'_>) -> bool {
-    let (provider_id, model_id, variant) = message.info.model_identity();
-    provider_id == Some(identity.provider_id)
-        && model_id == Some(identity.model_id)
-        && variant == Some(identity.variant)
+    let model_identity = message.info.model_identity();
+    model_identity.provider_id() == Some(identity.provider_id)
+        && model_identity.model_id() == Some(identity.model_id)
+        && model_identity.variant() == Some(identity.variant)
 }
 
 #[cfg(test)]

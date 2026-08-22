@@ -437,6 +437,12 @@ invalid directory remains an enumeration warning but is treated as unknown—not
 a mismatch—during recovery. A malformed row or conflicting alias invalidates
 the whole observation and preserves launch effect custody rather than being
 dropped as apparent absence during recovery.
+The same OpenCode edge owns native export message identity. Top-level and
+nested model-route forms are transport alternatives for one aggregate, never
+component donors. A message with both forms is accepted only when the complete
+provider/model/variant aggregates agree exactly; a conflict or complementary
+partial forms invalidate the export before launch recovery, resume observation,
+or session projection can consume it.
 The initial request has a stable durable claim independent of the listed row
 bytes. An exact retry consults that claim before native relisting and replays its
 immutable first-page rows, warnings, completion state, and optional cursor;
