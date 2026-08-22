@@ -15,10 +15,12 @@ use crate::child_custody::ChildCustody;
 use crate::durable_fs;
 use crate::encoding::{bounded_text, decode_base64, encode_base64, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
+#[cfg(unix)]
+use crate::native_process::GatedCommand;
 use crate::native_process::{
     process_group_incarnation as launch_process_incarnation,
     process_group_is_live as launch_process_group_is_live,
-    terminate_process_group_child as terminate_child, ExecGate as LaunchExecGate, GatedCommand,
+    terminate_process_group_child as terminate_child, ExecGate as LaunchExecGate,
 };
 use crate::native_runtime;
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};

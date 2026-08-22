@@ -239,9 +239,9 @@ pub fn detect_params(
     let required_settings_ids = required_settings_ids(&params, request_id)?;
     let opencode = executable_evidence("opencode", host.deadline_unix_ms);
     let curl = quota_transport_evidence(host.deadline_unix_ms);
-    let profiles = profile_evidence(data_root, profile_root, &opencode);
+    let profiles = profile_evidence(host, data_root, profile_root, &opencode, &curl, request_id);
     let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
-    let installed = setup_installed(&opencode, &curl, &profiles, &settings_store);
+    let installed = setup_installed(&profiles, &settings_store);
     Ok(detect_result(
         opencode,
         curl,
@@ -420,24 +420,108 @@ fn native_implementation_evidence(program: &str, path: &Path) -> Option<Value> {
 }
 
 fn profile_evidence(
+    host: &HostContext,
     data_root: Option<&str>,
     profile_root: Option<&str>,
     opencode: &Value,
+    quota_transport: &Value,
+    request_id: &str,
 ) -> Vec<Value> {
-    let native_runtime_ready = evidence_ready(opencode);
+    let ambient_native_runtime_ready = evidence_ready(opencode);
+    let ambient_quota_observer_ready = evidence_ready(quota_transport);
+    let durable_identity_available = host
+        .data_root
+        .as_deref()
+        .is_some_and(|root| !root.trim().is_empty());
     ACCOUNTS
         .iter()
         .map(|account| {
-            let auth_present = opencode_auth_file_present(account.opencode_auth_path);
+            let (
+                native_runtime_ready,
+                native_runtime_source,
+                native_runtime_identity,
+                auth_path,
+                native_runtime_error,
+            ) = if durable_identity_available {
+                match native_runtime::resolve_existing_for_setup(host, account, request_id) {
+                    Ok(Some(runtime)) => (
+                        true,
+                        "persisted",
+                        Some(runtime.identity_sha256().to_string()),
+                        runtime.expand_path(account.opencode_auth_path),
+                        None,
+                    ),
+                    Ok(None) => (
+                        ambient_native_runtime_ready,
+                        "ambient_admission",
+                        None,
+                        expand_tilde(account.opencode_auth_path),
+                        None,
+                    ),
+                    Err(error) => (
+                        false,
+                        "persisted",
+                        None,
+                        expand_tilde(account.opencode_auth_path),
+                        Some(format!("{}: {}", error.code, error.message)),
+                    ),
+                }
+            } else {
+                (
+                    ambient_native_runtime_ready,
+                    "ambient_admission",
+                    None,
+                    expand_tilde(account.opencode_auth_path),
+                    None,
+                )
+            };
+            let (
+                quota_observer_ready,
+                quota_observer_source,
+                quota_observer_identity,
+                quota_observer_error,
+            ) = if durable_identity_available {
+                match quota_observer::resolve_existing_for_setup(host, account, request_id) {
+                    Ok(Some(identity)) => (true, "persisted", Some(identity), None),
+                    Ok(None) => (
+                        ambient_quota_observer_ready,
+                        "ambient_admission",
+                        None,
+                        None,
+                    ),
+                    Err(error) => (
+                        false,
+                        "persisted",
+                        None,
+                        Some(format!("{}: {}", error.code, error.message)),
+                    ),
+                }
+            } else {
+                (
+                    ambient_quota_observer_ready,
+                    "ambient_admission",
+                    None,
+                    None,
+                )
+            };
+            let auth_present = auth_file_present(&auth_path);
             json!({
                 "profile": account.opencode_wrapper,
                 "logical_account": account.opencode_wrapper,
                 "logical_account_present": true,
                 "native_runtime": "opencode",
                 "native_runtime_ready": native_runtime_ready,
+                "native_runtime_identity_source": native_runtime_source,
+                "native_runtime_identity_sha256": native_runtime_identity,
+                "native_runtime_error": native_runtime_error,
+                "quota_observer_ready": quota_observer_ready,
+                "quota_observer_identity_source": quota_observer_source,
+                "quota_observer_identity_sha256": quota_observer_identity,
+                "quota_observer_error": quota_observer_error,
                 "opencode_auth_path": account.opencode_auth_path,
+                "effective_opencode_auth_path": auth_path.display().to_string(),
                 "opencode_auth_present": auth_present,
-                "profile_ready": native_runtime_ready && auth_present,
+                "profile_ready": native_runtime_ready && quota_observer_ready && auth_present,
                 "data_root": data_root,
                 "profile_root": profile_root,
                 "quota_probe": account.quota_probe_kind(),
@@ -446,18 +530,22 @@ fn profile_evidence(
         .collect()
 }
 
-fn auth_summary() -> String {
-    let present = ACCOUNTS
+fn auth_summary(profiles: &[Value]) -> String {
+    let present = profiles
         .iter()
-        .map(|account| {
-            let state = if opencode_auth_file_present(account.opencode_auth_path) {
+        .map(|profile| {
+            let state = if profile["opencode_auth_present"] == true {
                 "present"
             } else {
                 "missing"
             };
             format!(
                 "{}:{}:{}",
-                account.opencode_wrapper, state, account.opencode_auth_path
+                profile["profile"].as_str().unwrap_or("unknown"),
+                state,
+                profile["effective_opencode_auth_path"]
+                    .as_str()
+                    .unwrap_or("unknown")
             )
         })
         .collect::<Vec<_>>()
@@ -494,12 +582,16 @@ fn setup_warnings(
             .get("native_runtime_ready")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let quota_observer_ready = profile
+            .get("quota_observer_ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let auth_present = profile
             .get("opencode_auth_present")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         warnings.push(json!(format!(
-            "{name} is not ready: native_runtime_ready={native_runtime_ready}, opencode_auth_present={auth_present}"
+            "{name} is not ready: native_runtime_ready={native_runtime_ready}, quota_observer_ready={quota_observer_ready}, opencode_auth_present={auth_present}"
         )));
     }
     if let Some(message) = settings_store.blocking_message() {
@@ -641,15 +733,8 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-fn setup_installed(
-    opencode: &Value,
-    curl: &Value,
-    profiles: &[Value],
-    settings_store: &SettingsTransitionReadiness,
-) -> bool {
-    evidence_ready(opencode)
-        && evidence_ready(curl)
-        && settings_store.ready
+fn setup_installed(profiles: &[Value], settings_store: &SettingsTransitionReadiness) -> bool {
+    settings_store.ready
         && profiles
             .iter()
             .all(|profile| profile.get("profile_ready").and_then(Value::as_bool) == Some(true))
@@ -685,7 +770,7 @@ fn detect_result(
             "opencode": opencode,
             "curl": curl,
         },
-        "auth": auth_summary(),
+        "auth": auth_summary(&profiles),
         "profiles": profiles,
         "warnings": warnings,
     })
@@ -1872,8 +1957,8 @@ fn invalid_native_identity_rebind(request_id: &str, message: impl Into<String>) 
     ProviderFailure::invalid_request(request_id, "invalid_native_identity_rebind", message)
 }
 
-fn opencode_auth_file_present(path: &str) -> bool {
-    expand_tilde(path).is_file()
+fn auth_file_present(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn settings_schema_mismatch_diagnostic() -> Value {
@@ -1936,5 +2021,65 @@ mod tests {
             !sentinel.exists(),
             "manifest rejection must precede the setup version spawn"
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_readiness_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn persisted_identity_disagreement_blocks_ambient_setup_readiness() {
+        let directory = tempfile::tempdir().expect("setup identity fixture");
+        let data_root = directory.path().to_string_lossy().into_owned();
+        let runtime_root = directory
+            .path()
+            .join("provider-state/opencode/native-runtimes");
+        let observer_root = directory
+            .path()
+            .join("provider-state/opencode/quota-observers");
+        fs::create_dir_all(&runtime_root).expect("runtime identity root");
+        fs::create_dir_all(&observer_root).expect("observer identity root");
+        fs::write(runtime_root.join("opencode1.json"), br#"{}"#)
+            .expect("incompatible persisted runtime");
+        fs::write(observer_root.join("opencode1.json"), br#"{}"#)
+            .expect("incompatible persisted observer");
+        let host = HostContext {
+            app: "test".to_string(),
+            app_version: None,
+            platform: None,
+            working_directory: None,
+            config_root: None,
+            data_root: Some(data_root.clone()),
+            env: None,
+            deadline_unix_ms: None,
+        };
+        let ambient_ready = json!({
+            "present": true,
+            "version": { "ready": true },
+            "implementation": { "ready": true },
+        });
+
+        let profiles = profile_evidence(
+            &host,
+            Some(&data_root),
+            None,
+            &ambient_ready,
+            &ambient_ready,
+            "setup-identity-test",
+        );
+        let profile = profiles
+            .iter()
+            .find(|profile| profile["profile"] == "opencode1")
+            .expect("opencode1 profile evidence");
+
+        assert_eq!(profile["native_runtime_identity_source"], "persisted");
+        assert_eq!(profile["native_runtime_ready"], false);
+        assert!(profile["native_runtime_error"].is_string());
+        assert_eq!(profile["quota_observer_identity_source"], "persisted");
+        assert_eq!(profile["quota_observer_ready"], false);
+        assert!(profile["quota_observer_error"].is_string());
+        assert_eq!(profile["profile_ready"], false);
     }
 }

@@ -243,6 +243,38 @@ pub struct OpencodeAuthObservation {
     pub output_exceeded_bound: bool,
 }
 
+pub(crate) struct PreparedOpencodeImport {
+    custody: ChildCustody,
+    gate: ExecGate,
+    actor: ProcessGroupActor,
+}
+
+impl PreparedOpencodeImport {
+    pub(crate) fn actor(&self) -> &ProcessGroupActor {
+        &self.actor
+    }
+
+    pub(crate) fn observe(self, timeout: Duration) -> Result<String, OpencodeImportError> {
+        let Self {
+            custody,
+            gate,
+            actor: _,
+        } = self;
+        gate.release().map_err(import_spawn_error)?;
+        let output = custody
+            .wait_with_bounded_output_timeout(
+                timeout,
+                MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+                MAX_NATIVE_COMMAND_OUTPUT_BYTES,
+            )
+            .map_err(import_spawn_error)?
+            .ok_or(OpencodeImportError::TimedOut)?;
+        validate_bounded_import_output(&output)?;
+        validate_import_status(&output)?;
+        parse_import_stdout(&output.stdout)
+    }
+}
+
 pub(crate) struct PreparedOpencodeAuthObservation {
     before: Option<Vec<u8>>,
     auth_path: PathBuf,
@@ -594,31 +626,37 @@ fn run_session_list_command(
     parse_session_list_stdout(&output.stdout)
 }
 
-pub fn import_session(
+pub(crate) fn prepare_import_session(
     path: &Path,
     runtime: &NativeRuntimeContext,
     working_directory: &Path,
-    timeout: Duration,
-) -> Result<String, OpencodeImportError> {
-    let mut command = runtime.command();
+) -> Result<PreparedOpencodeImport, OpencodeImportError> {
+    let mut command =
+        GatedCommand::new(runtime.program(), runtime.fixed_args()).map_err(import_spawn_error)?;
     command
+        .command_mut()
         .current_dir(working_directory)
         .arg("import")
         .arg(path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = command.spawn().map_err(import_spawn_error)?;
-    let output = ChildCustody::new(child)
-        .wait_with_bounded_output_timeout(
-            timeout,
-            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
-            MAX_NATIVE_COMMAND_OUTPUT_BYTES,
-        )
-        .map_err(import_spawn_error)?
-        .ok_or(OpencodeImportError::TimedOut)?;
-    validate_bounded_import_output(&output)?;
-    validate_import_status(&output)?;
-    parse_import_stdout(&output.stdout)
+        .stderr(Stdio::piped())
+        .env_clear()
+        .envs(runtime.execution_environment(&BTreeMap::new()));
+    let (child, gate) = command.spawn().map_err(import_spawn_error)?;
+    let custody = ChildCustody::with_cleanup(child, |child| {
+        let _ = terminate_process_group_child(child);
+    });
+    let actor = actor_for_child(
+        custody
+            .child_ref()
+            .expect("prepared import child custody is active"),
+    )
+    .map_err(import_spawn_error)?;
+    Ok(PreparedOpencodeImport {
+        custody,
+        gate,
+        actor,
+    })
 }
 
 pub(crate) fn prepare_auth_list(

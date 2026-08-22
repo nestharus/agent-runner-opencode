@@ -359,7 +359,12 @@ durably publishes the content-addressed source artifact, and then persists a
 binding-keyed prepared operation before import. A successful
 import durably advances that operation with the observed target session before
 decision and materialization receipts are finalized. Native import stdout is
-strictly decoded, but its reported session ID is only a candidate: the provider
+strictly decoded. Import execution starts behind the provider exec gate: the
+prepared operation durably binds the exact process-group incarnation before the
+gate is released, and recovery must prove that actor terminal or recycled before
+it may treat any target export as stable or finalize a receipt. Thus provider
+loss cannot leave a still-live import actor outside the shared result. The
+reported session ID is only a candidate: the provider
 durably adds that candidate to the prepared operation before any later deadline
 checkpoint, then exports that exact target and verifies its identity and
 normalized content against the prepared artifact before advancing to imported.
@@ -565,15 +570,18 @@ environment-selected transport branch. Auth refresh binds both
 the native OpenCode runtime identity and this quota-observer identity before it
 admits a credential mutation.
 
-`setup.detect` reports provider-wide `installed=true` only after the direct
-`opencode` executable matches this build's target-specific reviewed manifest
-before its exact-path `--version` probe, the in-process quota transport matches
-this build's source/dependency identity, every logical account's OpenCode auth
-file is present, and every declared caller `settings_id` resolves to a valid
-exact persisted record. Numbered account names are catalog identities only;
+`setup.detect` reports provider-wide `installed=true` only after every logical
+account agrees with the identities its effect paths will use. When an account
+already has a durable native-runtime or quota-observer record, detection
+read-only previews the same validation/upgrade selection as effect admission and
+checks auth at the runtime-bound path; any disagreement reports the profile not
+ready and requires the owned rebind/upgrade path. Ambient direct-`opencode` and
+current-build quota evidence is admission evidence only for a component with no
+persisted identity. Every declared caller `settings_id` must also resolve to a
+valid exact persisted record. Numbered account names are catalog identities only;
 setup never resolves or executes them as wrappers. Logical profile readiness is
-derived from the one manifest-bound direct runtime plus that profile's auth
-evidence. The direct probe uses the earlier of the host deadline and a
+derived from its selected runtime, observer, and effective auth evidence. The
+ambient direct probe uses the earlier of the host deadline and a
 two-second ceiling. A missing, unapproved, non-executable, failing, or stalled
 direct implementation leaves the provider non-installed and produces a
 tool- or profile-specific warning; regular-file presence alone is never

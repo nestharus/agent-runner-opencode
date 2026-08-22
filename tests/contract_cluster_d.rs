@@ -1831,6 +1831,52 @@ fn contract_setup_detect_install_sync() {
 }
 
 #[test]
+fn contract_setup_detect_rejects_ambient_readiness_when_persisted_runtime_disagrees() {
+    let host = HostRoots::new("agent-runner-opencode-setup-persisted-runtime");
+    let toolchain = FakeToolchain::new();
+    let home = HomeFixture::new("agent-runner-opencode-setup-persisted-runtime-home");
+    home.write_all_opencode_auths();
+    success_result(
+        invoke_validated_with_host(
+            "settings.migrate",
+            json!({ "dry_run": false, "legacy": legacy_fixture() }),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsMigrateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsMigrateResponse",
+        "settings.schema.json#/$defs/SettingsMigrateResult",
+    );
+    write_native_runtime_identity(host.data_root(), &toolchain, "opencode1");
+    let path = prepend_path(toolchain.dir());
+    let data_root = path_string(host.data_root());
+
+    let detect = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.detect",
+            setup_detect_data_root_params(&data_root),
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupDetectRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupDetectResponse",
+        "setup.schema.json#/$defs/SetupDetectResult",
+    );
+
+    assert_eq!(detect["binary"]["opencode"]["version"]["ready"], true);
+    assert_eq!(detect["installed"], false);
+    let profile = detect["profiles"]
+        .as_array()
+        .expect("setup profiles")
+        .iter()
+        .find(|profile| profile["profile"] == "opencode1")
+        .expect("opencode1 setup profile");
+    assert_eq!(profile["native_runtime_identity_source"], "persisted");
+    assert_eq!(profile["native_runtime_ready"], false);
+    assert!(profile["native_runtime_error"].is_string());
+    assert_eq!(profile["profile_ready"], false);
+}
+
+#[test]
 fn contract_setup_sync_accepts_only_declared_account_references() {
     let host = HostRoots::new("agent-runner-opencode-setup-account-admission");
     let result = success_result(
@@ -3085,7 +3131,9 @@ fn contract_rotation_reconciles_settings_changed_after_import_without_reimport()
     .expect("prepared rotation operation JSON");
     operation["phase"] = json!("imported");
     operation["target_session_id"] = json!(ROTATION_SOURCE_SESSION);
-    operation["imported_at_unix_ms"] = json!(agent_runner_opencode::encoding::now_unix_ms());
+    let imported_at = agent_runner_opencode::encoding::now_unix_ms();
+    operation["import_actor_terminal_at_unix_ms"] = json!(imported_at);
+    operation["imported_at_unix_ms"] = json!(imported_at);
     fs::write(
         &operation_path,
         serde_json::to_vec_pretty(&operation).expect("encode imported rotation operation"),

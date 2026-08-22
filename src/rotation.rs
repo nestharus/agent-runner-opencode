@@ -5,6 +5,7 @@ use crate::activity::ActivityTargets;
 use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
+use crate::native_process::{actor_is_terminal_or_recycled, ProcessGroupActor};
 use crate::native_runtime;
 use crate::opencode::{self, OpencodeExportError};
 use crate::operation_bounds;
@@ -32,6 +33,7 @@ const ROTATION_RESERVATION_RETENTION: Duration = Duration::from_secs(2 * 60);
 const MAX_ROTATION_ARTIFACT_RECORDS: usize = MAX_ROTATION_LIVE_RECORDS * 2;
 const MAX_ROTATION_COMPATIBILITY_RECORDS: usize = 4096;
 const ROTATION_STATE_DIR: &str = "provider-state/opencode/rotation";
+const ROTATION_OPERATION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Default)]
 struct RotationCapacity {
@@ -163,7 +165,7 @@ pub fn materialize_params(
                 budget.remaining(request_id)?,
                 request_id,
             )?;
-            reconcile_prepared_operation(
+            execute_or_reconcile_prepared_operation(
                 host,
                 &params,
                 &binding,
@@ -247,7 +249,7 @@ pub fn materialize_params(
         .map_err(|error| rotation_artifact_failure(request_id, error))?;
     budget.checkpoint(request_id)?;
     let mut operation = RotationOperation {
-        schema_version: 1,
+        schema_version: ROTATION_OPERATION_SCHEMA_VERSION,
         binding_sha256: binding_digest(&binding),
         binding: binding_value(&binding),
         authorization_id: authorization["authorization_id"]
@@ -264,6 +266,9 @@ pub fn materialize_params(
         boundary,
         prepared_at_unix_ms: now_unix_ms(),
         phase: RotationOperationPhase::Prepared,
+        import_actor_process_group_id: None,
+        import_actor_process_group_incarnation: None,
+        import_actor_terminal_at_unix_ms: None,
         target_session_id: None,
         import_candidate_session_id: None,
         imported_at_unix_ms: None,
@@ -274,32 +279,12 @@ pub fn materialize_params(
     reservation.disarm();
     drop(operation_capacity_lock);
     budget.checkpoint(request_id)?;
-    let target_session_id = match opencode::import_session(
-        &artifact_path,
-        &target_runtime,
-        working_directory,
-        budget.remaining(request_id)?,
-    ) {
-        Ok(target_session_id) => target_session_id,
-        Err(error) => {
-            return Err(rotation_recovery_required(
-                request_id,
-                &binding,
-                &operation,
-                None,
-                Some(format!(
-                    "import outcome could not be settled from native output: {error:?}"
-                )),
-            ));
-        }
-    };
-    validate_and_record_imported_target(
+    admit_and_observe_import(
         host,
         &binding,
         &target_runtime,
         &mut operation,
-        &target_session_id,
-        true,
+        working_directory,
         &budget,
         request_id,
     )?;
@@ -485,6 +470,12 @@ struct RotationOperation {
     boundary: String,
     prepared_at_unix_ms: u64,
     phase: RotationOperationPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_actor_process_group_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_actor_process_group_incarnation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_actor_terminal_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1367,10 +1358,21 @@ fn validate_rotation_operation(
     operation: &RotationOperation,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
+    let actor_identity_present = operation
+        .import_actor_process_group_id
+        .is_some_and(|value| value > 0)
+        && operation
+            .import_actor_process_group_incarnation
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    let actor_identity_absent = operation.import_actor_process_group_id.is_none()
+        && operation.import_actor_process_group_incarnation.is_none()
+        && operation.import_actor_terminal_at_unix_ms.is_none();
     let phase_valid = match operation.phase {
         RotationOperationPhase::Prepared => {
             operation.target_session_id.is_none()
                 && operation.imported_at_unix_ms.is_none()
+                && (actor_identity_absent || actor_identity_present)
                 && operation
                     .import_candidate_session_id
                     .as_deref()
@@ -1383,9 +1385,11 @@ fn validate_rotation_operation(
                 .is_some_and(|value| !value.trim().is_empty())
                 && operation.import_candidate_session_id.is_none()
                 && operation.imported_at_unix_ms.is_some()
+                && actor_identity_present
+                && operation.import_actor_terminal_at_unix_ms.is_some()
         }
     };
-    if operation.schema_version != 1
+    if operation.schema_version != ROTATION_OPERATION_SCHEMA_VERSION
         || operation.binding_sha256 != binding_digest(binding)
         || operation.binding != binding_value(binding)
         || operation.authorization_id.trim().is_empty()
@@ -1433,6 +1437,156 @@ fn write_rotation_operation(
             .map_err(|error| rotation_state_failure(request_id, error))?,
     )
     .map_err(|error| rotation_state_failure(request_id, error))
+}
+
+fn execute_or_reconcile_prepared_operation(
+    host: &HostContext,
+    params: &Value,
+    binding: &RotationBinding,
+    target_runtime: &native_runtime::NativeRuntimeContext,
+    operation: &mut RotationOperation,
+    budget: &RotationBudget,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if operation.import_actor_process_group_id.is_none() {
+        let working_directory = rotation_working_directory(host, request_id)?;
+        return admit_and_observe_import(
+            host,
+            binding,
+            target_runtime,
+            operation,
+            working_directory,
+            budget,
+            request_id,
+        );
+    }
+    require_rotation_import_actor_terminal(operation, request_id)?;
+    write_rotation_operation(host, binding, operation, request_id)?;
+    reconcile_prepared_operation(
+        host,
+        params,
+        binding,
+        target_runtime,
+        operation,
+        budget,
+        request_id,
+    )
+}
+
+fn admit_and_observe_import(
+    host: &HostContext,
+    binding: &RotationBinding,
+    target_runtime: &native_runtime::NativeRuntimeContext,
+    operation: &mut RotationOperation,
+    working_directory: &Path,
+    budget: &RotationBudget,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let import_timeout = budget.remaining(request_id)?;
+    let prepared = opencode::prepare_import_session(
+        Path::new(&operation.artifact_path),
+        target_runtime,
+        working_directory,
+    )
+    .map_err(|error| {
+        rotation_recovery_required(
+            request_id,
+            binding,
+            operation,
+            None,
+            Some(format!(
+                "import could not be prepared before native effect: {error:?}"
+            )),
+        )
+    })?;
+    publish_rotation_import_actor(host, binding, operation, prepared.actor(), request_id)?;
+    let observed = prepared.observe(import_timeout);
+    operation.import_actor_terminal_at_unix_ms = Some(now_unix_ms());
+    if let Err(error) = write_rotation_operation(host, binding, operation, request_id) {
+        return Err(rotation_recovery_required(
+            request_id,
+            binding,
+            operation,
+            None,
+            Some(format!(
+                "native import actor became terminal but its terminal proof could not be persisted: {error:?}"
+            )),
+        ));
+    }
+    let target_session_id = match observed {
+        Ok(target_session_id) => target_session_id,
+        Err(error) => {
+            return Err(rotation_recovery_required(
+                request_id,
+                binding,
+                operation,
+                None,
+                Some(format!(
+                    "import outcome could not be settled from native output: {error:?}"
+                )),
+            ));
+        }
+    };
+    validate_and_record_imported_target(
+        host,
+        binding,
+        target_runtime,
+        operation,
+        &target_session_id,
+        true,
+        budget,
+        request_id,
+    )
+}
+
+fn publish_rotation_import_actor(
+    host: &HostContext,
+    binding: &RotationBinding,
+    operation: &mut RotationOperation,
+    actor: &ProcessGroupActor,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    operation.import_actor_process_group_id = Some(actor.process_group_id);
+    operation.import_actor_process_group_incarnation = Some(actor.incarnation.clone());
+    operation.import_actor_terminal_at_unix_ms = None;
+    if let Err(error) = write_rotation_operation(host, binding, operation, request_id) {
+        operation.import_actor_process_group_id = None;
+        operation.import_actor_process_group_incarnation = None;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn require_rotation_import_actor_terminal(
+    operation: &mut RotationOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if operation.import_actor_terminal_at_unix_ms.is_some() {
+        return Ok(());
+    }
+    let (Some(process_group_id), Some(incarnation)) = (
+        operation.import_actor_process_group_id,
+        operation.import_actor_process_group_incarnation.as_ref(),
+    ) else {
+        return Err(rotation_operation_invalid(
+            request_id,
+            "an effect-admitted rotation import has no durable native actor incarnation",
+        ));
+    };
+    let actor = ProcessGroupActor {
+        process_group_id,
+        incarnation: incarnation.clone(),
+    };
+    match actor_is_terminal_or_recycled(&actor) {
+        Ok(true) => {
+            operation.import_actor_terminal_at_unix_ms = Some(now_unix_ms());
+            Ok(())
+        }
+        Ok(false) => Err(rotation_import_actor_active(request_id, operation)),
+        Err(error) => Err(rotation_import_actor_unverifiable(
+            request_id, operation, error,
+        )),
+    }
 }
 
 fn reconcile_prepared_operation(
@@ -2221,9 +2375,44 @@ fn rotation_recovery_required(
             "expected_target_session_id": binding.source_session_id,
             "supplied_recovery_target_session_id": supplied_target,
             "prepared_artifact_path": operation.artifact_path,
+            "import_actor_process_group_id": operation.import_actor_process_group_id,
+            "import_actor_process_group_incarnation": operation.import_actor_process_group_incarnation,
+            "import_actor_terminal_at_unix_ms": operation.import_actor_terminal_at_unix_ms,
             "recovery": "retry with recovery_target_session_id after confirming the imported target session; if import never occurred, import the prepared artifact once and supply the resulting session id",
             "observation": observation,
         }),
+    )
+}
+
+fn rotation_import_actor_active(
+    request_id: &str,
+    operation: &RotationOperation,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "rotation_import_actor_active",
+        "rotation recovery is blocked while the exact native import actor remains live",
+        json!({
+            "import_actor_process_group_id": operation.import_actor_process_group_id,
+            "import_actor_process_group_incarnation": operation.import_actor_process_group_incarnation,
+            "required_action": "retry the unchanged materialization after the native import actor is terminal or recycled",
+        }),
+    )
+}
+
+fn rotation_import_actor_unverifiable(
+    request_id: &str,
+    operation: &RotationOperation,
+    error: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "rotation_import_actor_unverifiable",
+        format!(
+            "could not verify terminal custody for rotation import actor {:?}/{:?}: {error}",
+            operation.import_actor_process_group_id,
+            operation.import_actor_process_group_incarnation
+        ),
     )
 }
 
@@ -2256,7 +2445,9 @@ fn rotation_boundary_missing(request_id: &str, source_session_id: &str) -> Provi
 
 #[cfg(test)]
 mod tests {
-    use super::validate_rotation_export;
+    use super::*;
+    use crate::native_process::{actor_for_child, configure_process_group};
+    use std::process::Command;
 
     #[test]
     fn rotation_rejects_message_without_source_session_identity() {
@@ -2276,5 +2467,45 @@ mod tests {
         .expect("native export fixture");
 
         assert!(validate_rotation_export(&native, "ses_source", "request-test").is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rotation_recovery_waits_for_the_exact_import_actor() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        configure_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn rotation import actor");
+        let actor = actor_for_child(&child).expect("identify rotation import actor");
+        let mut operation = RotationOperation {
+            schema_version: ROTATION_OPERATION_SCHEMA_VERSION,
+            binding_sha256: "binding".to_string(),
+            binding: json!({}),
+            authorization_id: "authorization".to_string(),
+            assessment_request_id: "assessment".to_string(),
+            materialization_request_id: "materialization".to_string(),
+            artifact_path: "/tmp/artifact".to_string(),
+            artifact_sha256: "artifact".to_string(),
+            boundary: "boundary".to_string(),
+            prepared_at_unix_ms: 1,
+            phase: RotationOperationPhase::Prepared,
+            import_actor_process_group_id: Some(actor.process_group_id),
+            import_actor_process_group_incarnation: Some(actor.incarnation),
+            import_actor_terminal_at_unix_ms: None,
+            target_session_id: None,
+            import_candidate_session_id: None,
+            imported_at_unix_ms: None,
+        };
+
+        let active = require_rotation_import_actor_terminal(&mut operation, "request-test")
+            .expect_err("live import actor must block rotation recovery");
+        assert_eq!(active.code, "rotation_import_actor_active");
+        assert!(operation.import_actor_terminal_at_unix_ms.is_none());
+
+        child.kill().expect("terminate rotation import actor");
+        child.wait().expect("reap rotation import actor");
+        require_rotation_import_actor_terminal(&mut operation, "request-test")
+            .expect("terminal import actor permits rotation recovery");
+        assert!(operation.import_actor_terminal_at_unix_ms.is_some());
     }
 }

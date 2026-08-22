@@ -149,6 +149,19 @@ pub(crate) fn validated_persisted_identity_evidence(
     read_persisted_identity_evidence(host, account, request_id, true)
 }
 
+pub(crate) fn resolve_existing_for_setup(
+    host: &HostContext,
+    account: &AccountProfile,
+    request_id: &str,
+) -> Result<Option<String>, ProviderFailure> {
+    let _lock = acquire_observer_lock(host, account, Duration::ZERO, request_id)?;
+    let Some(context) = read_observer_context(host, account, request_id)? else {
+        return Ok(None);
+    };
+    preview_observer_context_activation(account, context, request_id)
+        .map(|context| Some(context.identity_sha256))
+}
+
 fn read_persisted_identity_evidence(
     host: &HostContext,
     account: &AccountProfile,
@@ -476,13 +489,24 @@ fn activate_observer_context(
     context: QuotaObserverContext,
     request_id: &str,
 ) -> Result<QuotaObserverContext, ProviderFailure> {
+    let prior_schema_version = context.schema_version;
+    let activated = preview_observer_context_activation(account, context, request_id)?;
+    if prior_schema_version != QUOTA_OBSERVER_SCHEMA_VERSION {
+        write_observer_context(host, account, &activated, request_id)?;
+    }
+    Ok(activated)
+}
+
+fn preview_observer_context_activation(
+    account: &AccountProfile,
+    context: QuotaObserverContext,
+    request_id: &str,
+) -> Result<QuotaObserverContext, ProviderFailure> {
     validate_observer_context(&context, account, request_id)?;
     if context.schema_version == QUOTA_OBSERVER_SCHEMA_VERSION {
         return Ok(context);
     }
-    let upgraded = candidate_context(account, BTreeMap::new(), request_id)?;
-    write_observer_context(host, account, &upgraded, request_id)?;
-    Ok(upgraded)
+    candidate_context(account, BTreeMap::new(), request_id)
 }
 
 fn validate_observer_implementation(

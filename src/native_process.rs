@@ -1,15 +1,22 @@
 //! Durable native-process admission and process-group custody.
 
 use std::ffi::OsStr;
+#[cfg(target_os = "linux")]
 use std::fs;
-use std::io::{self, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus};
+#[cfg(unix)]
 use std::time::Duration;
 #[cfg(unix)]
 use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
 
+#[cfg(unix)]
 const EXEC_GATE_ARG: &str = "__launch_exec_gate";
+#[cfg(unix)]
 const EXEC_GATE_FD_ENV: &str = "AGENT_RUNNER_OPENCODE_LAUNCH_GATE_FD";
 #[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);

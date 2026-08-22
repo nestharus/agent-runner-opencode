@@ -140,6 +140,18 @@ pub fn resolve_existing_for_account(
     Ok(Some(context))
 }
 
+pub(crate) fn resolve_existing_for_setup(
+    host: &HostContext,
+    account: &AccountProfile,
+    request_id: &str,
+) -> Result<Option<NativeRuntimeContext>, ProviderFailure> {
+    let _lock = acquire_runtime_lock(host, account, Duration::ZERO, request_id)?;
+    let Some(context) = read_runtime_context(host, account, request_id)? else {
+        return Ok(None);
+    };
+    preview_runtime_context_activation(account, context, request_id).map(Some)
+}
+
 pub(crate) fn persisted_identity_evidence(
     host: &HostContext,
     account: &AccountProfile,
@@ -702,6 +714,19 @@ fn activate_runtime_context(
     context: NativeRuntimeContext,
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
+    let prior_schema_version = context.schema_version;
+    let activated = preview_runtime_context_activation(account, context, request_id)?;
+    if prior_schema_version != NATIVE_RUNTIME_SCHEMA_VERSION {
+        write_runtime_context(host, account, &activated, request_id)?;
+    }
+    Ok(activated)
+}
+
+fn preview_runtime_context_activation(
+    account: &AccountProfile,
+    context: NativeRuntimeContext,
+    request_id: &str,
+) -> Result<NativeRuntimeContext, ProviderFailure> {
     validate_runtime_record_identity(&context, account, request_id)?;
     if context.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
         validate_current_runtime_implementation(&context, account, request_id)?;
@@ -709,9 +734,7 @@ fn activate_runtime_context(
     }
     if context.schema_version == WRAPPER_NATIVE_RUNTIME_SCHEMA_VERSION {
         validate_predecessor_runtime_implementation(&context, account, request_id)?;
-        let upgraded = candidate_context(account, context.execution_env, request_id)?;
-        write_runtime_context(host, account, &upgraded, request_id)?;
-        return Ok(upgraded);
+        return candidate_context(account, context.execution_env, request_id);
     }
     let admitted = validate_predecessor_runtime_implementation(&context, account, request_id)?;
     let selected_program = resolve_program(OPENCODE_NATIVE_PROGRAM, &context.execution_env)
@@ -752,7 +775,7 @@ fn activate_runtime_context(
         &fixed_args,
         (&approved.id, &approved.version),
     );
-    let upgraded = NativeRuntimeContext {
+    Ok(NativeRuntimeContext {
         schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
         account_wrapper: account.opencode_wrapper.to_string(),
         program: context.program,
@@ -764,9 +787,7 @@ fn activate_runtime_context(
         implementation_version: approved.version,
         program_stamp: admitted.program_stamp,
         identity_sha256,
-    };
-    write_runtime_context(host, account, &upgraded, request_id)?;
-    Ok(upgraded)
+    })
 }
 
 struct PredecessorImplementationAdmission {
