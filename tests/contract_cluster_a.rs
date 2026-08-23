@@ -1558,7 +1558,7 @@ fn contract_launch_resume_rejects_unbounded_option_shaped_payload_before_spawn()
 }
 
 #[test]
-fn contract_launch_env_uses_declared_boundary() {
+fn contract_launch_env_preserves_declared_and_inherited_environment() {
     let fake_wrapper = FakeOpencodeWrapper::with_script(env_probe_opencode_script());
     let path = prepend_path(fake_wrapper.dir());
     let log_path = fake_wrapper.log_path_str();
@@ -1586,7 +1586,7 @@ fn contract_launch_env_uses_declared_boundary() {
             ("OPENAI_API_KEY", "ambient-openai-secret-do-not-leak"),
         ],
     );
-    assert_declared_env_boundary(&output, fake_wrapper.log_path());
+    assert_environment_passthrough(&output, fake_wrapper.log_path());
 }
 
 #[test]

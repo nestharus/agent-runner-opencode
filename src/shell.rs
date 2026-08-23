@@ -4,8 +4,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const ENV_PASSTHROUGH_KEYS: &[&str] = &["PATH", "HOME", "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG"];
-
 #[derive(Debug)]
 pub struct ShellOutput {
     pub stdout: Vec<u8>,
@@ -20,14 +18,7 @@ pub fn run(argv: &[String]) -> io::Result<ShellOutput> {
 }
 
 pub fn command(program: &str) -> Command {
-    let mut command = Command::new(resolved_program(program));
-    command.env_clear();
-    command.envs(
-        ENV_PASSTHROUGH_KEYS
-            .iter()
-            .filter_map(|key| std::env::var_os(key).map(|value| (*key, value))),
-    );
-    command
+    Command::new(resolved_program(program))
 }
 
 fn validate_argv(argv: &[String]) -> io::Result<(&String, &[String])> {

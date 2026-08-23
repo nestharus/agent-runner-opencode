@@ -34,8 +34,6 @@ const PREDECESSOR_QUOTA_OBSERVER_CONTRACT: &str = "chatgpt_wham_curl/v1";
 pub(crate) const QUOTA_OBSERVER_CONTRACT: &str = "agent-runner-opencode.chatgpt-wham-http/v1";
 const QUOTA_OBSERVER_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_QUOTA_OBSERVER_STATE_BYTES: usize = 1024 * 1024;
-#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
-const OBSERVER_ENV_KEYS: &[&str] = &["PATH", "HOME"];
 const IN_PROCESS_TRANSPORT_KIND: &str = "in_process_reqwest_rustls_webpki";
 #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 const CONTRACT_FIXTURE_TRANSPORT_KIND: &str = "contract_test_external_curl";
@@ -338,14 +336,7 @@ fn candidate_external_fixture_context(
 
 #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
 fn ambient_observer_environment() -> BTreeMap<String, String> {
-    OBSERVER_ENV_KEYS
-        .iter()
-        .filter_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| ((*key).to_string(), value))
-        })
-        .collect()
+    std::env::vars().collect()
 }
 
 #[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]

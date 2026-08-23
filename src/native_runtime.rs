@@ -43,23 +43,6 @@ const OPENCODE_BASH_DEFAULT_TIMEOUT_ENV: &str = "OPENCODE_EXPERIMENTAL_BASH_DEFA
 const PROVIDER_BASH_DEFAULT_TIMEOUT_MS: &str = "2000000000";
 const NATIVE_RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_NATIVE_RUNTIME_STATE_BYTES: usize = 1024 * 1024;
-const STABLE_AMBIENT_ENV_KEYS: &[&str] = &[
-    "PATH",
-    "HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "XDG_CACHE_HOME",
-    "OPENCODE_CONFIG",
-    "OPENCODE_CONFIG_DIR",
-    "OPENCODE_DISABLE_EXTERNAL_SKILLS",
-    "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
-    "OPENCODE_DISABLE_FFF",
-    "OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER",
-    OPENCODE_BASH_DEFAULT_TIMEOUT_ENV,
-    "OULIPOLY_DATA_DIR",
-    "AGENT_BASH_AGENT_RUNNER_BIN",
-];
 const TRANSIENT_ENV_KEYS: &[&str] = &[
     "AGENT_RUNNER_OPENCODE_QUOTA_SCRIPT_LOG",
     "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
@@ -473,13 +456,8 @@ fn native_execution_environment(
 }
 
 pub(crate) fn ambient_stable_environment() -> BTreeMap<String, String> {
-    STABLE_AMBIENT_ENV_KEYS
-        .iter()
-        .filter_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| ((*key).to_string(), value))
-        })
+    std::env::vars()
+        .filter(|(key, _)| !TRANSIENT_ENV_KEYS.contains(&key.as_str()))
         .collect()
 }
 

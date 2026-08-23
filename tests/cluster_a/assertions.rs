@@ -222,12 +222,12 @@ pub fn assert_status_derived_terminal_signal(final_event: &Value) {
     );
 }
 
-pub fn assert_declared_env_boundary(output: &std::process::Output, wrapper_log_path: &Path) {
+pub fn assert_environment_passthrough(output: &std::process::Output, wrapper_log_path: &Path) {
     assert_stderr_diagnostics_only(output);
     let events = parse_launch_events(&output.stdout);
     let final_event = final_launch_event(&events);
     assert_declared_env_exit_event(final_event);
-    assert_declared_env_log(wrapper_log_path);
+    assert_environment_log(wrapper_log_path);
 }
 
 pub fn assert_declared_env_exit_event(final_event: &Value) {
@@ -238,14 +238,13 @@ pub fn assert_declared_env_exit_event(final_event: &Value) {
     );
 }
 
-pub fn assert_declared_env_log(wrapper_log_path: &Path) {
+pub fn assert_environment_log(wrapper_log_path: &Path) {
     let wrapper_log = declared_env_log_text(wrapper_log_path);
     assert_declared_child_env_logged(&wrapper_log);
     assert_declared_xdg_data_home_logged(&wrapper_log);
     assert_oulipoly_linkage_logged(&wrapper_log);
-    assert_undeclared_child_env_unset(&wrapper_log);
-    assert_ambient_secret_absent(&wrapper_log);
-    assert_openai_api_key_unset(&wrapper_log);
+    assert_inherited_child_env_logged(&wrapper_log);
+    assert_openai_api_key_logged(&wrapper_log);
 }
 
 pub fn assert_declared_child_env_logged(wrapper_log: &str) {
@@ -277,28 +276,17 @@ pub fn assert_oulipoly_linkage_logged(wrapper_log: &str) {
     );
 }
 
-pub fn assert_undeclared_child_env_unset(wrapper_log: &str) {
+pub fn assert_inherited_child_env_logged(wrapper_log: &str) {
     assert!(
-        wrapper_log.contains("undeclared=<unset>"),
-        "undeclared parent env must not reach child; log={wrapper_log:?}"
+        wrapper_log.contains("undeclared=ambient-secret-do-not-leak"),
+        "inherited parent env must reach child without an allowlist; log={wrapper_log:?}"
     );
 }
 
-pub fn assert_ambient_secret_absent(wrapper_log: &str) {
+pub fn assert_openai_api_key_logged(wrapper_log: &str) {
     assert!(
-        !wrapper_log.contains("ambient-secret-do-not-leak"),
-        "undeclared parent env value leaked into child log; log={wrapper_log:?}"
-    );
-}
-
-pub fn assert_openai_api_key_unset(wrapper_log: &str) {
-    assert!(
-        wrapper_log.contains("openai=<unset>"),
-        "ambient OPENAI_API_KEY must not reach child; log={wrapper_log:?}"
-    );
-    assert!(
-        !wrapper_log.contains("ambient-openai-secret-do-not-leak"),
-        "ambient OPENAI_API_KEY value leaked into child log; log={wrapper_log:?}"
+        wrapper_log.contains("openai=ambient-openai-secret-do-not-leak"),
+        "inherited OPENAI_API_KEY must reach child without key-specific filtering; log={wrapper_log:?}"
     );
 }
 
