@@ -718,7 +718,11 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
 
     write_fake_wrapper(
         &fake_wrapper_path(fake_wrapper.dir()),
-        fake_counted_new_session_script(fake_wrapper.log_path(), provider_session_id),
+        fake_large_historical_session_list_then_counted_new_session_script(
+            fake_wrapper.log_path(),
+            provider_session_id,
+            300,
+        ),
     );
 
     let replay = support::invoke_with_request("launch", request);
@@ -726,7 +730,7 @@ fn contract_launch_prepared_recovery_waits_for_prior_actor_before_readmission() 
     assert_eq!(
         fs::read_to_string(fake_wrapper.log_path()).expect("read recovered launch count"),
         "1\n",
-        "the exec-gated unpublished actor and exhaustive empty session list should readmit exactly one launch"
+        "the exec-gated unpublished actor and complete historical session population should readmit exactly one launch"
     );
 }
 

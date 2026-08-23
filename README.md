@@ -356,10 +356,10 @@ proves no actor was ever published), recovery
 binds a matching session only when its user turn carries the provider-authored
 delivery identity embedded in that request's actual child payload, and readmits
 the request only after a
-same-context list bounded to 257 native rows proves no effect. Recovery admits
-at most 256 sessions, examines at most eight plausible candidates, captures at
-most 2 MiB of list output, and shares one five-second/host-deadline budget across
-listing and candidate exports.
+complete same-context native session list proves no effect. Recovery does not
+apply a row-count limit before filtering that list, examines at most eight
+plausible candidates, captures at most 2 MiB of list output, and shares one
+five-second/host-deadline budget across listing and candidate exports.
 Non-Unix builds do not admit native launch because they cannot provide this
 process-group custody contract.
 

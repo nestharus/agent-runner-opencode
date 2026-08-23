@@ -581,6 +581,50 @@ exit 0\n",
     )
 }
 
+pub fn fake_large_historical_session_list_then_counted_new_session_script(
+    count_path: &Path,
+    session_id: &str,
+    session_count: usize,
+) -> String {
+    let sessions = Value::Array(
+        (0..session_count)
+            .map(|index| {
+                json!({
+                    "id": format!("ses_historical_{index:03}"),
+                    "updated": 1
+                })
+            })
+            .collect(),
+    )
+    .to_string();
+    let event = json!({
+        "type": "step_start",
+        "timestamp": OBSERVED_AT_UNIX_MS,
+        "sessionID": session_id,
+        "part": {
+            "type": "step-start",
+            "sessionID": session_id
+        }
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"session\" ] && [ \"${{2:-}}\" = \"list\" ]; then\n\
+  printf '%s\\n' {sessions}\n\
+  exit 0\n\
+fi\n\
+count=0\n\
+if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
+count=$((count + 1))\n\
+printf '%s\\n' \"$count\" > {count_path}\n\
+printf '%s\\n' {event}\n\
+exit 0\n",
+        count_path = shell_single_quote(&path_string(count_path)),
+        event = shell_single_quote(&event),
+        sessions = shell_single_quote(&sessions),
+    )
+}
+
 pub fn fake_counted_resume_script(count_path: &Path, payload: &str) -> String {
     let export = json!({
         "info": {"id": resume_session_id(), "title": "durable resume contract"},

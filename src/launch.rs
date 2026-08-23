@@ -52,7 +52,6 @@ const MAX_LAUNCH_INTEGRITY_FAILURES: usize = 32;
 const MAX_LAUNCH_INTEGRITY_FAILURE_DETAIL_BYTES: usize = 512;
 const MAX_LAUNCH_INTEGRITY_EVIDENCE_BYTES: usize = 32 * 1024;
 const LAUNCH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_LAUNCH_RECOVERY_SESSIONS: usize = 256;
 const MAX_LAUNCH_RECOVERY_CANDIDATES: usize = 8;
 const OPENCODE_SESSION_FLAG: &str = "--session";
 const OPENCODE_RUN_ARG: &str = "run";
@@ -1875,18 +1874,10 @@ fn recover_prepared_launch(
         &state.recovery.fixed_args,
         &state.recovery.working_directory,
         &env,
-        Some(MAX_LAUNCH_RECOVERY_SESSIONS.saturating_add(1)),
+        None,
         launch_recovery_remaining(host, started, request_id)?,
     )
     .map_err(|error| launch_recovery_unavailable(request_id, format!("{error:?}")))?;
-    if sessions.len() > MAX_LAUNCH_RECOVERY_SESSIONS {
-        return Err(launch_recovery_unavailable(
-            request_id,
-            format!(
-                "session population exceeds the supported {MAX_LAUNCH_RECOVERY_SESSIONS}-session recovery bound"
-            ),
-        ));
-    }
     let mut candidates = sessions
         .iter()
         .filter(|entry| launch_recovery_session_is_plausible(entry, state))
