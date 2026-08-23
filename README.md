@@ -778,7 +778,7 @@ request with a named identity-lock result rather than waiting indefinitely.
    a deadline of at most 20 seconds and waits one such drain interval.
 2. The operator reconciles every nonterminal obligation that consumes that
    component. If any effect remains ambiguous, abort the rollout and retain the
-   old identity; the cutover interval does not begin until obligations are settled.
+   old identity; sealing does not begin until obligations are settled.
 3. The host submits the plan's typed `seal` request while admission remains
    blocked. The provider requires the exact durable `awaiting_host_drain` plan
    predecessor and rejects sealing if either host assertion is false or the
@@ -821,6 +821,18 @@ request with a named identity-lock result rather than waiting indefinitely.
    retry replays the durable terminal result and the same authorization without
    consulting later component state.
 
+This choreography intentionally chooses effect safety over a bounded maintenance
+outage. `maximum_drain_ms=20000` bounds only the initial deadline assigned to
+each affected in-flight request before Seal; it is not a cycle-wide deadline and
+does not bound dependency staging, the validation exception, Observe, Release,
+or exact recovery after response loss. Once Seal succeeds, ordinary admission
+for the selected profile/component can therefore remain blocked indefinitely if
+the host, operator, or dependency does not complete the exact successors. The
+host must retain and retry the exact durable next request—especially a lost
+terminal Release—until it receives provider release authorization. The provider
+does not expire `awaiting_cutover` or `awaiting_host_release`, auto-reopen
+ordinary traffic, or trade an ambiguous native effect for availability.
+
 ### Rebind replay and retention
 
 Each profile/component retains at most 64 cycle records. Plan publication
@@ -848,11 +860,13 @@ ordinary traffic and the component's cutover-validation exception. The provider'
 durable terminal release authorization owns the transition back to ordinary
 admission.
 
-After obligations are settled, the declared cutover bound is one
-20-second admission interval; rollback is the same bounded two-file maintenance
-operation. This drain/reconcile/reset boundary preserves the old identities for
-recovery while giving wrapper and observer upgrades an explicit restoration
-path.
+The only 20-second availability bound in this protocol is the initial per-request
+drain deadline. Total selected-component downtime has no finite provider-owned
+bound; commit, rollback, and response-loss recovery remain fail-closed until the
+exact terminal Release authorization is delivered. The drain/reconcile/reset
+boundary preserves the old identities for recovery while giving runtime and
+observer upgrades an explicit restoration path without claiming bounded service
+restoration.
 
 ## Rotation capacity, concurrency, and retention
 

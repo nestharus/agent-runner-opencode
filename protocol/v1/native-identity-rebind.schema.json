@@ -181,7 +181,10 @@
         "profile": { "$ref": "#/$defs/Profile" },
         "component": { "$ref": "#/$defs/Component" },
         "phase": { "enum": ["awaiting_host_drain", "awaiting_cutover", "awaiting_host_release", "completed", "rolled_back", "rejected"] },
-        "maximum_drain_ms": { "const": 20000 },
+        "maximum_drain_ms": {
+          "const": 20000,
+          "description": "Maximum deadline for each affected in-flight request during the pre-Seal host drain only; this is not a cycle-wide cutover, validation, release, or response-loss recovery deadline."
+        },
         "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
         "observed_evidence": { "$ref": "#/$defs/ComponentEvidence" },
         "observation_id": { "$ref": "#/$defs/Digest" },
