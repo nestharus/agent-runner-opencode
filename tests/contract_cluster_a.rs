@@ -917,6 +917,7 @@ fn contract_native_runtime_identity_is_shared_across_capabilities() {
         &[
             ("PATH", conflicting_path.as_str()),
             ("HOME", conflicting_home_path.as_str()),
+            ("CONTEXT_SELECTOR", "runtime-a"),
         ],
     );
     let export_response = json_stdout(&exported);
@@ -971,6 +972,109 @@ fn contract_native_runtime_identity_is_shared_across_capabilities() {
 }
 
 #[test]
+fn contract_native_runtime_scrubs_schema_v4_environment_without_rebinding() {
+    let runtime = IsolatedLaunchSettings::new();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let home = tempfile::tempdir().expect("create native runtime HOME");
+    let home_path = home.path().to_string_lossy().into_owned();
+    let first_log = fake_wrapper.dir().join("first-launch.log");
+    let first_log_path = first_log.to_string_lossy().into_owned();
+    let first_launch = invoke_with_host_and_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                ("HOME", home_path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_WRAPPER_LOG", first_log_path.as_str()),
+                ("PER_INVOCATION_ENV", "first-value"),
+            ],
+        ),
+        runtime.host_overrides(),
+        &[("PATH", path.as_str()), ("HOME", home_path.as_str())],
+    );
+    assert_output_success(&first_launch, "initial native runtime launch");
+
+    let state_path = runtime
+        .data_root()
+        .join("provider-state/opencode/native-runtimes/opencode1.json");
+    let mut schema_v4: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read initial native runtime identity"),
+    )
+    .expect("parse initial native runtime identity");
+    schema_v4["schema_version"] = json!(4);
+    schema_v4["execution_env"]["ACCIDENTALLY_PERSISTED_ENV"] = json!("must-be-forwarded-not-bound");
+    schema_v4["identity_sha256"] = json!(agent_runner_opencode::encoding::sha256_hex(
+        json!({
+            "account_wrapper": schema_v4["account_wrapper"].clone(),
+            "program": schema_v4["program"].clone(),
+            "program_sha256": schema_v4["program_sha256"].clone(),
+            "execution_env": schema_v4["execution_env"].clone(),
+            "native_contract_id": schema_v4["native_contract_id"].clone(),
+            "fixed_args": schema_v4["fixed_args"].clone(),
+            "implementation_manifest_id": schema_v4["implementation_manifest_id"].clone(),
+            "implementation_version": schema_v4["implementation_version"].clone(),
+        })
+        .to_string()
+        .as_bytes(),
+    ));
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&schema_v4).expect("serialize schema-v4 runtime identity"),
+    )
+    .expect("write schema-v4 runtime identity");
+
+    let second_log = fake_wrapper.dir().join("second-launch.log");
+    let second_log_path = second_log.to_string_lossy().into_owned();
+    let second_launch = invoke_with_host_and_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                ("HOME", home_path.as_str()),
+                (
+                    "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                    second_log_path.as_str(),
+                ),
+                ("PER_INVOCATION_ENV", "second-value"),
+            ],
+        ),
+        runtime.host_overrides(),
+        &[("PATH", path.as_str()), ("HOME", home_path.as_str())],
+    );
+    assert_output_success(
+        &second_launch,
+        "launch after schema-v4 environment migration",
+    );
+
+    let upgraded: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read upgraded native runtime identity"),
+    )
+    .expect("parse upgraded native runtime identity");
+    assert_eq!(upgraded["schema_version"], 5);
+    assert_eq!(
+        upgraded["execution_env"].as_object().map(|env| env.len()),
+        Some(4)
+    );
+    assert!(upgraded["execution_env"].get("HOME").is_some());
+    assert!(upgraded["execution_env"].get("PATH").is_some());
+    assert!(upgraded["execution_env"]
+        .get("OULIPOLY_OPENCODE_ACCOUNT")
+        .is_some());
+    assert!(upgraded["execution_env"]
+        .get("OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS")
+        .is_some());
+    assert!(upgraded["execution_env"]
+        .get("ACCIDENTALLY_PERSISTED_ENV")
+        .is_none());
+    assert!(upgraded["execution_env"]
+        .get("PER_INVOCATION_ENV")
+        .is_none());
+}
+
+#[test]
 fn contract_native_runtime_binds_direct_opencode_implementation() {
     let runtime = IsolatedLaunchSettings::new();
     let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_runtime_identity_script());
@@ -999,7 +1103,8 @@ fn contract_native_runtime_binds_direct_opencode_implementation() {
         &fs::read(&state_path).expect("read direct native runtime identity"),
     )
     .expect("parse direct native runtime identity");
-    assert_eq!(state["schema_version"], 4);
+    assert_eq!(state["schema_version"], 5);
+    assert!(state["execution_env"].get("CONTEXT_SELECTOR").is_none());
     assert_eq!(
         state["program_stamp"]["byte_length"],
         fs::metadata(fake_wrapper.dir().join("opencode"))
@@ -1110,7 +1215,11 @@ fn contract_native_runtime_upgrades_predecessor_wrapper_binding_before_effect() 
         }),
         runtime.host_overrides(),
         "session.schema.json#/$defs/SessionExportRequest",
-        &[("PATH", path.as_str()), ("HOME", home_path.as_str())],
+        &[
+            ("PATH", path.as_str()),
+            ("HOME", home_path.as_str()),
+            ("CONTEXT_SELECTOR", "runtime-a"),
+        ],
     );
     let response = json_stdout(&export);
     assert_eq!(response["ok"], true, "response={response}");
@@ -1119,7 +1228,8 @@ fn contract_native_runtime_upgrades_predecessor_wrapper_binding_before_effect() 
         &fs::read(&state_path).expect("read upgraded native runtime binding"),
     )
     .expect("parse upgraded native runtime binding");
-    assert_eq!(upgraded["schema_version"], 4);
+    assert_eq!(upgraded["schema_version"], 5);
+    assert!(upgraded["execution_env"].get("CONTEXT_SELECTOR").is_none());
     assert!(upgraded["program_stamp"]["byte_length"]
         .as_u64()
         .is_some_and(|length| length > 0));

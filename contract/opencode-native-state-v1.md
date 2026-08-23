@@ -10,8 +10,8 @@ initial admission, rebind, and predecessor upgrade the provider resolves the
 and admits it only when
 the target platform, byte length, digest, version, and semantic contract match
 `contract/native-implementation-manifest-v1.json`. It binds that manifest
-identity, an admitted size/inode/change metadata stamp, the exact cleared stable
-environment, and fixed `--pure` argument, then persists them per numbered
+identity, an admitted size/inode/change metadata stamp, the durable environment
+selectors, and fixed `--pure` argument, then persists them per numbered
 account. Reuse validates executable status, canonical path, the constant-time
 metadata stamp, and the immutable build manifest under the account lock without
 rereading the whole executable. The stamp is persistence/incarnation evidence,
@@ -31,22 +31,27 @@ exact-path `--version` probe and never resolves or executes the numbered logical
 account identities. Per-account setup readiness is the conjunction of that one
 direct-runtime result and the account's declared auth-file evidence.
 
-Schema-v1 wrapper, schema-v2 direct native-runtime, and schema-v3 manifest-bound
-bindings are bounded transition inputs only. The provider validates the exact
-recorded bytes and requires the currently selected direct implementation to be
-manifest-approved. While holding the account runtime lock, it persists the
-schema-v4 manifest-bound identity and metadata stamp before any new native
-effect. It never uses the schema-v1 wrapper as the acting implementation after
-the upgrade-capable provider is installed.
+Schema-v1 wrapper, schema-v2 direct native-runtime, schema-v3 manifest-bound,
+and schema-v4 full-environment bindings are bounded transition inputs only. The
+provider validates their recorded implementation evidence and requires the
+currently selected direct implementation to be manifest-approved. While holding
+the account runtime lock, it persists the schema-v5 manifest-bound identity and
+metadata stamp before any new native effect. Schema-v4 activation also removes
+accidentally persisted per-invocation values while holding the account lock. It
+never uses the schema-v1 wrapper as the acting implementation after the
+upgrade-capable provider is installed.
 
-The bound environment identifies the native state namespace. `HOME` and any
-explicit stable XDG/OpenCode configuration values are part of the identity. If
+The bound environment identifies the executable and native state namespace.
+`HOME`, `PATH`, `XDG_DATA_HOME`, the provider Bash-timeout policy, and the
+logical account marker are its only persisted selectors. If
 an isolated numbered account has no explicit `XDG_DATA_HOME`, the provider binds
-`$HOME/.opencodeN` for account N. The provider clears all other ambient values,
-adds the logical account identity as `OULIPOLY_OPENCODE_ACCOUNT`, and invokes the
-canonical absolute executable; `PATH` remains identity-bound for tools that an
-OpenCode turn may itself execute, but does not select the OpenCode executable
-after admission. `--pure` excludes external plugins from the acting boundary.
+`$HOME/.opencodeN` for account N. Every other inherited or request-declared
+environment variable is forwarded to the child for that invocation without
+becoming durable identity state. The provider adds the logical account identity
+as `OULIPOLY_OPENCODE_ACCOUNT` and invokes the canonical absolute executable;
+`PATH` remains identity-bound for tools that an OpenCode turn may itself execute,
+but does not select the OpenCode executable after admission. `--pure` excludes
+external plugins from the acting boundary.
 
 Agent Runner launches favor completion of long-running agent work over
 OpenCode's shorter implicit per-Bash cutoff. The provider therefore owns a
