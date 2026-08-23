@@ -1,0 +1,28 @@
+# Contract snapshot provenance
+
+These schemas are an exact snapshot of `contract/v1` from
+`nestharus/agent-runner` commit
+`afdd74fc4ab658a6be0441c7ca5bfb5cb8bafdbb`.
+
+The snapshot is updated as one unit. A provider change must not privately edit
+these files; update the upstream contract first, copy the complete directory at
+a named commit, update this provenance record, and run the provider contract
+suite.
+
+SHA-256 identities:
+
+```text
+3ce23f580ef7bf896e2c12f43a91a777945c8f67d9e1981ca728217e9f0b5a10  common.schema.json
+69e413286bc1376b48e79eb63d6da8debed6257a627c7d50152ac931f2b93954  describe.schema.json
+c39d0c97e3f74b102e08bff14bb28baefdfa23f2fef7fa7fb67c308af05b049b  discovery.schema.json
+faf3b06a455e8a00a9f10c36b0ecf3038d6de6627873cf3cba3368a050ff8e9e  launch.schema.json
+25144a109c8dd4d56c6268d0e89f562b8dca1b3bb8cc5ce1e0f9ef09ac80433d  migration.schema.json
+292412aed125b9bf9dfaebbd239faef969a47d699ba5a95b91871964a9cb6eb7  policy.schema.json
+e33411bf286d74c64118b597d7fffc7e7c68d456f25fd48c27a4738224d6ddd4  quota.schema.json
+762d361115fb42ec708fb10fe93834955e94341b3faee7112b3ffaae211eb190  rotation.schema.json
+ea190f0eebf373cac05d84135ced6003a14faeddbd992453314596603def8b67  schema.schema.json
+71385c9ed6f8e935560691fd57e1f072a6f0fe1f3323b125e13515ea8b03b3ac  session.schema.json
+f844876032d7ce0f289fec571823026758b1349d8dfe0b7bbcb6e7197a78e9d8  settings.schema.json
+2e515d18166740c807a03f26454ed4e5857f7eea6759aa65a857476aee11c953  setup.schema.json
+8dd39342bd7177cfd92df52046f4912555971418d0a95fa98074db8235196c6c  terminal.schema.json
+```

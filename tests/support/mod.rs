@@ -2,10 +2,66 @@
 
 use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Map, Value};
+use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 pub const CONTRACT: &str = "oulipoly.provider/v1";
+
+static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[allow(dead_code)]
+pub fn write_fake_opencode_dispatcher(directory: &Path) {
+    let path = directory.join("opencode");
+    let directory = directory.to_string_lossy().replace('\'', "'\\''");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+if [ \"${{1-}}\" != \"--pure\" ]; then exit 65; fi\n\
+shift\n\
+case \"${{OULIPOLY_OPENCODE_ACCOUNT-}}\" in\n\
+  opencode1|opencode2|opencode3|opencode4|opencode5)\n\
+    exec '{directory}/'\"${{OULIPOLY_OPENCODE_ACCOUNT}}\" \"$@\" ;;\n\
+  *) exit 64 ;;\n\
+esac\n"
+        ),
+    )
+    .expect("write fake direct OpenCode dispatcher");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&path)
+            .expect("fake direct OpenCode dispatcher metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod fake direct OpenCode dispatcher");
+    }
+}
+
+const DEFAULT_RUNTIME_PROVIDERS_TOML: &str = r#"
+[opencode]
+command = "opencode1"
+
+[opencode1]
+command = "opencode1"
+
+[opencode2]
+command = "opencode2"
+
+[opencode3]
+command = "opencode3"
+
+[opencode4]
+command = "opencode4"
+
+[opencode5]
+command = "opencode5"
+"#;
 
 pub fn invoke(subcommand: &str, params: Value) -> Output {
     invoke_with_host(subcommand, params, json!({}))
@@ -62,6 +118,7 @@ pub fn invoke_validated_with_host_and_env(
 }
 
 pub fn invoke_with_request(subcommand: &str, request_json: Value) -> Output {
+    ensure_default_runtime_settings(&request_json);
     let stdin = request_stdin_bytes(&request_json);
     invoke_raw_stdin(subcommand, &stdin)
 }
@@ -69,11 +126,36 @@ pub fn invoke_with_request(subcommand: &str, request_json: Value) -> Output {
 #[allow(dead_code)]
 pub fn invoke_with_request_and_env(
     subcommand: &str,
-    request_json: Value,
+    mut request_json: Value,
     env: &[(&str, &str)],
 ) -> Output {
+    scope_default_host_to_native_env(&mut request_json, env);
+    ensure_default_runtime_settings(&request_json);
     let stdin = request_stdin_bytes(&request_json);
     invoke_raw_stdin_with_env(subcommand, &stdin, env)
+}
+
+#[allow(dead_code)]
+pub fn invoke_with_request_and_env_fresh_deadline(
+    subcommand: &str,
+    mut request_json: Value,
+    env: &[(&str, &str)],
+    deadline_after: std::time::Duration,
+) -> (Output, std::time::Duration) {
+    scope_default_host_to_native_env(&mut request_json, env);
+    ensure_default_runtime_settings(&request_json);
+    let mut child = spawn_provider(subcommand, env);
+    let deadline_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after the epoch")
+        .as_millis() as u64
+        + deadline_after.as_millis() as u64;
+    request_json["host"]["deadline_unix_ms"] = json!(deadline_unix_ms);
+    let stdin = request_stdin_bytes(&request_json);
+    let started = std::time::Instant::now();
+    write_provider_stdin(&mut child, &stdin);
+    let output = wait_provider(child);
+    (output, started.elapsed())
 }
 
 pub fn invoke_raw_stdin(subcommand: &str, stdin_bytes: &[u8]) -> Output {
@@ -93,7 +175,10 @@ pub fn invoke_raw_stdin_with_env(
 pub fn request_envelope(subcommand: &str, params: Value, host_overrides: Value) -> Value {
     json!({
         "contract": CONTRACT,
-        "request_id": format!("req-{subcommand}"),
+        "request_id": format!(
+            "req-{subcommand}-{}",
+            REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ),
         "provider_instance_id": "opencode-primary",
         "host": host_context(host_overrides),
         "params": params
@@ -116,13 +201,15 @@ pub fn assert_valid_request_envelope(request: &Value, request_schema: &str) {
 }
 
 pub fn host_context(host_overrides: Value) -> Value {
+    let config_root = default_test_root().join("config");
+    let data_root = default_test_root().join("data");
     let mut host = json!({
         "app": "oulipoly-agent-runner",
         "app_version": "0.0.0",
         "platform": "linux-x86_64",
         "working_directory": "/tmp",
-        "config_root": "/tmp/config",
-        "data_root": "/tmp/data",
+        "config_root": config_root.to_string_lossy(),
+        "data_root": data_root.to_string_lossy(),
         "env": { "TERM": "xterm-256color" }
     });
     if let (Some(host), Some(overrides)) = (host.as_object_mut(), host_overrides.as_object()) {
@@ -131,6 +218,87 @@ pub fn host_context(host_overrides: Value) -> Value {
         }
     }
     host
+}
+
+fn default_test_root() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "agent-runner-opencode-contract-{}",
+        std::process::id()
+    ))
+}
+
+#[allow(dead_code)]
+pub fn isolated_test_config_root(label: &str) -> PathBuf {
+    default_test_root().join("isolated-config").join(format!(
+        "{label}-{}",
+        REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+pub fn ensure_default_runtime_settings(request: &Value) {
+    static INITIALIZE_LOCK: Mutex<()> = Mutex::new(());
+    let Some(config_root) = request
+        .pointer("/host/config_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    if !config_root.starts_with(default_test_root()) {
+        return;
+    }
+    let _guard = INITIALIZE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_path = config_root.join("agent-runner-opencode/settings-store.json");
+    fs::create_dir_all(&config_root).expect("create host config root fixture");
+    if let Some(data_root) = request.pointer("/host/data_root").and_then(Value::as_str) {
+        fs::create_dir_all(data_root).expect("create default provider data fixture");
+    }
+    if !store_path.exists() {
+        let mut migration = json!({
+            "contract": CONTRACT,
+            "request_id": "fixture-activate-default-runtime-settings",
+            "provider_instance_id": "opencode-primary",
+            "host": request["host"],
+            "params": {
+                "dry_run": false,
+                "legacy": { "providers_toml": DEFAULT_RUNTIME_PROVIDERS_TOML }
+            }
+        });
+        // Fixture activation is a prerequisite, not part of the operation whose
+        // deliberately short deadline a contract may be exercising.
+        migration["host"]
+            .as_object_mut()
+            .expect("fixture migration host")
+            .remove("deadline_unix_ms");
+        let output = invoke_raw_stdin("settings.migrate", &request_stdin_bytes(&migration));
+        let response = json_stdout(&output);
+        assert_eq!(
+            response["ok"], true,
+            "production settings migration must activate the default runtime fixture: {response}"
+        );
+    }
+}
+
+fn scope_default_host_to_native_env(request: &mut Value, env: &[(&str, &str)]) {
+    let default_config_root = default_test_root().join("config");
+    if request.pointer("/host/config_root").and_then(Value::as_str) != default_config_root.to_str()
+    {
+        return;
+    }
+    let state_context = env
+        .iter()
+        .filter(|(key, _)| matches!(*key, "PATH" | "HOME"))
+        .collect::<Vec<_>>();
+    if state_context.is_empty() {
+        return;
+    }
+    let mut hasher = DefaultHasher::new();
+    state_context.hash(&mut hasher);
+    let root = default_test_root().join(format!("native-env-{:016x}", hasher.finish()));
+    request["host"]["config_root"] = json!(root.join("config").to_string_lossy());
+    request["host"]["data_root"] = json!(root.join("data").to_string_lossy());
 }
 
 pub fn json_stdout(output: &Output) -> Value {
@@ -245,15 +413,20 @@ fn request_stdin_bytes(request_json: &Value) -> Vec<u8> {
 }
 
 fn spawn_provider(subcommand: &str, env: &[(&str, &str)]) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_agent-runner-opencode"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-runner-opencode"));
+    command
         .arg(subcommand)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear()
-        .envs(env.iter().copied())
-        .spawn()
-        .unwrap()
+        .envs(env.iter().copied());
+    if !env.iter().any(|(key, _)| *key == "HOME") {
+        let home = default_test_root().join("home");
+        fs::create_dir_all(&home).expect("create default native HOME fixture");
+        command.env("HOME", home);
+    }
+    command.spawn().unwrap()
 }
 
 fn write_provider_stdin(child: &mut std::process::Child, stdin_bytes: &[u8]) {

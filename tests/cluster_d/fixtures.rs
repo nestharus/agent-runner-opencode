@@ -9,10 +9,6 @@ pub const UPDATE_SECRET_TOKEN: &str = "opencode_contract_update_secret_token_mus
 
 pub const SETUP_AUTH_SENTINEL: &str = "SETUP_AUTH_SENTINEL_DO_NOT_LEAK";
 
-pub const OPENCODE_VERSION_SENTINEL: &str = "opencode 0.0.0-contract";
-
-pub const CHATGPT_USAGE_READY_SENTINEL: &str = "contract_chatgpt_usage_ready";
-
 pub const ROTATION_SOURCE_SESSION: &str = "ses_source_contract_d";
 
 pub const PROVIDERS_TOML: &str = r#"
@@ -27,6 +23,18 @@ command = "opencode2"
 args = ["run", "--dangerously-skip-permissions"]
 quota_script = "chatgpt-usage ~/.codex5/auth.json"
 refresh_auth_command = "/bin/false"
+
+[opencode3]
+command = "opencode3"
+args = ["run", "--dangerously-skip-permissions"]
+
+[opencode4]
+command = "opencode4"
+args = ["run", "--dangerously-skip-permissions"]
+
+[opencode5]
+command = "opencode5"
+args = ["run", "--dangerously-skip-permissions"]
 "#;
 
 pub const MODEL_TOML: &str = r#"
@@ -129,25 +137,108 @@ pub struct RotationOpencodeFixture {
     import_record: PathBuf,
     import_cwd_record: PathBuf,
     import_count_record: PathBuf,
+    import_release_marker: PathBuf,
+    import_descendant_release_marker: PathBuf,
+    target_export_block_marker: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    finalization_fault_marker: Option<PathBuf>,
 }
 
 impl RotationOpencodeFixture {
     pub fn new() -> Self {
+        Self::configured(false, None, false, false, false, false, 0)
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn with_post_import_finalization_fault() -> Self {
+        Self::configured(true, None, false, false, false, false, 0)
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn with_post_import_finalization_fault_and_target_id(target_session_id: &str) -> Self {
+        Self::configured(true, Some(target_session_id), false, false, false, false, 0)
+    }
+
+    pub fn with_hanging_import() -> Self {
+        Self::configured(false, None, true, false, false, false, 0)
+    }
+
+    pub fn with_inconsistent_successful_import() -> Self {
+        Self::configured(false, None, false, true, false, false, 0)
+    }
+
+    pub fn with_temporarily_unavailable_rekeyed_target(target_session_id: &str) -> Self {
+        Self::configured(false, Some(target_session_id), false, false, true, false, 0)
+    }
+
+    pub fn with_live_import_descendant_and_target_id(target_session_id: &str) -> Self {
+        Self::configured(false, Some(target_session_id), false, false, false, true, 0)
+    }
+
+    pub fn with_oversized_export() -> Self {
+        Self::configured(false, None, false, false, false, false, 16 * 1024 * 1024)
+    }
+
+    pub fn with_large_export() -> Self {
+        Self::configured(false, None, false, false, false, false, 15 * 1024 * 1024)
+    }
+
+    fn configured(
+        inject_fault: bool,
+        target_session_id: Option<&str>,
+        hang_import: bool,
+        corrupt_imported_content: bool,
+        block_target_export: bool,
+        spawn_import_descendant: bool,
+        export_payload_bytes: usize,
+    ) -> Self {
         let root = unique_temp_dir("agent-runner-opencode-rotation-native");
         fs::create_dir_all(&root).expect("create rotation native fixture");
         let import_record = root.join("imported-session.json");
         let import_cwd_record = root.join("imported-session.cwd");
         let import_count_record = root.join("imported-session.count");
-        write_executable(&root.join("opencode1"), &rotation_source_script());
+        let import_release_marker = root.join("release-hanging-import");
+        let import_descendant_release_marker = root.join("release-import-descendant");
+        let target_export_block_marker = root.join("block-target-export");
+        if block_target_export {
+            fs::write(&target_export_block_marker, b"blocked\n")
+                .expect("block the synthetic target export");
+        }
+        let finalization_fault_marker =
+            inject_fault.then(|| root.join("fail-post-import-finalization"));
+        if let Some(marker) = &finalization_fault_marker {
+            fs::write(marker, b"armed\n").expect("arm post-import finalization fault");
+        }
+        write_executable(
+            &root.join("opencode1"),
+            &rotation_source_script(export_payload_bytes),
+        );
         write_executable(
             &root.join("opencode2"),
-            &rotation_target_script(&import_record, &import_cwd_record, &import_count_record),
+            &rotation_target_script(
+                &import_record,
+                &import_cwd_record,
+                &import_count_record,
+                &import_release_marker,
+                &import_descendant_release_marker,
+                &target_export_block_marker,
+                finalization_fault_marker.as_deref(),
+                target_session_id,
+                hang_import,
+                corrupt_imported_content,
+                spawn_import_descendant,
+            ),
         );
+        crate::support::write_fake_opencode_dispatcher(&root);
         Self {
             root,
             import_record,
             import_cwd_record,
             import_count_record,
+            import_release_marker,
+            import_descendant_release_marker,
+            target_export_block_marker,
+            finalization_fault_marker,
         }
     }
 
@@ -175,6 +266,42 @@ impl RotationOpencodeFixture {
             .parse()
             .expect("recorded import count")
     }
+
+    pub fn import_was_attempted(&self) -> bool {
+        self.import_record.exists() || self.import_count_record.exists()
+    }
+
+    pub fn release_hanging_import(&self) {
+        fs::write(&self.import_release_marker, b"release\n")
+            .expect("release the synthetic hanging import");
+    }
+
+    pub fn release_import_descendant(&self) {
+        fs::write(&self.import_descendant_release_marker, b"release\n")
+            .expect("release the synthetic import descendant");
+    }
+
+    pub fn restore_target_export(&self) {
+        fs::remove_file(&self.target_export_block_marker)
+            .expect("restore the synthetic target export");
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn restore_operation_state_writes(&self, data_root: &Path) {
+        let operation_root = data_root.join("provider-state/opencode/rotation/operations");
+        fs::remove_file(&operation_root).expect("remove blocked operation-state path");
+        fs::rename(
+            operation_root.with_file_name("operations-blocked"),
+            &operation_root,
+        )
+        .expect("restore prepared operation-state directory");
+        assert!(
+            self.finalization_fault_marker
+                .as_ref()
+                .is_some_and(|marker| !marker.exists()),
+            "target import should consume the armed finalization fault"
+        );
+    }
 }
 
 impl Drop for RotationOpencodeFixture {
@@ -183,7 +310,7 @@ impl Drop for RotationOpencodeFixture {
     }
 }
 
-fn rotation_source_script() -> String {
+fn rotation_source_script(export_payload_bytes: usize) -> String {
     r#"#!/usr/bin/python3
 import json
 import sys
@@ -211,38 +338,119 @@ native = {
     }],
     "nativeRoot": {"preserved": True}
 }
+if __EXPORT_PAYLOAD_BYTES__:
+    native["nativeRoot"]["payload"] = "x" * __EXPORT_PAYLOAD_BYTES__
 print("Exporting session: " + session_id)
 print(json.dumps(native))
 "#
-    .to_string()
+    .replace(
+        "__EXPORT_PAYLOAD_BYTES__",
+        &export_payload_bytes.to_string(),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rotation_target_script(
     import_record: &Path,
     import_cwd_record: &Path,
     import_count_record: &Path,
+    import_release_marker: &Path,
+    import_descendant_release_marker: &Path,
+    target_export_block_marker: &Path,
+    finalization_fault_marker: Option<&Path>,
+    target_session_id: Option<&str>,
+    hang_import: bool,
+    corrupt_imported_content: bool,
+    spawn_import_descendant: bool,
 ) -> String {
+    let fault_marker = finalization_fault_marker
+        .map(path_string)
+        .unwrap_or_default();
     format!(
         r#"#!/usr/bin/python3
 import json
 import pathlib
+import subprocess
 import sys
+import time
 
-if len(sys.argv) != 3 or sys.argv[1] != "import":
+if len(sys.argv) != 3:
     raise SystemExit(64)
+if sys.argv[1] == "export":
+    if pathlib.Path({export_block_marker}).exists():
+        raise SystemExit(2)
+    if not pathlib.Path({record}).exists():
+        raise SystemExit(2)
+    native = json.loads(pathlib.Path({record}).read_text())
+    if native["info"]["id"] != sys.argv[2]:
+        raise SystemExit(2)
+    print(json.dumps(native, separators=(",", ":")))
+    raise SystemExit(0)
+if sys.argv[1] != "import":
+    raise SystemExit(64)
+if {hang_import}:
+    while not pathlib.Path({release_marker}).exists():
+        time.sleep(0.05)
 native = json.loads(pathlib.Path(sys.argv[2]).read_text())
+target_session_id = {target_session_id}
+if target_session_id:
+    native["info"]["id"] = target_session_id
+    for message in native.get("messages", []):
+        message.get("info", {{}})["sessionID"] = target_session_id
+if {corrupt_imported_content}:
+    native["messages"][0]["parts"][0]["text"] = "inconsistent imported content"
 pathlib.Path({record}).write_text(json.dumps(native, separators=(",", ":")))
 pathlib.Path({cwd_record}).write_text(str(pathlib.Path.cwd()))
 count_path = pathlib.Path({count_record})
 count = int(count_path.read_text()) if count_path.exists() else 0
 count_path.write_text(str(count + 1))
+if {spawn_import_descendant}:
+    subprocess.Popen(
+        [sys.executable, "-c", "import pathlib,sys,time; marker=pathlib.Path(sys.argv[1]);\nwhile not marker.exists(): time.sleep(0.05)", {descendant_release_marker}],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+fault_marker = pathlib.Path({fault_marker}) if {fault_enabled} else None
+if fault_marker is not None and fault_marker.exists():
+    operation_root = pathlib.Path(sys.argv[2]).parents[3] / "provider-state" / "opencode" / "rotation" / "operations"
+    operation_root.rename(operation_root.with_name("operations-blocked"))
+    operation_root.write_text("blocked\n")
+    fault_marker.unlink()
 print("Imported session: " + native["info"]["id"])
 "#,
         record = serde_json::to_string(&path_string(import_record)).expect("record path JSON"),
         cwd_record =
             serde_json::to_string(&path_string(import_cwd_record)).expect("cwd record path JSON"),
         count_record = serde_json::to_string(&path_string(import_count_record))
-            .expect("count record path JSON")
+            .expect("count record path JSON"),
+        release_marker = serde_json::to_string(&path_string(import_release_marker))
+            .expect("release marker path JSON"),
+        descendant_release_marker =
+            serde_json::to_string(&path_string(import_descendant_release_marker))
+                .expect("descendant release marker path JSON"),
+        export_block_marker = serde_json::to_string(&path_string(target_export_block_marker))
+            .expect("target export block marker path JSON"),
+        fault_marker = serde_json::to_string(&fault_marker).expect("fault marker path JSON"),
+        fault_enabled = if finalization_fault_marker.is_some() {
+            "True"
+        } else {
+            "False"
+        },
+        target_session_id =
+            serde_json::to_string(target_session_id.unwrap_or("")).expect("target session id JSON"),
+        hang_import = if hang_import { "True" } else { "False" },
+        corrupt_imported_content = if corrupt_imported_content {
+            "True"
+        } else {
+            "False"
+        },
+        spawn_import_descendant = if spawn_import_descendant {
+            "True"
+        } else {
+            "False"
+        },
     )
 }
 
@@ -330,9 +538,9 @@ impl HomeFixture {
         &self.path_string
     }
 
-    pub fn write_all_codex_auths(&self) {
-        for relative in codex_auth_relatives() {
-            write_codex_auth(&self.path.join(relative));
+    pub fn write_all_opencode_auths(&self) {
+        for relative in opencode_auth_relatives() {
+            write_opencode_auth(&self.path.join(relative));
         }
     }
 }
@@ -351,25 +559,23 @@ fn create_home_dir(path: &Path) {
     fs::create_dir_all(path).expect("create temp HOME");
 }
 
-pub fn codex_auth_relatives() -> [&'static str; 5] {
+pub fn opencode_auth_relatives() -> [&'static str; 5] {
     [
-        ".codex/auth.json",
-        ".codex5/auth.json",
-        ".codex2/auth.json",
-        ".codex3/auth.json",
-        ".codex4/auth.json",
+        ".local/share/opencode/auth.json",
+        ".opencode2/opencode/auth.json",
+        ".opencode3/opencode/auth.json",
+        ".opencode4/opencode/auth.json",
+        ".opencode5/opencode/auth.json",
     ]
 }
 
-pub fn write_codex_auth(path: &Path) {
+pub fn write_opencode_auth(path: &Path) {
     fs::create_dir_all(path.parent().expect("auth parent")).expect("create auth parent");
-    fs::write(path, codex_auth_fixture()).expect("write auth fixture");
+    fs::write(path, opencode_auth_fixture()).expect("write auth fixture");
 }
 
-pub fn codex_auth_fixture() -> String {
-    format!(
-        "{{\"tokens\":{{\"access_token\":\"{SETUP_AUTH_SENTINEL}\",\"account_id\":\"acct\"}}}}\n"
-    )
+pub fn opencode_auth_fixture() -> String {
+    format!("{{\"openai\":{{\"access\":\"{SETUP_AUTH_SENTINEL}\",\"accountId\":\"acct\"}}}}\n")
 }
 
 impl Drop for HomeFixture {
@@ -411,7 +617,7 @@ fn create_fake_toolchain_dir(dir: &Path) {
 
 pub fn write_fake_toolchain(dir: &Path) {
     write_executable(&dir.join("opencode"), fake_opencode_binary_script());
-    write_executable(&dir.join("chatgpt-usage"), fake_chatgpt_usage_script());
+    write_executable(&dir.join("curl"), fake_curl_binary_script());
     for wrapper in opencode_wrappers() {
         write_executable(&dir.join(wrapper), fake_wrapper_script());
     }
@@ -421,8 +627,8 @@ pub fn fake_opencode_binary_script() -> &'static str {
     "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'opencode 0.0.0-contract\\n'; exit 0; fi\nprintf 'fake opencode\\n'\nexit 0\n"
 }
 
-pub fn fake_chatgpt_usage_script() -> &'static str {
-    "#!/bin/sh\nprintf '{\"contract_chatgpt_usage_ready\":true,\"windows\":[]}\\n'\nexit 0\n"
+pub fn fake_curl_binary_script() -> &'static str {
+    "#!/bin/sh\nprintf 'curl 0.0.0-contract\\n'\nexit 0\n"
 }
 
 pub fn opencode_wrappers() -> [&'static str; 5] {
@@ -481,47 +687,26 @@ pub fn write_executable_write_error(path: &Path, err: &std::io::Error) -> String
     format!("write {}: {err}", path.display())
 }
 
+#[cfg(unix)]
 pub fn write_executable_metadata_error(path: &Path, err: &std::io::Error) -> String {
     format!("metadata {}: {err}", path.display())
 }
 
+#[cfg(unix)]
 pub fn write_executable_chmod_error(path: &Path, err: &std::io::Error) -> String {
     format!("chmod {}: {err}", path.display())
 }
 
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(unique_temp_dir_name(prefix))
-}
-
-pub fn unique_temp_dir_name(prefix: &str) -> String {
-    formatted_temp_dir_name(prefix, current_time_nanos(), current_process_id())
-}
-
-pub fn current_time_nanos() -> u128 {
-    SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
-        .as_nanos()
-}
-
-pub fn current_process_id() -> u32 {
-    std::process::id()
-}
-
-pub fn formatted_temp_dir_name(prefix: &str, nanos: u128, process_id: u32) -> String {
-    format!("{prefix}-{process_id}-{nanos}")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
 pub fn prepend_path(dir: &Path) -> String {
-    joined_path_string(prepended_path_entries(dir))
-}
-
-pub fn prepended_path_entries(dir: &Path) -> Vec<PathBuf> {
-    vec![dir.to_path_buf()]
-}
-
-pub fn joined_path_string(paths: Vec<PathBuf>) -> String {
-    std::env::join_paths(paths)
+    std::env::join_paths([dir])
         .expect("join PATH entries")
         .to_string_lossy()
         .into_owned()

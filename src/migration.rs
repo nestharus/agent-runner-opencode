@@ -1,15 +1,25 @@
 //! Declared roles: mapper, validator, orchestration, accessor, formatter, predicate
 
+use crate::activity::ActivityTargets;
+use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
+use crate::operation_bounds;
+use crate::path_guard;
 use serde_json::{json, Value};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 const PROVIDER_DIR: &str = "agent-runner-opencode";
 const MIGRATION_DIR: &str = "migration";
 const LEGACY_PROVIDER_ARTIFACT_DIR: &str = "provider-owned-migration-artifacts";
+const MAX_MIGRATION_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MIGRATION_ARTIFACTS: usize = 256;
+const MAX_MIGRATION_COMPATIBILITY_ARTIFACTS: usize = 4096;
+const MIGRATION_ARTIFACT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn plan_params(params: Value, _request_id: &str) -> Result<Value, ProviderFailure> {
     Ok(json!({
@@ -31,20 +41,55 @@ pub fn apply_params(
     ensure_confirmation(&params, request_id)?;
     let config_root = config_root(host, request_id)?;
     let artifact_root = artifact_root(&config_root, &params, request_id)?;
-    fs::create_dir_all(&artifact_root)
+    durable_fs::create_directories(&artifact_root)
         .map_err(|err| migration_artifact_dir_failure(request_id, err))?;
     let actions = planned_actions(&params);
     let summary = artifact_summary(&params, &actions);
-    let path = artifact_root.join("opencode-provider-migration-summary.json");
+    let bytes = artifact_bytes(&summary, request_id)?;
+    if bytes.len() > MAX_MIGRATION_ARTIFACT_BYTES {
+        return Err(migration_artifact_capacity_failure(request_id));
+    }
+    let path = artifact_root.join(format!(
+        "opencode-provider-migration-summary-{}.json",
+        sha256_hex(&bytes)
+    ));
     ensure_canonical_contained(&path, &config_root, request_id)?;
-    write_artifact(&path, &summary, request_id)?;
-    let bytes = read_artifact(&path, request_id)?;
+    let _lock = acquire_migration_capacity_lock(host, &artifact_root, request_id)?;
+    maintain_migration_artifact_capacity(&artifact_root, &path, request_id)?;
+    write_artifact(&path, &bytes, request_id)?;
     Ok(migration_apply_result(
         actions,
         migration_apply_artifacts(&path, &bytes),
         migration_warnings(&params),
         &artifact_root,
     ))
+}
+
+pub(crate) fn activity_targets(params: &Value, result: Option<&Value>) -> ActivityTargets {
+    let mut targets = ActivityTargets::default();
+    if let Some(provider) = string_param(params, "target_provider") {
+        targets.attempted("provider", provider, "params.target_provider");
+    }
+    targets.attempted(
+        "migration_input_digest",
+        sha256_hex(params.to_string().as_bytes()),
+        "params.content_sha256",
+    );
+    if let Some(artifacts) = result
+        .and_then(|result| result.get("artifacts"))
+        .and_then(Value::as_array)
+    {
+        for artifact in artifacts {
+            if let Some(digest) = artifact
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                targets.generated("migration_artifact", digest, "result.artifacts[].sha256");
+            }
+        }
+    }
+    targets
 }
 
 fn migration_apply_result(
@@ -90,7 +135,8 @@ fn planned_actions(params: &Value) -> Vec<Value> {
         }),
         json!({
             "kind": "write_provider_owned_artifact",
-            "artifact": "opencode-provider-migration-summary.json",
+            "artifact": "opencode-provider-migration-summary-<sha256>.json",
+            "publication": "content_addressed_atomic",
         }),
     ]
 }
@@ -202,7 +248,7 @@ fn ensure_provider_owned_artifact_root(
     let requested = validated_normalized_absolute_path(requested, request_id)?;
     for root in allowed_roots {
         let root = validated_normalized_absolute_path(root, request_id)?;
-        if requested.starts_with(&root) {
+        if requested == root {
             ensure_canonical_contained(&requested, config_root, request_id)?;
             return Ok(());
         }
@@ -215,12 +261,9 @@ fn ensure_canonical_contained(
     config_root: &Path,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
-    let canonical_root = canonical_path(config_root, request_id)?;
-    let canonical_requested = canonical_create_path(requested, request_id)?;
-    if canonical_requested.starts_with(canonical_root) {
-        return Ok(());
-    }
-    Err(invalid_artifact_root(request_id))
+    path_guard::confined_target(config_root, requested)
+        .map(|_| ())
+        .map_err(|_| invalid_artifact_root(request_id))
 }
 
 fn validated_normalized_absolute_path(
@@ -255,65 +298,6 @@ fn ensure_no_parent_component(path: &Path, request_id: &str) -> Result<(), Provi
     Ok(())
 }
 
-fn canonical_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    fs::canonicalize(path)
-        .map_err(|err| migration_artifact_root_canonicalize_failure(request_id, err))
-}
-
-fn canonical_create_path(path: &Path, request_id: &str) -> Result<PathBuf, ProviderFailure> {
-    let existing = existing_ancestor_path(path, request_id)?;
-    let suffix = create_path_suffix(path, existing, request_id)?;
-    ensure_create_path_suffix(suffix, request_id)?;
-    let mut canonical = canonical_path(existing, request_id)?;
-    append_create_path_suffix(&mut canonical, suffix);
-    Ok(canonical)
-}
-
-fn existing_ancestor_path<'a>(
-    path: &'a Path,
-    request_id: &str,
-) -> Result<&'a Path, ProviderFailure> {
-    existing_ancestor(path).ok_or_else(|| invalid_artifact_root(request_id))
-}
-
-fn create_path_suffix<'a>(
-    path: &'a Path,
-    existing: &'a Path,
-    request_id: &str,
-) -> Result<&'a Path, ProviderFailure> {
-    path.strip_prefix(existing)
-        .map_err(|_| invalid_artifact_root(request_id))
-}
-
-fn ensure_create_path_suffix(suffix: &Path, request_id: &str) -> Result<(), ProviderFailure> {
-    for component in suffix.components() {
-        if !is_create_path_suffix_component(component) {
-            return Err(invalid_artifact_root(request_id));
-        }
-    }
-    Ok(())
-}
-
-fn is_create_path_suffix_component(component: Component<'_>) -> bool {
-    matches!(component, Component::Normal(_) | Component::CurDir)
-}
-
-fn append_create_path_suffix(canonical: &mut PathBuf, suffix: &Path) {
-    for component in suffix.components() {
-        push_create_path_component(canonical, component);
-    }
-}
-
-fn push_create_path_component(canonical: &mut PathBuf, component: Component<'_>) {
-    if let Component::Normal(part) = component {
-        canonical.push(part);
-    }
-}
-
-fn existing_ancestor(path: &Path) -> Option<&Path> {
-    path.ancestors().find(|ancestor| ancestor.exists())
-}
-
 fn has_parent_component(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::ParentDir))
@@ -339,28 +323,167 @@ fn invalid_artifact_root(request_id: &str) -> ProviderFailure {
 }
 
 fn artifact_summary(params: &Value, actions: &[Value]) -> Value {
+    let legacy = params.get("legacy").unwrap_or(&Value::Null);
     json!({
         "schema": "opencode.provider_migration/v1",
         "target_provider": string_param(params, "target_provider").unwrap_or("agent-runner-opencode"),
         "scope": string_param(params, "scope").unwrap_or("provider_owned"),
-        "legacy": legacy_summary(params.get("legacy").unwrap_or(&Value::Null)),
+        "legacy": legacy_summary(legacy),
+        "legacy_input_sha256": sha256_hex(legacy.to_string().as_bytes()),
         "actions": actions,
         "live_cutover": false,
     })
 }
 
 fn legacy_summary(legacy: &Value) -> Value {
+    let providers_toml = legacy.get("providers_toml").and_then(Value::as_str);
     json!({
-        "has_providers_toml": legacy.get("providers_toml").and_then(Value::as_str).is_some(),
+        "has_providers_toml": providers_toml.is_some(),
+        "providers_toml_sha256": providers_toml.map(|value| sha256_hex(value.as_bytes())),
+        "models": legacy_model_identities(legacy),
         "model_count": legacy.get("models").and_then(Value::as_object).map(|models| models.len()).unwrap_or(0),
     })
 }
 
-fn write_artifact(path: &Path, value: &Value, request_id: &str) -> Result<(), ProviderFailure> {
-    let bytes = artifact_bytes(value, request_id)?;
-    let mut file = create_artifact_file(path, request_id)?;
-    file.write_all(&bytes)
-        .map_err(|err| migration_artifact_write_failure(request_id, err))
+fn legacy_model_identities(legacy: &Value) -> Vec<Value> {
+    legacy
+        .get("models")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| {
+            let raw = value.as_str().unwrap_or_default();
+            let parsed = raw.parse::<toml::Value>().ok();
+            json!({
+                "file": name,
+                "sha256": sha256_hex(raw.as_bytes()),
+                "name": parsed.as_ref().and_then(|value| value.get("name")).and_then(toml::Value::as_str),
+                "provider": parsed.as_ref().and_then(|value| value.get("provider")).and_then(toml::Value::as_str),
+                "model": parsed.as_ref().and_then(|value| value.get("model")).and_then(toml::Value::as_str),
+            })
+        })
+        .collect()
+}
+
+fn write_artifact(path: &Path, bytes: &[u8], request_id: &str) -> Result<(), ProviderFailure> {
+    let parent = path.parent().ok_or_else(|| {
+        migration_artifact_create_failure(
+            request_id,
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no parent"),
+        )
+    })?;
+    match durable_fs::read_file_bounded(path, MAX_MIGRATION_ARTIFACT_BYTES) {
+        Ok(existing) if existing == bytes => return Ok(()),
+        Ok(_) => {
+            return Err(migration_artifact_write_failure(
+                request_id,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "content-addressed migration artifact contains different bytes",
+                ),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(migration_artifact_write_failure(request_id, error)),
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| migration_artifact_create_failure(request_id, error))?;
+    temporary
+        .as_file_mut()
+        .write_all(bytes)
+        .map_err(|error| migration_artifact_write_failure(request_id, error))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| migration_artifact_write_failure(request_id, error))?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {}
+        Err(error)
+            if durable_fs::read_file_bounded(path, MAX_MIGRATION_ARTIFACT_BYTES)
+                .is_ok_and(|existing| existing == bytes) => {}
+        Err(error) => return Err(migration_artifact_write_failure(request_id, error.error)),
+    }
+    durable_fs::sync_directory(parent)
+        .map_err(|error| migration_artifact_write_failure(request_id, error))
+}
+
+fn acquire_migration_capacity_lock(
+    host: &HostContext,
+    artifact_root: &Path,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    let path = artifact_root.join(".capacity.lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(path)
+        .map_err(|error| migration_artifact_create_failure(request_id, error))?;
+    let timeout =
+        operation_bounds::remaining_timeout(host.deadline_unix_ms, MIGRATION_LOCK_TIMEOUT)
+            .ok_or_else(|| migration_artifact_lock_timeout(request_id))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| migration_artifact_create_failure(request_id, error))?
+    {
+        return Err(migration_artifact_lock_timeout(request_id));
+    }
+    Ok(lock)
+}
+
+fn maintain_migration_artifact_capacity(
+    artifact_root: &Path,
+    current_path: &Path,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let mut retained = 0_usize;
+    let mut visited = 0_usize;
+    for entry in fs::read_dir(artifact_root)
+        .map_err(|error| migration_artifact_dir_failure(request_id, error))?
+    {
+        let entry = entry.map_err(|error| migration_artifact_dir_failure(request_id, error))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("opencode-provider-migration-summary-")
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+        {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .map_err(|error| migration_artifact_dir_failure(request_id, error))?
+            .is_file()
+        {
+            return Err(migration_artifact_capacity_failure(request_id));
+        }
+        visited += 1;
+        if visited > MAX_MIGRATION_COMPATIBILITY_ARTIFACTS {
+            return Err(migration_artifact_capacity_failure(request_id));
+        }
+        let expired = path != current_path
+            && entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= MIGRATION_ARTIFACT_RETENTION);
+        if expired {
+            fs::remove_file(&path)
+                .map_err(|error| migration_artifact_write_failure(request_id, error))?;
+            continue;
+        }
+        retained += 1;
+    }
+    if !current_path.exists() && retained >= MAX_MIGRATION_ARTIFACTS {
+        return Err(migration_artifact_capacity_failure(request_id));
+    }
+    durable_fs::sync_directory(artifact_root)
+        .map_err(|error| migration_artifact_write_failure(request_id, error))
 }
 
 fn string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
@@ -378,34 +501,11 @@ fn migration_artifact_dir_failure(request_id: &str, err: std::io::Error) -> Prov
     )
 }
 
-fn read_artifact(path: &Path, request_id: &str) -> Result<Vec<u8>, ProviderFailure> {
-    fs::read(path).map_err(|err| migration_artifact_read_failure(request_id, err))
-}
-
-fn migration_artifact_read_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
-    ProviderFailure::internal(
-        request_id,
-        "migration_artifact_read_failed",
-        format!("failed to read provider-owned artifact: {err}"),
-    )
-}
-
 fn migration_confirmation_required_failure(request_id: &str) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
         "migration_confirmation_required",
         "migration.apply requires confirmation.approved=true",
-    )
-}
-
-fn migration_artifact_root_canonicalize_failure(
-    request_id: &str,
-    err: std::io::Error,
-) -> ProviderFailure {
-    ProviderFailure::internal(
-        request_id,
-        "migration_artifact_root_canonicalize_failed",
-        format!("failed to canonicalize migration artifact root: {err}"),
     )
 }
 
@@ -424,10 +524,6 @@ fn migration_artifact_serialize_failure(
     )
 }
 
-fn create_artifact_file(path: &Path, request_id: &str) -> Result<fs::File, ProviderFailure> {
-    fs::File::create(path).map_err(|err| migration_artifact_create_failure(request_id, err))
-}
-
 fn migration_artifact_create_failure(request_id: &str, err: std::io::Error) -> ProviderFailure {
     ProviderFailure::internal(
         request_id,
@@ -441,5 +537,23 @@ fn migration_artifact_write_failure(request_id: &str, err: std::io::Error) -> Pr
         request_id,
         "migration_artifact_write_failed",
         format!("failed to write provider-owned migration artifact: {err}"),
+    )
+}
+
+fn migration_artifact_capacity_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        request_id,
+        "migration_artifact_capacity_exceeded",
+        format!(
+            "provider-owned migration artifacts reached the supported {MAX_MIGRATION_ARTIFACTS}-record or {MAX_MIGRATION_ARTIFACT_BYTES}-byte-per-record bound; wait for the 30-day retention window or remove obsolete provider-owned summaries"
+        ),
+    )
+}
+
+fn migration_artifact_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "migration_artifact_lock_timeout",
+        "migration artifact capacity lock could not be acquired before the operation deadline",
     )
 }

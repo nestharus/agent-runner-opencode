@@ -22,9 +22,9 @@ pub fn assert_normalized_account_settings_record(record: &Value, wrapper: &str, 
     assert_eq!(record["values"]["provider"], "opencode");
     assert_eq!(record["values"]["profile"], wrapper);
     assert_eq!(record["values"]["wrapper"], wrapper);
-    assert_eq!(record["values"]["quota"]["source"], "codex");
+    assert_eq!(record["values"]["quota"]["source"], "opencode_auth");
     assert_eq!(record["values"]["quota"]["auth_path"], auth_path);
-    assert_eq!(record["values"]["quota"]["usage_command"], "chatgpt-usage");
+    assert_eq!(record["values"]["quota"]["probe"], "native_chatgpt_usage");
     assert_eq!(record["values"]["launch"]["format"], "json");
     assert_eq!(
         record["values"]["launch"]["dangerously_skip_permissions"].as_bool(),
@@ -102,6 +102,18 @@ pub fn assert_settings_invalid_result(invalid: &Value) {
     );
 }
 
+pub fn assert_settings_invalid_model_result(invalid: &Value, code: &str) {
+    assert_settings_invalid_result(invalid);
+    assert!(
+        invalid["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == code),
+        "expected {code} diagnostic; result={invalid:?}"
+    );
+}
+
 pub fn assert_settings_migrate_result(
     result: &Value,
     config_root: &Path,
@@ -124,7 +136,7 @@ pub fn assert_settings_migrate_result(
 pub fn assert_setup_detect_installed(detect: &Value, data_root: &str, profile_root: &str) {
     assert_setup_auth_sentinel_absent(detect);
     assert_eq!(detect["installed"], true);
-    assert!(detect["warnings"].as_array().is_some());
+    assert!(detect["warnings"].as_array().expect("warnings").is_empty());
     assert!(
         detect.get("binary").is_some(),
         "detect should report binary evidence"
@@ -133,29 +145,31 @@ pub fn assert_setup_detect_installed(detect: &Value, data_root: &str, profile_ro
         detect.get("auth").is_some(),
         "detect should report auth readiness"
     );
-    assert_detect_contains_sentinels(detect);
+    assert_detect_binary_readiness(detect);
     assert_detect_contains_roots(detect, data_root, profile_root);
     assert_detect_profiles(detect);
 }
 
-pub fn assert_detect_contains_sentinels(detect: &Value) {
-    assert!(
-        json_contains_string(&detect["binary"], OPENCODE_VERSION_SENTINEL),
-        "detect binary evidence should include fake opencode --version sentinel {OPENCODE_VERSION_SENTINEL}; binary={}",
-        detect["binary"]
-    );
-    assert!(
-        json_contains_string(&detect["binary"], "chatgpt-usage")
-            || json_contains_string(&detect["auth"], "chatgpt-usage")
-            || json_contains_string(&detect["profiles"], "chatgpt-usage"),
-        "detect provider-owned evidence should mention chatgpt-usage; detect={detect}"
-    );
-    assert!(
-        json_contains_string(&detect["binary"], CHATGPT_USAGE_READY_SENTINEL)
-            || json_contains_string(&detect["auth"], CHATGPT_USAGE_READY_SENTINEL)
-            || json_contains_string(&detect["profiles"], CHATGPT_USAGE_READY_SENTINEL),
-        "detect provider-owned evidence should include chatgpt-usage readiness sentinel {CHATGPT_USAGE_READY_SENTINEL}; detect={detect}"
-    );
+pub fn assert_detect_binary_readiness(detect: &Value) {
+    for program in ["opencode", "curl"] {
+        assert_eq!(
+            detect["binary"][program]["version"]["ready"], true,
+            "setup must prove {program} readiness; detect={detect}"
+        );
+        assert_eq!(detect["binary"][program]["version"]["status"], 0);
+        assert_eq!(
+            detect["binary"][program]["implementation"]["ready"], true,
+            "setup must prove {program} manifest admission; detect={detect}"
+        );
+        assert_eq!(
+            detect["binary"][program]["implementation"]["manifest_contract"],
+            "agent-runner-opencode.native-implementation-manifest/v1"
+        );
+        assert_eq!(
+            detect["binary"][program]["implementation"]["version"],
+            "contract-test-fixture"
+        );
+    }
 }
 
 pub fn assert_detect_contains_roots(detect: &Value, data_root: &str, profile_root: &str) {
@@ -182,20 +196,50 @@ pub fn assert_detect_profiles(detect: &Value) {
     ] {
         assert!(
             json_contains_string(detect, wrapper),
-            "detect should reflect {wrapper} wrapper presence; detect={detect}"
+            "detect should reflect the {wrapper} logical account; detect={detect}"
         );
     }
     assert!(
         profiles.len() >= 5,
         "detect should report the five opencode profiles"
     );
+    assert!(profiles.iter().all(|profile| {
+        profile["logical_account_present"] == true
+            && profile["native_runtime_ready"] == true
+            && profile["opencode_auth_present"] == true
+            && profile["profile_ready"] == true
+    }));
 }
 
 pub fn assert_setup_install_result(install: &Value) {
     assert_setup_auth_sentinel_absent(install);
+    let steps = install["steps"].as_array().expect("steps");
     assert!(
-        !install["steps"].as_array().expect("steps").is_empty(),
+        !steps.is_empty(),
         "setup.install_plan should return actionable setup steps"
+    );
+    let native = steps
+        .iter()
+        .find(|step| step["kind"] == "verify_reviewed_native_implementation")
+        .expect("reviewed native implementation verification step");
+    assert_eq!(native["component"], "opencode");
+    assert_eq!(
+        native["manifest_contract"],
+        "agent-runner-opencode.native-implementation-manifest/v1"
+    );
+    assert_eq!(
+        native["semantic_contract"],
+        "agent-runner-opencode.opencode-native-state/v1"
+    );
+    assert_eq!(native["post_admission_probe"], "--version");
+    let activation = steps
+        .iter()
+        .find(|step| step["kind"] == "prepare_provider_settings")
+        .expect("provider settings activation step");
+    assert_eq!(activation["activation_operation"], "settings.migrate");
+    assert_eq!(
+        activation["activation_identity"],
+        "legacy_provider_table_key_to_exact_settings_record_id"
     );
 }
 
@@ -208,7 +252,7 @@ pub fn assert_setup_sync_result(sync: &Value) {
 pub fn assert_setup_missing_dependency_result(detect: &Value) {
     assert_eq!(
         detect["installed"], false,
-        "setup.detect must report not installed when required tools and wrappers are absent"
+        "setup.detect must report not installed when required runtime or auth evidence is absent"
     );
     assert!(
         !detect["warnings"]
@@ -218,31 +262,27 @@ pub fn assert_setup_missing_dependency_result(detect: &Value) {
         "missing setup prerequisites must produce warnings"
     );
     assert_eq!(detect["binary"]["opencode"]["present"], false);
-    assert_eq!(detect["binary"]["chatgpt-usage"]["present"], false);
-    assert!(
-        detect["profiles"]
-            .as_array()
-            .expect("profiles array")
-            .iter()
-            .any(|profile| profile["wrapper_present"] == false),
-        "missing wrappers should be reflected in profile readiness evidence; detect={detect}"
-    );
+    assert_eq!(detect["binary"]["curl"]["present"], false);
+    assert!(detect["profiles"]
+        .as_array()
+        .expect("profiles array")
+        .iter()
+        .all(|profile| profile["logical_account_present"] == true
+            && profile["native_runtime_ready"] == false));
     assert!(
         json_contains_string(&detect["binary"], "opencode"),
         "missing dependency diagnostics/evidence must name opencode; detect={detect}"
     );
     assert!(
-        json_contains_string(&detect["binary"], "chatgpt-usage")
-            || json_contains_string(&detect["profiles"], "chatgpt-usage")
-            || json_contains_string(&detect["auth"], "chatgpt-usage"),
-        "missing dependency diagnostics/evidence must name chatgpt-usage; detect={detect}"
+        json_contains_string(&detect["binary"], "curl"),
+        "missing dependency diagnostics/evidence must name curl; detect={detect}"
     );
 }
 
 pub fn assert_setup_plan_fixture_missing(detect: &Value) {
     assert_eq!(
         detect["installed"], false,
-        "fixture must start with missing opencode/chatgpt-usage/wrapper prerequisites; detect={detect}"
+        "fixture must start with missing opencode/curl/wrapper prerequisites; detect={detect}"
     );
 }
 
@@ -294,6 +334,17 @@ pub fn assert_rotation_allowed(allowed: &Value) {
     assert_rotation_requirements(allowed);
     assert!(allowed.get("score").is_some());
     assert!(allowed.get("reason").is_some());
+    assert!(
+        allowed["requirements"]
+            .as_array()
+            .expect("requirements")
+            .iter()
+            .any(
+                |requirement| requirement["kind"] == "provider_authorization"
+                    && requirement["met"] == true
+            ),
+        "allowed assessment must carry provider-issued authorization evidence: {allowed}"
+    );
 }
 
 pub fn assert_rotation_denied(denied: &Value) {
@@ -319,7 +370,7 @@ pub fn assert_rotation_materialized(materialized: &Value) {
         ROTATION_SOURCE_SESSION
     );
     let artifacts = materialized["artifacts"].as_array().expect("artifacts");
-    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts.len(), 2);
     let artifact_path = Path::new(artifacts[0]["path"].as_str().expect("artifact path"));
     let artifact_bytes = fs::read(artifact_path).expect("materialized native export artifact");
     let artifact_digest = sha256_hex(&artifact_bytes);
@@ -334,6 +385,20 @@ pub fn assert_rotation_materialized(materialized: &Value) {
         sha256_hex(&artifact_bytes),
         "artifact digest should cover the imported native export"
     );
+    let decision_path = Path::new(
+        artifacts[1]["path"]
+            .as_str()
+            .expect("decision receipt path"),
+    );
+    let decision_bytes = fs::read(decision_path).expect("rotation decision receipt");
+    assert_eq!(artifacts[1]["sha256"], sha256_hex(&decision_bytes));
+    let decision: Value =
+        serde_json::from_slice(&decision_bytes).expect("rotation decision receipt JSON");
+    assert_eq!(decision["binding"]["source_provider"], "opencode-secondary");
+    assert_eq!(decision["binding"]["target_provider"], "opencode-primary");
+    assert_eq!(decision["binding"]["source_account"], "opencode1");
+    assert_eq!(decision["binding"]["target_account"], "opencode2");
+    assert_private_rotation_artifact(decision_path);
     assert_valid(
         &materialized["host_state_plan"],
         "rotation.schema.json#/$defs/RotationHostStatePlan",
@@ -346,9 +411,23 @@ pub fn assert_rotation_materialized(materialized: &Value) {
         materialized["host_state_plan"]["chain_id"],
         "chain-contract-d"
     );
+    assert_eq!(
+        materialized["host_state_plan"]["source_provider"],
+        "opencode-secondary"
+    );
+    assert_eq!(
+        materialized["host_state_plan"]["target_provider"],
+        "opencode-primary"
+    );
+    assert_eq!(
+        materialized["host_state_plan"]["artifacts"],
+        materialized["artifacts"]
+    );
     let segments = materialized["host_state_plan"]["segments"]
         .as_array()
         .expect("rotation segments");
+    assert_eq!(segments[0]["provider"], "opencode-secondary");
+    assert_eq!(segments[1]["provider"], "opencode-primary");
     assert_eq!(segments[0]["ended_at"], "2026-07-01T00:00:00.000Z");
     assert_eq!(segments[1]["started_at"], segments[0]["ended_at"]);
 }
@@ -638,7 +717,7 @@ impl MigrationSnapshots {
             &self.data_before,
             &data_after,
             host.data_root(),
-            live.provider_artifact_root(),
+            &host.data_root().join("provider-state/opencode/activity"),
             "host.data_root",
         );
         assert_forbidden_live_routes_unchanged(&self.config_before, &config_after);

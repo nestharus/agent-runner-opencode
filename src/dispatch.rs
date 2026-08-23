@@ -8,15 +8,295 @@
 //!       - per-capability handler invocation
 //!       - request/response envelope decode-encode
 
+use crate::activity::{ActivityContext, ActivityTargets};
 use crate::discovery;
 use crate::encoding::canonical_json_bytes;
 use crate::envelope::{
     failure_response, success_response, ProviderFailure, RequestEnvelope, CONTRACT,
+    MAX_HOST_ENV_BYTES, MAX_HOST_ENV_ENTRIES, MAX_HOST_ENV_KEY_BYTES, MAX_HOST_ENV_VALUE_BYTES,
+    MAX_HOST_LABEL_BYTES, MAX_HOST_PATH_BYTES, MAX_PROVIDER_INSTANCE_ID_BYTES,
+    MAX_REQUEST_ENVELOPE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 use crate::schema::{describe_result, schema_result_params};
 use crate::{launch, migration, policy, quota, rotation, session, settings, setup, terminal};
 use serde_json::Value;
 use std::io::Write;
+
+#[derive(Clone, Copy)]
+struct Route<'a> {
+    external_name: &'a str,
+    operation: Operation,
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Describe,
+    Schema,
+    DiscoveryModels,
+    DiscoveryAccounts,
+    Launch,
+    PolicyEvaluate,
+    TerminalClassify,
+    Session(session::Command),
+    Quota(quota::Command),
+    Settings(settings::Command),
+    Setup(setup::Command),
+    RotationAssess,
+    RotationMaterialize,
+    MigrationPlan,
+    MigrationApply,
+    Unknown,
+}
+
+struct EnvelopedOutcome {
+    result: Value,
+    activity_targets: ActivityTargets,
+}
+
+impl EnvelopedOutcome {
+    fn new(result: Value) -> Self {
+        Self {
+            result,
+            activity_targets: ActivityTargets::default(),
+        }
+    }
+
+    fn with_activity(result: Value, activity_targets: ActivityTargets) -> Self {
+        Self {
+            result,
+            activity_targets,
+        }
+    }
+
+    fn from_session(outcome: session::SessionOutcome) -> Self {
+        Self {
+            result: outcome.result,
+            activity_targets: ActivityTargets::default(),
+        }
+    }
+}
+
+impl<'a> Route<'a> {
+    fn resolve(external_name: &'a str) -> Self {
+        let operation = match external_name {
+            "describe" => Operation::Describe,
+            "schema" => Operation::Schema,
+            "discovery.models" => Operation::DiscoveryModels,
+            "discovery.accounts" => Operation::DiscoveryAccounts,
+            "launch" => Operation::Launch,
+            "policy.evaluate" => Operation::PolicyEvaluate,
+            "terminal.classify" => Operation::TerminalClassify,
+            "session.locate_transcript" => Operation::Session(session::Command::LocateTranscript),
+            "session.read_turns" => Operation::Session(session::Command::ReadTurns),
+            "session.capture" => Operation::Session(session::Command::Capture),
+            "session.enumerate" => Operation::Session(session::Command::Enumerate),
+            "session.export" => Operation::Session(session::Command::Export),
+            "session.replace" => Operation::Session(session::Command::Replace),
+            "quota.source" => Operation::Quota(quota::Command::Source),
+            "quota.probe" => Operation::Quota(quota::Command::Probe),
+            "quota.refresh_auth" => Operation::Quota(quota::Command::RefreshAuth),
+            "settings.list" => Operation::Settings(settings::Command::List),
+            "settings.get" => Operation::Settings(settings::Command::Get),
+            "settings.create" => Operation::Settings(settings::Command::Create),
+            "settings.update" => Operation::Settings(settings::Command::Update),
+            "settings.delete" => Operation::Settings(settings::Command::Delete),
+            "settings.validate" => Operation::Settings(settings::Command::Validate),
+            "settings.migrate" => Operation::Settings(settings::Command::Migrate),
+            "setup.detect" => Operation::Setup(setup::Command::Detect),
+            "setup.install_plan" => Operation::Setup(setup::Command::InstallPlan),
+            "setup.sync_plan" => Operation::Setup(setup::Command::SyncPlan),
+            "setup_brain.turn" => Operation::Setup(setup::Command::BrainTurn),
+            "rotation.assess" => Operation::RotationAssess,
+            "rotation.materialize" => Operation::RotationMaterialize,
+            "migration.plan" => Operation::MigrationPlan,
+            "migration.apply" => Operation::MigrationApply,
+            _ => Operation::Unknown,
+        };
+        Self {
+            external_name,
+            operation,
+        }
+    }
+
+    fn write<W: Write>(
+        self,
+        request: RequestEnvelope,
+        writer: &mut W,
+    ) -> Result<i32, ProviderFailure> {
+        match self.operation {
+            Operation::Describe => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |request| {
+                    validate_empty_params(
+                        &request.params,
+                        &request.request_id,
+                        "invalid_describe_params",
+                    )?;
+                    Ok(EnvelopedOutcome::new(describe_result()))
+                },
+            ),
+            Operation::Schema => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |request| {
+                    schema_result_params(request.params, &request.request_id)
+                        .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::DiscoveryModels => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |_| Ok(EnvelopedOutcome::new(discovery::models())),
+            ),
+            Operation::DiscoveryAccounts => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |_| Ok(EnvelopedOutcome::new(discovery::accounts())),
+            ),
+            Operation::Launch => write_streaming_launch(self.external_name, request, writer),
+            Operation::PolicyEvaluate => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, _| policy::attempted_activity_targets(&request.params),
+                |request| {
+                    policy::evaluate_params_with_activity(
+                        &request.host,
+                        request.params,
+                        &request.request_id,
+                    )
+                    .map(|(result, targets)| EnvelopedOutcome::with_activity(result, targets))
+                },
+            ),
+            Operation::TerminalClassify => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |request| {
+                    terminal::classify_params(request.params, &request.request_id)
+                        .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::Session(command) => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                move |request, result| {
+                    session::activity_targets(
+                        command,
+                        &request.host,
+                        &request.params,
+                        result,
+                        &request.request_id,
+                    )
+                },
+                move |request| {
+                    session::handle(command, request).map(EnvelopedOutcome::from_session)
+                },
+            ),
+            Operation::Quota(command) => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| {
+                    quota::activity_targets(
+                        &request.host,
+                        &request.params,
+                        result,
+                        &request.request_id,
+                    )
+                },
+                move |request| quota::handle(command, request).map(EnvelopedOutcome::new),
+            ),
+            Operation::Settings(command) => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                move |request, result| settings::activity_targets(command, &request.params, result),
+                move |request| settings::handle(command, request).map(EnvelopedOutcome::new),
+            ),
+            Operation::Setup(command) => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                move |request| setup::handle(command, request).map(EnvelopedOutcome::new),
+            ),
+            Operation::RotationAssess => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| rotation::activity_targets(&request.params, result),
+                |request| {
+                    rotation::assess_params(
+                        &request.host,
+                        request.params,
+                        &request.request_id,
+                        request.provider_instance_id.as_deref().unwrap_or(""),
+                    )
+                    .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::RotationMaterialize => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| rotation::activity_targets(&request.params, result),
+                |request| {
+                    rotation::materialize_params(
+                        &request.host,
+                        request.params,
+                        &request.request_id,
+                        request.provider_instance_id.as_deref().unwrap_or(""),
+                    )
+                    .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::MigrationPlan => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| migration::activity_targets(&request.params, result),
+                |request| {
+                    migration::plan_params(request.params, &request.request_id)
+                        .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::MigrationApply => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                |request, result| migration::activity_targets(&request.params, result),
+                |request| {
+                    migration::apply_params(&request.host, request.params, &request.request_id)
+                        .map(EnvelopedOutcome::new)
+                },
+            ),
+            Operation::Unknown => write_enveloped_operation(
+                self.external_name,
+                request,
+                writer,
+                no_activity_targets,
+                |request| {
+                    Err(unknown_subcommand_failure(
+                        request.request_id,
+                        self.external_name,
+                    ))
+                },
+            ),
+        }
+    }
+}
 
 pub fn handle_invocation(args: &[String], stdin: &[u8]) -> (Vec<u8>, i32) {
     let mut stdout = Vec::new();
@@ -43,6 +323,9 @@ pub fn subcommand_from_args<'a>(
 }
 
 pub fn decode_request(stdin: &[u8]) -> Result<RequestEnvelope, ProviderFailure> {
+    if stdin.len() > MAX_REQUEST_ENVELOPE_BYTES {
+        return Err(request_envelope_capacity_exceeded());
+    }
     let raw = parse_raw_request(stdin).map_err(invalid_json_failure)?;
     let request_id = fallback_request_id(request_id_from_raw(&raw));
     validate_params_present(&raw, &request_id)?;
@@ -50,68 +333,78 @@ pub fn decode_request(stdin: &[u8]) -> Result<RequestEnvelope, ProviderFailure> 
     validate_request_envelope(request)
 }
 
-pub fn handle_decoded_invocation(
+fn write_enveloped_operation<W: Write, P, H>(
+    external_name: &str,
     request: RequestEnvelope,
-    subcommand: &str,
-) -> Result<Value, ProviderFailure> {
-    match subcommand {
-        "describe" => {
-            validate_empty_params(
-                &request.params,
-                &request.request_id,
-                "invalid_describe_params",
-            )?;
-            Ok(success_response(&request.request_id, describe_result()))
-        }
-        "schema" => Ok(success_response(
-            &request.request_id,
-            schema_result_params(request.params, &request.request_id)?,
-        )),
-        "discovery.models" => Ok(success_response(&request.request_id, discovery::models())),
-        "discovery.accounts" => Ok(success_response(&request.request_id, discovery::accounts())),
-        "launch" => Err(launch_requires_streaming_writer_failure(request.request_id)),
-        "policy.evaluate" => Ok(success_response(
-            &request.request_id,
-            policy::evaluate_params(request.params, &request.request_id)?,
-        )),
-        "terminal.classify" => Ok(success_response(
-            &request.request_id,
-            terminal::classify_params(request.params, &request.request_id)?,
-        )),
-        "session.locate_transcript"
-        | "session.read_turns"
-        | "session.capture"
-        | "session.enumerate"
-        | "session.export"
-        | "session.replace" => handle_capability(subcommand, request, session::handle),
-        "quota.source" | "quota.probe" | "quota.refresh_auth" => {
-            handle_capability(subcommand, request, quota::handle)
-        }
-        "settings.list" | "settings.get" | "settings.create" | "settings.update"
-        | "settings.delete" | "settings.validate" | "settings.migrate" => {
-            handle_capability(subcommand, request, settings::handle)
-        }
-        "setup.detect" | "setup.install_plan" | "setup.sync_plan" | "setup_brain.turn" => {
-            handle_capability(subcommand, request, setup::handle)
-        }
-        "rotation.assess" => Ok(success_response(
-            &request.request_id,
-            rotation::assess_params(request.params, &request.request_id)?,
-        )),
-        "rotation.materialize" => Ok(success_response(
-            &request.request_id,
-            rotation::materialize_params(&request.host, request.params, &request.request_id)?,
-        )),
-        "migration.plan" => Ok(success_response(
-            &request.request_id,
-            migration::plan_params(request.params, &request.request_id)?,
-        )),
-        "migration.apply" => Ok(success_response(
-            &request.request_id,
-            migration::apply_params(&request.host, request.params, &request.request_id)?,
-        )),
-        unknown => Err(unknown_subcommand_failure(request.request_id, unknown)),
+    writer: &mut W,
+    project_activity: P,
+    handle: H,
+) -> Result<i32, ProviderFailure>
+where
+    P: Fn(&RequestEnvelope, Option<&Value>) -> ActivityTargets,
+    H: FnOnce(RequestEnvelope) -> Result<EnvelopedOutcome, ProviderFailure>,
+{
+    let activity = ActivityContext::from_request(&request, external_name);
+    let attempted_targets = project_activity(&request, None);
+    if let Err(error) = activity.started(&attempted_targets) {
+        eprintln!("provider activity start evidence warning: {error:?}");
     }
+    let request_id = request.request_id.clone();
+    let request_snapshot = request.clone();
+    let outcome = match handle(request) {
+        Ok(outcome) => {
+            let mut completed_targets = project_activity(&request_snapshot, Some(&outcome.result));
+            completed_targets.extend(outcome.activity_targets.clone());
+            if let Err(error) = activity.succeeded(0, &completed_targets) {
+                eprintln!("provider activity completion evidence warning: {error:?}");
+            }
+            outcome
+        }
+        Err(failure) => {
+            if let Err(error) = activity.failed(&failure, &attempted_targets) {
+                eprintln!("provider activity completion evidence warning: {error:?}");
+            }
+            return Err(failure);
+        }
+    };
+    let response = success_response(&request_id, outcome.result);
+    writer
+        .write_all(&canonical_json_bytes(&response))
+        .map_err(stdout_write_failure)?;
+    writer.flush().map_err(stdout_write_failure)?;
+    Ok(0)
+}
+
+fn write_streaming_launch<W: Write>(
+    external_name: &str,
+    request: RequestEnvelope,
+    writer: &mut W,
+) -> Result<i32, ProviderFailure> {
+    let activity = ActivityContext::from_request(&request, external_name);
+    let attempted_targets = launch::attempted_activity_targets(&request.params);
+    if let Err(error) = activity.started(&attempted_targets) {
+        eprintln!("provider activity start evidence warning: {error:?}");
+    }
+    let result = launch::stream(&request.request_id, &request.host, request.params, writer);
+    match &result {
+        Ok(outcome) => {
+            let mut completed_targets = attempted_targets.clone();
+            completed_targets.extend(outcome.activity_targets.clone());
+            if let Err(error) = activity.succeeded(outcome.exit_code, &completed_targets) {
+                eprintln!("provider activity completion evidence warning: {error:?}");
+            }
+        }
+        Err(failure) => {
+            if let Err(error) = activity.failed(failure, &attempted_targets) {
+                eprintln!("provider activity completion evidence warning: {error:?}");
+            }
+        }
+    }
+    result.map(|outcome| outcome.exit_code)
+}
+
+fn no_activity_targets(_: &RequestEnvelope, _: Option<&Value>) -> ActivityTargets {
+    ActivityTargets::default()
 }
 
 fn write_invocation_result<W: Write>(
@@ -120,15 +413,8 @@ fn write_invocation_result<W: Write>(
     writer: &mut W,
 ) -> Result<i32, ProviderFailure> {
     let request = decode_request(stdin)?;
-    let subcommand = subcommand_from_args(args, &request.request_id)?;
-    if subcommand == "launch" {
-        return launch::stream(&request.request_id, &request.host, request.params, writer);
-    }
-    let response = handle_decoded_invocation(request, subcommand)?;
-    writer
-        .write_all(&canonical_json_bytes(&response))
-        .map_err(stdout_write_failure)?;
-    Ok(0)
+    let external_name = subcommand_from_args(args, &request.request_id)?;
+    Route::resolve(external_name).write(request, writer)
 }
 
 fn parse_raw_request(stdin: &[u8]) -> Result<Value, serde_json::Error> {
@@ -188,19 +474,52 @@ fn validate_request_envelope(request: RequestEnvelope) -> Result<RequestEnvelope
     if request.request_id.trim().is_empty() {
         return Err(invalid_request_id_failure());
     }
-    if request.host.app.trim().is_empty() {
+    if request.request_id.len() > MAX_REQUEST_ID_BYTES
+        || request
+            .provider_instance_id
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_PROVIDER_INSTANCE_ID_BYTES)
+    {
+        return Err(request_envelope_capacity_exceeded());
+    }
+    if request.host.app.trim().is_empty()
+        || request.host.app.len() > MAX_HOST_LABEL_BYTES
+        || request
+            .host
+            .app_version
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_HOST_LABEL_BYTES)
+        || request
+            .host
+            .platform
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_HOST_LABEL_BYTES)
+        || [
+            request.host.working_directory.as_ref(),
+            request.host.config_root.as_ref(),
+            request.host.data_root.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value.len() > MAX_HOST_PATH_BYTES)
+        || !host_env_within_bounds(request.host.env.as_ref())
+    {
         return Err(invalid_host_failure(request.request_id));
     }
     Ok(request)
 }
 
-fn handle_capability(
-    subcommand: &str,
-    request: RequestEnvelope,
-    handle: fn(&str, RequestEnvelope) -> Result<Value, ProviderFailure>,
-) -> Result<Value, ProviderFailure> {
-    let request_id = request.request_id.clone();
-    Ok(success_response(&request_id, handle(subcommand, request)?))
+fn host_env_within_bounds(env: Option<&std::collections::BTreeMap<String, String>>) -> bool {
+    let Some(env) = env else {
+        return true;
+    };
+    env.len() <= MAX_HOST_ENV_ENTRIES
+        && env.iter().all(|(key, value)| {
+            key.len() <= MAX_HOST_ENV_KEY_BYTES && value.len() <= MAX_HOST_ENV_VALUE_BYTES
+        })
+        && env.iter().fold(0_usize, |total, (key, value)| {
+            total.saturating_add(key.len()).saturating_add(value.len())
+        }) <= MAX_HOST_ENV_BYTES
 }
 
 fn unknown_subcommand_failure(request_id: String, subcommand: &str) -> ProviderFailure {
@@ -208,14 +527,6 @@ fn unknown_subcommand_failure(request_id: String, subcommand: &str) -> ProviderF
         request_id,
         "unknown_subcommand",
         format!("unknown provider subcommand: {subcommand}"),
-    )
-}
-
-fn launch_requires_streaming_writer_failure(request_id: String) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "launch_requires_streaming_writer",
-        "launch must be invoked through the streaming dispatch branch",
     )
 }
 
@@ -298,10 +609,48 @@ fn invalid_host_failure(request_id: String) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
         "invalid_host",
-        "host.app must be a non-empty string",
+        "host identity, path, or environment exceeds the supported bounded envelope",
+    )
+}
+
+fn request_envelope_capacity_exceeded() -> ProviderFailure {
+    ProviderFailure::invalid_request(
+        "unknown",
+        "request_envelope_capacity_exceeded",
+        format!("request envelope exceeds the supported {MAX_REQUEST_ENVELOPE_BYTES}-byte bound"),
     )
 }
 
 fn report_stdout_write_failure(err: std::io::Error) {
     eprintln!("failed to write stdout: {err}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_decode_rejects_input_above_the_process_bound_before_parsing() {
+        let bytes = vec![b' '; MAX_REQUEST_ENVELOPE_BYTES + 1];
+        let failure = decode_request(&bytes).expect_err("oversized envelope must fail");
+        assert_eq!(failure.code, "request_envelope_capacity_exceeded");
+    }
+
+    #[test]
+    fn request_decode_rejects_host_environment_above_the_entry_bound() {
+        let env = (0..=MAX_HOST_ENV_ENTRIES)
+            .map(|index| (format!("KEY_{index}"), json!("value")))
+            .collect::<serde_json::Map<_, _>>();
+        let bytes = serde_json::to_vec(&json!({
+            "contract": CONTRACT,
+            "request_id": "request-bounded-env",
+            "provider_instance_id": "opencode-primary",
+            "host": {"app": "agent-runner", "env": env},
+            "params": {},
+        }))
+        .expect("serialize request fixture");
+        let failure = decode_request(&bytes).expect_err("oversized host env must fail");
+        assert_eq!(failure.code, "invalid_host");
+    }
 }

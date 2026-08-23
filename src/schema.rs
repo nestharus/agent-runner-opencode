@@ -1,13 +1,13 @@
 //! Declared roles: formatter, parser, validator, accessor, mapper, predicate
 
-use crate::account::{AccountProfile, ACCOUNTS};
 use crate::envelope::{ProviderFailure, CONTRACT};
-use crate::models::{alias_names, DEFAULT_MODEL_ALIAS};
+use crate::settings_definition;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub const SETTINGS_SCHEMA_ID: &str = "opencode.settings/v1";
-const SETTINGS_SCHEMA_URI: &str = "https://schemas.oulipoly.dev/opencode.settings/v1.json";
+pub const NATIVE_IDENTITY_REBIND_SCHEMA_ID: &str = "opencode.native-identity-rebind/v1";
+pub const ROTATION_DECISION_SCHEMA_ID: &str = "opencode.rotation-decision/v1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,7 +18,7 @@ pub struct SchemaParams {
 pub fn schema_result_params(params: Value, request_id: &str) -> Result<Value, ProviderFailure> {
     let params = parse_schema_params(params, request_id)?;
     validate_schema_id(request_id, &params.schema_id)?;
-    Ok(schema_result())
+    Ok(schema_result(&params.schema_id))
 }
 
 pub fn validate_schema_id(request_id: &str, schema_id: &str) -> Result<(), ProviderFailure> {
@@ -31,7 +31,7 @@ pub fn validate_schema_id(request_id: &str, schema_id: &str) -> Result<(), Provi
 pub fn describe_result() -> Value {
     json!({
         "provider_id": "opencode",
-        "display_name": "OpenCode Codex Hybrid",
+        "display_name": "OpenCode",
         "contract_versions": [CONTRACT],
         "preferred_contract": CONTRACT,
         "capabilities": {
@@ -51,155 +51,45 @@ pub fn describe_result() -> Value {
         "settings_schema_id": SETTINGS_SCHEMA_ID,
         "concurrency": {
             "safe_for_parallel_invocation": true,
-            "state_locking": "atomic_file_writes_and_provider_cli_owned_state",
+            "state_locking": "interprocess_locked_atomic_file_transactions",
             "settings_version_tokens": true,
             "stdout_protocol_only": true,
-            "notes": "This provider is one-shot and daemonless; auth and quota attribution are owned by paired codex auth paths.",
+            "notes": "This provider is one-shot and daemonless; each account's native OpenCode auth path owns quota probing and refresh attribution.",
         },
     })
 }
 
 pub fn opencode_settings_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": SETTINGS_SCHEMA_URI,
-        "title": "OpenCode Hybrid Provider Settings",
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "id": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Stable provider settings identifier."
-            },
-            "display_name": {
-                "type": "string",
-                "minLength": 1
-            },
-            "account": {
-                "type": "string",
-                "enum": account_values(account_wrapper),
-                "default": default_account_value(account_wrapper),
-                "description": "Pinned OpenCode wrapper profile; quota and auth are attributed through the paired codex auth path."
-            },
-            "opencode_wrapper": {
-                "type": "string",
-                "enum": account_values(account_wrapper),
-                "description": "Resolved wrapper command for the selected account."
-            },
-            "opencode_index": {
-                "type": "integer",
-                "minimum": account_index_min(),
-                "maximum": account_index_max(),
-                "description": "Resolved one-based wrapper index for the selected account."
-            },
-            "codex_auth_path": {
-                "type": "string",
-                "enum": account_values(codex_auth_path),
-                "description": "Paired codex auth path used for quota attribution."
-            },
-            "codex_account_tag": {
-                "type": "string",
-                "enum": account_values(codex_account_tag),
-                "description": "Human-readable tag for the paired codex account."
-            },
-            "codex_account_hash": {
-                "type": "string",
-                "enum": account_values(codex_account_hash),
-                "description": "Stable short fingerprint for the paired codex account."
-            },
-            "model": {
-                "type": "string",
-                "enum": alias_names(),
-                "default": DEFAULT_MODEL_ALIAS,
-                "description": "Provider model alias mapped to openai/gpt-5.6-sol with the matching effort variant."
-            },
-            "working_directory": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Launch working directory."
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["interactive", "non_interactive"],
-                "default": "non_interactive"
-            },
-            "launch": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "dangerously_skip_permissions": { "type": "boolean", "default": true },
-                    "format": { "type": "string", "enum": ["json"], "default": "json" },
-                    "preserve_pure_wrapper": { "type": "boolean", "default": true }
-                }
-            },
-            "quota": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "source": { "type": "string", "enum": ["codex_auth"], "default": "codex_auth" },
-                    "auth_path": { "type": "string", "enum": account_values(codex_auth_path) }
-                }
-            },
-            "extra_env": {
-                "type": "object",
-                "additionalProperties": { "type": "string" },
-                "default": {}
-            }
-        }
-    })
-}
-
-fn account_values(field: fn(&AccountProfile) -> &'static str) -> Vec<&'static str> {
-    ACCOUNTS.iter().map(field).collect()
-}
-
-fn account_wrapper(account: &AccountProfile) -> &'static str {
-    account.opencode_wrapper
-}
-
-fn codex_auth_path(account: &AccountProfile) -> &'static str {
-    account.codex_auth_path
-}
-
-fn codex_account_tag(account: &AccountProfile) -> &'static str {
-    account.codex_account_tag
-}
-
-fn codex_account_hash(account: &AccountProfile) -> &'static str {
-    account.codex_account_hash
-}
-
-fn default_account_value(field: fn(&AccountProfile) -> &'static str) -> &'static str {
-    field(&ACCOUNTS[0])
-}
-
-fn account_index_min() -> u8 {
-    ACCOUNTS
-        .iter()
-        .map(|account| account.opencode_index)
-        .min()
-        .expect("account profile constant is non-empty")
-}
-
-fn account_index_max() -> u8 {
-    ACCOUNTS
-        .iter()
-        .map(|account| account.opencode_index)
-        .max()
-        .expect("account profile constant is non-empty")
+    settings_definition::opencode_settings_schema()
 }
 
 fn parse_schema_params(params: Value, request_id: &str) -> Result<SchemaParams, ProviderFailure> {
     serde_json::from_value(params).map_err(|err| invalid_schema_params_failure(request_id, err))
 }
 
-fn schema_result() -> Value {
-    json!({
-        "schema_id": SETTINGS_SCHEMA_ID,
-        "schema": opencode_settings_schema(),
-        "ui": settings_schema_ui(),
-    })
+fn schema_result(schema_id: &str) -> Value {
+    match schema_id {
+        SETTINGS_SCHEMA_ID => json!({
+            "schema_id": SETTINGS_SCHEMA_ID,
+            "schema": opencode_settings_schema(),
+            "ui": settings_schema_ui(),
+        }),
+        NATIVE_IDENTITY_REBIND_SCHEMA_ID => json!({
+            "schema_id": NATIVE_IDENTITY_REBIND_SCHEMA_ID,
+            "schema": serde_json::from_str::<Value>(include_str!(
+                "../protocol/v1/native-identity-rebind.schema.json"
+            ))
+            .expect("native identity rebind schema must be valid JSON"),
+        }),
+        ROTATION_DECISION_SCHEMA_ID => json!({
+            "schema_id": ROTATION_DECISION_SCHEMA_ID,
+            "schema": serde_json::from_str::<Value>(include_str!(
+                "../protocol/v1/rotation-decision.schema.json"
+            ))
+            .expect("rotation decision schema must be valid JSON"),
+        }),
+        _ => unreachable!("schema id was validated before projection"),
+    }
 }
 
 fn settings_schema_ui() -> Value {
@@ -208,19 +98,22 @@ fn settings_schema_ui() -> Value {
             {
                 "id": "launch",
                 "title": "Launch",
-                "fields": ["account", "model", "working_directory"]
+                "fields": ["wrapper", "model", "working_directory"]
             },
             {
                 "id": "metadata",
                 "title": "Metadata",
-                "fields": ["id", "display_name", "extra_env"]
+                "fields": ["profile", "quota", "extra_env"]
             }
         ]
     })
 }
 
 fn is_supported_schema_id(schema_id: &str) -> bool {
-    schema_id == SETTINGS_SCHEMA_ID
+    matches!(
+        schema_id,
+        SETTINGS_SCHEMA_ID | NATIVE_IDENTITY_REBIND_SCHEMA_ID | ROTATION_DECISION_SCHEMA_ID
+    )
 }
 
 fn unknown_schema_failure(request_id: &str, schema_id: &str) -> ProviderFailure {

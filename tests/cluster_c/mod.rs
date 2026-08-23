@@ -14,9 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod assertions;
 pub mod fixtures;
 pub mod requests;
-pub mod stream;
 
 pub use assertions::*;
 pub use fixtures::*;
 pub use requests::*;
-pub use stream::*;

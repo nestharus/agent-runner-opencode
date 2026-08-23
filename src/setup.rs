@@ -1,51 +1,304 @@
 //! Declared roles: accessor, mapper, orchestration, validator, predicate, filter, formatter, parser
 
-use crate::account::ACCOUNTS;
-use crate::encoding::bounded_text;
+use crate::account::{profile_for_wrapper_reference, ACCOUNTS};
+use crate::child_custody::ChildCustody;
+use crate::durable_fs;
+use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
+use crate::native_implementation_manifest;
+use crate::native_runtime;
+use crate::operation_bounds;
+use crate::path_guard;
+use crate::quota_observer;
+use crate::schema::NATIVE_IDENTITY_REBIND_SCHEMA_ID;
+use crate::settings::{self, SettingsTransitionReadiness};
 use crate::shell;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
-pub fn handle(subcommand: &str, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
+const SETUP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const NATIVE_IDENTITY_REBIND_PROTOCOL: &str = "opencode.native-identity-rebind/v1";
+const NATIVE_IDENTITY_REBIND_DRAIN_MS: u64 = 20_000;
+const NATIVE_IDENTITY_REBIND_STATE_DIR: &str = "provider-state/opencode/native-identity-rebind";
+const NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION: u32 = 2;
+const NATIVE_IDENTITY_REBIND_STATE_BYTES: usize = 16 * 1024;
+const NATIVE_IDENTITY_REBIND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT: usize = 64;
+const NATIVE_IDENTITY_REBIND_REPLAY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum NativeIdentityRebindRequest {
+    Plan {
+        protocol: String,
+        targets: Vec<NativeIdentityRebindTarget>,
+    },
+    Seal {
+        protocol: String,
+        cycle_id: String,
+        operation_id: String,
+        profile: String,
+        component: NativeIdentityRebindComponent,
+        prior_evidence: NativeIdentityRebindEvidence,
+        host_handoff: NativeIdentityRebindSealHandoff,
+    },
+    Observe {
+        protocol: String,
+        cycle_id: String,
+        operation_id: String,
+        profile: String,
+        component: NativeIdentityRebindComponent,
+        prior_evidence: NativeIdentityRebindEvidence,
+        disposition: NativeIdentityRebindDisposition,
+        host_handoff: NativeIdentityRebindObservationHandoff,
+    },
+    Release {
+        protocol: String,
+        cycle_id: String,
+        operation_id: String,
+        observation_id: String,
+        profile: String,
+        component: NativeIdentityRebindComponent,
+        prior_evidence: NativeIdentityRebindEvidence,
+        observed_evidence: NativeIdentityRebindEvidence,
+        disposition: NativeIdentityRebindDisposition,
+        host_handoff: NativeIdentityRebindReleaseHandoff,
+    },
+}
+
+#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+struct NativeIdentityRebindTarget {
+    profile: String,
+    component: NativeIdentityRebindComponent,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeIdentityRebindComponent {
+    NativeRuntime,
+    QuotaObserver,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeIdentityRebindEvidence {
+    component_identity_sha256: Option<String>,
+    state_record_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeIdentityRebindDisposition {
+    Committed,
+    RolledBack,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeIdentityRebindSealHandoff {
+    ordinary_admission_blocked: bool,
+    obligations_reconciled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeIdentityRebindObservationHandoff {
+    ordinary_admission_blocked: bool,
+    validation_capability_completed: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeIdentityRebindReleaseHandoff {
+    ordinary_admission_blocked: bool,
+}
+
+struct NativeIdentityRebindOperationView<'a> {
+    cycle_id: &'a str,
+    component: NativeIdentityRebindComponent,
+    prior_evidence: &'a NativeIdentityRebindEvidence,
+    observed_evidence: &'a NativeIdentityRebindEvidence,
+    phase: &'a str,
+    diagnostic: Option<&'a str>,
+    disposition: Option<NativeIdentityRebindDisposition>,
+    next_action: Option<&'a str>,
+}
+
+struct NativeIdentityRebindSealBinding<'a> {
+    cycle_id: &'a str,
+    profile: &'a str,
+    component: NativeIdentityRebindComponent,
+    prior_evidence: &'a NativeIdentityRebindEvidence,
+}
+
+struct NativeIdentityRebindObservationBinding<'a> {
+    cycle_id: &'a str,
+    profile: &'a str,
+    component: NativeIdentityRebindComponent,
+    prior_evidence: &'a NativeIdentityRebindEvidence,
+    observed_evidence: &'a NativeIdentityRebindEvidence,
+    disposition: NativeIdentityRebindDisposition,
+}
+
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeIdentityRebindCycleRecord {
+    schema_version: u32,
+    cycle_id: String,
+    operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observation_id: Option<String>,
+    profile: String,
+    component: NativeIdentityRebindComponent,
+    prior_evidence: NativeIdentityRebindEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_evidence: Option<NativeIdentityRebindEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disposition: Option<NativeIdentityRebindDisposition>,
+    phase: NativeIdentityRebindCyclePhase,
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeIdentityRebindCyclePhase {
+    AwaitingHostDrain,
+    AwaitingCutover,
+    AwaitingHostRelease,
+    Completed,
+    RolledBack,
+}
+
+impl NativeIdentityRebindCyclePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingHostDrain => "awaiting_host_drain",
+            Self::AwaitingCutover => "awaiting_cutover",
+            Self::AwaitingHostRelease => "awaiting_host_release",
+            Self::Completed => "completed",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+}
+
+impl NativeIdentityRebindDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+}
+
+impl NativeIdentityRebindComponent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeRuntime => "native_runtime",
+            Self::QuotaObserver => "quota_observer",
+        }
+    }
+
+    fn validation_capability(self) -> &'static str {
+        match self {
+            Self::NativeRuntime => "launch",
+            Self::QuotaObserver => "quota_probe",
+        }
+    }
+
+    fn provider_state_record(self, profile: &str) -> String {
+        match self {
+            Self::NativeRuntime => format!("native-runtimes/{profile}.json"),
+            Self::QuotaObserver => format!("quota-observers/{profile}.json"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Command {
+    Detect,
+    InstallPlan,
+    SyncPlan,
+    BrainTurn,
+}
+
+pub(crate) fn handle(command: Command, request: RequestEnvelope) -> Result<Value, ProviderFailure> {
     let RequestEnvelope {
         host,
         params,
         request_id,
         ..
     } = request;
-    match subcommand {
-        "setup.detect" => detect_params(&host, params, &request_id),
-        "setup.install_plan" => install_plan_params(params, &request_id),
-        "setup.sync_plan" => sync_plan_params(params, &request_id),
-        "setup_brain.turn" => Err(brain_unsupported(request_id)),
-        unknown => Err(unknown_setup_subcommand_failure(request_id, unknown)),
+    match command {
+        Command::Detect => detect_params(&host, params, &request_id),
+        Command::InstallPlan => install_plan_params(&host, params, &request_id),
+        Command::SyncPlan => sync_plan_params(&host, params, &request_id),
+        Command::BrainTurn => Err(brain_unsupported(request_id)),
     }
 }
 
 pub fn detect_params(
     host: &HostContext,
     params: Value,
-    _request_id: &str,
+    request_id: &str,
 ) -> Result<Value, ProviderFailure> {
     let data_root = string_param(&params, "data_root").or(host.data_root.as_deref());
     let profile_root = string_param(&params, "profile_root");
-    let opencode = executable_evidence("opencode");
-    let chatgpt_usage = executable_evidence("chatgpt-usage");
-    let profiles = profile_evidence(data_root, profile_root);
-    let installed = setup_installed(&opencode, &chatgpt_usage, &profiles);
-    Ok(detect_result(opencode, chatgpt_usage, profiles, installed))
+    let required_settings_ids = required_settings_ids(&params, request_id)?;
+    let opencode = executable_evidence("opencode", host.deadline_unix_ms);
+    let curl = quota_transport_evidence(host.deadline_unix_ms);
+    let profiles = profile_evidence(host, data_root, profile_root, &opencode, &curl, request_id);
+    let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
+    let installed = setup_installed(&profiles, &settings_store);
+    Ok(detect_result(
+        opencode,
+        curl,
+        profiles,
+        settings_store,
+        installed,
+    ))
 }
 
-pub fn install_plan_params(params: Value, _request_id: &str) -> Result<Value, ProviderFailure> {
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
+fn quota_transport_evidence(deadline_unix_ms: Option<u64>) -> Value {
+    executable_evidence("curl", deadline_unix_ms)
+}
+
+#[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]
+fn quota_transport_evidence(_deadline_unix_ms: Option<u64>) -> Value {
+    quota_observer::setup_transport_evidence()
+}
+
+pub fn install_plan_params(
+    host: &HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
     let target = string_param(&params, "target").unwrap_or("local");
-    Ok(install_plan_result(target))
+    let required_settings_ids = required_settings_ids(&params, request_id)?;
+    let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
+    Ok(install_plan_result(target, &settings_store))
 }
 
-pub fn sync_plan_params(params: Value, _request_id: &str) -> Result<Value, ProviderFailure> {
+pub fn sync_plan_params(
+    host: &HostContext,
+    params: Value,
+    request_id: &str,
+) -> Result<Value, ProviderFailure> {
+    let required_settings_ids = required_settings_ids(&params, request_id)?;
     let desired = desired_profiles(&params);
-    let operations = sync_operations(&desired);
-    let diagnostics = sync_diagnostics(&params);
+    let mut operations = sync_operations(&desired);
+    if let Some(rebind) = parse_native_identity_rebind(&params, request_id)? {
+        operations.extend(native_identity_rebind_operations(host, rebind, request_id)?);
+    }
+    let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
+    let diagnostics = sync_diagnostics(&params, &settings_store);
     Ok(sync_plan_result(operations, diagnostics))
 }
 
@@ -57,189 +310,348 @@ pub fn brain_unsupported(request_id: String) -> ProviderFailure {
     )
 }
 
-fn executable_evidence(program: &str) -> Value {
-    executable_evidence_json(program, executable_probe(program))
+fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
+    let path = find_on_path(program);
+    executable_evidence_at(program, path, deadline_unix_ms)
 }
 
-struct ExecutableProbe {
+fn executable_evidence_at(
+    program: &str,
     path: Option<PathBuf>,
-    version: Value,
-}
-
-fn executable_probe(program: &str) -> ExecutableProbe {
-    ExecutableProbe {
-        path: find_on_path(program),
-        version: command_output_evidence(program, &["--version"]),
-    }
-}
-
-fn executable_evidence_json(program: &str, probe: ExecutableProbe) -> Value {
+    deadline_unix_ms: Option<u64>,
+) -> Value {
+    let timeout = operation_bounds::remaining_timeout(deadline_unix_ms, SETUP_PROBE_TIMEOUT);
+    let implementation = match (&path, timeout) {
+        (Some(path), Some(_)) => native_implementation_evidence(program, path),
+        _ => None,
+    };
+    let version = match (&path, &implementation, timeout) {
+        (Some(path), Some(implementation), Some(timeout)) if implementation["ready"] == true => {
+            let resolved_program = path.to_string_lossy().into_owned();
+            let mut command = shell::command(&resolved_program);
+            command
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let output = command
+                .spawn()
+                .and_then(|child| ChildCustody::new(child).wait_with_output_timeout(timeout));
+            match output {
+                Ok(Some(output)) => json!({
+                    "present": true,
+                    "status": output.status.code().unwrap_or(1),
+                    "ready": output.status.success(),
+                }),
+                Ok(None) => json!({
+                    "present": true,
+                    "ready": false,
+                    "timed_out": true,
+                    "error": format!("{resolved_program} --version exceeded the setup probe deadline"),
+                }),
+                Err(err) => json!({
+                    "present": true,
+                    "ready": false,
+                    "error": err.to_string(),
+                }),
+            }
+        }
+        (Some(_), _, None) => json!({
+            "present": true,
+            "ready": false,
+            "timed_out": true,
+            "error": "host deadline expired before the setup probe",
+        }),
+        (Some(_), _, Some(_)) => json!({
+            "present": true,
+            "ready": false,
+            "error": "executable identity is not approved for this provider build",
+        }),
+        (None, _, _) => json!({
+            "present": false,
+            "ready": false,
+            "error": format!("{program} was not found in PATH"),
+        }),
+    };
     json!({
         "program": program,
-        "present": probe.path.is_some(),
-        "path": probe.path.map(|path| path.to_string_lossy().into_owned()),
-        "version": probe.version,
+        "present": path.is_some(),
+        "path": path.map(|path| path.to_string_lossy().into_owned()),
+        "version": version,
+        "implementation": implementation,
     })
 }
 
-fn command_output_evidence(program: &str, args: &[&str]) -> Value {
-    let argv = command_argv(program, args);
-    match shell::run(&argv) {
-        Ok(output) => command_success_evidence(output),
-        Err(err) => command_error_evidence(err),
-    }
-}
-
-fn command_success_evidence(output: shell::ShellOutput) -> Value {
-    let stdout = sanitized_command_output(&output.stdout, 500);
-    let stderr = sanitized_command_output(&output.stderr, 500);
-    command_success_json(output.status, stdout, stderr)
-}
-
-struct SanitizedOutput {
-    present: bool,
-    byte_len: usize,
-    excerpt: String,
-    redacted: bool,
-}
-
-fn sanitized_command_output(bytes: &[u8], max_len: usize) -> SanitizedOutput {
-    let text = decoded_output_text(bytes);
-    let (redacted, changed) = redact_sensitive_text(&text);
-    sanitized_output(bytes, redacted.trim(), changed, max_len)
-}
-
-fn redacted_excerpt(text: &str, max_len: usize) -> String {
-    let (redacted, _) = redact_sensitive_text(text);
-    bounded_text(redacted.trim(), max_len)
-}
-
-fn redact_sensitive_text(text: &str) -> (String, bool) {
-    let lines = redacted_lines(text);
-    (redacted_text(&lines), any_redacted_line(&lines))
-}
-
-struct RedactedLine {
-    text: String,
-    changed: bool,
-}
-
-fn redacted_lines(text: &str) -> Vec<RedactedLine> {
-    text.lines().map(redacted_line).collect()
-}
-
-fn redacted_line(line: &str) -> RedactedLine {
-    let changed = line_contains_secret(line);
-    RedactedLine {
-        text: redacted_line_text(line, changed),
-        changed,
-    }
-}
-
-fn redacted_line_text(line: &str, changed: bool) -> String {
-    if changed {
-        redacted_placeholder()
-    } else {
-        printable_line(line)
-    }
-}
-
-fn redacted_placeholder() -> String {
-    "[redacted]".to_string()
-}
-
-fn redacted_text(lines: &[RedactedLine]) -> String {
-    lines
-        .iter()
-        .map(|line| line.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn any_redacted_line(lines: &[RedactedLine]) -> bool {
-    lines.iter().any(|line| line.changed)
-}
-
-fn line_contains_secret(line: &str) -> bool {
-    let lowered = line.to_ascii_lowercase();
-    secret_keyword_present(&lowered) || token_shaped_fragment_present(line)
-}
-
-fn secret_keyword_present(lowered: &str) -> bool {
-    [
-        "api_key",
-        "authorization",
-        "bearer",
-        "credential",
-        "password",
-        "private_key",
-        "refresh",
-        "secret",
-        "token",
-    ]
-    .iter()
-    .any(|needle| lowered.contains(needle))
-}
-
-fn token_shaped_fragment_present(line: &str) -> bool {
-    line.split(|ch: char| !is_token_fragment_char(ch))
-        .any(is_token_shaped_fragment)
-}
-
-fn is_token_fragment_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+' | '/' | '=')
-}
-
-fn is_token_shaped_fragment(fragment: &str) -> bool {
-    fragment.len() >= 32
-        || fragment.starts_with("sk-")
-        || fragment.starts_with("eyJ")
-        || fragment.starts_with("ghp_")
-        || fragment.starts_with("gho_")
-        || fragment.starts_with("xox")
-}
-
-fn printable_line(line: &str) -> String {
-    line.chars()
-        .map(|ch| {
-            if ch.is_control() && ch != '\t' {
-                ' '
-            } else {
-                ch
+fn native_implementation_evidence(program: &str, path: &Path) -> Option<Value> {
+    let expected_contract = match program {
+        "opencode" => native_runtime::OPENCODE_NATIVE_CONTRACT_ID,
+        "curl" => quota_observer::QUOTA_OBSERVER_CONTRACT,
+        _ => return None,
+    };
+    let (sha256, byte_length) =
+        match durable_fs::sha256_file_bounded(path, durable_fs::MAX_BOUND_EXECUTABLE_BYTES) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Some(json!({
+                    "ready": false,
+                    "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+                    "error": error.to_string(),
+                }));
             }
+        };
+    match native_implementation_manifest::approved_implementation(program, &sha256, byte_length) {
+        Ok(Some(approved)) if approved.semantic_contract == expected_contract => Some(json!({
+            "ready": true,
+            "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+            "manifest_id": approved.id,
+            "version": approved.version,
+            "semantic_contract": approved.semantic_contract,
+            "sha256": sha256,
+            "byte_length": byte_length,
+        })),
+        Ok(Some(_)) => Some(json!({
+            "ready": false,
+            "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+            "sha256": sha256,
+            "byte_length": byte_length,
+            "error": "implementation manifest entry has the wrong semantic contract",
+        })),
+        Ok(None) => Some(json!({
+            "ready": false,
+            "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+            "sha256": sha256,
+            "byte_length": byte_length,
+            "error": "implementation identity is not in the reviewed manifest",
+        })),
+        Err(error) => Some(json!({
+            "ready": false,
+            "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+            "sha256": sha256,
+            "byte_length": byte_length,
+            "error": error,
+        })),
+    }
+}
+
+fn profile_evidence(
+    host: &HostContext,
+    data_root: Option<&str>,
+    profile_root: Option<&str>,
+    opencode: &Value,
+    quota_transport: &Value,
+    request_id: &str,
+) -> Vec<Value> {
+    let ambient_native_runtime_ready = evidence_ready(opencode);
+    let ambient_quota_observer_ready = evidence_ready(quota_transport);
+    let durable_identity_available = host
+        .data_root
+        .as_deref()
+        .is_some_and(|root| !root.trim().is_empty());
+    ACCOUNTS
+        .iter()
+        .map(|account| {
+            let (
+                native_runtime_ready,
+                native_runtime_source,
+                native_runtime_identity,
+                auth_path,
+                native_runtime_error,
+            ) = if durable_identity_available {
+                match native_runtime::resolve_existing_for_setup(host, account, request_id) {
+                    Ok(Some(runtime)) => (
+                        true,
+                        "persisted",
+                        Some(runtime.identity_sha256().to_string()),
+                        runtime.expand_path(account.opencode_auth_path),
+                        None,
+                    ),
+                    Ok(None) => (
+                        ambient_native_runtime_ready,
+                        "ambient_admission",
+                        None,
+                        expand_tilde(account.opencode_auth_path),
+                        None,
+                    ),
+                    Err(error) => (
+                        false,
+                        "persisted",
+                        None,
+                        expand_tilde(account.opencode_auth_path),
+                        Some(format!("{}: {}", error.code, error.message)),
+                    ),
+                }
+            } else {
+                (
+                    ambient_native_runtime_ready,
+                    "ambient_admission",
+                    None,
+                    expand_tilde(account.opencode_auth_path),
+                    None,
+                )
+            };
+            let (
+                quota_observer_ready,
+                quota_observer_source,
+                quota_observer_identity,
+                quota_observer_error,
+            ) = if durable_identity_available {
+                match quota_observer::resolve_existing_for_setup(host, account, request_id) {
+                    Ok(Some(identity)) => (true, "persisted", Some(identity), None),
+                    Ok(None) => (
+                        ambient_quota_observer_ready,
+                        "ambient_admission",
+                        None,
+                        None,
+                    ),
+                    Err(error) => (
+                        false,
+                        "persisted",
+                        None,
+                        Some(format!("{}: {}", error.code, error.message)),
+                    ),
+                }
+            } else {
+                (
+                    ambient_quota_observer_ready,
+                    "ambient_admission",
+                    None,
+                    None,
+                )
+            };
+            let auth_present = auth_file_present(&auth_path);
+            json!({
+                "profile": account.opencode_wrapper,
+                "logical_account": account.opencode_wrapper,
+                "logical_account_present": true,
+                "native_runtime": "opencode",
+                "native_runtime_ready": native_runtime_ready,
+                "native_runtime_identity_source": native_runtime_source,
+                "native_runtime_identity_sha256": native_runtime_identity,
+                "native_runtime_error": native_runtime_error,
+                "quota_observer_ready": quota_observer_ready,
+                "quota_observer_identity_source": quota_observer_source,
+                "quota_observer_identity_sha256": quota_observer_identity,
+                "quota_observer_error": quota_observer_error,
+                "opencode_auth_path": account.opencode_auth_path,
+                "effective_opencode_auth_path": auth_path.display().to_string(),
+                "opencode_auth_present": auth_present,
+                "profile_ready": native_runtime_ready && quota_observer_ready && auth_present,
+                "data_root": data_root,
+                "profile_root": profile_root,
+                "quota_probe": account.quota_probe_kind(),
+            })
         })
         .collect()
 }
 
-fn profile_evidence(data_root: Option<&str>, profile_root: Option<&str>) -> Vec<Value> {
-    ACCOUNTS
+fn auth_summary(profiles: &[Value]) -> String {
+    let present = profiles
         .iter()
-        .map(|account| profile_json(account, data_root, profile_root))
+        .map(|profile| {
+            let state = if profile["opencode_auth_present"] == true {
+                "present"
+            } else {
+                "missing"
+            };
+            format!(
+                "{}:{}:{}",
+                profile["profile"].as_str().unwrap_or("unknown"),
+                state,
+                profile["effective_opencode_auth_path"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("OpenCode auth metadata only; {present}; quota probe native_chatgpt_usage")
+}
+
+fn setup_warnings(
+    opencode: &Value,
+    curl: &Value,
+    profiles: &[Value],
+    settings_store: &SettingsTransitionReadiness,
+) -> Vec<Value> {
+    let mut warnings = Vec::new();
+    if !evidence_ready(opencode) {
+        warnings.push(json!(
+            "opencode executable probe did not complete successfully"
+        ));
+    }
+    if !evidence_ready(curl) {
+        warnings.push(json!(
+            "quota transport readiness probe did not complete successfully"
+        ));
+    }
+    for profile in profiles {
+        if profile.get("profile_ready").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let name = profile
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown profile");
+        let native_runtime_ready = profile
+            .get("native_runtime_ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let quota_observer_ready = profile
+            .get("quota_observer_ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let auth_present = profile
+            .get("opencode_auth_present")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        warnings.push(json!(format!(
+            "{name} is not ready: native_runtime_ready={native_runtime_ready}, quota_observer_ready={quota_observer_ready}, opencode_auth_present={auth_present}"
+        )));
+    }
+    if let Some(message) = settings_store.blocking_message() {
+        warnings.push(json!(message));
+    }
+    warnings
+}
+
+fn sync_diagnostics(params: &Value, settings_store: &SettingsTransitionReadiness) -> Vec<Value> {
+    let mut diagnostics = desired_profile_diagnostics(params);
+    if params.get("settings_schema_id").and_then(Value::as_str) != Some("opencode.settings/v1") {
+        diagnostics.push(settings_schema_mismatch_diagnostic());
+    }
+    if let Some(message) = settings_store.blocking_message() {
+        diagnostics.push(json!({
+            "severity": "error",
+            "path": "host.config_root",
+            "message": message,
+            "code": "settings_transition_blocked",
+        }));
+    }
+    diagnostics
+}
+
+fn desired_profile_diagnostics(params: &Value) -> Vec<Value> {
+    profile_reference_diagnostics(params, "desired_profiles")
+}
+
+fn profile_reference_diagnostics(params: &Value, field: &str) -> Vec<Value> {
+    params
+        .get(field)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| match value.as_str() {
+            Some(reference) if profile_for_wrapper_reference(reference).is_none() => {
+                Some(unknown_profile_diagnostic(field, reference))
+            }
+            None => Some(invalid_profile_type_diagnostic(field)),
+            _ => None,
+        })
         .collect()
 }
 
-fn auth_summary() -> String {
-    let present = auth_entries().join(", ");
-    format!("codex auth metadata only; {present}; quota command chatgpt-usage")
-}
-
-fn setup_warnings(installed: bool) -> Vec<Value> {
-    if installed {
-        return Vec::new();
-    }
-    vec![json!(
-        "one or more opencode setup prerequisites were not detected"
-    )]
-}
-
-fn sync_diagnostics(params: &Value) -> Vec<Value> {
-    if params.get("settings_schema_id").and_then(Value::as_str) == Some("opencode.settings/v1") {
-        return Vec::new();
-    }
-    vec![settings_schema_mismatch_diagnostic()]
-}
-
-fn wrapper_names() -> Vec<&'static str> {
+fn profile_names() -> Vec<&'static str> {
     ACCOUNTS
         .iter()
         .map(|account| account.opencode_wrapper)
@@ -247,91 +659,99 @@ fn wrapper_names() -> Vec<&'static str> {
 }
 
 fn string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
-    non_empty_param_string(param_string(raw_param(params, key)))
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
-fn raw_param<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
-    params.get(key)
+/// Provider setup defaults to the exact record IDs used by the installed
+/// Agent Runner OpenCode provider names. A host that has adopted opaque record
+/// IDs can instead declare one `settings_id` or the complete `settings_ids`
+/// population whose activation must be proven before setup reports ready.
+fn required_settings_ids(params: &Value, request_id: &str) -> Result<Vec<String>, ProviderFailure> {
+    let one = params.get("settings_id");
+    let many = params.get("settings_ids");
+    if one.is_some() && many.is_some() {
+        return Err(invalid_setup_settings_ids(
+            request_id,
+            "settings_id and settings_ids are mutually exclusive",
+        ));
+    }
+    let declared = if let Some(value) = one {
+        vec![non_empty_setup_settings_id(value, request_id)?.to_string()]
+    } else if let Some(values) = many {
+        let values = values.as_array().ok_or_else(|| {
+            invalid_setup_settings_ids(request_id, "settings_ids must be an array")
+        })?;
+        if values.is_empty() || values.len() > settings::MAX_SETTINGS_ACTIVATION_IDS {
+            return Err(invalid_setup_settings_ids(
+                request_id,
+                "settings_ids must contain between one and 4096 exact record IDs",
+            ));
+        }
+        values
+            .iter()
+            .map(|value| non_empty_setup_settings_id(value, request_id).map(str::to_string))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        ACCOUNTS
+            .iter()
+            .map(|account| {
+                if account.opencode_index == 1 {
+                    "opencode".to_string()
+                } else {
+                    account.opencode_wrapper.to_string()
+                }
+            })
+            .collect()
+    };
+    let unique = declared.into_iter().collect::<BTreeSet<_>>();
+    if unique.is_empty() {
+        return Err(invalid_setup_settings_ids(
+            request_id,
+            "at least one exact settings ID is required",
+        ));
+    }
+    Ok(unique.into_iter().collect())
 }
 
-fn param_string(value: Option<&Value>) -> Option<&str> {
-    value.and_then(Value::as_str)
+fn non_empty_setup_settings_id<'a>(
+    value: &'a Value,
+    request_id: &str,
+) -> Result<&'a str, ProviderFailure> {
+    value
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            invalid_setup_settings_ids(request_id, "settings IDs must be non-empty strings")
+        })
 }
 
-fn non_empty_param_string(value: Option<&str>) -> Option<&str> {
-    value.filter(|value| !value.trim().is_empty())
+fn invalid_setup_settings_ids(request_id: &str, message: &str) -> ProviderFailure {
+    ProviderFailure::invalid_request(request_id, "invalid_setup_settings_ids", message)
 }
 
 fn find_on_path(program: &str) -> Option<PathBuf> {
-    let path = path_env()?;
-    first_existing_path_candidate(path_candidates(path_entries(&path), program))
-}
-
-fn path_env() -> Option<std::ffi::OsString> {
-    std::env::var_os("PATH")
-}
-
-fn path_entries(path: &std::ffi::OsStr) -> Vec<PathBuf> {
-    std::env::split_paths(path).collect()
-}
-
-fn path_candidates(entries: Vec<PathBuf>, program: &str) -> Vec<PathBuf> {
-    entries
-        .into_iter()
-        .map(|dir| path_candidate(&dir, program))
-        .collect()
-}
-
-fn path_candidate(dir: &Path, program: &str) -> PathBuf {
-    dir.join(program)
-}
-
-fn first_existing_path_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
-    candidates
-        .into_iter()
-        .find(|candidate| path_candidate_is_file(candidate))
-}
-
-fn path_candidate_is_file(candidate: &Path) -> bool {
-    candidate.is_file()
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(program))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
-    let Some(relative) = tilde_relative(path) else {
-        return literal_path(path);
-    };
-    let Some(home) = home_dir() else {
-        return literal_path(path);
-    };
-    home_relative_path(&home, relative)
+    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(relative), Some(home)) => Path::new(&home).join(relative),
+        _ => PathBuf::from(path),
+    }
 }
 
-fn tilde_relative(path: &str) -> Option<&str> {
-    path.strip_prefix("~/")
-}
-
-fn home_dir() -> Option<std::ffi::OsString> {
-    std::env::var_os("HOME")
-}
-
-fn home_relative_path(home: &std::ffi::OsStr, relative: &str) -> PathBuf {
-    Path::new(home).join(relative)
-}
-
-fn literal_path(path: &str) -> PathBuf {
-    PathBuf::from(path)
-}
-
-fn unknown_setup_subcommand_failure(request_id: String, unknown: &str) -> ProviderFailure {
-    ProviderFailure::unsupported(
-        request_id,
-        "unknown_setup_subcommand",
-        format!("unknown setup subcommand: {unknown}"),
-    )
-}
-
-fn setup_installed(opencode: &Value, chatgpt_usage: &Value, profiles: &[Value]) -> bool {
-    evidence_present(opencode) && evidence_present(chatgpt_usage) && any_wrapper_present(profiles)
+fn setup_installed(profiles: &[Value], settings_store: &SettingsTransitionReadiness) -> bool {
+    settings_store.ready
+        && profiles
+            .iter()
+            .all(|profile| profile.get("profile_ready").and_then(Value::as_bool) == Some(true))
 }
 
 fn evidence_present(evidence: &Value) -> bool {
@@ -341,38 +761,82 @@ fn evidence_present(evidence: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn any_wrapper_present(profiles: &[Value]) -> bool {
-    profiles
-        .iter()
-        .any(|profile| profile.get("wrapper_present").and_then(Value::as_bool) == Some(true))
+fn evidence_ready(evidence: &Value) -> bool {
+    evidence_present(evidence)
+        && evidence.pointer("/version/ready").and_then(Value::as_bool) == Some(true)
+        && evidence
+            .get("implementation")
+            .filter(|implementation| !implementation.is_null())
+            .is_none_or(|implementation| implementation["ready"] == true)
 }
 
 fn detect_result(
     opencode: Value,
-    chatgpt_usage: Value,
+    curl: Value,
     profiles: Vec<Value>,
+    settings_store: SettingsTransitionReadiness,
     installed: bool,
 ) -> Value {
+    let warnings = setup_warnings(&opencode, &curl, &profiles, &settings_store);
     json!({
         "installed": installed,
         "binary": {
             "opencode": opencode,
-            "chatgpt-usage": chatgpt_usage,
+            "curl": curl,
         },
-        "auth": auth_summary(),
+        "auth": auth_summary(&profiles),
         "profiles": profiles,
-        "warnings": setup_warnings(installed),
+        "warnings": warnings,
     })
 }
 
-fn install_plan_result(target: &str) -> Value {
+fn install_plan_result(target: &str, settings_store: &SettingsTransitionReadiness) -> Value {
+    let quota_transport = quota_transport_install_step(target);
     json!({
         "steps": [
-            {"kind": "verify_tool", "target": target, "command": "opencode --version"},
-            {"kind": "verify_tool", "target": target, "command": "chatgpt-usage <codex-auth-path>"},
-            {"kind": "verify_wrappers", "target": target, "wrappers": wrapper_names()},
-            {"kind": "prepare_provider_settings", "schema_id": "opencode.settings/v1"}
+            {
+                "kind": "verify_settings_transition",
+                "target": target,
+                "blocking": !settings_store.ready,
+                "settings_store": settings_store.evidence(),
+            },
+            {
+                "kind": "verify_reviewed_native_implementation",
+                "target": target,
+                "component": "opencode",
+                "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+                "semantic_contract": native_runtime::OPENCODE_NATIVE_CONTRACT_ID,
+                "post_admission_probe": "--version"
+            },
+            quota_transport,
+            {
+                "kind": "verify_logical_profiles",
+                "target": target,
+                "profiles": profile_names(),
+                "native_runtime": "opencode",
+                "auth_requirement": "per_profile"
+            },
+            {
+                "kind": "prepare_provider_settings",
+                "schema_id": "opencode.settings/v1",
+                "activation_operation": "settings.migrate",
+                "activation_identity": "legacy_provider_table_key_to_exact_settings_record_id"
+            }
         ]
+    })
+}
+
+#[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
+fn quota_transport_install_step(target: &str) -> Value {
+    json!({"kind": "verify_tool", "target": target, "command": "curl --version"})
+}
+
+#[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]
+fn quota_transport_install_step(target: &str) -> Value {
+    json!({
+        "kind": "verify_in_process_transport",
+        "target": target,
+        "contract": quota_observer::QUOTA_OBSERVER_CONTRACT,
     })
 }
 
@@ -381,35 +845,21 @@ fn sync_plan_result(operations: Vec<Value>, diagnostics: Vec<Value>) -> Value {
 }
 
 fn desired_profiles(params: &Value) -> Vec<String> {
-    desired_profile_values(params)
-        .map(desired_profile_strings)
-        .unwrap_or_else(default_profiles)
-}
-
-fn desired_profile_values(params: &Value) -> Option<&[Value]> {
-    params
+    let Some(values) = params
         .get("desired_profiles")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
-}
-
-fn desired_profile_strings(values: &[Value]) -> Vec<String> {
-    owned_profile_strings(desired_profile_string_entries(values))
-}
-
-fn desired_profile_string_entries(values: &[Value]) -> Vec<&str> {
+    else {
+        return default_profiles();
+    };
     values
         .iter()
-        .filter_map(desired_profile_string_entry)
+        .filter_map(Value::as_str)
+        .filter_map(profile_for_wrapper_reference)
+        .map(|account| account.opencode_wrapper.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
-}
-
-fn desired_profile_string_entry(value: &Value) -> Option<&str> {
-    value.as_str()
-}
-
-fn owned_profile_strings(entries: Vec<&str>) -> Vec<String> {
-    entries.into_iter().map(str::to_string).collect()
 }
 
 fn default_profiles() -> Vec<String> {
@@ -423,144 +873,1274 @@ fn default_profiles() -> Vec<String> {
 fn sync_operations(desired: &[String]) -> Vec<Value> {
     desired
         .iter()
-        .map(|profile| sync_operation(profile.as_str()))
+        .map(|profile| {
+            json!({
+                "kind": "ensure_profile",
+                "profile": profile,
+                "schema_id": "opencode.settings/v1"
+            })
+        })
         .collect()
 }
 
-fn sync_operation(profile: &str) -> Value {
-    json!({"kind": "ensure_profile", "profile": profile, "schema_id": "opencode.settings/v1"})
+fn parse_native_identity_rebind(
+    params: &Value,
+    request_id: &str,
+) -> Result<Option<NativeIdentityRebindRequest>, ProviderFailure> {
+    params
+        .get("native_identity_rebind")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                invalid_native_identity_rebind(
+                    request_id,
+                    format!("maintenance request does not match its protocol: {error}"),
+                )
+            })
+        })
+        .transpose()
 }
 
-fn command_argv(program: &str, args: &[&str]) -> Vec<String> {
-    let mut argv = vec![program.to_string()];
-    argv.extend(args.iter().map(|arg| (*arg).to_string()));
-    argv
-}
-
-fn command_error_evidence(err: std::io::Error) -> Value {
-    json!({
-        "present": false,
-        "error": redacted_excerpt(&err.to_string(), 300),
-    })
-}
-
-fn command_success_json(status: i32, stdout: SanitizedOutput, stderr: SanitizedOutput) -> Value {
-    json!({
-        "present": true,
-        "status": status,
-        "ready": status == 0,
-        "stdout_present": stdout.present,
-        "stderr_present": stderr.present,
-        "stdout_bytes": stdout.byte_len,
-        "stderr_bytes": stderr.byte_len,
-        "stdout": stdout.excerpt,
-        "stderr": stderr.excerpt,
-        "redacted": stdout.redacted || stderr.redacted,
-    })
-}
-
-fn decoded_output_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).to_string()
-}
-
-fn sanitized_output(
-    bytes: &[u8],
-    redacted: &str,
-    changed: bool,
-    max_len: usize,
-) -> SanitizedOutput {
-    SanitizedOutput {
-        present: !bytes.is_empty(),
-        byte_len: bytes.len(),
-        excerpt: bounded_text(redacted, max_len),
-        redacted: changed,
+fn native_identity_rebind_operations(
+    host: &HostContext,
+    request: NativeIdentityRebindRequest,
+    request_id: &str,
+) -> Result<Vec<Value>, ProviderFailure> {
+    match request {
+        NativeIdentityRebindRequest::Plan { protocol, targets } => {
+            require_native_identity_rebind_protocol(&protocol, request_id)?;
+            if targets.is_empty() || targets.len() > ACCOUNTS.len() * 2 {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "plan targets must contain between one and ten component-scoped identities",
+                ));
+            }
+            if targets.iter().collect::<BTreeSet<_>>().len() != targets.len() {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "plan targets must not contain duplicate profile/component identities",
+                ));
+            }
+            targets
+                .into_iter()
+                .map(|target| {
+                    let account = canonical_rebind_profile(&target.profile, request_id)?;
+                    let cycle_id = native_identity_rebind_cycle_id(
+                        request_id,
+                        account.opencode_wrapper,
+                        target.component,
+                    );
+                    let planned = persist_native_identity_rebind_plan(
+                        host,
+                        &cycle_id,
+                        account,
+                        target.component,
+                        request_id,
+                    )?;
+                    Ok(native_identity_rebind_operation(
+                        account.opencode_wrapper,
+                        NativeIdentityRebindOperationView {
+                            cycle_id: &cycle_id,
+                            component: target.component,
+                            prior_evidence: &planned.prior_evidence,
+                            observed_evidence: &planned.prior_evidence,
+                            phase: "awaiting_host_drain",
+                            diagnostic: None,
+                            disposition: None,
+                            next_action: Some("seal"),
+                        },
+                    ))
+                })
+                .collect()
+        }
+        NativeIdentityRebindRequest::Seal {
+            protocol,
+            cycle_id,
+            operation_id,
+            profile,
+            component,
+            prior_evidence,
+            host_handoff,
+        } => {
+            require_native_identity_rebind_protocol(&protocol, request_id)?;
+            validate_native_identity_rebind_cycle_id(&cycle_id, request_id)?;
+            validate_native_identity_evidence(&prior_evidence, request_id)?;
+            let account = canonical_rebind_profile(&profile, request_id)?;
+            let expected_operation_id = native_identity_rebind_operation_id(
+                &cycle_id,
+                account.opencode_wrapper,
+                component,
+                &prior_evidence,
+            );
+            if operation_id != expected_operation_id {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "operation_id does not bind the supplied profile, component, and prior identity evidence",
+                ));
+            }
+            if !host_handoff.ordinary_admission_blocked || !host_handoff.obligations_reconciled {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "cutover sealing requires blocked ordinary admission and reconciled provider obligations",
+                ));
+            }
+            let sealed_evidence =
+                native_identity_evidence(host, account, component, request_id, false)?;
+            if sealed_evidence != prior_evidence {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "selected provider identity state changed during the host drain; request a new component-scoped plan while admission remains blocked",
+                ));
+            }
+            persist_native_identity_rebind_seal(
+                host,
+                NativeIdentityRebindSealBinding {
+                    cycle_id: &cycle_id,
+                    profile: account.opencode_wrapper,
+                    component,
+                    prior_evidence: &prior_evidence,
+                },
+                request_id,
+            )?;
+            Ok(vec![native_identity_rebind_operation(
+                account.opencode_wrapper,
+                NativeIdentityRebindOperationView {
+                    cycle_id: &cycle_id,
+                    component,
+                    prior_evidence: &prior_evidence,
+                    observed_evidence: &sealed_evidence,
+                    phase: "awaiting_cutover",
+                    diagnostic: None,
+                    disposition: None,
+                    next_action: Some("observe"),
+                },
+            )])
+        }
+        NativeIdentityRebindRequest::Observe {
+            protocol,
+            cycle_id,
+            operation_id,
+            profile,
+            component,
+            prior_evidence,
+            disposition,
+            host_handoff,
+        } => {
+            require_native_identity_rebind_protocol(&protocol, request_id)?;
+            validate_native_identity_rebind_cycle_id(&cycle_id, request_id)?;
+            validate_native_identity_evidence(&prior_evidence, request_id)?;
+            let account = canonical_rebind_profile(&profile, request_id)?;
+            let expected_operation_id = native_identity_rebind_operation_id(
+                &cycle_id,
+                account.opencode_wrapper,
+                component,
+                &prior_evidence,
+            );
+            if operation_id != expected_operation_id {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "operation_id does not bind the supplied profile, component, and prior identity evidence",
+                ));
+            }
+            let observed_evidence =
+                native_identity_evidence(host, account, component, request_id, true)?;
+            let validation_window_complete = host_handoff.ordinary_admission_blocked
+                && host_handoff.validation_capability_completed;
+            let (phase, diagnostic) = match disposition {
+                _ if validation_window_complete
+                    && native_identity_rebind_disposition_matches(
+                        disposition,
+                        &prior_evidence,
+                        &observed_evidence,
+                    ) =>
+                {
+                    let admitted_phase = persist_native_identity_rebind_observation(
+                        host,
+                        NativeIdentityRebindObservationBinding {
+                            cycle_id: &cycle_id,
+                            profile: account.opencode_wrapper,
+                            component,
+                            prior_evidence: &prior_evidence,
+                            observed_evidence: &observed_evidence,
+                            disposition,
+                        },
+                        request_id,
+                    )?;
+                    (admitted_phase.as_str(), None)
+                }
+                NativeIdentityRebindDisposition::Committed => (
+                    "rejected",
+                    Some("commit observation requires ordinary admission to remain blocked, completion of the selected component's validation capability, and a newly admitted identity record for that component"),
+                ),
+                NativeIdentityRebindDisposition::RolledBack => (
+                    "rejected",
+                    Some("rollback observation requires ordinary admission to remain blocked, completion of the selected component's validation capability, and exact restoration of that component's prior identity record"),
+                ),
+            };
+            Ok(vec![native_identity_rebind_operation(
+                account.opencode_wrapper,
+                NativeIdentityRebindOperationView {
+                    cycle_id: &cycle_id,
+                    component,
+                    prior_evidence: &prior_evidence,
+                    observed_evidence: &observed_evidence,
+                    phase,
+                    diagnostic,
+                    disposition: Some(disposition),
+                    next_action: (phase == "awaiting_host_release").then_some("release"),
+                },
+            )])
+        }
+        NativeIdentityRebindRequest::Release {
+            protocol,
+            cycle_id,
+            operation_id,
+            observation_id,
+            profile,
+            component,
+            prior_evidence,
+            observed_evidence,
+            disposition,
+            host_handoff,
+        } => {
+            require_native_identity_rebind_protocol(&protocol, request_id)?;
+            validate_native_identity_rebind_cycle_id(&cycle_id, request_id)?;
+            validate_native_identity_evidence(&prior_evidence, request_id)?;
+            validate_native_identity_evidence(&observed_evidence, request_id)?;
+            let account = canonical_rebind_profile(&profile, request_id)?;
+            let expected_operation_id = native_identity_rebind_operation_id(
+                &cycle_id,
+                account.opencode_wrapper,
+                component,
+                &prior_evidence,
+            );
+            if operation_id != expected_operation_id {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "operation_id does not bind the supplied profile, component, and prior identity evidence",
+                ));
+            }
+            let expected_observation_id = native_identity_rebind_observation_id(
+                &operation_id,
+                &observed_evidence,
+                disposition,
+            );
+            if observation_id != expected_observation_id {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "observation_id does not bind the supplied operation, disposition, and observed component identity",
+                ));
+            }
+            let _observation_lock = acquire_native_identity_rebind_lock(
+                host,
+                account.opencode_wrapper,
+                component,
+                request_id,
+            )?;
+            let admitted_cycle = read_native_identity_rebind_cycle(
+                host,
+                &cycle_id,
+                account.opencode_wrapper,
+                component,
+                request_id,
+            )?
+            .ok_or_else(|| {
+                invalid_native_identity_rebind(
+                    request_id,
+                    "release requires a provider-admitted awaiting_host_release observation",
+                )
+            })?;
+            if native_identity_rebind_cycle_expired(&admitted_cycle, now_unix_ms()) {
+                let expired_path = native_identity_rebind_cycle_path(
+                    host,
+                    &cycle_id,
+                    account.opencode_wrapper,
+                    component,
+                    request_id,
+                )?;
+                fs::remove_file(&expired_path)
+                    .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+                durable_fs::sync_directory(
+                    expired_path
+                        .parent()
+                        .expect("native identity rebind cycle always has a parent"),
+                )
+                .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "the rebind cycle replay window expired; begin a new plan request",
+                ));
+            }
+            let expected_observation = NativeIdentityRebindCycleRecord {
+                schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
+                cycle_id: cycle_id.clone(),
+                operation_id: operation_id.clone(),
+                observation_id: Some(observation_id.clone()),
+                profile: account.opencode_wrapper.to_string(),
+                component,
+                prior_evidence: prior_evidence.clone(),
+                observed_evidence: Some(observed_evidence.clone()),
+                disposition: Some(disposition),
+                phase: admitted_cycle.phase,
+                updated_at_unix_ms: admitted_cycle.updated_at_unix_ms,
+            };
+            if !native_identity_rebind_cycle_matches(&admitted_cycle, &expected_observation) {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "release does not match the provider-admitted awaiting_host_release observation",
+                ));
+            }
+            if !host_handoff.ordinary_admission_blocked {
+                return Ok(vec![native_identity_rebind_operation(
+                    account.opencode_wrapper,
+                    NativeIdentityRebindOperationView {
+                        cycle_id: &cycle_id,
+                        component,
+                        prior_evidence: &prior_evidence,
+                        observed_evidence: &observed_evidence,
+                        phase: "rejected",
+                        diagnostic: Some(
+                            "release settlement requires ordinary admission to remain blocked until the provider returns a terminal authorization",
+                        ),
+                        disposition: Some(disposition),
+                        next_action: None,
+                    },
+                )]);
+            }
+            if admitted_cycle.phase != NativeIdentityRebindCyclePhase::AwaitingHostRelease {
+                return Ok(vec![native_identity_rebind_operation(
+                    account.opencode_wrapper,
+                    NativeIdentityRebindOperationView {
+                        cycle_id: &cycle_id,
+                        component,
+                        prior_evidence: &prior_evidence,
+                        observed_evidence: &observed_evidence,
+                        phase: admitted_cycle.phase.as_str(),
+                        diagnostic: None,
+                        disposition: Some(disposition),
+                        next_action: None,
+                    },
+                )]);
+            }
+            let current_evidence =
+                native_identity_evidence(host, account, component, request_id, true)?;
+            let (phase, diagnostic) = if current_evidence != observed_evidence {
+                (
+                    "rejected",
+                    Some("selected provider identity changed after observation and before provider release settlement"),
+                )
+            } else if !native_identity_rebind_disposition_matches(
+                disposition,
+                &prior_evidence,
+                &current_evidence,
+            ) {
+                (
+                    "rejected",
+                    Some("selected provider identity no longer satisfies the admitted observation disposition"),
+                )
+            } else {
+                let terminal_phase = match disposition {
+                    NativeIdentityRebindDisposition::Committed => {
+                        NativeIdentityRebindCyclePhase::Completed
+                    }
+                    NativeIdentityRebindDisposition::RolledBack => {
+                        NativeIdentityRebindCyclePhase::RolledBack
+                    }
+                };
+                let terminal_cycle = NativeIdentityRebindCycleRecord {
+                    phase: terminal_phase,
+                    updated_at_unix_ms: now_unix_ms(),
+                    ..admitted_cycle
+                };
+                write_native_identity_rebind_cycle(host, &terminal_cycle, request_id)?;
+                (terminal_phase.as_str(), None)
+            };
+            Ok(vec![native_identity_rebind_operation(
+                account.opencode_wrapper,
+                NativeIdentityRebindOperationView {
+                    cycle_id: &cycle_id,
+                    component,
+                    prior_evidence: &prior_evidence,
+                    observed_evidence: &current_evidence,
+                    phase,
+                    diagnostic,
+                    disposition: Some(disposition),
+                    next_action: None,
+                },
+            )])
+        }
     }
 }
 
-fn profile_json(
+fn native_identity_evidence(
+    host: &HostContext,
     account: &crate::account::AccountProfile,
-    data_root: Option<&str>,
-    profile_root: Option<&str>,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+    require_valid_identity: bool,
+) -> Result<NativeIdentityRebindEvidence, ProviderFailure> {
+    let evidence = match (component, require_valid_identity) {
+        (NativeIdentityRebindComponent::NativeRuntime, true) => {
+            native_runtime::validated_persisted_identity_evidence(host, account, request_id)?
+        }
+        (NativeIdentityRebindComponent::NativeRuntime, false) => {
+            native_runtime::persisted_identity_evidence(host, account, request_id)?
+        }
+        (NativeIdentityRebindComponent::QuotaObserver, true) => {
+            quota_observer::validated_persisted_identity_evidence(host, account, request_id)?
+        }
+        (NativeIdentityRebindComponent::QuotaObserver, false) => {
+            quota_observer::persisted_identity_evidence(host, account, request_id)?
+        }
+    };
+    let (component_identity_sha256, state_record_sha256) = evidence
+        .map(|(component_identity, state_record)| (Some(component_identity), Some(state_record)))
+        .unwrap_or((None, None));
+    Ok(NativeIdentityRebindEvidence {
+        component_identity_sha256,
+        state_record_sha256,
+    })
+}
+
+fn native_identity_rebind_operation(
+    profile: &str,
+    view: NativeIdentityRebindOperationView<'_>,
 ) -> Value {
-    profile_evidence_json(account, data_root, profile_root, profile_probe(account))
+    let NativeIdentityRebindOperationView {
+        cycle_id,
+        component,
+        prior_evidence,
+        observed_evidence,
+        phase,
+        diagnostic,
+        disposition,
+        next_action,
+    } = view;
+    let operation_id =
+        native_identity_rebind_operation_id(cycle_id, profile, component, prior_evidence);
+    let validation_capability = component.validation_capability();
+    let mut operation = json!({
+        "kind": "native_identity_rebind",
+        "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
+        "schema_id": NATIVE_IDENTITY_REBIND_SCHEMA_ID,
+        "cycle_id": cycle_id,
+        "operation_id": operation_id,
+        "profile": profile,
+        "component": component.as_str(),
+        "phase": phase,
+        "maximum_drain_ms": NATIVE_IDENTITY_REBIND_DRAIN_MS,
+        "prior_evidence": prior_evidence,
+        "observed_evidence": observed_evidence,
+        "responsibilities": [
+            {
+                "actor": "host",
+                "action": format!("block ordinary capability admission that consumes the selected {} identity, bound in-flight consumers to the drain interval, and keep ordinary admission blocked through provider release settlement", component.as_str()),
+                "completion": "seal, observe, and release assert host_handoff.ordinary_admission_blocked=true"
+            },
+            {
+                "actor": "operator",
+                "action": format!("reconcile every nonterminal obligation that consumes the selected {} identity before cutover", component.as_str()),
+                "completion": "the seal request asserts host_handoff.obligations_reconciled=true"
+            },
+            {
+                "actor": "host",
+                "action": format!("while ordinary admission remains blocked, authorize exactly one operation-bound {validation_capability}, then reopen ordinary admission only after a terminal provider release authorization"),
+                "completion": "observe asserts the selected validation capability completed; completed or rolled_back returns release_authorization.ordinary_admission_may_reopen=true"
+            },
+            {
+                "actor": "operator",
+                "action": format!("stage the replacement {} dependency and preserve its prior provider identity record for rollback", component.as_str()),
+                "completion": "the observed component identity differs from the plan-bound prior identity, or the prior identity is restored"
+            },
+            {
+                "actor": "provider",
+                "action": "bind the request to the component-scoped plan identity and observe that provider-owned identity record",
+                "completion": "observation emits an observation-bound release request; release durably settles completed or rolled_back before authorizing host admission to reopen"
+            }
+        ],
+        "implementation_evidence": {
+            "provider_state_record": component.provider_state_record(profile)
+        }
+    });
+    match next_action {
+        Some("seal") => {
+            operation["next_request"] = json!({
+                "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
+                "action": "seal",
+                "cycle_id": cycle_id,
+                "operation_id": operation_id,
+                "profile": profile,
+                "component": component.as_str(),
+                "prior_evidence": prior_evidence,
+                "host_handoff": {
+                    "ordinary_admission_blocked": true,
+                    "obligations_reconciled": true
+                }
+            });
+        }
+        Some("observe") => {
+            operation["next_request"] = json!({
+                "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
+                "action": "observe",
+                "cycle_id": cycle_id,
+                "operation_id": operation_id,
+                "profile": profile,
+                "component": component.as_str(),
+                "prior_evidence": prior_evidence,
+                "disposition": "committed",
+                "host_handoff": {
+                    "ordinary_admission_blocked": true,
+                    "validation_capability_completed": true
+                }
+            });
+        }
+        Some("release") => {
+            let disposition = disposition.expect("release follows a typed observation");
+            let observation_id = native_identity_rebind_observation_id(
+                &operation_id,
+                observed_evidence,
+                disposition,
+            );
+            operation["observation_id"] = json!(observation_id);
+            operation["disposition"] = json!(disposition.as_str());
+            operation["next_request"] = json!({
+                "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
+                "action": "release",
+                "cycle_id": cycle_id,
+                "operation_id": operation_id,
+                "observation_id": observation_id,
+                "profile": profile,
+                "component": component.as_str(),
+                "prior_evidence": prior_evidence,
+                "observed_evidence": observed_evidence,
+                "disposition": disposition.as_str(),
+                "host_handoff": {
+                    "ordinary_admission_blocked": true
+                }
+            });
+        }
+        Some(_) => unreachable!("native rebind operation has a fixed next-action set"),
+        None => {}
+    }
+    if let Some(disposition) = disposition {
+        let observation_id =
+            native_identity_rebind_observation_id(&operation_id, observed_evidence, disposition);
+        operation["observation_id"] = json!(observation_id);
+        operation["disposition"] = json!(disposition.as_str());
+    }
+    if phase == "completed" || phase == "rolled_back" {
+        operation["release_authorization"] = json!({
+            "ordinary_admission_may_reopen": true
+        });
+    }
+    if let Some(diagnostic) = diagnostic {
+        operation["diagnostic"] = json!(diagnostic);
+    }
+    operation
 }
 
-struct ProfileProbe {
-    wrapper_path: Option<PathBuf>,
-    codex_auth_present: bool,
-}
-
-fn profile_probe(account: &crate::account::AccountProfile) -> ProfileProbe {
-    profile_probe_from_parts(
-        find_on_path(account.opencode_wrapper),
-        codex_auth_file_present(account.codex_auth_path),
+fn native_identity_rebind_observation_id(
+    operation_id: &str,
+    observed_evidence: &NativeIdentityRebindEvidence,
+    disposition: NativeIdentityRebindDisposition,
+) -> String {
+    sha256_hex(
+        json!({
+            "operation_id": operation_id,
+            "observed_evidence": observed_evidence,
+            "disposition": disposition.as_str(),
+        })
+        .to_string()
+        .as_bytes(),
     )
 }
 
-fn profile_probe_from_parts(
-    wrapper_path: Option<PathBuf>,
-    codex_auth_present: bool,
-) -> ProfileProbe {
-    ProfileProbe {
-        wrapper_path,
-        codex_auth_present,
+fn native_identity_rebind_disposition_matches(
+    disposition: NativeIdentityRebindDisposition,
+    prior_evidence: &NativeIdentityRebindEvidence,
+    observed_evidence: &NativeIdentityRebindEvidence,
+) -> bool {
+    match disposition {
+        NativeIdentityRebindDisposition::Committed => identity_component_rebound(
+            prior_evidence.component_identity_sha256.as_deref(),
+            observed_evidence.component_identity_sha256.as_deref(),
+        ),
+        NativeIdentityRebindDisposition::RolledBack => observed_evidence == prior_evidence,
     }
 }
 
-fn codex_auth_file_present(path: &str) -> bool {
-    path_is_file(&expanded_auth_path(path))
+fn persist_native_identity_rebind_plan(
+    host: &HostContext,
+    cycle_id: &str,
+    account: &crate::account::AccountProfile,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<NativeIdentityRebindCycleRecord, ProviderFailure> {
+    let profile = account.opencode_wrapper;
+    let _lock = acquire_native_identity_rebind_lock(host, profile, component, request_id)?;
+    prepare_native_identity_rebind_cycle_slot(host, cycle_id, profile, component, request_id)?;
+    if let Some(existing) =
+        read_native_identity_rebind_cycle(host, cycle_id, profile, component, request_id)?
+    {
+        if existing.phase == NativeIdentityRebindCyclePhase::AwaitingHostDrain {
+            return Ok(existing);
+        }
+        return Err(invalid_native_identity_rebind(
+            request_id,
+            "the rebind cycle already advanced beyond or conflicts with this plan request",
+        ));
+    }
+    let prior_evidence = native_identity_evidence(host, account, component, request_id, false)?;
+    let planned = NativeIdentityRebindCycleRecord {
+        schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
+        cycle_id: cycle_id.to_string(),
+        operation_id: native_identity_rebind_operation_id(
+            cycle_id,
+            profile,
+            component,
+            &prior_evidence,
+        ),
+        observation_id: None,
+        profile: profile.to_string(),
+        component,
+        prior_evidence,
+        observed_evidence: None,
+        disposition: None,
+        phase: NativeIdentityRebindCyclePhase::AwaitingHostDrain,
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    write_native_identity_rebind_cycle(host, &planned, request_id)?;
+    Ok(planned)
 }
 
-fn expanded_auth_path(path: &str) -> PathBuf {
-    expand_tilde(path)
+fn persist_native_identity_rebind_seal(
+    host: &HostContext,
+    binding: NativeIdentityRebindSealBinding<'_>,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let NativeIdentityRebindSealBinding {
+        cycle_id,
+        profile,
+        component,
+        prior_evidence,
+    } = binding;
+    let _lock = acquire_native_identity_rebind_lock(host, profile, component, request_id)?;
+    let sealed = NativeIdentityRebindCycleRecord {
+        schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
+        cycle_id: cycle_id.to_string(),
+        operation_id: native_identity_rebind_operation_id(
+            cycle_id,
+            profile,
+            component,
+            prior_evidence,
+        ),
+        observation_id: None,
+        profile: profile.to_string(),
+        component,
+        prior_evidence: prior_evidence.clone(),
+        observed_evidence: None,
+        disposition: None,
+        phase: NativeIdentityRebindCyclePhase::AwaitingCutover,
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    prepare_native_identity_rebind_cycle_slot(host, cycle_id, profile, component, request_id)?;
+    let existing =
+        read_native_identity_rebind_cycle(host, cycle_id, profile, component, request_id)?
+            .ok_or_else(|| {
+                invalid_native_identity_rebind(
+                    request_id,
+                    "seal requires a provider-admitted awaiting_host_drain predecessor for the exact rebind cycle",
+                )
+            })?;
+    if existing.phase == NativeIdentityRebindCyclePhase::AwaitingHostDrain
+        && native_identity_rebind_cycle_matches(&existing, &sealed)
+    {
+        return write_native_identity_rebind_cycle(host, &sealed, request_id);
+    }
+    if existing.phase == NativeIdentityRebindCyclePhase::AwaitingCutover
+        && native_identity_rebind_cycle_matches(&existing, &sealed)
+    {
+        return Ok(());
+    }
+    Err(invalid_native_identity_rebind(
+        request_id,
+        "the rebind cycle already advanced beyond or conflicts with this seal request",
+    ))
 }
 
-fn path_is_file(path: &Path) -> bool {
+fn persist_native_identity_rebind_observation(
+    host: &HostContext,
+    binding: NativeIdentityRebindObservationBinding<'_>,
+    request_id: &str,
+) -> Result<NativeIdentityRebindCyclePhase, ProviderFailure> {
+    let NativeIdentityRebindObservationBinding {
+        cycle_id,
+        profile,
+        component,
+        prior_evidence,
+        observed_evidence,
+        disposition,
+    } = binding;
+    let _lock = acquire_native_identity_rebind_lock(host, profile, component, request_id)?;
+    let operation_id =
+        native_identity_rebind_operation_id(cycle_id, profile, component, prior_evidence);
+    let observation = NativeIdentityRebindCycleRecord {
+        schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
+        cycle_id: cycle_id.to_string(),
+        observation_id: Some(native_identity_rebind_observation_id(
+            &operation_id,
+            observed_evidence,
+            disposition,
+        )),
+        operation_id,
+        profile: profile.to_string(),
+        component,
+        prior_evidence: prior_evidence.clone(),
+        observed_evidence: Some(observed_evidence.clone()),
+        disposition: Some(disposition),
+        phase: NativeIdentityRebindCyclePhase::AwaitingHostRelease,
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    prepare_native_identity_rebind_cycle_slot(host, cycle_id, profile, component, request_id)?;
+    let existing = read_native_identity_rebind_cycle(
+        host, cycle_id, profile, component, request_id,
+    )?
+    .ok_or_else(|| {
+        invalid_native_identity_rebind(
+            request_id,
+            "observe requires a provider-sealed awaiting_cutover predecessor for the exact rebind cycle",
+        )
+    })?;
+    if existing.phase == NativeIdentityRebindCyclePhase::AwaitingCutover {
+        let sealed = NativeIdentityRebindCycleRecord {
+            schema_version: NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION,
+            cycle_id: cycle_id.to_string(),
+            operation_id: observation.operation_id.clone(),
+            observation_id: None,
+            profile: profile.to_string(),
+            component,
+            prior_evidence: prior_evidence.clone(),
+            observed_evidence: None,
+            disposition: None,
+            phase: NativeIdentityRebindCyclePhase::AwaitingCutover,
+            updated_at_unix_ms: existing.updated_at_unix_ms,
+        };
+        if !native_identity_rebind_cycle_matches(&existing, &sealed) {
+            return Err(invalid_native_identity_rebind(
+                request_id,
+                "observe does not match the provider-sealed awaiting_cutover predecessor",
+            ));
+        }
+        write_native_identity_rebind_cycle(host, &observation, request_id)?;
+        return Ok(observation.phase);
+    }
+    if existing.phase == NativeIdentityRebindCyclePhase::AwaitingHostDrain {
+        return Err(invalid_native_identity_rebind(
+            request_id,
+            "observe requires a provider-sealed awaiting_cutover predecessor for the exact rebind cycle",
+        ));
+    }
+    if native_identity_rebind_cycle_matches(&existing, &observation) {
+        return Ok(existing.phase);
+    }
+    Err(invalid_native_identity_rebind(
+        request_id,
+        "the rebind cycle already owns a different admitted observation",
+    ))
+}
+
+fn write_native_identity_rebind_cycle(
+    host: &HostContext,
+    cycle: &NativeIdentityRebindCycleRecord,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let path = native_identity_rebind_cycle_path(
+        host,
+        &cycle.cycle_id,
+        &cycle.profile,
+        cycle.component,
+        request_id,
+    )?;
+    let parent = path
+        .parent()
+        .expect("native identity rebind cycle always has a parent");
+    durable_fs::create_private_directories(parent)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    let bytes = serde_json::to_vec_pretty(&cycle)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    if bytes.len() > NATIVE_IDENTITY_REBIND_STATE_BYTES {
+        return Err(native_identity_rebind_state_failure(
+            request_id,
+            format!(
+                "cycle record exceeds supported {NATIVE_IDENTITY_REBIND_STATE_BYTES}-byte bound"
+            ),
+        ));
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error.error))?;
+    durable_fs::sync_directory(parent)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))
+}
+
+fn native_identity_rebind_cycle_matches(
+    left: &NativeIdentityRebindCycleRecord,
+    right: &NativeIdentityRebindCycleRecord,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.cycle_id == right.cycle_id
+        && left.operation_id == right.operation_id
+        && left.observation_id == right.observation_id
+        && left.profile == right.profile
+        && left.component == right.component
+        && left.prior_evidence == right.prior_evidence
+        && left.observed_evidence == right.observed_evidence
+        && left.disposition == right.disposition
+}
+
+fn read_native_identity_rebind_cycle(
+    host: &HostContext,
+    cycle_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<Option<NativeIdentityRebindCycleRecord>, ProviderFailure> {
+    let path = native_identity_rebind_cycle_path(host, cycle_id, profile, component, request_id)?;
+    let bytes = match durable_fs::read_file_bounded(&path, NATIVE_IDENTITY_REBIND_STATE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(native_identity_rebind_state_failure(request_id, error)),
+    };
+    let cycle: NativeIdentityRebindCycleRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    validate_native_identity_rebind_cycle_record(&cycle, cycle_id, profile, component, request_id)?;
+    Ok(Some(cycle))
+}
+
+fn validate_native_identity_rebind_cycle_record(
+    cycle: &NativeIdentityRebindCycleRecord,
+    cycle_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let phase_binding_valid = match (
+        cycle.phase,
+        &cycle.observation_id,
+        &cycle.observed_evidence,
+        cycle.disposition,
+    ) {
+        (
+            NativeIdentityRebindCyclePhase::AwaitingHostDrain
+            | NativeIdentityRebindCyclePhase::AwaitingCutover,
+            None,
+            None,
+            None,
+        ) => true,
+        (
+            NativeIdentityRebindCyclePhase::AwaitingHostRelease,
+            Some(observation_id),
+            Some(observed_evidence),
+            Some(disposition),
+        ) => {
+            observation_id
+                == &native_identity_rebind_observation_id(
+                    &cycle.operation_id,
+                    observed_evidence,
+                    disposition,
+                )
+        }
+        (
+            NativeIdentityRebindCyclePhase::Completed,
+            Some(observation_id),
+            Some(observed_evidence),
+            Some(NativeIdentityRebindDisposition::Committed),
+        ) => {
+            observation_id
+                == &native_identity_rebind_observation_id(
+                    &cycle.operation_id,
+                    observed_evidence,
+                    NativeIdentityRebindDisposition::Committed,
+                )
+        }
+        (
+            NativeIdentityRebindCyclePhase::RolledBack,
+            Some(observation_id),
+            Some(observed_evidence),
+            Some(NativeIdentityRebindDisposition::RolledBack),
+        ) => {
+            observation_id
+                == &native_identity_rebind_observation_id(
+                    &cycle.operation_id,
+                    observed_evidence,
+                    NativeIdentityRebindDisposition::RolledBack,
+                )
+        }
+        _ => false,
+    };
+    if cycle.schema_version != NATIVE_IDENTITY_REBIND_STATE_SCHEMA_VERSION
+        || cycle.cycle_id != cycle_id
+        || cycle.profile != profile
+        || cycle.component != component
+        || cycle.updated_at_unix_ms == 0
+        || !phase_binding_valid
+        || cycle.operation_id
+            != native_identity_rebind_operation_id(
+                cycle_id,
+                profile,
+                component,
+                &cycle.prior_evidence,
+            )
+    {
+        return Err(native_identity_rebind_state_failure(
+            request_id,
+            "persisted cycle record is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_native_identity_rebind_cycle_slot(
+    host: &HostContext,
+    cycle_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let root = native_identity_rebind_component_state_root(host, profile, component, request_id)?;
+    durable_fs::create_private_directories(&root)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    let now = now_unix_ms();
+    let mut retained = 0_usize;
+    for entry in fs::read_dir(&root)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?
+    {
+        let entry =
+            entry.map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+        if !entry
+            .file_type()
+            .map_err(|error| native_identity_rebind_state_failure(request_id, error))?
+            .is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let retained_cycle_id = entry
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| valid_sha256(value))
+            .ok_or_else(|| {
+                native_identity_rebind_state_failure(
+                    request_id,
+                    "persisted cycle path has an invalid cycle identity",
+                )
+            })?
+            .to_string();
+        let path = confined_native_identity_rebind_target(host, &entry.path(), request_id)?;
+        let bytes = durable_fs::read_file_bounded(&path, NATIVE_IDENTITY_REBIND_STATE_BYTES)
+            .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+        let cycle: NativeIdentityRebindCycleRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+        validate_native_identity_rebind_cycle_record(
+            &cycle,
+            &retained_cycle_id,
+            profile,
+            component,
+            request_id,
+        )?;
+        if native_identity_rebind_cycle_expired(&cycle, now) {
+            fs::remove_file(&path)
+                .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+            durable_fs::sync_directory(&root)
+                .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+            if retained_cycle_id == cycle_id {
+                return Err(invalid_native_identity_rebind(
+                    request_id,
+                    "the rebind cycle replay window expired; begin a new plan request",
+                ));
+            }
+        } else {
+            retained = retained.saturating_add(1);
+        }
+    }
+    let target = native_identity_rebind_cycle_path(host, cycle_id, profile, component, request_id)?;
+    if retained >= MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT && !target.exists() {
+        return Err(native_identity_rebind_capacity_failure(request_id));
+    }
+    Ok(())
+}
+
+fn native_identity_rebind_cycle_expired(cycle: &NativeIdentityRebindCycleRecord, now: u64) -> bool {
+    matches!(
+        cycle.phase,
+        NativeIdentityRebindCyclePhase::AwaitingHostDrain
+            | NativeIdentityRebindCyclePhase::Completed
+            | NativeIdentityRebindCyclePhase::RolledBack
+    ) && cycle
+        .updated_at_unix_ms
+        .saturating_add(NATIVE_IDENTITY_REBIND_REPLAY_WINDOW_MS)
+        < now
+}
+
+fn acquire_native_identity_rebind_lock(
+    host: &HostContext,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<fs::File, ProviderFailure> {
+    let root = native_identity_rebind_state_root(host, request_id)?;
+    durable_fs::create_private_directories(&root)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    let lock_path = confined_native_identity_rebind_target(
+        host,
+        &root.join(format!("{profile}-{}.lock", component.as_str())),
+        request_id,
+    )?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(lock_path)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
+    let timeout = operation_bounds::remaining_timeout(
+        host.deadline_unix_ms,
+        NATIVE_IDENTITY_REBIND_LOCK_TIMEOUT,
+    )
+    .ok_or_else(|| native_identity_rebind_lock_timeout(request_id))?;
+    if !operation_bounds::lock_exclusive_for(&lock, timeout)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))?
+    {
+        return Err(native_identity_rebind_lock_timeout(request_id));
+    }
+    Ok(lock)
+}
+
+fn native_identity_rebind_cycle_path(
+    host: &HostContext,
+    cycle_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let root = native_identity_rebind_component_state_root(host, profile, component, request_id)?;
+    confined_native_identity_rebind_target(host, &root.join(format!("{cycle_id}.json")), request_id)
+}
+
+fn native_identity_rebind_component_state_root(
+    host: &HostContext,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let root = native_identity_rebind_state_root(host, request_id)?;
+    confined_native_identity_rebind_target(
+        host,
+        &root.join(format!("{profile}-{}", component.as_str())),
+        request_id,
+    )
+}
+
+fn native_identity_rebind_state_root(
+    host: &HostContext,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let data_root = native_identity_rebind_data_root(host, request_id)?;
+    confined_native_identity_rebind_target(
+        host,
+        &data_root.join(NATIVE_IDENTITY_REBIND_STATE_DIR),
+        request_id,
+    )
+}
+
+fn native_identity_rebind_data_root<'a>(
+    host: &'a HostContext,
+    request_id: &str,
+) -> Result<&'a Path, ProviderFailure> {
+    host.data_root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+        .map(Path::new)
+        .ok_or_else(|| {
+            invalid_native_identity_rebind(
+                request_id,
+                "native identity rebind requires host.data_root for durable observation custody",
+            )
+        })
+}
+
+fn confined_native_identity_rebind_target(
+    host: &HostContext,
+    target: &Path,
+    request_id: &str,
+) -> Result<PathBuf, ProviderFailure> {
+    let data_root = native_identity_rebind_data_root(host, request_id)?;
+    path_guard::confined_target(data_root, target)
+        .map_err(|error| native_identity_rebind_state_failure(request_id, error))
+}
+
+fn native_identity_rebind_state_failure(
+    request_id: &str,
+    error: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "native_identity_rebind_state_failed",
+        format!("native identity rebind observation custody failed: {error}"),
+    )
+}
+
+fn native_identity_rebind_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "native_identity_rebind_lock_timeout",
+        "native identity rebind observation lock could not be acquired before the operation deadline",
+    )
+}
+
+fn native_identity_rebind_capacity_failure(request_id: &str) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "native_identity_rebind_cycle_capacity",
+        format!(
+            "native identity rebind retains at most {MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT} active obligations and terminal replays per profile/component; terminal replays expire after the bounded replay window"
+        ),
+        json!({
+            "maximum_cycles_per_component": MAX_NATIVE_IDENTITY_REBIND_CYCLES_PER_COMPONENT,
+            "replay_window_ms": NATIVE_IDENTITY_REBIND_REPLAY_WINDOW_MS,
+        }),
+    )
+}
+
+fn native_identity_rebind_cycle_id(
+    plan_request_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+) -> String {
+    sha256_hex(
+        json!({
+            "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
+            "plan_request_id": plan_request_id,
+            "profile": profile,
+            "component": component.as_str(),
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+fn validate_native_identity_rebind_cycle_id(
+    cycle_id: &str,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if valid_sha256(cycle_id) {
+        return Ok(());
+    }
+    Err(invalid_native_identity_rebind(
+        request_id,
+        "cycle_id must be a lowercase SHA-256 value emitted by a plan response",
+    ))
+}
+
+fn native_identity_rebind_operation_id(
+    cycle_id: &str,
+    profile: &str,
+    component: NativeIdentityRebindComponent,
+    prior_evidence: &NativeIdentityRebindEvidence,
+) -> String {
+    sha256_hex(
+        json!({
+            "protocol": NATIVE_IDENTITY_REBIND_PROTOCOL,
+            "cycle_id": cycle_id,
+            "profile": profile,
+            "component": component.as_str(),
+            "prior_evidence": prior_evidence,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+fn identity_component_rebound(prior: Option<&str>, observed: Option<&str>) -> bool {
+    observed.is_some() && observed != prior
+}
+
+fn canonical_rebind_profile(
+    profile: &str,
+    request_id: &str,
+) -> Result<&'static crate::account::AccountProfile, ProviderFailure> {
+    profile_for_wrapper_reference(profile)
+        .filter(|account| account.opencode_wrapper == profile)
+        .ok_or_else(|| {
+            invalid_native_identity_rebind(
+                request_id,
+                format!("native identity rebind requires a canonical profile: {profile}"),
+            )
+        })
+}
+
+fn require_native_identity_rebind_protocol(
+    protocol: &str,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if protocol == NATIVE_IDENTITY_REBIND_PROTOCOL {
+        return Ok(());
+    }
+    Err(invalid_native_identity_rebind(
+        request_id,
+        format!("unsupported native identity rebind protocol: {protocol}"),
+    ))
+}
+
+fn validate_native_identity_evidence(
+    evidence: &NativeIdentityRebindEvidence,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let component_valid = evidence
+        .component_identity_sha256
+        .as_deref()
+        .is_none_or(valid_sha256);
+    let record_valid = evidence
+        .state_record_sha256
+        .as_deref()
+        .is_none_or(valid_sha256);
+    let presence_matches =
+        evidence.component_identity_sha256.is_some() == evidence.state_record_sha256.is_some();
+    if component_valid && record_valid && presence_matches {
+        return Ok(());
+    }
+    Err(invalid_native_identity_rebind(
+        request_id,
+        "component evidence must contain paired lowercase semantic-identity and state-record SHA-256 values, or two null values",
+    ))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn invalid_native_identity_rebind(request_id: &str, message: impl Into<String>) -> ProviderFailure {
+    ProviderFailure::invalid_request(request_id, "invalid_native_identity_rebind", message)
+}
+
+fn auth_file_present(path: &Path) -> bool {
     path.is_file()
-}
-
-fn profile_evidence_json(
-    account: &crate::account::AccountProfile,
-    data_root: Option<&str>,
-    profile_root: Option<&str>,
-    probe: ProfileProbe,
-) -> Value {
-    json!({
-        "profile": account.opencode_wrapper,
-        "wrapper": account.opencode_wrapper,
-        "wrapper_present": probe.wrapper_path.is_some(),
-        "wrapper_path": probe.wrapper_path.map(|path| path.to_string_lossy().into_owned()),
-        "codex_auth_path": account.codex_auth_path,
-        "codex_auth_present": probe.codex_auth_present,
-        "data_root": data_root,
-        "profile_root": profile_root,
-        "quota_probe": "chatgpt-usage",
-    })
-}
-
-fn auth_entries() -> Vec<String> {
-    ACCOUNTS.iter().map(auth_entry).collect()
-}
-
-fn auth_entry(account: &crate::account::AccountProfile) -> String {
-    format!(
-        "{}:{}:{}",
-        account.opencode_wrapper,
-        auth_state(account.codex_auth_path),
-        account.codex_auth_path
-    )
-}
-
-fn auth_state(path: &str) -> &'static str {
-    auth_state_label(codex_auth_file_present(path))
-}
-
-fn auth_state_label(present: bool) -> &'static str {
-    if present {
-        "present"
-    } else {
-        "missing"
-    }
 }
 
 fn settings_schema_mismatch_diagnostic() -> Value {
@@ -570,4 +2150,118 @@ fn settings_schema_mismatch_diagnostic() -> Value {
         "message": "sync plan expects opencode.settings/v1 settings",
         "code": "settings_schema_mismatch",
     })
+}
+
+fn unknown_profile_diagnostic(field: &str, reference: &str) -> Value {
+    json!({
+        "severity": "error",
+        "path": field,
+        "message": format!("unknown OpenCode account wrapper reference: {reference}"),
+        "code": "unknown_opencode_profile",
+    })
+}
+
+fn invalid_profile_type_diagnostic(field: &str) -> Value {
+    json!({
+        "severity": "error",
+        "path": field,
+        "message": "OpenCode account wrapper references must be strings",
+        "code": "invalid_opencode_profile",
+    })
+}
+
+#[cfg(all(test, unix, not(feature = "contract-test-fixtures")))]
+mod tests {
+    use super::executable_evidence_at;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn setup_does_not_execute_an_unapproved_direct_implementation() {
+        let directory = tempfile::tempdir().expect("create setup probe fixture");
+        let sentinel = directory.path().join("unapproved-executed");
+        let program = directory.path().join("opencode");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf acted > '{}'\n",
+                sentinel.to_string_lossy()
+            ),
+        )
+        .expect("write unapproved executable");
+        let mut permissions = fs::metadata(&program)
+            .expect("unapproved executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).expect("mark unapproved fixture executable");
+
+        let evidence = executable_evidence_at("opencode", Some(program), None);
+
+        assert_eq!(evidence["version"]["ready"], false);
+        assert_eq!(evidence["implementation"]["ready"], false);
+        assert!(
+            !sentinel.exists(),
+            "manifest rejection must precede the setup version spawn"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_readiness_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn persisted_identity_disagreement_blocks_ambient_setup_readiness() {
+        let directory = tempfile::tempdir().expect("setup identity fixture");
+        let data_root = directory.path().to_string_lossy().into_owned();
+        let runtime_root = directory
+            .path()
+            .join("provider-state/opencode/native-runtimes");
+        let observer_root = directory
+            .path()
+            .join("provider-state/opencode/quota-observers");
+        fs::create_dir_all(&runtime_root).expect("runtime identity root");
+        fs::create_dir_all(&observer_root).expect("observer identity root");
+        fs::write(runtime_root.join("opencode1.json"), br#"{}"#)
+            .expect("incompatible persisted runtime");
+        fs::write(observer_root.join("opencode1.json"), br#"{}"#)
+            .expect("incompatible persisted observer");
+        let host = HostContext {
+            app: "test".to_string(),
+            app_version: None,
+            platform: None,
+            working_directory: None,
+            config_root: None,
+            data_root: Some(data_root.clone()),
+            env: None,
+            deadline_unix_ms: None,
+        };
+        let ambient_ready = json!({
+            "present": true,
+            "version": { "ready": true },
+            "implementation": { "ready": true },
+        });
+
+        let profiles = profile_evidence(
+            &host,
+            Some(&data_root),
+            None,
+            &ambient_ready,
+            &ambient_ready,
+            "setup-identity-test",
+        );
+        let profile = profiles
+            .iter()
+            .find(|profile| profile["profile"] == "opencode1")
+            .expect("opencode1 profile evidence");
+
+        assert_eq!(profile["native_runtime_identity_source"], "persisted");
+        assert_eq!(profile["native_runtime_ready"], false);
+        assert!(profile["native_runtime_error"].is_string());
+        assert_eq!(profile["quota_observer_identity_source"], "persisted");
+        assert_eq!(profile["quota_observer_ready"], false);
+        assert!(profile["quota_observer_error"].is_string());
+        assert_eq!(profile["profile_ready"], false);
+    }
 }

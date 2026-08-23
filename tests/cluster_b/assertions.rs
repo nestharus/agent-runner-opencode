@@ -1,164 +1,84 @@
-// declared_role: validator, accessor, predicate, orchestration
+// declared_role: validator, orchestration
 #![allow(unused_imports)]
 
 use super::*;
 
 pub fn assert_native_export_fixture(export: &Value) {
-    let info = native_export_info(export);
-    let session_id = native_export_info_id(info);
-    assert_native_export_session_id(session_id);
-    assert_native_export_title(native_export_info_title(info));
-    let messages = native_export_messages(export);
-    assert_native_export_messages_present(messages);
-    assert_native_messages(messages, session_id);
-    assert_native_export_not_contract_envelope(export);
-}
-
-pub fn native_export_info(export: &Value) -> &serde_json::Map<String, Value> {
-    export["info"].as_object().expect("export.info object")
-}
-
-pub fn native_export_info_id(info: &serde_json::Map<String, Value>) -> &str {
-    info["id"].as_str().expect("info.id string")
-}
-
-pub fn assert_native_export_session_id(session_id: &str) {
+    let info = export["info"].as_object().expect("export.info object");
+    let session_id = info["id"].as_str().expect("info.id string");
     assert!(
         session_id.starts_with("ses_"),
         "unexpected session id {session_id}"
     );
-}
-
-pub fn native_export_info_title(info: &serde_json::Map<String, Value>) -> Option<&str> {
-    info["title"].as_str()
-}
-
-pub fn assert_native_export_title(title: Option<&str>) {
     assert!(
-        title.is_some_and(non_empty_string),
+        info["title"]
+            .as_str()
+            .is_some_and(|title| !title.is_empty()),
         "info.title should be a non-empty native opencode title"
     );
-}
 
-pub fn non_empty_string(value: &str) -> bool {
-    !value.is_empty()
-}
-
-pub fn native_export_messages(export: &Value) -> &[Value] {
-    export["messages"].as_array().expect("messages array")
-}
-
-pub fn assert_native_export_messages_present(messages: &[Value]) {
+    let messages = export["messages"].as_array().expect("messages array");
     assert!(
         !messages.is_empty(),
         "native export should include messages"
     );
-}
-
-pub fn assert_native_export_not_contract_envelope(export: &Value) {
-    assert!(
-        export.get("contract").is_none(),
-        "native opencode export is source material, not a provider contract envelope"
-    );
-}
-
-pub fn assert_native_messages(messages: &[Value], session_id: &str) {
     let mut part_types = BTreeSet::new();
     for message in messages {
-        assert_native_message(message, session_id, &mut part_types);
+        let role = message["info"]["role"]
+            .as_str()
+            .expect("message.info.role string");
+        assert!(
+            matches!(role, "user" | "assistant"),
+            "unexpected native message role {role}"
+        );
+        assert_eq!(
+            message["info"]["sessionID"].as_str(),
+            Some(session_id),
+            "message sessionID should match export info.id"
+        );
+        let parts = message["parts"].as_array().expect("message.parts array");
+        assert!(!parts.is_empty(), "native message should include parts");
+        for part in parts {
+            part_types.insert(part["type"].as_str().expect("native part type").to_string());
+            assert_eq!(
+                part["sessionID"].as_str(),
+                Some(session_id),
+                "part sessionID should match export info.id"
+            );
+        }
     }
-    assert_expected_part_types(&part_types);
-}
-
-pub fn assert_native_message(message: &Value, session_id: &str, part_types: &mut BTreeSet<String>) {
-    assert_native_message_role(native_message_role(message));
-    assert_native_message_session_id(native_message_session_id(message), session_id);
-    let parts = native_message_parts(message);
-    assert_native_message_parts_present(parts);
-    assert_native_message_parts(parts, session_id, part_types);
-}
-
-pub fn native_message_role(message: &Value) -> &str {
-    message["info"]["role"]
-        .as_str()
-        .expect("message.info.role string")
-}
-
-pub fn assert_native_message_role(role: &str) {
-    assert!(
-        matches!(role, "user" | "assistant"),
-        "unexpected native message role {role}"
-    );
-}
-
-pub fn native_message_session_id(message: &Value) -> Option<&str> {
-    message["info"]["sessionID"].as_str()
-}
-
-pub fn assert_native_message_session_id(actual: Option<&str>, session_id: &str) {
-    assert_eq!(
-        actual,
-        Some(session_id),
-        "message sessionID should match export info.id"
-    );
-}
-
-pub fn native_message_parts(message: &Value) -> &[Value] {
-    message["parts"].as_array().expect("message.parts array")
-}
-
-pub fn assert_native_message_parts_present(parts: &[Value]) {
-    assert!(!parts.is_empty(), "native message should include parts");
-}
-
-pub fn assert_native_message_parts(
-    parts: &[Value],
-    session_id: &str,
-    part_types: &mut BTreeSet<String>,
-) {
-    for part in parts {
-        assert_native_part(part, session_id, part_types);
-    }
-}
-
-pub fn assert_native_part(part: &Value, session_id: &str, part_types: &mut BTreeSet<String>) {
-    record_part_type(part_types, native_part_type(part));
-    assert_native_part_session(part, session_id);
-}
-
-pub fn assert_native_part_session(part: &Value, session_id: &str) {
-    assert_eq!(
-        part["sessionID"].as_str(),
-        Some(session_id),
-        "part sessionID should match export info.id"
-    );
-}
-
-pub fn assert_expected_part_types(part_types: &BTreeSet<String>) {
     for expected in ["step-start", "text", "step-finish"] {
         assert!(
             part_types.contains(expected),
             "native export should include a {expected} part; saw {part_types:?}"
         );
     }
+    assert!(
+        export.get("contract").is_none(),
+        "native opencode export is source material, not a provider contract envelope"
+    );
 }
 
-pub fn assert_read_turns_result(result: &Value) {
+pub fn assert_first_read_turns_result(result: &Value) -> Vec<String> {
+    let expected_count = fixture_message_count();
     assert_eq!(
         result["turn_count"].as_u64(),
-        Some(fixture_message_count() as u64),
+        Some(expected_count as u64),
         "turn_count should match the native opencode export message count"
     );
     assert!(result["complete"].is_boolean(), "complete should be a bool");
+    let turns = turns(result);
     assert_eq!(
-        result["turns"].as_array().expect("turns array").len(),
-        fixture_message_count(),
+        turns.len(),
+        expected_count,
         "turns length should match turn_count and native message count"
     );
-    for turn in turns(result) {
+    for turn in turns {
         assert_eq!(turn["session_id"].as_str(), Some(fixture_session_id()));
-        assert!(turn["turn_id"].as_str().is_some_and(non_empty_string));
-        assert!(turn["role"].as_str().is_some_and(non_empty_string));
+        assert!(turn["turn_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(turn["role"].as_str().is_some_and(|value| !value.is_empty()));
         let timestamp = turn["timestamp"]
             .as_str()
             .expect("turn timestamp should be a string");
@@ -166,17 +86,9 @@ pub fn assert_read_turns_result(result: &Value) {
             .unwrap_or_else(|err| panic!("turn timestamp must be RFC3339: {err}"));
         assert!(turn["body"].is_array(), "turn body should be an array");
     }
-}
-
-pub fn assert_first_read_turns_result(result: &Value) -> Vec<String> {
-    assert_read_turns_result(result);
-    let first_ids = turn_ids(result);
-    assert_turn_id_count_matches_fixture(&first_ids);
-    first_ids
-}
-
-pub fn assert_turn_id_count_matches_fixture(first_ids: &[String]) {
-    assert_eq!(first_ids.len(), fixture_message_count());
+    let ids = turn_ids(result);
+    assert_eq!(ids.len(), expected_count);
+    ids
 }
 
 pub fn assert_missing_read_turns_error(path: &str) {
@@ -184,52 +96,26 @@ pub fn assert_missing_read_turns_error(path: &str) {
 }
 
 pub fn assert_not_located_result(result: &Value) {
-    assert_not_located_result_state(result);
-    assert_not_located_result_metadata(result);
-}
-
-pub fn assert_not_located_result_state(result: &Value) {
-    assert_not_located_value(located_value(result));
-    assert_locate_path_absent(result_path(result));
-}
-
-pub fn located_value(result: &Value) -> &Value {
-    &result["located"]
-}
-
-pub fn assert_not_located_value(located: &Value) {
-    assert_eq!(*located, false);
-}
-
-pub fn result_path(result: &Value) -> Option<&Value> {
-    result.get("path")
-}
-
-pub fn assert_locate_path_absent(path: Option<&Value>) {
+    assert_eq!(result["located"], false);
     assert!(
-        path.is_none(),
+        result.get("path").is_none(),
         "opencode has no transcript file, so locate_transcript must omit path"
     );
-}
-
-pub fn assert_not_located_result_metadata(result: &Value) {
-    assert_non_empty_result_string(
-        result,
-        "format_id",
-        "not-located response should still identify the transcript/export format",
-    );
-    assert_non_empty_result_string(
-        result,
-        "source_id",
-        "not-located response should still identify the opencode source",
-    );
-}
-
-pub fn assert_non_empty_result_string(result: &Value, key: &str, message: &str) {
-    assert!(
-        result[key].as_str().is_some_and(|value| !value.is_empty()),
-        "{message}"
-    );
+    for (key, message) in [
+        (
+            "format_id",
+            "not-located response should still identify the transcript/export format",
+        ),
+        (
+            "source_id",
+            "not-located response should still identify the opencode source",
+        ),
+    ] {
+        assert!(
+            result[key].as_str().is_some_and(|value| !value.is_empty()),
+            "{message}"
+        );
+    }
 }
 
 pub fn assert_stable_turn_ids(second: &Value, first_ids: &[String]) {
@@ -241,30 +127,31 @@ pub fn assert_stable_turn_ids(second: &Value, first_ids: &[String]) {
 }
 
 pub fn assert_canonical_export_result(result: &Value, sha_message: &str) {
-    assert_canonical_export_format(result);
-    let decoded = canonical_result_decoded_bytes(result);
-    assert_canonical_export_sha(result, &decoded, sha_message);
-    assert_canonical_export_turn_count(result, &decoded);
-}
-
-pub fn assert_canonical_export_format(result: &Value) {
     assert_eq!(result["canonical_format"], CANONICAL_FORMAT);
-}
-
-pub fn assert_canonical_export_sha(result: &Value, decoded: &[u8], sha_message: &str) {
+    let decoded = canonical_result_decoded_bytes(result);
     assert_eq!(
-        canonical_bytes_sha(decoded),
+        canonical_bytes_sha(&decoded),
         canonical_result_sha(result),
         "{sha_message}"
     );
-}
-
-pub fn assert_canonical_export_turn_count(result: &Value, decoded: &[u8]) {
     assert_eq!(
-        canonical_record_count(decoded),
+        canonical_record_count(&decoded),
         canonical_result_turn_count(result),
         "canonical record count must match turn_count"
     );
+
+    let text = std::str::from_utf8(&decoded).expect("canonical export UTF-8");
+    let records = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("canonical record"))
+        .collect::<Vec<_>>();
+    assert!(!records.is_empty());
+    for record in records {
+        assert_eq!(record["metadata"]["provider_id"], "openai");
+        assert_eq!(record["metadata"]["model_id"], "gpt-5.5");
+        assert_eq!(record["metadata"]["variant"], "low");
+    }
 }
 
 pub fn assert_deterministic_export(first: &Value, second: &Value) {
@@ -279,44 +166,83 @@ pub fn assert_deterministic_export(first: &Value, second: &Value) {
 }
 
 pub fn assert_empty_enumerate_result(result: &Value) {
-    assert_eq!(enumerate_sessions(result).len(), 0);
+    assert_eq!(
+        result["sessions"].as_array().expect("sessions array").len(),
+        0
+    );
     assert_eq!(result["complete"], true);
     assert!(result["next_cursor"].is_null());
-    assert_eq!(enumerate_warnings(result).len(), 0);
+    assert_eq!(
+        result["warnings"].as_array().expect("warnings array").len(),
+        0
+    );
 }
 
 pub fn assert_multiple_enumerate_result(result: &Value) {
-    let sessions = enumerate_sessions(result);
+    let sessions = result["sessions"].as_array().expect("sessions array");
     assert_eq!(sessions.len(), 2);
-    assert_enumerate_entry(
-        &sessions[0],
-        "ses_list_one",
-        Some("First session"),
-        Some("/tmp/project-one"),
-        Some(111),
-        Some(222),
-        Some(3),
+    for (entry, provider_session_id, title, cwd, created, updated, turn_count) in [
+        (
+            &sessions[0],
+            "ses_list_one",
+            Some("First session"),
+            Some("/tmp/project-one"),
+            Some(111),
+            Some(222),
+            Some(3),
+        ),
+        (
+            &sessions[1],
+            "ses_list_two",
+            None,
+            Some("/var/tmp/project-two"),
+            Some(333),
+            Some(444),
+            Some(0),
+        ),
+    ] {
+        assert_eq!(entry["provider_session_id"], provider_session_id);
+        match title {
+            Some(value) => assert_eq!(entry["title"].as_str(), Some(value)),
+            None => assert!(entry["title"].is_null()),
+        }
+        match cwd {
+            Some(value) => assert_eq!(entry["cwd"].as_str(), Some(value)),
+            None => assert!(entry["cwd"].is_null()),
+        }
+        for (field, expected) in [
+            ("created_unix_ms", created),
+            ("updated_unix_ms", updated),
+            ("turn_count", turn_count),
+        ] {
+            match expected {
+                Some(value) => assert_eq!(entry[field].as_u64(), Some(value), "{field}"),
+                None => assert!(entry[field].is_null(), "{field} should be null: {entry}"),
+            }
+        }
+        assert_eq!(entry["source"]["kind"], "opencode.session_list");
+        assert!(entry["source"]["detail"].as_str().is_some());
+    }
+    assert_eq!(
+        result["warnings"].as_array().expect("warnings array").len(),
+        0
     );
-    assert_enumerate_entry(
-        &sessions[1],
-        "ses_list_two",
-        None,
-        Some("/var/tmp/project-two"),
-        Some(333),
-        Some(444),
-        Some(0),
-    );
-    assert_eq!(enumerate_warnings(result).len(), 0);
 }
 
 pub fn assert_bad_cwd_enumerate_result(result: &Value) {
-    let sessions = enumerate_sessions(result);
+    let sessions = result["sessions"].as_array().expect("sessions array");
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0]["provider_session_id"], "ses_relative_cwd");
     assert!(sessions[0]["cwd"].is_null());
     assert_eq!(sessions[1]["provider_session_id"], "ses_missing_cwd");
     assert!(sessions[1]["cwd"].is_null());
-    let warnings = enumerate_warning_text(result);
+    let warnings = result["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .map(|warning| warning.as_str().expect("warning string"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         warnings.contains("non-absolute"),
         "relative cwd warning missing: {warnings}"
@@ -328,131 +254,76 @@ pub fn assert_bad_cwd_enumerate_result(result: &Value) {
 }
 
 pub fn assert_limited_enumerate_result(result: &Value, limit: usize) {
-    let sessions = enumerate_sessions(result);
+    let sessions = result["sessions"].as_array().expect("sessions array");
     assert_eq!(sessions.len(), limit);
     assert_eq!(sessions[0]["provider_session_id"], "ses_limit_one");
     assert_eq!(sessions[1]["provider_session_id"], "ses_limit_two");
+    assert_eq!(result["complete"], false);
+    assert!(
+        result["next_cursor"]
+            .as_str()
+            .is_some_and(|cursor| cursor.starts_with("v3:")),
+        "truncated enumeration must return an opaque continuation cursor: {result}"
+    );
 }
 
-pub fn assert_session_list_limit_forwarded(log_path: &Path, limit: u64) {
+pub fn assert_session_list_uses_bounded_snapshot(log_path: &Path) {
     let log = fs::read_to_string(log_path).expect("read fake session list wrapper log");
     assert!(
         log.contains("arg=session"),
-        "session list wrapper should receive session subcommand: {log}"
+        "missing session subcommand: {log}"
     );
-    assert!(
-        log.contains("arg=list"),
-        "session list wrapper should receive list subcommand: {log}"
-    );
+    assert!(log.contains("arg=list"), "missing list subcommand: {log}");
     assert!(
         log.contains("arg=--format") && log.contains("arg=json"),
-        "session list wrapper should receive JSON format args: {log}"
+        "missing JSON format args: {log}"
     );
     assert!(
-        log.contains("arg=--max-count") && log.contains(&format!("arg={limit}")),
-        "session list wrapper should receive max-count limit {limit}: {log}"
+        log.contains("arg=--max-count"),
+        "missing native row bound: {log}"
     );
-}
-
-pub fn assert_enumerate_error_code(response: &Value, code: &str) {
-    assert_error_code(response, code);
-}
-
-pub fn assert_error_code(response: &Value, code: &str) {
-    assert_eq!(response["error"]["code"], code);
-}
-
-pub fn assert_error_message_contains(response: &Value, needle: &str) {
-    let message = response["error"]["message"]
-        .as_str()
-        .expect("error message string");
     assert!(
-        message.contains(needle),
-        "error message should contain {needle:?}: {message}"
+        log.contains("arg=257"),
+        "provider pagination must request one sentinel row above its 256-session snapshot bound: {log}"
     );
 }
 
-pub fn enumerate_sessions(result: &Value) -> &[Value] {
-    result["sessions"].as_array().expect("sessions array")
+pub fn assert_second_enumerate_page(result: &Value) {
+    let sessions = result["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["provider_session_id"], "ses_limit_three");
+    assert_eq!(result["complete"], true);
+    assert!(result["next_cursor"].is_null());
 }
 
-pub fn enumerate_warnings(result: &Value) -> &[Value] {
-    result["warnings"].as_array().expect("warnings array")
-}
-
-pub fn enumerate_warning_text(result: &Value) -> String {
-    enumerate_warnings(result)
-        .iter()
-        .map(|warning| warning.as_str().expect("warning string"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-pub fn assert_enumerate_entry(
-    entry: &Value,
-    provider_session_id: &str,
-    title: Option<&str>,
-    cwd: Option<&str>,
-    created_unix_ms: Option<u64>,
-    updated_unix_ms: Option<u64>,
-    turn_count: Option<u64>,
-) {
-    assert_eq!(entry["provider_session_id"], provider_session_id);
-    assert_optional_string(&entry["title"], title, "title");
-    assert_optional_string(&entry["cwd"], cwd, "cwd");
-    assert_optional_u64(
-        &entry["created_unix_ms"],
-        created_unix_ms,
-        "created_unix_ms",
+fn assert_capture_artifacts(artifacts: &Value) {
+    let artifacts = artifacts.as_array().expect("artifacts array");
+    assert!(
+        !artifacts.is_empty(),
+        "capture should return source artifacts"
     );
-    assert_optional_u64(
-        &entry["updated_unix_ms"],
-        updated_unix_ms,
-        "updated_unix_ms",
-    );
-    assert_optional_u64(&entry["turn_count"], turn_count, "turn_count");
-    assert_eq!(entry["source"]["kind"], "opencode.session_list");
-    assert!(entry["source"]["detail"].as_str().is_some());
-}
-
-pub fn assert_optional_string(value: &Value, expected: Option<&str>, label: &str) {
-    match expected {
-        Some(expected) => assert_eq!(value.as_str(), Some(expected), "{label}"),
-        None => assert!(value.is_null(), "{label} should be null: {value}"),
-    }
-}
-
-pub fn assert_optional_u64(value: &Value, expected: Option<u64>, label: &str) {
-    match expected {
-        Some(expected) => assert_eq!(value.as_u64(), Some(expected), "{label}"),
-        None => assert!(value.is_null(), "{label} should be null: {value}"),
+    for artifact in artifacts {
+        if let Some(path) = artifact.get("path").and_then(Value::as_str) {
+            assert!(
+                !path.contains("opencode.db") && !path.contains(".opencode"),
+                "capture artifacts should avoid private DB path assumptions: {artifact}"
+            );
+        }
     }
 }
 
 pub fn assert_launch_capture_result(result: &Value, session_id: &str) {
-    assert_launch_capture_state(result, session_id);
-    assert_capture_artifacts(&result["artifacts"]);
-}
-
-pub fn assert_launch_capture_state(result: &Value, session_id: &str) {
-    assert_launch_capture_provider_session(result, session_id);
-    assert_launch_capture_state_source(result);
-}
-
-pub fn assert_launch_capture_provider_session(result: &Value, session_id: &str) {
     assert_eq!(
         result["provider_session_id"].as_str(),
         Some(session_id),
         "capture should preserve the launch-derived opencode sessionID"
     );
-}
-
-pub fn assert_launch_capture_state_source(result: &Value) {
     assert_eq!(
         result["state"]["source"].as_str(),
         Some("launch.session.provider_session_id"),
         "launch.session.provider_session_id should be the canonical launch evidence key"
     );
+    assert_capture_artifacts(&result["artifacts"]);
 }
 
 pub fn assert_live_capture_result(result: &Value, session_id: &str) {
@@ -462,38 +333,6 @@ pub fn assert_live_capture_result(result: &Value, session_id: &str) {
         Some("live_report.provider_session_id")
     );
     assert_capture_artifacts(&result["artifacts"]);
-}
-
-pub fn assert_capture_artifacts(artifacts: &Value) {
-    let artifacts = capture_artifacts_array(artifacts);
-    assert_capture_artifact_collection(artifacts);
-    assert_capture_artifact_entries(artifacts);
-}
-
-pub fn capture_artifacts_array(artifacts: &Value) -> &[Value] {
-    artifacts.as_array().expect("artifacts array")
-}
-
-pub fn assert_capture_artifact_collection(artifacts: &[Value]) {
-    assert!(
-        !artifacts.is_empty(),
-        "capture should return source artifacts"
-    );
-}
-
-pub fn assert_capture_artifact_entries(artifacts: &[Value]) {
-    for artifact in artifacts {
-        assert_not_private_db_artifact(artifact);
-    }
-}
-
-pub fn assert_not_private_db_artifact(artifact: &Value) {
-    if let Some(path) = artifact.get("path").and_then(Value::as_str) {
-        assert!(
-            !path.contains("opencode.db") && !path.contains(".opencode"),
-            "capture artifacts should avoid private DB path assumptions: {artifact}"
-        );
-    }
 }
 
 pub fn assert_bare_capture_result(result: &Value, session_id: &str) {
@@ -529,87 +368,42 @@ pub fn assert_pinned_capture_result(result: &Value, session_id: &str) {
 
 pub fn assert_removed_evidence_capture_error(response: &Value) {
     assert_eq!(
-        removed_evidence_error_code(response),
-        "invalid_session_capture_params",
+        response["error"]["code"], "invalid_session_capture_params",
         "removed evidence.provider_session_id shape must not be accepted"
     );
 }
 
-pub fn removed_evidence_error_code(response: &Value) -> &Value {
-    &response["error"]["code"]
-}
-
 pub fn assert_replace_response(output: &std::process::Output) {
     let response = json_stdout(output);
-    assert_replace_response_envelope(output, &response);
-}
-
-pub fn assert_replace_response_envelope(output: &std::process::Output, response: &Value) {
-    if replace_response_unsupported(response) {
-        assert_unsupported_replace_response(response);
-    } else {
-        assert_successful_replace_response(output, response);
+    if response["ok"] == false {
+        assert_valid(&response, "common.schema.json#/$defs/ErrorResponseEnvelope");
+        assert_eq!(
+            response["error"]["category"], "unsupported",
+            "session.replace should be honestly unsupported rather than mutating opencode storage"
+        );
+        return;
     }
-}
 
-pub fn replace_response_unsupported(response: &Value) -> bool {
-    response["ok"] == false
-}
-
-pub fn assert_unsupported_replace_response(response: &Value) {
-    assert_valid(response, "common.schema.json#/$defs/ErrorResponseEnvelope");
-    assert_eq!(
-        response["error"]["category"], "unsupported",
-        "session.replace should be honestly unsupported rather than mutating opencode storage"
-    );
-}
-
-pub fn assert_successful_replace_response(output: &std::process::Output, response: &Value) {
-    assert_successful_replace_process(output);
-    assert_successful_replace_schemas(response);
-    assert_successful_replace_result_fields(&response["result"]);
-}
-
-pub fn assert_successful_replace_process(output: &std::process::Output) {
     assert!(
         output.status.success(),
         "successful session.replace envelope should exit zero; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-pub fn assert_successful_replace_schemas(response: &Value) {
     assert_valid(
-        response,
+        &response,
         "session.schema.json#/$defs/SessionReplaceResponse",
     );
     assert_valid(
         &response["result"],
         "session.schema.json#/$defs/SessionReplaceResult",
     );
-}
-
-pub fn assert_successful_replace_result_fields(result: &Value) {
-    assert_replace_changed_false(result);
-    assert_replace_artifacts_empty(replace_artifacts(result));
-}
-
-pub fn assert_replace_changed_false(result: &Value) {
-    assert_eq!(result["changed"], false);
-}
-
-pub fn replace_artifacts(result: &Value) -> &[Value] {
-    result["artifacts"].as_array().expect("artifacts array")
-}
-
-pub fn assert_replace_artifacts_empty(artifacts: &[Value]) {
+    assert_eq!(response["result"]["changed"], false);
     assert_eq!(
-        artifacts.len(),
+        response["result"]["artifacts"]
+            .as_array()
+            .expect("artifacts array")
+            .len(),
         0,
         "changed=false replace fallback should not report storage artifacts"
     );
-}
-
-pub fn assert_file_unchanged(path: &Path, before: &str, message: &str) {
-    assert_eq!(file_sha256(path), before, "{message}");
 }

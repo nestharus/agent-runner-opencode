@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oulipoly.dev/opencode/native-identity-rebind/v1",
+  "x-protocol": "opencode.native-identity-rebind/v1",
+  "title": "OpenCode Component-Scoped Native Identity Rebind Maintenance Protocol",
+  "type": "object",
+  "$defs": {
+    "Profile": {
+      "enum": ["opencode1", "opencode2", "opencode3", "opencode4", "opencode5"]
+    },
+    "Component": {
+      "enum": ["native_runtime", "quota_observer"]
+    },
+    "Target": {
+      "type": "object",
+      "properties": {
+        "profile": { "$ref": "#/$defs/Profile" },
+        "component": { "$ref": "#/$defs/Component" }
+      },
+      "required": ["profile", "component"],
+      "additionalProperties": false
+    },
+    "Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "OptionalDigest": {
+      "oneOf": [
+        { "$ref": "#/$defs/Digest" },
+        { "type": "null" }
+      ]
+    },
+    "ComponentEvidence": {
+      "type": "object",
+      "properties": {
+        "component_identity_sha256": { "$ref": "#/$defs/OptionalDigest" },
+        "state_record_sha256": { "$ref": "#/$defs/OptionalDigest" }
+      },
+      "required": ["component_identity_sha256", "state_record_sha256"],
+      "oneOf": [
+        {
+          "properties": {
+            "component_identity_sha256": { "$ref": "#/$defs/Digest" },
+            "state_record_sha256": { "$ref": "#/$defs/Digest" }
+          }
+        },
+        {
+          "properties": {
+            "component_identity_sha256": { "type": "null" },
+            "state_record_sha256": { "type": "null" }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "PlanRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "opencode.native-identity-rebind/v1" },
+        "action": { "const": "plan" },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/Target" }
+        }
+      },
+      "required": ["protocol", "action", "targets"],
+      "additionalProperties": false
+    },
+    "SealHandoff": {
+      "type": "object",
+      "properties": {
+        "ordinary_admission_blocked": { "type": "boolean" },
+        "obligations_reconciled": { "type": "boolean" }
+      },
+      "required": ["ordinary_admission_blocked", "obligations_reconciled"],
+      "additionalProperties": false
+    },
+    "ObservationHandoff": {
+      "type": "object",
+      "properties": {
+        "ordinary_admission_blocked": { "type": "boolean" },
+        "validation_capability_completed": { "type": "boolean" }
+      },
+      "required": ["ordinary_admission_blocked", "validation_capability_completed"],
+      "additionalProperties": false
+    },
+    "ReleaseHandoff": {
+      "type": "object",
+      "properties": {
+        "ordinary_admission_blocked": { "type": "boolean" }
+      },
+      "required": ["ordinary_admission_blocked"],
+      "additionalProperties": false
+    },
+    "ReleaseAuthorization": {
+      "type": "object",
+      "properties": {
+        "ordinary_admission_may_reopen": { "const": true }
+      },
+      "required": ["ordinary_admission_may_reopen"],
+      "additionalProperties": false
+    },
+    "SealRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "opencode.native-identity-rebind/v1" },
+        "action": { "const": "seal" },
+        "cycle_id": { "$ref": "#/$defs/Digest" },
+        "operation_id": { "$ref": "#/$defs/Digest" },
+        "profile": { "$ref": "#/$defs/Profile" },
+        "component": { "$ref": "#/$defs/Component" },
+        "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
+        "host_handoff": { "$ref": "#/$defs/SealHandoff" }
+      },
+      "required": ["protocol", "action", "cycle_id", "operation_id", "profile", "component", "prior_evidence", "host_handoff"],
+      "additionalProperties": false
+    },
+    "ObservationRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "opencode.native-identity-rebind/v1" },
+        "action": { "const": "observe" },
+        "cycle_id": { "$ref": "#/$defs/Digest" },
+        "operation_id": { "$ref": "#/$defs/Digest" },
+        "profile": { "$ref": "#/$defs/Profile" },
+        "component": { "$ref": "#/$defs/Component" },
+        "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
+        "disposition": { "enum": ["committed", "rolled_back"] },
+        "host_handoff": { "$ref": "#/$defs/ObservationHandoff" }
+      },
+      "required": ["protocol", "action", "cycle_id", "operation_id", "profile", "component", "prior_evidence", "disposition", "host_handoff"],
+      "additionalProperties": false
+    },
+    "ReleaseRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "opencode.native-identity-rebind/v1" },
+        "action": { "const": "release" },
+        "cycle_id": { "$ref": "#/$defs/Digest" },
+        "operation_id": { "$ref": "#/$defs/Digest" },
+        "observation_id": { "$ref": "#/$defs/Digest" },
+        "profile": { "$ref": "#/$defs/Profile" },
+        "component": { "$ref": "#/$defs/Component" },
+        "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
+        "observed_evidence": { "$ref": "#/$defs/ComponentEvidence" },
+        "disposition": { "enum": ["committed", "rolled_back"] },
+        "host_handoff": { "$ref": "#/$defs/ReleaseHandoff" }
+      },
+      "required": ["protocol", "action", "cycle_id", "operation_id", "observation_id", "profile", "component", "prior_evidence", "observed_evidence", "disposition", "host_handoff"],
+      "additionalProperties": false
+    },
+    "Request": {
+      "oneOf": [
+        { "$ref": "#/$defs/PlanRequest" },
+        { "$ref": "#/$defs/SealRequest" },
+        { "$ref": "#/$defs/ObservationRequest" },
+        { "$ref": "#/$defs/ReleaseRequest" }
+      ]
+    },
+    "Responsibility": {
+      "type": "object",
+      "properties": {
+        "actor": { "enum": ["host", "operator", "provider"] },
+        "action": { "type": "string", "minLength": 1 },
+        "completion": { "type": "string", "minLength": 1 }
+      },
+      "required": ["actor", "action", "completion"],
+      "additionalProperties": false
+    },
+    "Operation": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "native_identity_rebind" },
+        "protocol": { "const": "opencode.native-identity-rebind/v1" },
+        "schema_id": { "const": "opencode.native-identity-rebind/v1" },
+        "cycle_id": { "$ref": "#/$defs/Digest" },
+        "operation_id": { "$ref": "#/$defs/Digest" },
+        "profile": { "$ref": "#/$defs/Profile" },
+        "component": { "$ref": "#/$defs/Component" },
+        "phase": { "enum": ["awaiting_host_drain", "awaiting_cutover", "awaiting_host_release", "completed", "rolled_back", "rejected"] },
+        "maximum_drain_ms": {
+          "const": 20000,
+          "description": "Maximum deadline for each affected in-flight request during the pre-Seal host drain only; this is not a cycle-wide cutover, validation, release, or response-loss recovery deadline."
+        },
+        "prior_evidence": { "$ref": "#/$defs/ComponentEvidence" },
+        "observed_evidence": { "$ref": "#/$defs/ComponentEvidence" },
+        "observation_id": { "$ref": "#/$defs/Digest" },
+        "disposition": { "enum": ["committed", "rolled_back"] },
+        "responsibilities": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/Responsibility" }
+        },
+        "next_request": { "$ref": "#/$defs/Request" },
+        "release_authorization": { "$ref": "#/$defs/ReleaseAuthorization" },
+        "diagnostic": { "type": "string", "minLength": 1 },
+        "implementation_evidence": {
+          "type": "object",
+          "properties": {
+            "provider_state_record": { "type": "string", "minLength": 1 }
+          },
+          "required": ["provider_state_record"],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "kind", "protocol", "schema_id", "cycle_id", "operation_id", "profile", "component", "phase",
+        "maximum_drain_ms", "prior_evidence", "observed_evidence",
+        "responsibilities", "implementation_evidence"
+      ],
+      "allOf": [
+        {
+          "if": { "properties": { "phase": { "const": "awaiting_host_drain" } } },
+          "then": {
+            "required": ["next_request"],
+            "properties": { "next_request": { "$ref": "#/$defs/SealRequest" } }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "awaiting_cutover" } } },
+          "then": {
+            "required": ["next_request"],
+            "properties": { "next_request": { "$ref": "#/$defs/ObservationRequest" } }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "awaiting_host_release" } } },
+          "then": {
+            "required": ["observation_id", "disposition", "next_request"],
+            "properties": { "next_request": { "$ref": "#/$defs/ReleaseRequest" } }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "enum": ["completed", "rolled_back"] } } },
+          "then": {
+            "required": ["observation_id", "disposition", "release_authorization"],
+            "not": { "required": ["next_request"] }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "rejected" } } },
+          "then": {
+            "required": ["observation_id", "disposition"],
+            "not": {
+              "anyOf": [
+                { "required": ["next_request"] },
+                { "required": ["release_authorization"] }
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
+}

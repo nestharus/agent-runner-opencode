@@ -127,24 +127,67 @@ pub fn assert_contract_launch_stream_output(
 ) {
     assert_stderr_diagnostics_only(output);
     let events = launch_events_from_output(output, "launch stdout");
-    assert_contract_launch_events(&events, fixture_session_id);
+    assert_monotonic_launch_events(&events);
+    assert_eq!(
+        collect_stream_bytes(&events, "stdout"),
+        FAKE_LAUNCH_STDOUT,
+        "stdout events must byte-preserve the selected opencodeN wrapper output"
+    );
+    assert_eq!(
+        collect_stream_bytes(&events, "stderr"),
+        FAKE_LAUNCH_STDERR,
+        "stderr events must byte-preserve the selected opencodeN wrapper output"
+    );
+    assert_eq!(
+        expected_session_marker(&events, fixture_session_id)["value"],
+        true,
+        "session marker should use a truthy marker value"
+    );
+    assert_provider_session_marker(&events, fixture_session_id);
+    let final_event = final_launch_event(&events);
+    assert_eq!(
+        final_event["kind"], "exit",
+        "final launch line must be exit"
+    );
+    assert!(
+        final_event.get("status").is_some(),
+        "exit event must carry status"
+    );
+    assert!(
+        final_event.get("terminal_signal").is_some(),
+        "exit event must carry terminal_signal"
+    );
+    assert_process_status_kind(&final_event["status"]);
+    assert_eq!(
+        final_event["status"],
+        json!({ "kind": "exited", "code": 7 }),
+        "final status should truthfully report the controlled wrapper exit status"
+    );
+    assert_status_derived_terminal_signal(final_event);
+    assert!(
+        final_event.get("session").is_some(),
+        "exit event must carry captured session evidence"
+    );
+    assert!(
+        json_contains_string(&final_event["session"], fixture_session_id),
+        "exit.session must carry the same opencode sessionID evidence as the marker; session={}",
+        final_event["session"]
+    );
     assert_output_status_code(
         output,
         Some(7),
         "provider process should preserve nonzero child exit-code parity",
     );
-    assert_wrapper_log(wrapper_log_path);
-}
-
-pub fn assert_contract_launch_events(events: &[Value], fixture_session_id: &str) {
-    assert_monotonic_launch_events(events);
-    assert_launch_stream_bytes(events);
-    assert_session_marker(events, fixture_session_id);
-    assert_provider_session_marker(events, fixture_session_id);
-    assert_exit_event(
-        events,
-        json!({ "kind": "exited", "code": 7 }),
-        fixture_session_id,
+    let wrapper_log = wrapper_log_text(wrapper_log_path);
+    assert!(
+        wrapper_log
+            .lines()
+            .any(|line| { line == "argv0=opencode1" || line.ends_with("/opencode1") }),
+        "launch should cross the selected opencode1 wrapper boundary; log={wrapper_log:?}"
+    );
+    assert!(
+        wrapper_log.lines().any(|line| line == "arg=run"),
+        "wrapper should receive opencode run argv; log={wrapper_log:?}"
     );
 }
 
@@ -160,37 +203,6 @@ pub fn assert_launch_events_not_empty(events: &[Value], label: &str) {
     assert!(!events.is_empty(), "{label} must contain NDJSON events");
 }
 
-pub fn assert_launch_stream_bytes(events: &[Value]) {
-    assert_launch_stdout_bytes(&collect_stream_bytes(events, "stdout"));
-    assert_launch_stderr_bytes(&collect_stream_bytes(events, "stderr"));
-}
-
-pub fn assert_launch_stdout_bytes(stdout_bytes: &[u8]) {
-    assert_eq!(
-        stdout_bytes, FAKE_LAUNCH_STDOUT,
-        "stdout events must byte-preserve the selected opencodeN wrapper output"
-    );
-}
-
-pub fn assert_launch_stderr_bytes(stderr_bytes: &[u8]) {
-    assert_eq!(
-        stderr_bytes, FAKE_LAUNCH_STDERR,
-        "stderr events must byte-preserve the selected opencodeN wrapper output"
-    );
-}
-
-pub fn assert_session_marker(events: &[Value], fixture_session_id: &str) {
-    let session_marker = expected_session_marker(events, fixture_session_id);
-    assert_session_marker_truthy(session_marker);
-}
-
-pub fn assert_session_marker_truthy(session_marker: &Value) {
-    assert_eq!(
-        session_marker["value"], true,
-        "session marker should use a truthy marker value"
-    );
-}
-
 pub fn assert_provider_session_marker(events: &[Value], fixture_session_id: &str) {
     let marker = events
         .iter()
@@ -202,86 +214,11 @@ pub fn assert_provider_session_marker(events: &[Value], fixture_session_id: &str
     );
 }
 
-pub fn assert_exit_event(events: &[Value], expected_status: Value, fixture_session_id: &str) {
-    let final_event = final_launch_event(events);
-    assert_exit_event_kind(final_event);
-    assert_exit_event_status_present(final_event);
-    assert_exit_event_terminal_signal_present(final_event);
-    assert_process_status_kind(&final_event["status"]);
-    assert_exit_event_status(final_event, expected_status);
-    assert_status_derived_terminal_signal(final_event);
-    assert_exit_event_session_present(final_event);
-    assert_exit_event_session_contains(final_event, fixture_session_id);
-}
-
-pub fn assert_exit_event_kind(final_event: &Value) {
-    assert_eq!(
-        final_event["kind"], "exit",
-        "final launch line must be exit"
-    );
-}
-
-pub fn assert_exit_event_status_present(final_event: &Value) {
-    assert!(
-        final_event.get("status").is_some(),
-        "exit event must carry status"
-    );
-}
-
-pub fn assert_exit_event_terminal_signal_present(final_event: &Value) {
-    assert!(
-        final_event.get("terminal_signal").is_some(),
-        "exit event must carry terminal_signal"
-    );
-}
-
-pub fn assert_exit_event_status(final_event: &Value, expected_status: Value) {
-    assert_eq!(
-        final_event["status"], expected_status,
-        "final status should truthfully report the controlled wrapper exit status"
-    );
-}
-
-pub fn assert_exit_event_session_present(final_event: &Value) {
-    assert!(
-        final_event.get("session").is_some(),
-        "exit event must carry captured session evidence"
-    );
-}
-
-pub fn assert_exit_event_session_contains(final_event: &Value, fixture_session_id: &str) {
-    assert!(
-        json_contains_string(&final_event["session"], fixture_session_id),
-        "exit.session must carry the same opencode sessionID evidence as the marker; session={}",
-        final_event["session"]
-    );
-}
-
 pub fn assert_status_derived_terminal_signal(final_event: &Value) {
     assert_eq!(
         final_event["terminal_signal"]["kind"],
         expected_signal_kind_for_status(&final_event["status"]),
         "terminal_signal should be status-derived"
-    );
-}
-
-pub fn assert_wrapper_log(wrapper_log_path: &Path) {
-    let wrapper_log = wrapper_log_text(wrapper_log_path);
-    assert_selected_wrapper_invoked(&wrapper_log);
-    assert_wrapper_run_arg(&wrapper_log);
-}
-
-pub fn assert_selected_wrapper_invoked(wrapper_log: &str) {
-    assert!(
-        wrapper_log_has_selected_wrapper(wrapper_log),
-        "launch should cross the selected opencode1 wrapper boundary; log={wrapper_log:?}"
-    );
-}
-
-pub fn assert_wrapper_run_arg(wrapper_log: &str) {
-    assert!(
-        wrapper_log_has_run_arg(wrapper_log),
-        "wrapper should receive opencode run argv; log={wrapper_log:?}"
     );
 }
 
@@ -475,6 +412,21 @@ pub fn assert_live_launch_output(output: &std::process::Output) {
     assert_status_derived_terminal_signal(final_event);
     let diagnostics = output_stderr_stdout_diagnostics(output);
     assert_live_provider_exit_code(output, final_event, &diagnostics);
+    assert_output_success_with_diagnostics(output, "live launch", &diagnostics);
+    assert_eq!(
+        final_event["status"],
+        json!({ "kind": "exited", "code": 0 })
+    );
+    assert_eq!(final_event["terminal_signal"]["kind"], "clean_exit");
+    assert!(events.iter().any(|event| {
+        event["kind"] == "marker"
+            && event["name"] == "oulipoly.launch_route"
+            && event["value"].to_string().contains("openai/gpt-5.6-luna")
+            && event["value"].to_string().contains("low")
+    }));
+    assert!(events.iter().any(|event| {
+        event["kind"] == "marker" && event["name"] == "oulipoly.provider_session"
+    }));
 }
 
 pub fn assert_live_provider_exit_code(
@@ -551,18 +503,32 @@ pub fn assert_oversized_prompt_segments(wrapper_log_path: &Path, prompt: &str) {
     );
     let boundary = argv_arg_index_owned(&argv, "--");
     let segments = &argv[boundary + 1..];
-    assert!(segments.len() > 1, "oversized prompt must be tokenized");
+    let delivery = segments
+        .iter()
+        .position(|segment| segment.starts_with("[OULIPOLY-DELIVERY"))
+        .expect("provider delivery marker must follow the prompt");
+    let prompt_segments = &segments[..delivery];
+    assert!(
+        prompt_segments.len() > 1,
+        "oversized prompt must be tokenized"
+    );
     assert!(
         segments.iter().all(|segment| !segment.contains(' ')),
         "generated message tokens must not contain ASCII spaces"
     );
     for option_text in ["--share", "--attach", "--session", "-m"] {
         assert!(
-            segments.iter().any(|segment| segment == option_text),
+            prompt_segments.iter().any(|segment| segment == option_text),
             "{option_text} must remain positional message text"
         );
     }
-    assert_eq!(opencode_1_18_9_message(segments), prompt);
+    assert_eq!(opencode_1_18_9_message(prompt_segments), prompt);
+    assert!(
+        segments[delivery..]
+            .join(" ")
+            .starts_with("[OULIPOLY-DELIVERY "),
+        "provider delivery marker must remain recognizable after tokenization"
+    );
 }
 
 pub fn assert_short_prompt_argv_unchanged(wrapper_log_path: &Path) {
@@ -571,7 +537,11 @@ pub fn assert_short_prompt_argv_unchanged(wrapper_log_path: &Path) {
         .iter()
         .map(|arg| (*arg).to_string())
         .collect::<Vec<_>>();
-    assert_eq!(argv, expected);
+    assert_eq!(&argv[..expected.len()], expected);
+    assert_eq!(argv.len(), expected.len() + 1);
+    assert!(argv
+        .last()
+        .is_some_and(|arg| { arg.starts_with("[OULIPOLY-DELIVERY ") && arg.ends_with(']') }));
 }
 
 pub fn assert_oversized_resume_prompt(
@@ -579,7 +549,7 @@ pub fn assert_oversized_resume_prompt(
     wrapper_log_path: &Path,
     prompt: &str,
 ) {
-    assert_output_success(output, "launch oversized resume prompt");
+    assert_eq!(output.status.code(), Some(1));
     let argv = wrapper_nul_log_args(wrapper_log_path);
     let session = argv_arg_index_owned(&argv, OPENCODE_SESSION_FLAG_FOR_TEST);
     let boundary = argv_arg_index_owned(&argv, "--");
@@ -598,7 +568,9 @@ pub fn assert_oversized_resume_prompt(
         marker["value"]["prompt_sha256"],
         sha256_hex(prompt.as_bytes())
     );
-    assert_eq!(marker["value"]["message_id"], "msg-user");
+    assert!(marker["value"]["event_timestamp_unix_ms"].is_u64());
+    assert_eq!(marker["value"]["source"], "opencode.run.format_json");
+    assert_unresolved_resume_completion(output, &events);
 }
 
 pub fn assert_oversized_prompt_rejected(output: &std::process::Output, wrapper_log_path: &Path) {
@@ -644,7 +616,7 @@ pub fn assert_argv_session_before_notification_payload(argv: &[&str]) {
     let session_flag = argv_arg_index(argv, OPENCODE_SESSION_FLAG_FOR_TEST);
     let payload = argv_arg_index_containing(argv, NOTIFICATION_PAYLOAD_NEEDLE_FOR_TEST);
     assert!(
-        argv_index_before(session_flag, payload),
+        session_flag < payload,
         "--session must be before notification payload; argv={argv:?}"
     );
 }
@@ -652,13 +624,6 @@ pub fn assert_argv_session_before_notification_payload(argv: &[&str]) {
 pub fn assert_submitted_user_turn_marker(events: &[Value]) {
     let marker = expected_submitted_user_turn_marker(events);
     assert_submitted_user_turn_marker_value(marker);
-}
-
-pub fn assert_no_submitted_user_turn_marker(events: &[Value]) {
-    assert!(
-        submitted_user_turn_marker(events).is_none(),
-        "unconfirmed resume must not emit a submitted user turn marker; events={events:?}"
-    );
 }
 
 pub fn assert_produced_assistant_response_marker(events: &[Value]) {
@@ -687,6 +652,42 @@ pub fn assert_no_produced_assistant_response_marker(events: &[Value]) {
     );
 }
 
+pub fn assert_unresolved_resume_completion(output: &std::process::Output, events: &[Value]) {
+    assert_output_status_code(
+        output,
+        Some(1),
+        "a submitted resume without a completed response must be non-clean",
+    );
+    let markers = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "marker" && event["name"] == "oulipoly.resume_completion_unresolved"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        markers.len(),
+        1,
+        "unresolved resume completion must have one explicit handoff marker; events={events:?}"
+    );
+    assert_eq!(
+        markers[0]["value"]["state"],
+        "submitted_user_turn_without_completed_assistant_response"
+    );
+    assert_eq!(
+        markers[0]["value"]["provider_session_id"],
+        resume_session_id()
+    );
+    assert!(markers[0]["value"]["required_action"]
+        .as_str()
+        .is_some_and(|action| action.contains("reconcile")));
+    let final_event = final_launch_event(events);
+    assert_eq!(final_event["status"]["kind"], "unknown");
+    assert_eq!(final_event["terminal_signal"]["kind"], "unknown");
+    assert!(final_event["terminal_signal"]["evidence"]
+        .as_str()
+        .is_some_and(|evidence| evidence.contains("completion remains unconfirmed")));
+}
+
 pub fn assert_submitted_user_turn_marker_value(marker: &Value) {
     assert_submitted_user_turn_provider_session(marker);
     assert_submitted_user_turn_prompt_hash(marker);
@@ -711,18 +712,23 @@ pub fn assert_submitted_user_turn_prompt_hash(marker: &Value) {
 }
 
 pub fn assert_submitted_user_turn_source(marker: &Value) {
-    assert_eq!(marker["value"]["source"].as_str(), Some("opencode.export"));
+    assert_eq!(
+        marker["value"]["source"].as_str(),
+        Some("opencode.run.format_json")
+    );
 }
 
 pub fn assert_submitted_user_turn_message_id(marker: &Value) {
-    assert_eq!(marker["value"]["message_id"].as_str(), Some("msg-user"));
+    assert!(marker["value"]["event_timestamp_unix_ms"].is_u64());
 }
 
 pub fn assert_submitted_user_turn_delivery_nonce(marker: &Value) {
-    assert_eq!(
-        marker["value"]["delivery_nonce"].as_str(),
-        Some("5169694d-de0f-40d1-890c-6e28e55bab27")
-    );
+    let nonce = marker["value"]["delivery_nonce"]
+        .as_str()
+        .expect("provider-authored delivery nonce");
+    assert_eq!(nonce.len(), 64);
+    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(nonce, "5169694d-de0f-40d1-890c-6e28e55bab27");
 }
 
 pub fn assert_empty_resume_payload_rejected(
@@ -766,6 +772,47 @@ pub fn assert_policy_accepts_for_wrapper(response: &Value, wrapper: &str) {
     assert_policy_accepted(result);
     assert_policy_argv_for_wrapper(&policy_result_argv(result), wrapper);
     assert_policy_env(policy_result_env(result));
+}
+
+pub fn assert_policy_accepts_model(response: &Value, provider_model: &str, effort: &str) {
+    assert_policy_response_shape(response);
+    assert_policy_response_secret_absent(response);
+    let result = policy_result(response);
+    assert_policy_accepted(result);
+    let argv = policy_result_argv(result);
+    assert_eq!(argv.first().map(String::as_str), Some("opencode1"));
+    assert!(
+        pure_semantics_preserved(&argv),
+        "policy must preserve wrapper-owned pure semantics; argv={argv:?}"
+    );
+    assert_contains_subsequence(
+        &argv,
+        &[
+            "run",
+            "--format",
+            "json",
+            "--dangerously-skip-permissions",
+            "-m",
+            provider_model,
+            "--variant",
+            effort,
+        ],
+    );
+    assert_policy_env(policy_result_env(result));
+}
+
+pub fn assert_policy_rejects_invalid_model(response: &Value) {
+    assert_policy_response_shape(response);
+    let result = policy_result(response);
+    assert_policy_rejected(result, "inconsistent model identity must be rejected");
+    assert_policy_diagnostic(policy_diagnostics(result), "invalid_model", "provider args");
+}
+
+pub fn assert_policy_rejected_with_code(response: &Value, code: &str) {
+    assert_policy_response_shape(response);
+    let result = policy_result(response);
+    assert_policy_rejected(result, "policy request must be rejected");
+    assert_policy_diagnostic(policy_diagnostics(result), code, "account");
 }
 
 pub fn assert_policy_accepted(result: &Value) {
@@ -904,9 +951,17 @@ pub fn assert_valid_launch_event(line_number: usize, event: &Value) {
 }
 
 pub fn assert_monotonic_launch_events(events: &[Value]) {
+    let request_id = events
+        .first()
+        .and_then(|event| event["request_id"].as_str())
+        .expect("launch stream must contain a request_id");
+    assert!(
+        request_id.starts_with("req-launch-"),
+        "launch request_id should use the test sequence: {request_id}"
+    );
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event["contract"], CONTRACT);
-        assert_eq!(event["request_id"], "req-launch");
+        assert_eq!(event["request_id"], request_id);
         assert!(
             event["time_unix_ms"].as_u64().is_some(),
             "launch event line {} must carry time_unix_ms",

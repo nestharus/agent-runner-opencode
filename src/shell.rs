@@ -1,6 +1,5 @@
 //! Declared roles: orchestration, mapper, validator, accessor
 
-use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -23,7 +22,11 @@ pub fn run(argv: &[String]) -> io::Result<ShellOutput> {
 pub fn command(program: &str) -> Command {
     let mut command = Command::new(resolved_program(program));
     command.env_clear();
-    command.envs(env_passthrough_pairs());
+    command.envs(
+        ENV_PASSTHROUGH_KEYS
+            .iter()
+            .filter_map(|key| std::env::var_os(key).map(|value| (*key, value))),
+    );
     command
 }
 
@@ -45,49 +48,15 @@ fn resolved_program(program: &str) -> PathBuf {
     if program_has_path_component(path) {
         return path.to_path_buf();
     }
-    find_on_path(program).unwrap_or_else(|| PathBuf::from(program))
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(program))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from(program))
 }
 
 fn program_has_path_component(path: &Path) -> bool {
     path.is_absolute() || path.components().count() > 1
-}
-
-fn find_on_path(program: &str) -> Option<PathBuf> {
-    let path = path_env()?;
-    existing_path_candidate(path_candidates(path_entries(&path), program))
-}
-
-fn path_env() -> Option<OsString> {
-    std::env::var_os("PATH")
-}
-
-fn path_entries(path: &OsString) -> Vec<PathBuf> {
-    std::env::split_paths(path).collect()
-}
-
-fn path_candidates(entries: Vec<PathBuf>, program: &str) -> Vec<PathBuf> {
-    entries.into_iter().map(|dir| dir.join(program)).collect()
-}
-
-fn existing_path_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
-    candidates.into_iter().find(|candidate| candidate.is_file())
-}
-
-fn env_passthrough_pairs() -> Vec<(&'static str, OsString)> {
-    ENV_PASSTHROUGH_KEYS
-        .iter()
-        .filter_map(|key| optional_env_pair(key))
-        .collect()
-}
-
-fn optional_env_pair(key: &'static str) -> Option<(&'static str, OsString)> {
-    env_value(key).map(|value| env_pair(key, value))
-}
-
-fn env_value(key: &str) -> Option<OsString> {
-    std::env::var_os(key)
-}
-
-fn env_pair(key: &'static str, value: OsString) -> (&'static str, OsString) {
-    (key, value)
 }

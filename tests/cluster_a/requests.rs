@@ -6,11 +6,28 @@ use agent_runner_opencode::encoding::sha256_hex;
 use super::*;
 
 pub fn launch_params(effort: &str) -> Value {
+    let alias = format!("gpt-{effort}");
+    launch_params_for_model(
+        "opencode1",
+        "opencode1",
+        &alias,
+        "openai/gpt-5.6-sol",
+        effort,
+    )
+}
+
+pub fn launch_params_for_model(
+    settings_id: &str,
+    command: &str,
+    alias: &str,
+    provider_model: &str,
+    effort: &str,
+) -> Value {
     json!({
-        "settings_id": "opencode1",
+        "settings_id": settings_id,
         "mode": "agent",
-        "model": model_request(effort),
-        "argv": host_candidate_argv(effort),
+        "model": model_request_for(alias, provider_model, effort),
+        "argv": host_candidate_argv_for_model(command, provider_model, effort),
         "working_directory": env!("CARGO_MANIFEST_DIR")
     })
 }
@@ -54,7 +71,10 @@ pub fn launch_params_with_argv_and_prompt_env(
 
 pub fn resume_launch_params_with_arg_payload() -> Value {
     let mut params = launch_params("low");
-    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["session"] = json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
     *params["argv"]
         .as_array_mut()
         .expect("launch argv")
@@ -70,7 +90,10 @@ pub fn resume_launch_params_with_arg_payload_env(path: &str, log_path: &str) -> 
 
 pub fn resume_launch_params_with_prompt_env(prompt: &str, path: &str, log_path: &str) -> Value {
     let mut params = launch_params_with_prompt(prompt);
-    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["session"] = json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
     launch_params_with_wrapper_env(params, path, log_path)
 }
 
@@ -86,7 +109,10 @@ pub fn resume_launch_params_with_arg_payload_prompt_env(
 
 pub fn resume_launch_params_with_stdin_payload() -> Value {
     let mut params = launch_params("low");
-    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["session"] = json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
     params["argv"].as_array_mut().expect("launch argv").pop();
     params["stdin"] = json!({
         "encoding": "utf8",
@@ -102,7 +128,10 @@ pub fn resume_launch_params_with_stdin_payload_env(path: &str, log_path: &str) -
 
 pub fn resume_launch_params_without_payload() -> Value {
     let mut params = launch_params("low");
-    params["session"] = json!({ "known_provider_session_id": resume_session_id() });
+    params["session"] = json!({
+        "known_provider_session_id": resume_session_id(),
+        "start_mode": "resume"
+    });
     params["argv"].as_array_mut().expect("launch argv").pop();
     params["model"]["inputs"]["prompt"] = json!("");
     params
@@ -131,20 +160,74 @@ pub fn launch_params_with_policy_effective_argv_env(
 }
 
 pub fn policy_evaluate_params() -> Value {
+    policy_evaluate_params_for_model("gpt-low", "openai/gpt-5.6-sol", "low")
+}
+
+pub fn policy_evaluate_params_for_model(alias: &str, provider_model: &str, effort: &str) -> Value {
+    policy_evaluate_params_for_account_model("opencode1", alias, provider_model, effort)
+}
+
+pub fn policy_evaluate_params_for_account_model(
+    account: &str,
+    alias: &str,
+    provider_model: &str,
+    effort: &str,
+) -> Value {
     json!({
-        "settings_id": "opencode1",
+        "settings_id": account,
         "mode": "agent",
-        "model": model_request("low"),
+        "model": model_request_for(alias, provider_model, effort),
         "launch": {
-            "argv": host_candidate_argv("low"),
+            "argv": host_candidate_argv_for_model(account, provider_model, effort),
             "working_directory": env!("CARGO_MANIFEST_DIR")
         }
     })
 }
 
+pub fn policy_evaluate_luna_max_params() -> Value {
+    policy_evaluate_params_for_model("gpt-luna-max", "openai/gpt-5.6-luna", "max")
+}
+
+pub fn policy_evaluate_luna_low_params() -> Value {
+    policy_evaluate_params_for_model("gpt-luna-low", "openai/gpt-5.6-luna", "low")
+}
+
+pub fn policy_evaluate_model_mismatch_params() -> Value {
+    let mut params = policy_evaluate_luna_max_params();
+    params["model"]["provider_args"] = json!(["-m", "openai/gpt-5.6-sol", "--variant", "max"]);
+    params
+}
+
+pub fn policy_evaluate_extra_model_arg_params() -> Value {
+    let mut params = policy_evaluate_params();
+    params["model"]["provider_args"]
+        .as_array_mut()
+        .expect("model provider args")
+        .push(json!("--share"));
+    params
+}
+
 pub fn policy_evaluate_params_with_host_candidate_argv() -> Value {
     let mut params = policy_evaluate_params();
     params["launch"]["argv"] = json!(host_candidate_argv("low"));
+    params
+}
+
+pub fn policy_evaluate_params_with_tool_restrictions() -> Value {
+    let mut params = policy_evaluate_params_with_host_candidate_argv();
+    params["launch"]["tool_restrictions"] = json!({
+        "kind": "codex",
+        "codex": {
+            "disabled_features": ["web_search"]
+        }
+    });
+    params
+}
+
+pub fn policy_evaluate_params_with_system_prompt_override() -> Value {
+    let mut params = policy_evaluate_params_with_host_candidate_argv();
+    params["launch"]["system_prompt_override"] =
+        json!("Do not use a built-in child invocation mechanism.");
     params
 }
 
@@ -177,7 +260,7 @@ pub fn forbidden_policy_evaluate_params_for_account_host_candidate(
     params
 }
 
-pub fn policy_evaluate_account_one_provider_name_settings_id_params() -> Value {
+pub fn policy_evaluate_account_one_persisted_settings_id_params() -> Value {
     policy_evaluate_params_with_settings_id(policy_evaluate_params_with_host_candidate_argv())
 }
 
@@ -188,7 +271,7 @@ pub fn policy_evaluate_account_one_plain_host_command_params() -> Value {
 }
 
 pub fn policy_evaluate_params_with_settings_id(mut params: Value) -> Value {
-    params["settings_id"] = json!("opencode");
+    params["settings_id"] = json!("opencode1");
     params
 }
 
@@ -214,8 +297,7 @@ pub fn forbidden_policy_evaluate_params(forbidden_flag: &str, forbidden_env_key:
 }
 
 pub fn policy_evaluate_params_with_env(settings_id: &str, env: &[(&str, &str)]) -> Value {
-    let mut params = policy_evaluate_params();
-    params["settings_id"] = json!(settings_id);
+    let mut params = policy_evaluate_params_for_account_host_candidate(settings_id);
     params["launch"]["env"] = env
         .iter()
         .map(|(key, value)| (key.to_string(), json!(value)))
@@ -255,6 +337,49 @@ pub fn launch_params_with_env(effort: &str, env: &[(&str, &str)]) -> Value {
     params
 }
 
+pub fn launch_luna_max_params_with_env(path: &str, log_path: &str) -> Value {
+    let params = launch_params_for_model(
+        "opencode1",
+        "opencode1",
+        "gpt-luna-max",
+        "openai/gpt-5.6-luna",
+        "max",
+    );
+    launch_params_with_wrapper_env(params, path, log_path)
+}
+
+pub fn launch_luna_low_params_with_env(path: &str, log_path: &str) -> Value {
+    let params = launch_params_for_model(
+        "opencode1",
+        "opencode1",
+        "gpt-luna-low",
+        "openai/gpt-5.6-luna",
+        "low",
+    );
+    launch_params_with_wrapper_env(params, path, log_path)
+}
+
+pub fn live_luna_low_launch_params(path: &str, home: &str) -> Value {
+    let mut params = launch_params_for_model(
+        "opencode5",
+        "opencode5",
+        "gpt-luna-low",
+        "openai/gpt-5.6-luna",
+        "low",
+    );
+    params["env"] = json!({ "PATH": path, "HOME": home });
+    params
+}
+
+pub fn launch_create_session_params_with_env(path: &str, log_path: &str) -> Value {
+    let mut params = launch_params_with_wrapper_env(launch_params("low"), path, log_path);
+    params["session"] = json!({
+        "known_provider_session_id": "ses_caller_selected_create",
+        "start_mode": "create"
+    });
+    params
+}
+
 pub fn launch_params_with_wrapper_env(mut params: Value, path: &str, log_path: &str) -> Value {
     params["env"] = wrapper_env(path, log_path);
     params
@@ -267,10 +392,10 @@ pub fn wrapper_env(path: &str, log_path: &str) -> Value {
     })
 }
 
-pub fn model_request(effort: &str) -> Value {
+pub fn model_request_for(alias: &str, provider_model: &str, effort: &str) -> Value {
     json!({
-        "name": format!("gpt-{effort}"),
-        "provider_args": ["-m", "openai/gpt-5.6-sol", "--variant", effort],
+        "name": alias,
+        "provider_args": ["-m", provider_model, "--variant", effort],
         "inputs": {
             "prompt": "reply with the single word: ok",
             "named": {}
@@ -306,6 +431,14 @@ pub fn host_candidate_argv(effort: &str) -> Vec<&str> {
 }
 
 pub fn host_candidate_argv_for_command<'a>(command: &'a str, effort: &'a str) -> Vec<&'a str> {
+    host_candidate_argv_for_model(command, "openai/gpt-5.6-sol", effort)
+}
+
+pub fn host_candidate_argv_for_model<'a>(
+    command: &'a str,
+    provider_model: &'a str,
+    effort: &'a str,
+) -> Vec<&'a str> {
     let mut argv = vec![command];
     if command.rsplit('/').next() == Some("opencode") {
         argv.push("--pure");
@@ -314,7 +447,7 @@ pub fn host_candidate_argv_for_command<'a>(command: &'a str, effort: &'a str) ->
         "run",
         "--dangerously-skip-permissions",
         "-m",
-        "openai/gpt-5.6-sol",
+        provider_model,
         "--variant",
         effort,
         "reply with the single word: ok",

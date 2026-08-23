@@ -52,47 +52,17 @@ impl FixtureCoverage {
 }
 
 pub fn parse_opencode_fixture_events(fixture: &str) -> Vec<NumberedFixtureEvent> {
-    numbered_fixture_lines(non_empty_fixture_lines(fixture))
-        .into_iter()
-        .map(parse_numbered_fixture_line)
-        .collect()
-}
-
-pub fn non_empty_fixture_lines(fixture: &str) -> Vec<&str> {
-    non_empty_lines(fixture_lines(fixture))
-}
-
-pub fn fixture_lines(fixture: &str) -> Vec<&str> {
-    fixture.lines().collect()
-}
-
-pub fn non_empty_lines(lines: Vec<&str>) -> Vec<&str> {
-    lines
-        .into_iter()
-        .filter(|line| line_has_text(line))
-        .collect()
-}
-
-pub fn line_has_text(line: &str) -> bool {
-    !line.trim().is_empty()
-}
-
-pub fn numbered_fixture_lines(lines: Vec<&str>) -> Vec<(usize, &str)> {
-    lines
-        .into_iter()
+    fixture
+        .lines()
         .enumerate()
-        .map(|(index, line)| (index + 1, line))
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let line_number = index + 1;
+            let event = serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("fixture line {line_number} is invalid JSON: {err}"));
+            NumberedFixtureEvent { line_number, event }
+        })
         .collect()
-}
-
-pub fn parse_numbered_fixture_line((line_number, line): (usize, &str)) -> NumberedFixtureEvent {
-    parse_opencode_fixture_event(line_number, line)
-}
-
-pub fn parse_opencode_fixture_event(line_number: usize, line: &str) -> NumberedFixtureEvent {
-    let event = serde_json::from_str(line)
-        .unwrap_or_else(|err| panic!("fixture line {line_number} is invalid JSON: {err}"));
-    NumberedFixtureEvent { line_number, event }
 }
 
 pub fn fixture_event_type(numbered: &NumberedFixtureEvent) -> &str {
@@ -160,66 +130,22 @@ pub fn wrapper_nul_log_args(wrapper_log_path: &Path) -> Vec<String> {
 }
 
 pub fn wrapper_log_args(wrapper_log: &str) -> Vec<&str> {
-    wrapper_log_arg_values(wrapper_log_arg_lines(wrapper_log))
-}
-
-pub fn wrapper_log_arg_lines(wrapper_log: &str) -> Vec<&str> {
-    arg_log_lines(wrapper_log_lines(wrapper_log))
-}
-
-pub fn wrapper_log_lines(wrapper_log: &str) -> Vec<&str> {
-    wrapper_log.lines().collect()
-}
-
-pub fn arg_log_lines(lines: Vec<&str>) -> Vec<&str> {
-    lines
-        .into_iter()
-        .filter(|line| is_wrapper_log_arg_line(line))
+    wrapper_log
+        .lines()
+        .filter_map(|line| line.strip_prefix("arg="))
         .collect()
 }
 
-pub fn is_wrapper_log_arg_line(line: &str) -> bool {
-    line.starts_with("arg=")
-}
-
-pub fn wrapper_log_arg_values(lines: Vec<&str>) -> Vec<&str> {
-    lines.into_iter().map(wrapper_log_arg_value).collect()
-}
-
-pub fn wrapper_log_arg_value(line: &str) -> &str {
-    line.strip_prefix("arg=").expect("wrapper arg log line")
-}
-
 pub fn argv_arg_index(argv: &[&str], needle: &str) -> usize {
-    required_argv_arg_index(optional_argv_arg_index(argv, needle), needle, argv)
-}
-
-pub fn optional_argv_arg_index(argv: &[&str], needle: &str) -> Option<usize> {
-    argv.iter().position(|arg| *arg == needle)
+    argv.iter()
+        .position(|arg| *arg == needle)
+        .unwrap_or_else(|| panic!("argv missing {needle:?}: {argv:?}"))
 }
 
 pub fn argv_arg_index_containing(argv: &[&str], needle: &str) -> usize {
-    required_argv_arg_index(
-        optional_argv_arg_index_containing(argv, needle),
-        needle,
-        argv,
-    )
-}
-
-pub fn optional_argv_arg_index_containing(argv: &[&str], needle: &str) -> Option<usize> {
-    argv.iter().position(|arg| arg.contains(needle))
-}
-
-pub fn required_argv_arg_index(index: Option<usize>, needle: &str, argv: &[&str]) -> usize {
-    index.unwrap_or_else(|| missing_argv_arg_index(needle, argv))
-}
-
-pub fn missing_argv_arg_index(needle: &str, argv: &[&str]) -> ! {
-    panic!("argv missing {needle:?}: {argv:?}")
-}
-
-pub fn argv_index_before(left: usize, right: usize) -> bool {
-    left < right
+    argv.iter()
+        .position(|arg| arg.contains(needle))
+        .unwrap_or_else(|| panic!("argv missing {needle:?}: {argv:?}"))
 }
 
 pub fn wrapper_arg_log_line(value: &str) -> String {
@@ -228,32 +154,6 @@ pub fn wrapper_arg_log_line(value: &str) -> String {
 
 pub fn wrapper_stdin_log_line(value: &str) -> String {
     format!("stdin={value}")
-}
-
-pub fn wrapper_log_has_selected_wrapper(wrapper_log: &str) -> bool {
-    wrapper_log_lines_has_selected_wrapper(&wrapper_log_lines(wrapper_log))
-}
-
-pub fn wrapper_log_has_run_arg(wrapper_log: &str) -> bool {
-    wrapper_log_lines_has_run_arg(&wrapper_log_lines(wrapper_log))
-}
-
-pub fn wrapper_log_lines_has_selected_wrapper(lines: &[&str]) -> bool {
-    lines
-        .iter()
-        .any(|line| wrapper_log_line_is_selected_wrapper(line))
-}
-
-pub fn wrapper_log_line_is_selected_wrapper(line: &str) -> bool {
-    line == "argv0=opencode1" || line.ends_with("/opencode1")
-}
-
-pub fn wrapper_log_lines_has_run_arg(lines: &[&str]) -> bool {
-    lines.iter().any(|line| wrapper_log_line_is_run_arg(line))
-}
-
-pub fn wrapper_log_line_is_run_arg(line: &str) -> bool {
-    line == "arg=run"
 }
 
 pub fn declared_env_log_text(wrapper_log_path: &Path) -> String {
@@ -344,18 +244,6 @@ pub fn text_contains(text: &str, needle: &str) -> bool {
     text.contains(needle)
 }
 
-pub fn non_empty_launch_stdout_lines(stdout: &[u8]) -> Vec<&str> {
-    non_empty_lines(launch_stdout_lines(stdout))
-}
-
-pub fn launch_stdout_lines(stdout: &[u8]) -> Vec<&str> {
-    launch_stdout_text(stdout).lines().collect()
-}
-
-pub fn launch_stdout_text(stdout: &[u8]) -> &str {
-    std::str::from_utf8(stdout).expect("launch stdout should be UTF-8 NDJSON")
-}
-
 pub struct FakeOpencodeWrapper {
     pub dir: PathBuf,
     pub log_path: PathBuf,
@@ -375,6 +263,57 @@ impl FakeOpencodeWrapper {
         write_fake_wrapper(&wrapper_path, script);
         let log_path_string = path_string(&log_path);
         Self::from_parts(dir, log_path, log_path_string)
+    }
+
+    pub fn with_counted_new_session(session_id: &str) -> Self {
+        let dir = unique_temp_dir("agent-runner-opencode-counted-new-session");
+        create_fake_wrapper_dir(&dir);
+        let wrapper_path = fake_wrapper_path(&dir);
+        let log_path = fake_wrapper_log_path(&dir);
+        write_fake_wrapper(
+            &wrapper_path,
+            fake_counted_new_session_script(&log_path, session_id),
+        );
+        let log_path_string = path_string(&log_path);
+        Self::from_parts(dir, log_path, log_path_string)
+    }
+
+    pub fn with_counted_resume() -> Self {
+        Self::with_counted_resume_payload(resume_payload())
+    }
+
+    pub fn with_counted_resume_payload(payload: &str) -> Self {
+        let dir = unique_temp_dir("agent-runner-opencode-counted-resume");
+        create_fake_wrapper_dir(&dir);
+        let wrapper_path = fake_wrapper_path(&dir);
+        let log_path = fake_wrapper_log_path(&dir);
+        write_fake_wrapper(
+            &wrapper_path,
+            fake_counted_resume_script(&log_path, payload),
+        );
+        let log_path_string = path_string(&log_path);
+        Self::from_parts(dir, log_path, log_path_string)
+    }
+
+    pub fn with_counted_resume_late_completion() -> (Self, PathBuf) {
+        let dir = unique_temp_dir("agent-runner-opencode-counted-resume-reconciliation");
+        create_fake_wrapper_dir(&dir);
+        let wrapper_path = fake_wrapper_path(&dir);
+        let log_path = fake_wrapper_log_path(&dir);
+        let completion_marker = dir.join("completion-ready");
+        write_fake_wrapper(
+            &wrapper_path,
+            fake_counted_resume_late_completion_script(
+                &log_path,
+                &completion_marker,
+                resume_payload(),
+            ),
+        );
+        let log_path_string = path_string(&log_path);
+        (
+            Self::from_parts(dir, log_path, log_path_string),
+            completion_marker,
+        )
     }
 
     fn from_parts(dir: PathBuf, log_path: PathBuf, log_path_string: String) -> Self {
@@ -413,6 +352,11 @@ pub fn fake_wrapper_log_path(dir: &Path) -> PathBuf {
 pub fn write_fake_wrapper(wrapper_path: &Path, script: String) {
     fs::write(wrapper_path, script).expect("write fake opencode1 wrapper");
     make_executable(wrapper_path);
+    crate::support::write_fake_opencode_dispatcher(
+        wrapper_path
+            .parent()
+            .expect("fake wrapper path has a parent"),
+    );
 }
 
 #[cfg(unix)]
@@ -540,6 +484,10 @@ pub fn fake_wrapper_log_script() -> &'static str {
 
 pub fn fake_wrapper_log_stdin_script() -> &'static str {
     "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '{\"info\":{\"id\":\"%s\",\"title\":\"empty resume fixture\"},\"messages\":[]}\\n' \"$2\"\n\
+  exit 0\n\
+fi\n\
 {\n\
   printf 'argv0=%s\\n' \"$0\"\n\
   for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
@@ -557,18 +505,246 @@ exit 0\n"
         .to_string()
 }
 
+pub fn fake_wrapper_runtime_identity_script() -> String {
+    "#!/bin/sh\n\
+if [ \"${CONTEXT_SELECTOR-}\" != \"runtime-a\" ]; then\n\
+  printf '%s\\n' 'native runtime selector mismatch' >&2\n\
+  exit 66\n\
+fi\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '{\"info\":{\"id\":\"%s\",\"title\":\"runtime identity fixture\"},\"messages\":[]}\\n' \"$2\"\n\
+fi\n\
+exit 0\n"
+        .to_string()
+}
+
+pub fn fake_counted_new_session_script(count_path: &Path, session_id: &str) -> String {
+    let event = json!({
+        "type": "step_start",
+        "timestamp": OBSERVED_AT_UNIX_MS,
+        "sessionID": session_id,
+        "part": {
+            "type": "step-start",
+            "sessionID": session_id
+        }
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"session\" ] && [ \"${{2:-}}\" = \"list\" ]; then\n\
+  if [ \"${{XDG_DATA_HOME-}}\" != \"/tmp/agent-runner-opencode-recovery-xdg\" ]; then\n\
+    printf '%s\\n' 'recovery XDG_DATA_HOME mismatch' >&2\n\
+    exit 65\n\
+  fi\n\
+  printf '%s\\n' '[]'\n\
+  exit 0\n\
+fi\n\
+count=0\n\
+if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
+count=$((count + 1))\n\
+printf '%s\\n' \"$count\" > {count_path}\n\
+printf '%s\\n' {event}\n\
+exit 0\n",
+        count_path = shell_single_quote(&path_string(count_path)),
+        event = shell_single_quote(&event),
+    )
+}
+
+pub fn fake_invalid_session_list_then_counted_new_session_script(
+    count_path: &Path,
+    session_id: &str,
+) -> String {
+    let event = json!({
+        "type": "step_start",
+        "timestamp": OBSERVED_AT_UNIX_MS,
+        "sessionID": session_id,
+        "part": {
+            "type": "step-start",
+            "sessionID": session_id
+        }
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"session\" ] && [ \"${{2:-}}\" = \"list\" ]; then\n\
+  printf '%s\\n' '[{{\"created\":\"4102444800000\"}}]'\n\
+  exit 0\n\
+fi\n\
+count=0\n\
+if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
+count=$((count + 1))\n\
+printf '%s\\n' \"$count\" > {count_path}\n\
+printf '%s\\n' {event}\n\
+exit 0\n",
+        count_path = shell_single_quote(&path_string(count_path)),
+        event = shell_single_quote(&event),
+    )
+}
+
+pub fn fake_counted_resume_script(count_path: &Path, payload: &str) -> String {
+    let export = json!({
+        "info": {"id": resume_session_id(), "title": "durable resume contract"},
+        "messages": [{
+            "info": {
+                "id": "msg-durable-resume-user",
+                "role": "user",
+                "sessionID": resume_session_id(),
+                "model": {
+                    "providerID": "openai",
+                    "modelID": "gpt-5.6-sol",
+                    "variant": "low"
+                },
+                "time": {"created": 4_102_444_800_000_u64}
+            },
+            "parts": [{"type": "text", "text": payload}]
+        }]
+    })
+    .to_string();
+    let event = json!({
+        "type": "step_start",
+        "timestamp": OBSERVED_AT_UNIX_MS,
+        "sessionID": resume_session_id(),
+        "part": {
+            "type": "step-start",
+            "sessionID": resume_session_id()
+        }
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '%s\\n' {export}\n\
+  exit 0\n\
+fi\n\
+count=0\n\
+if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
+count=$((count + 1))\n\
+printf '%s\\n' \"$count\" > {count_path}\n\
+printf '%s\\n' {event}\n\
+exit 0\n",
+        count_path = shell_single_quote(&path_string(count_path)),
+        export = shell_single_quote(&export),
+        event = shell_single_quote(&event),
+    )
+}
+
+pub fn fake_counted_resume_late_completion_script(
+    count_path: &Path,
+    completion_marker: &Path,
+    payload: &str,
+) -> String {
+    let delivery_marker_path = count_path.with_extension("delivery-marker");
+    let delivered_payload = format!("{payload}\n\n__PROVIDER_DELIVERY_MARKER__\n");
+    let user = json!({
+        "info": {
+            "id": "msg-durable-resume-user",
+            "role": "user",
+            "sessionID": resume_session_id(),
+            "model": {
+                "providerID": "openai",
+                "modelID": "gpt-5.6-sol",
+                "variant": "low"
+            },
+            "time": {"created": 4_102_444_800_000_u64}
+        },
+        "parts": [{"type": "text", "text": delivered_payload}]
+    });
+    let pending_export = json!({
+        "info": {"id": resume_session_id(), "title": "durable resume contract"},
+        "messages": [user.clone()]
+    })
+    .to_string();
+    let completed_export = json!({
+        "info": {"id": resume_session_id(), "title": "durable resume contract"},
+        "messages": [user, {
+            "info": {
+                "id": "msg-durable-resume-assistant",
+                "role": "assistant",
+                "sessionID": resume_session_id(),
+                "providerID": "openai",
+                "modelID": "gpt-5.6-sol",
+                "variant": "low",
+                "time": {
+                    "created": 4_102_444_800_001_u64,
+                    "completed": 4_102_444_800_002_u64
+                }
+            },
+            "parts": [{"type": "text", "text": "done"}]
+        }]
+    })
+    .to_string();
+    let event = json!({
+        "type": "step_start",
+        "timestamp": OBSERVED_AT_UNIX_MS,
+        "sessionID": resume_session_id(),
+        "part": {"type": "step-start", "sessionID": resume_session_id()}
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  delivery=$(/bin/cat {delivery_marker_path})\n\
+  if [ -e {completion_marker} ]; then\n\
+    printf '%s\\n' {completed_export} | /bin/sed \"s/__PROVIDER_DELIVERY_MARKER__/$delivery/g\"\n\
+  else\n\
+    printf '%s\\n' {pending_export} | /bin/sed \"s/__PROVIDER_DELIVERY_MARKER__/$delivery/g\"\n\
+  fi\n\
+  exit 0\n\
+fi\n\
+for arg in \"$@\"; do\n\
+  case \"$arg\" in\n\
+    *OULIPOLY-DELIVERY*) printf '%s' \"$arg\" > {delivery_marker_path} ;;\n\
+  esac\n\
+done\n\
+count=0\n\
+if [ -f {count_path} ]; then count=$(/bin/cat {count_path}); fi\n\
+count=$((count + 1))\n\
+printf '%s\\n' \"$count\" > {count_path}\n\
+printf '%s\\n' {event}\n\
+exit 0\n",
+        completion_marker = shell_single_quote(&path_string(completion_marker)),
+        delivery_marker_path = shell_single_quote(&path_string(&delivery_marker_path)),
+        count_path = shell_single_quote(&path_string(count_path)),
+        completed_export = shell_single_quote(&completed_export),
+        pending_export = shell_single_quote(&pending_export),
+        event = shell_single_quote(&event),
+    )
+}
+
 pub fn fake_wrapper_nul_log_resume_confirming_export_script(prompt: &str) -> String {
     let export = json!({
         "info": {"id": resume_session_id(), "title": "resume contract"},
-        "messages": [{
-            "info": {
-                "id": "msg-user",
-                "role": "user",
-                "sessionID": resume_session_id(),
-                "time": {"created": 4_102_444_800_000_u64}
+        "messages": [
+            {
+                "info": {
+                    "id": "msg-user",
+                    "role": "user",
+                    "sessionID": resume_session_id(),
+                    "model": {
+                        "providerID": "openai",
+                        "modelID": "gpt-5.6-sol",
+                        "variant": "low"
+                    },
+                    "time": {"created": 4_102_444_800_000_u64}
+                },
+                "parts": [{"type": "text", "text": prompt}]
             },
-            "parts": [{"type": "text", "text": prompt}]
-        }]
+            {
+                "info": {
+                    "id": "msg-assistant",
+                    "role": "assistant",
+                    "sessionID": resume_session_id(),
+                    "providerID": "openai",
+                    "modelID": "gpt-5.6-sol",
+                    "variant": "low",
+                    "time": {
+                        "created": 4_102_444_800_001_u64,
+                        "completed": 4_102_444_800_002_u64
+                    }
+                },
+                "parts": [{"type": "text", "text": "done"}]
+            }
+        ]
     })
     .to_string();
     format!(
@@ -587,7 +763,7 @@ exit 0\n",
 pub fn fake_wrapper_resume_confirming_export_script() -> &'static str {
     "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
-  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]}]}'\n\
+	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]}]}'\n\
   exit 0\n\
 fi\n\
 {\n\
@@ -601,7 +777,7 @@ exit 0\n"
 pub fn fake_wrapper_resume_unconfirmed_export_script() -> &'static str {
     "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
-  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"different prompt\"}]}]}'\n\
+	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"different prompt\"}]}]}'\n\
   exit 0\n\
 fi\n\
 {\n\
@@ -615,7 +791,7 @@ exit 0\n"
 pub fn fake_wrapper_completed_resume_then_hang_script() -> String {
     "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
-  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]}]}'\n\
+	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]},{\"info\":{\"id\":\"msg-assistant\",\"role\":\"assistant\",\"sessionID\":\"ses_resume_contract\",\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\",\"time\":{\"created\":4102444800001,\"completed\":4102444800002}},\"parts\":[{\"type\":\"text\",\"text\":\"done\"}]}]}'\n\
   exit 0\n\
 fi\n\
 printf '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000001,\"part\":{\"type\":\"step-start\",\"sessionID\":\"ses_resume_contract\"}}\\n'\n\
@@ -629,7 +805,7 @@ exit 9\n"
 pub fn fake_wrapper_completed_resume_with_non_terminal_tail_script() -> &'static str {
     "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
-  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":1780000000000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]}]}'\n\
+	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]},{\"info\":{\"id\":\"msg-assistant\",\"role\":\"assistant\",\"sessionID\":\"ses_resume_contract\",\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\",\"time\":{\"created\":4102444800001,\"completed\":4102444800002}},\"parts\":[{\"type\":\"text\",\"text\":\"done\"}]}]}'\n\
   exit 0\n\
 fi\n\
 printf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000003,\"part\":{\"type\":\"step-finish\",\"sessionID\":\"ses_resume_contract\",\"reason\":\"stop\"}}'\n\
@@ -640,10 +816,10 @@ exit 0\n"
 pub fn fake_wrapper_completed_export_then_hang_script() -> String {
     "#!/bin/sh\n\
 if [ \"$1\" = \"export\" ]; then\n\
-  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]},{\"info\":{\"id\":\"msg-assistant\",\"role\":\"assistant\",\"sessionID\":\"ses_resume_contract\",\"time\":{\"created\":4102444800001,\"completed\":4102444800002}},\"parts\":[{\"type\":\"text\",\"text\":\"done\"}]}]}'\n\
-  exit 0\n\
+  printf '%s\\n' 'unexpected full transcript export' > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
+  exit 70\n\
 fi\n\
-/bin/sleep 5\n\
+/bin/sleep 1\n\
 exit 9\n"
         .to_string()
 }
@@ -653,38 +829,15 @@ pub fn shell_single_quote(value: &str) -> String {
 }
 
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(unique_temp_dir_name(prefix))
-}
-
-pub fn unique_temp_dir_name(prefix: &str) -> String {
-    formatted_temp_dir_name(prefix, current_time_nanos(), current_process_id())
-}
-
-pub fn current_time_nanos() -> u128 {
-    SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
-        .as_nanos()
-}
-
-pub fn current_process_id() -> u32 {
-    std::process::id()
-}
-
-pub fn formatted_temp_dir_name(prefix: &str, nanos: u128, process_id: u32) -> String {
-    format!("{prefix}-{process_id}-{nanos}")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
 pub fn prepend_path(dir: &Path) -> String {
-    joined_path_string(prepended_path_entries(dir))
-}
-
-pub fn prepended_path_entries(dir: &Path) -> Vec<PathBuf> {
-    vec![dir.to_path_buf()]
-}
-
-pub fn joined_path_string(paths: Vec<PathBuf>) -> String {
-    std::env::join_paths(paths)
+    std::env::join_paths([dir])
         .expect("join PATH entries")
         .to_string_lossy()
         .into_owned()
@@ -695,152 +848,62 @@ pub fn path_string(path: &Path) -> String {
 }
 
 pub fn expected_signal_kind_for_status(status: &Value) -> &'static str {
-    signal_kind_for_process_status(terminal_signal_status_kind(status), status)
-}
-
-pub fn terminal_signal_status_kind(status: &Value) -> &str {
-    required_terminal_signal_status_kind(terminal_signal_status_kind_value(status))
-}
-
-pub fn terminal_signal_status_kind_value(status: &Value) -> Option<&str> {
-    status["kind"].as_str()
-}
-
-pub fn required_terminal_signal_status_kind(kind: Option<&str>) -> &str {
-    kind.expect("status.kind")
-}
-
-pub fn signal_kind_for_process_status(kind: &str, status: &Value) -> &'static str {
-    match kind {
-        "exited" => signal_kind_for_exited_status(status),
+    match status["kind"].as_str().expect("status.kind") {
+        "exited" if status["code"].as_i64() == Some(0) => "clean_exit",
+        "exited" => "nonzero_exit",
         "signal_terminated" => "signal_exit",
         "spawn_error" => "spawn_error",
         "prolonged_silence" => "prolonged_silence",
         "cancelled" => "cancelled",
         "unknown" => "unknown",
-        other => unexpected_process_status_kind(other),
+        other => panic!("unexpected ProcessStatus kind {other}"),
     }
-}
-
-pub fn signal_kind_for_exited_status(status: &Value) -> &'static str {
-    if process_status_exit_success(status) {
-        "clean_exit"
-    } else {
-        "nonzero_exit"
-    }
-}
-
-pub fn process_status_exit_success(status: &Value) -> bool {
-    status["code"].as_i64() == Some(0)
-}
-
-pub fn unexpected_process_status_kind(other: &str) -> ! {
-    panic!("unexpected ProcessStatus kind {other}")
 }
 
 pub fn fixture_session_id() -> &'static str {
-    let event = fixture_first_event();
-    Box::leak(fixture_event_session_id_string(&event).into_boxed_str())
-}
-
-pub fn fixture_first_event() -> Value {
-    let first_line = fixture_first_line();
-    serde_json::from_str(first_line).expect("fixture first line should be JSON")
-}
-
-pub fn fixture_first_line() -> &'static str {
-    first_fixture_line(fixture_non_empty_lines())
-}
-
-pub fn fixture_non_empty_lines() -> Vec<&'static str> {
-    first_non_empty_fixture_lines(static_fixture_lines())
-}
-
-pub fn static_fixture_lines() -> Vec<&'static str> {
-    include_str!("../fixtures/opencode_launch_events.jsonl")
+    let first_line = include_str!("../fixtures/opencode_launch_events.jsonl")
         .lines()
-        .collect()
-}
-
-pub fn first_non_empty_fixture_lines(lines: Vec<&'static str>) -> Vec<&'static str> {
-    first_non_empty_line(lines).into_iter().collect()
-}
-
-pub fn first_non_empty_line(lines: Vec<&str>) -> Option<&str> {
-    lines.into_iter().find(|line| line_has_text(line))
-}
-
-pub fn first_fixture_line(lines: Vec<&'static str>) -> &'static str {
-    lines
-        .into_iter()
-        .next()
+        .find(|line| !line.trim().is_empty())
         .expect("opencode launch fixture should not be empty")
+        .to_string();
+    let event: Value =
+        serde_json::from_str(&first_line).expect("fixture first line should be JSON");
+    Box::leak(
+        event["sessionID"]
+            .as_str()
+            .expect("fixture first line should carry sessionID")
+            .to_owned()
+            .into_boxed_str(),
+    )
 }
 
-pub fn fixture_event_session_id_string(event: &Value) -> String {
-    owned_fixture_session_id(required_fixture_event_session_id(
-        fixture_event_session_id_value(event),
-    ))
-}
-
-pub fn fixture_event_session_id_value(event: &Value) -> Option<&str> {
-    event["sessionID"].as_str()
-}
-
-pub fn required_fixture_event_session_id(session_id: Option<&str>) -> &str {
-    session_id.expect("fixture first line should carry sessionID")
-}
-
-pub fn owned_fixture_session_id(session_id: &str) -> String {
-    session_id.to_owned()
-}
-
-pub fn unix_ms_now() -> u64 {
+pub fn short_deadline_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after epoch")
         .as_millis() as u64
-}
-
-pub fn short_deadline_unix_ms() -> u64 {
-    unix_ms_now() + 250
+        + 1_500
 }
 
 pub fn string_array(value: &Value, label: &str) -> Vec<String> {
-    owned_string_array_entries(string_array_entries(value_array(value, label), label))
-}
-
-pub fn value_array<'a>(value: &'a Value, label: &str) -> &'a [Value] {
     value
         .as_array()
         .unwrap_or_else(|| panic!("{label} should be an array"))
-}
-
-pub fn string_array_entries<'a>(values: &'a [Value], label: &str) -> Vec<&'a str> {
-    values
         .iter()
-        .map(|value| string_array_entry(value, label))
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("{label} entries should be strings"))
+                .to_owned()
+        })
         .collect()
 }
 
-pub fn string_array_entry<'a>(value: &'a Value, label: &str) -> &'a str {
-    value
-        .as_str()
-        .unwrap_or_else(|| panic!("{label} entries should be strings"))
-}
-
-pub fn owned_string_array_entries(entries: Vec<&str>) -> Vec<String> {
-    entries.into_iter().map(str::to_owned).collect()
-}
-
 pub fn contains_subsequence(argv: &[String], expected: &[&str]) -> bool {
-    argv.windows(expected.len())
-        .any(|window| window_matches_expected(window, expected))
-}
-
-pub fn window_matches_expected(window: &[String], expected: &[&str]) -> bool {
-    window
-        .iter()
-        .map(String::as_str)
-        .eq(expected.iter().copied())
+    argv.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+    })
 }

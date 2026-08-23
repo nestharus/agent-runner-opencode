@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.oulipoly.dev/opencode/rotation-decision/v1",
+  "x-protocol": "opencode.rotation-decision/v1",
+  "title": "OpenCode Rotation Decision Receipt",
+  "type": "object",
+  "$defs": {
+    "Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "Account": {
+      "enum": ["opencode1", "opencode2", "opencode3", "opencode4", "opencode5"]
+    },
+    "SettingsSelection": {
+      "type": "object",
+      "properties": {
+        "settings_id": { "type": "string", "minLength": 1 },
+        "settings_version": { "type": "string", "minLength": 1 },
+        "settings_account": { "$ref": "#/$defs/Account" }
+      },
+      "required": ["settings_id", "settings_version", "settings_account"],
+      "additionalProperties": false
+    },
+    "OptionalSettingsSelection": {
+      "oneOf": [
+        { "$ref": "#/$defs/SettingsSelection" },
+        { "type": "null" }
+      ]
+    },
+    "Binding": {
+      "type": "object",
+      "properties": {
+        "chain_id": { "type": "string", "minLength": 1 },
+        "source_provider": { "type": "string", "minLength": 1 },
+        "target_provider": { "type": "string", "minLength": 1 },
+        "source_account": { "$ref": "#/$defs/Account" },
+        "target_account": { "$ref": "#/$defs/Account" },
+        "source_session_id": { "type": "string", "minLength": 1 },
+        "model_name": { "type": "string" },
+        "settings_selection": { "$ref": "#/$defs/OptionalSettingsSelection" },
+        "transition_reason": { "enum": ["manual", "quota_threshold", "exhausted"] },
+        "provider_instance_id": { "type": "string", "minLength": 1 },
+        "host_app": { "type": "string", "minLength": 1 }
+      },
+      "required": [
+        "chain_id",
+        "source_provider",
+        "target_provider",
+        "source_account",
+        "target_account",
+        "source_session_id",
+        "model_name",
+        "settings_selection",
+        "transition_reason",
+        "provider_instance_id",
+        "host_app"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema_version": { "const": 1 },
+    "schema_id": { "const": "opencode.rotation-decision/v1" },
+    "operation": { "const": "rotation.materialize" },
+    "binding_sha256": { "$ref": "#/$defs/Digest" },
+    "binding": { "$ref": "#/$defs/Binding" },
+    "authorized_settings_selection": { "$ref": "#/$defs/OptionalSettingsSelection" },
+    "settled_settings_selection": { "$ref": "#/$defs/OptionalSettingsSelection" },
+    "authorization_id": { "$ref": "#/$defs/Digest" },
+    "assessment_request_id": { "type": "string", "minLength": 1 },
+    "materialization_request_id": { "type": "string", "minLength": 1 },
+    "expected_target_session_id": { "type": "string", "minLength": 1 },
+    "actual_target_session_id": { "type": "string", "minLength": 1 },
+    "identity_matched": { "type": "boolean" },
+    "outcome": { "enum": ["settled", "recoverable_identity_change"] },
+    "recorded_at_unix_ms": { "type": "integer", "minimum": 0 }
+  },
+  "required": [
+    "schema_version",
+    "schema_id",
+    "operation",
+    "binding_sha256",
+    "binding",
+    "authorized_settings_selection",
+    "settled_settings_selection",
+    "authorization_id",
+    "assessment_request_id",
+    "materialization_request_id",
+    "expected_target_session_id",
+    "actual_target_session_id",
+    "identity_matched",
+    "outcome",
+    "recorded_at_unix_ms"
+  ],
+  "oneOf": [
+    {
+      "properties": {
+        "authorized_settings_selection": { "$ref": "#/$defs/SettingsSelection" },
+        "settled_settings_selection": { "$ref": "#/$defs/SettingsSelection" }
+      }
+    },
+    {
+      "properties": {
+        "authorized_settings_selection": { "type": "null" },
+        "settled_settings_selection": { "type": "null" }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

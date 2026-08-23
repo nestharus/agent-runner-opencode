@@ -5,10 +5,10 @@ use super::*;
 
 pub fn missing_prereq_install_needles() -> [&'static str; 7] {
     [
-        "verify_tool",
-        "opencode --version",
-        "chatgpt-usage",
-        "verify_wrappers",
+        "verify_reviewed_native_implementation",
+        "agent-runner-opencode.native-implementation-manifest/v1",
+        "curl --version",
+        "verify_logical_profiles",
         "opencode1",
         "prepare_provider_settings",
         "opencode.settings/v1",
@@ -26,6 +26,21 @@ pub fn missing_prereq_sync_needles() -> [&'static str; 4] {
 
 pub fn empty_request_params() -> Value {
     json!({})
+}
+
+pub fn setup_sync_rebind_params() -> Value {
+    json!({
+        "settings_schema_id": "opencode.settings/v1",
+        "desired_profiles": ["opencode3"],
+        "native_identity_rebind": {
+            "protocol": "opencode.native-identity-rebind/v1",
+            "action": "plan",
+            "targets": [
+                { "profile": "opencode3", "component": "native_runtime" },
+                { "profile": "opencode3", "component": "quota_observer" }
+            ]
+        }
+    })
 }
 
 pub fn settings_create_params(secret: Option<&str>) -> Value {
@@ -66,6 +81,22 @@ pub fn invalid_settings_validate_params() -> Value {
     settings_validate_params(invalid_opencode_settings_values())
 }
 
+pub fn luna_settings_validate_params() -> Value {
+    let mut values = opencode_settings_values(None);
+    values["model"] = json!({
+        "name": "gpt-luna-max",
+        "provider_model": "openai/gpt-5.6-luna",
+        "variant": "max"
+    });
+    settings_validate_params(values)
+}
+
+pub fn mismatched_luna_settings_validate_params() -> Value {
+    let mut params = luna_settings_validate_params();
+    params["values"]["model"]["provider_model"] = json!("openai/gpt-5.6-sol");
+    params
+}
+
 pub fn settings_validate_params(values: Value) -> Value {
     json!({ "values": values })
 }
@@ -74,7 +105,7 @@ pub fn invalid_opencode_settings_values() -> Value {
     json!({
         "provider": "opencode",
         "wrapper": "opencode99",
-        "model": { "provider_model": "", "variant": "impossible" },
+        "model": { "name": "unknown-model", "provider_model": "", "variant": "impossible" },
         "quota": { "auth_path": "" }
     })
 }
@@ -132,9 +163,9 @@ pub fn opencode_settings_values(secret: Option<&str>) -> Value {
             "variant": "high"
         },
         "quota": {
-            "source": "codex",
-            "auth_path": "~/.codex/auth.json",
-            "usage_command": "chatgpt-usage"
+            "source": "opencode_auth",
+            "auth_path": "~/.local/share/opencode/auth.json",
+            "probe": "native_chatgpt_usage"
         },
         "launch": {
             "format": "json",
@@ -151,17 +182,21 @@ pub fn path_wrapped_opencode_settings_values(wrapper: &str) -> Value {
     let mut values = opencode_settings_values(None);
     values["profile"] = json!(format!("/tmp/host-bin/{wrapper}"));
     values["wrapper"] = json!(format!("/tmp/host-bin/{wrapper}"));
-    values["quota"]["auth_path"] = json!("~/.codex/wrong-auth.json");
+    values["quota"]["auth_path"] = json!("~/.opencode-wrong/auth.json");
     values
 }
 
 pub fn rotation_assess_params(allowed: bool) -> Value {
     json!({
         "operation": "rotation.assess",
-        "settings_id": "opencode1",
+        "chain_id": "chain-contract-d",
         "model_name": "gpt-high",
-        "source": { "provider": "opencode1", "session_id": "ses_source_contract_d" },
-        "target": { "provider": "opencode2" },
+        "source_provider": "opencode-secondary",
+        "target_provider": "opencode-primary",
+        "source_account": "opencode1",
+        "target_account": "opencode2",
+        "source_session_id": ROTATION_SOURCE_SESSION,
+        "transition_reason": "quota_threshold",
         "requirements": rotation_requirements(allowed),
         "facts": {
             "quota": { "available": allowed, "remaining_ratio": if allowed { 0.72 } else { 0.01 } },
@@ -169,6 +204,19 @@ pub fn rotation_assess_params(allowed: bool) -> Value {
             "settings": { "source_profile_present": true, "target_profile_present": allowed }
         }
     })
+}
+
+pub fn rotation_assess_alias_params(allowed: bool) -> Value {
+    let mut params = rotation_assess_params(allowed);
+    params["source_account"] = json!("opencode");
+    params
+}
+
+pub fn rotation_same_account_alias_params() -> Value {
+    let mut params = rotation_assess_params(true);
+    params["source_account"] = json!("opencode");
+    params["target_account"] = json!("opencode1");
+    params
 }
 
 pub fn rotation_requirements(allowed: bool) -> Value {
@@ -183,8 +231,11 @@ pub fn rotation_materialize_params() -> Value {
     json!({
         "operation": "rotation.materialize",
         "chain_id": "chain-contract-d",
-        "source_provider": "opencode1",
-        "target_provider": "opencode2",
+        "model_name": "gpt-high",
+        "source_provider": "opencode-secondary",
+        "target_provider": "opencode-primary",
+        "source_account": "opencode1",
+        "target_account": "opencode2",
         "source_session_id": ROTATION_SOURCE_SESSION,
         "transition_reason": "quota_threshold",
         "requirements": rotation_requirements(true),
@@ -214,4 +265,28 @@ pub fn migration_apply_params(live: &LiveConfigFixture) -> Value {
         "artifact_root": live.provider_artifact_root().to_string_lossy(),
         "confirmation": { "approved": true, "source": "contract-test" }
     })
+}
+
+pub fn migration_apply_params_without_confirmation(live: &LiveConfigFixture) -> Value {
+    let mut params = migration_apply_params(live);
+    params
+        .as_object_mut()
+        .expect("migration params")
+        .remove("confirmation");
+    params
+}
+
+pub fn migration_apply_params_with_false_confirmation(live: &LiveConfigFixture) -> Value {
+    let mut params = migration_apply_params(live);
+    params["confirmation"]["approved"] = json!(false);
+    params
+}
+
+pub fn migration_apply_params_with_artifact_root(
+    live: &LiveConfigFixture,
+    artifact_root: &Path,
+) -> Value {
+    let mut params = migration_apply_params(live);
+    params["artifact_root"] = json!(artifact_root.to_string_lossy());
+    params
 }

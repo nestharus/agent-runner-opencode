@@ -5,7 +5,7 @@ use std::path::Path;
 
 const ADAPTER_SOURCES: &[&str] = &[
     "src/opencode.rs",
-    "src/codex.rs",
+    "src/quota_adapter.rs",
     "src/launch.rs",
     "src/quota.rs",
     "src/session.rs",

@@ -5,13 +5,23 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub const CONTRACT: &str = "oulipoly.provider/v1";
+pub const MAX_REQUEST_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_REQUEST_ID_BYTES: usize = 256;
+pub const MAX_PROVIDER_INSTANCE_ID_BYTES: usize = 256;
+pub const MAX_HOST_LABEL_BYTES: usize = 256;
+pub const MAX_HOST_PATH_BYTES: usize = 64 * 1024;
+pub const MAX_HOST_ENV_ENTRIES: usize = 128;
+pub const MAX_HOST_ENV_KEY_BYTES: usize = 256;
+pub const MAX_HOST_ENV_VALUE_BYTES: usize = 64 * 1024;
+pub const MAX_HOST_ENV_BYTES: usize = 256 * 1024;
 
 pub const CATEGORY_UNSUPPORTED: &str = "unsupported";
 pub const CATEGORY_INVALID_REQUEST: &str = "invalid_request";
+pub const CATEGORY_INVALID_SETTINGS: &str = "invalid_settings";
 pub const CATEGORY_CONFLICT: &str = "conflict";
 pub const CATEGORY_FAILED: &str = "failed";
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestEnvelope {
     pub contract: String,
@@ -21,7 +31,7 @@ pub struct RequestEnvelope {
     pub params: Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostContext {
     pub app: String,
@@ -75,6 +85,40 @@ impl ProviderFailure {
             json!({}),
             false,
             3,
+        )
+    }
+
+    pub fn invalid_settings(
+        request_id: impl Into<String>,
+        code: &'static str,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        provider_failure(
+            request_id,
+            CATEGORY_INVALID_SETTINGS,
+            code,
+            message,
+            details,
+            false,
+            2,
+        )
+    }
+
+    pub fn conflict(
+        request_id: impl Into<String>,
+        code: &'static str,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        provider_failure(
+            request_id,
+            CATEGORY_CONFLICT,
+            code,
+            message,
+            details,
+            false,
+            2,
         )
     }
 

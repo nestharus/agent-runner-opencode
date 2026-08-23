@@ -27,6 +27,102 @@ fn schema_response_conforms_and_returns_opencode_settings_v1() {
 }
 
 #[test]
+fn schema_response_exposes_native_identity_rebind_protocol() {
+    let output = invoke(
+        "schema",
+        json!({ "schema_id": "opencode.native-identity-rebind/v1" }),
+    );
+    assert_success(&output, "native identity rebind schema");
+    let response = json_stdout(&output);
+    assert_valid(&response, "schema.schema.json#/$defs/SchemaResponse");
+    assert_eq!(
+        response["result"]["schema_id"],
+        "opencode.native-identity-rebind/v1"
+    );
+    assert_eq!(
+        response["result"]["schema"]["$id"],
+        "https://schemas.oulipoly.dev/opencode/native-identity-rebind/v1"
+    );
+    assert_eq!(
+        response["result"]["schema"]["x-protocol"],
+        "opencode.native-identity-rebind/v1"
+    );
+    assert!(response["result"].get("ui").is_none());
+}
+
+#[test]
+fn schema_response_exposes_rotation_decision_protocol() {
+    let output = invoke(
+        "schema",
+        json!({ "schema_id": "opencode.rotation-decision/v1" }),
+    );
+    assert_success(&output, "rotation decision schema");
+    let response = json_stdout(&output);
+    assert_valid(&response, "schema.schema.json#/$defs/SchemaResponse");
+    assert_eq!(
+        response["result"]["schema_id"],
+        "opencode.rotation-decision/v1"
+    );
+    assert_eq!(
+        response["result"]["schema"]["$id"],
+        "https://schemas.oulipoly.dev/opencode/rotation-decision/v1"
+    );
+    assert_eq!(
+        response["result"]["schema"]["x-protocol"],
+        "opencode.rotation-decision/v1"
+    );
+    assert!(response["result"].get("ui").is_none());
+}
+
+#[test]
+fn pinned_contract_snapshot_matches_every_recorded_upstream_digest() {
+    let mut checked = 0;
+    for line in include_str!("../contract/v1/UPSTREAM.md").lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 2 || !fields[1].ends_with(".schema.json") {
+            continue;
+        }
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("contract/v1")
+                .join(fields[1]),
+        )
+        .expect("read pinned contract schema");
+        assert_eq!(
+            agent_runner_opencode::encoding::sha256_hex(&bytes),
+            fields[0],
+            "{} diverged from the recorded Agent Runner snapshot",
+            fields[1]
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 13, "all pinned contract schemas must be checked");
+    let schema_count =
+        std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("contract/v1"))
+            .expect("read pinned contract directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".schema.json"))
+            })
+            .count();
+    assert_eq!(schema_count, checked, "unrecorded contract schema found");
+}
+
+#[test]
+fn every_advertised_model_settings_value_is_semantically_valid() {
+    for values in schema_valid_settings_examples() {
+        let output = invoke("settings.validate", json!({ "values": values }));
+        assert_success(&output, "settings.validate advertised model");
+        let response = json_stdout(&output);
+        assert_eq!(response["result"]["valid"], true, "{response}");
+        assert_eq!(response["result"]["diagnostics"], json!([]), "{response}");
+    }
+}
+
+#[test]
 fn unknown_schema_id_returns_contract_error_envelope() {
     let output = invoke("schema", json!({ "schema_id": "unknown.settings/v1" }));
     assert_error_response(output, "unsupported", "unknown_schema");
@@ -41,7 +137,7 @@ fn discovery_models_lists_gpt_variants() {
 }
 
 #[test]
-fn discovery_accounts_maps_shuffled_codex_auth() {
+fn discovery_accounts_maps_native_opencode_auth() {
     let output = invoke("discovery.accounts", json!({}));
     assert_success(&output, "discovery.accounts");
     let response = json_stdout(&output);
@@ -198,7 +294,14 @@ fn assert_settings_schema_response(response: &Value) {
     let result = &response["result"];
     assert_eq!(result["schema_id"], "opencode.settings/v1");
     assert_embedded_schema_id_absolute(&result["schema"]);
-    compile_standalone_schema(&result["schema"]);
+    let schema = compile_standalone_schema(&result["schema"]);
+    assert_settings_schema_catalog(&result["schema"]);
+    for values in schema_valid_settings_examples() {
+        assert!(
+            schema.is_valid(&values),
+            "advertised schema must accept catalog settings value: {values}"
+        );
+    }
 }
 
 fn assert_embedded_schema_id_absolute(schema: &Value) {
@@ -210,11 +313,79 @@ fn assert_embedded_schema_id_absolute(schema: &Value) {
     }
 }
 
-fn compile_standalone_schema(schema: &Value) {
+fn compile_standalone_schema(schema: &Value) -> JSONSchema {
     JSONSchema::options()
         .with_draft(Draft::Draft202012)
         .compile(schema)
-        .unwrap();
+        .unwrap()
+}
+
+fn assert_settings_schema_catalog(schema: &Value) {
+    let variants = schema["properties"]["model"]["oneOf"]
+        .as_array()
+        .expect("model oneOf");
+    assert_eq!(variants.len(), 8);
+    assert!(variants.iter().any(|variant| {
+        variant["properties"]["selection"]["const"] == "requested"
+            && variant["required"] == json!(["selection"])
+    }));
+    let tuples = variants
+        .iter()
+        .filter(|variant| variant["properties"].get("name").is_some())
+        .map(|variant| {
+            (
+                variant["properties"]["name"]["const"]
+                    .as_str()
+                    .expect("model name"),
+                variant["properties"]["provider_model"]["const"]
+                    .as_str()
+                    .expect("provider model"),
+                variant["properties"]["variant"]["const"]
+                    .as_str()
+                    .expect("model variant"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tuples, expected_model_variants());
+    assert_eq!(
+        schema["properties"]["model"]["default"],
+        json!({
+            "name": "gpt-high",
+            "provider_model": "openai/gpt-5.6-sol",
+            "variant": "high"
+        })
+    );
+}
+
+fn schema_valid_settings_examples() -> Vec<Value> {
+    let mut examples = expected_model_variants()
+        .into_iter()
+        .map(|(name, provider_model, variant)| {
+            json!({
+                "provider": "opencode",
+                "profile": "opencode1",
+                "wrapper": "opencode1",
+                "model": {
+                    "name": name,
+                    "provider_model": provider_model,
+                    "variant": variant
+                },
+                "quota": {
+                    "source": "opencode_auth",
+                    "auth_path": "~/.local/share/opencode/auth.json",
+                    "probe": "native_chatgpt_usage"
+                },
+                "launch": {
+                    "format": "json",
+                    "dangerously_skip_permissions": true
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut requested = examples[0].clone();
+    requested["model"] = json!({ "selection": "requested" });
+    examples.push(requested);
+    examples
 }
 
 fn assert_discovery_models_response(response: &Value) {
@@ -229,29 +400,46 @@ fn assert_discovery_models_response(response: &Value) {
     let models = response["result"]["models"]
         .as_array()
         .expect("models array");
-    assert_eq!(models.len(), 5);
-    for (alias, effort) in expected_model_variants() {
-        assert_model_variant(models, alias, effort);
+    assert_eq!(models.len(), 7);
+    for (alias, provider_model, effort) in expected_model_variants() {
+        assert_model_variant(models, alias, provider_model, effort);
     }
 }
 
-fn expected_model_variants() -> [(&'static str, &'static str); 5] {
+fn expected_model_variants() -> [(&'static str, &'static str, &'static str); 7] {
     [
-        ("gpt-low", "low"),
-        ("gpt-medium", "medium"),
-        ("gpt-high", "high"),
-        ("gpt-xhigh", "xhigh"),
-        ("gpt-max", "max"),
+        ("gpt-low", "openai/gpt-5.6-sol", "low"),
+        ("gpt-medium", "openai/gpt-5.6-sol", "medium"),
+        ("gpt-high", "openai/gpt-5.6-sol", "high"),
+        ("gpt-xhigh", "openai/gpt-5.6-sol", "xhigh"),
+        ("gpt-max", "openai/gpt-5.6-sol", "max"),
+        ("gpt-luna-low", "openai/gpt-5.6-luna", "low"),
+        ("gpt-luna-max", "openai/gpt-5.6-luna", "max"),
     ]
 }
 
-fn assert_model_variant(models: &[Value], alias: &str, effort: &str) {
+fn assert_model_variant(models: &[Value], alias: &str, provider_model: &str, effort: &str) {
     let model = find_by_field(models, "name", alias);
-    assert_eq!(model["provider_model"], "openai/gpt-5.6-sol", "{alias}");
+    assert_eq!(model["provider_model"], provider_model, "{alias}");
     assert_eq!(
         model["provider_args"],
-        json!(["-m", "openai/gpt-5.6-sol", "--variant", effort]),
+        json!(["-m", provider_model, "--variant", effort]),
         "{alias} provider args"
+    );
+    assert_eq!(
+        model["account_eligibility"], "uniform_all_declared_accounts",
+        "{alias} account eligibility policy"
+    );
+    assert_eq!(
+        model["eligible_accounts"],
+        json!([
+            "opencode1",
+            "opencode2",
+            "opencode3",
+            "opencode4",
+            "opencode5"
+        ]),
+        "{alias} eligible accounts"
     );
 }
 
@@ -276,11 +464,41 @@ fn assert_discovery_accounts_response(response: &Value) {
 fn expected_account_mappings() -> [(&'static str, u64, &'static str, &'static str, &'static str); 5]
 {
     [
-        ("opencode1", 1, "~/.codex/auth.json", "codex1", "781db66f"),
-        ("opencode2", 2, "~/.codex5/auth.json", "codex5", "27f8ea6e"),
-        ("opencode3", 3, "~/.codex2/auth.json", "codex2", "60238f0b"),
-        ("opencode4", 4, "~/.codex3/auth.json", "codex3", "9d764739"),
-        ("opencode5", 5, "~/.codex4/auth.json", "codex4", "835bbc4d"),
+        (
+            "opencode1",
+            1,
+            "~/.local/share/opencode/auth.json",
+            "opencode1",
+            "b7590111",
+        ),
+        (
+            "opencode2",
+            2,
+            "~/.opencode2/opencode/auth.json",
+            "opencode2",
+            "6dadfdf6",
+        ),
+        (
+            "opencode3",
+            3,
+            "~/.opencode3/opencode/auth.json",
+            "opencode3",
+            "00d3e164",
+        ),
+        (
+            "opencode4",
+            4,
+            "~/.opencode4/opencode/auth.json",
+            "opencode4",
+            "d2b0bb16",
+        ),
+        (
+            "opencode5",
+            5,
+            "~/.opencode5/opencode/auth.json",
+            "opencode5",
+            "7aee8329",
+        ),
     ]
 }
 
@@ -398,13 +616,14 @@ fn assert_account_mapping(
     let account = find_by_field(accounts, "id", wrapper);
     assert_eq!(account["opencode_wrapper"], wrapper);
     assert_eq!(account["opencode_index"], index);
-    assert_eq!(account["codex_auth_path"], auth_path);
-    assert_eq!(account["codex_account_tag"], tag);
-    assert_eq!(account["codex_account_hash"], hash);
+    assert_eq!(account["quota_auth_path"], auth_path);
+    assert_eq!(account["account_tag"], tag);
+    assert_eq!(account["account_hash"], hash);
 
     let quota_source = &account["quota_source"];
-    assert_eq!(quota_source["kind"], "codex_auth");
+    assert_eq!(quota_source["kind"], "opencode_auth");
     assert_eq!(quota_source["auth_path"], auth_path);
+    assert_eq!(quota_source["probe"], "native_chatgpt_usage");
     assert_eq!(quota_source["account_tag"], tag);
     assert_eq!(quota_source["account_hash"], hash);
 }
