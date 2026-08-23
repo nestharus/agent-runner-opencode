@@ -455,9 +455,16 @@ fn diagnostics_for_policy(
     if params.launch.tool_restrictions.is_some() {
         diagnostics.push(unsupported_tool_restrictions_diagnostic());
     }
-    diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(
-        params, model,
-    )));
+    // A malformed command prefix cannot be stripped from the host candidate
+    // safely. Treating the whole argv as caller-owned in that case produces a
+    // cascade of misleading forbidden-flag diagnostics for provider-managed
+    // arguments. Report the command defect first; flag diagnostics become
+    // meaningful only after the logical wrapper prefix is valid.
+    if configured_launch_command(params).is_some() {
+        diagnostics.extend(forbidden_argv_diagnostics(&policy_launch_args(
+            params, model,
+        )));
+    }
     diagnostics
 }
 
@@ -512,12 +519,21 @@ fn launch_command_diagnostics(
     selection: &RuntimeSelection,
 ) -> Vec<PolicyDiagnostic> {
     let Some(command) = configured_launch_command(params) else {
+        let observed = params
+            .launch
+            .argv
+            .as_deref()
+            .and_then(|argv| argv.first())
+            .map(|command| format!("\"{command}\""))
+            .unwrap_or_else(|| "<missing>".to_string());
         return vec![diagnostic(
             "error",
             "invalid_command",
             format!(
-                "launch argv for account {} must begin with its exact canonical OpenCode wrapper",
-                selection.account.opencode_wrapper
+                "settings record {} selects account {}, but launch command {observed} is not its exact logical wrapper; configure this route with command = \"{}\"",
+                selection.settings_id,
+                selection.account.opencode_wrapper,
+                selection.account.opencode_wrapper,
             ),
         )];
     };

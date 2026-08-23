@@ -2084,6 +2084,17 @@ fn contract_policy_evaluate_rejects_account_one_plain_host_command() {
     assert_output_success(&output, "policy.evaluate account-one plain host command");
     let response = json_stdout(&output);
     assert_policy_rejected_with_code(&response, "invalid_command");
+    let diagnostics = policy_diagnostics(policy_result(&response));
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "an invalid logical command must not mislabel provider-managed args as forbidden: {response}"
+    );
+    let message = diagnostics[0]["message"]
+        .as_str()
+        .expect("invalid command diagnostic message");
+    assert!(message.contains("launch command \"opencode\""), "{message}");
+    assert!(message.contains("command = \"opencode1\""), "{message}");
 }
 
 #[test]
