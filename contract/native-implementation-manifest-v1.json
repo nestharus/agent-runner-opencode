@@ -10,6 +10,16 @@
       "sha256": "fd4cfd76ca65a706d0138886dd23094dd07e35460080024b1467baaf32dcee2e",
       "byte_length": 184277120,
       "semantic_contract": "agent-runner-opencode.opencode-native-state/v1"
+    },
+    {
+      "id": "opencode-1.18.21-linux-x86_64-c9485f62",
+      "component": "opencode",
+      "target_os": "linux",
+      "target_arch": "x86_64",
+      "version": "1.18.21",
+      "sha256": "c9485f62576606dbde6404647405df2401fada964b7f669f799dc125dbbeff99",
+      "byte_length": 184498304,
+      "semantic_contract": "agent-runner-opencode.opencode-native-state/v1"
     }
   ]
 }
