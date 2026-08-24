@@ -1,10 +1,10 @@
 //! Declared roles: orchestration
 
-mod cluster_c;
+mod quota_auth;
 #[allow(dead_code)]
 mod support;
 
-use cluster_c::*;
+use quota_auth::*;
 use serde_json::json;
 use support::{invoke_with_env, invoke_with_host_and_env, json_stdout};
 

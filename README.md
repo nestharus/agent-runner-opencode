@@ -33,6 +33,9 @@ sections own only the mechanisms reused across capabilities.
 | Operational activity evidence | `src/activity.rs` |
 | External envelope, dispatch, and schemas | `src/envelope.rs`, `src/dispatch.rs`, `src/schema.rs` |
 
+Contract-test ownership follows the same capability boundaries; see
+[`tests/README.md`](tests/README.md) for the executable target and helper map.
+
 ## Account and settings identities
 
 The provider recognizes five account-pinned wrappers, `opencode1` through

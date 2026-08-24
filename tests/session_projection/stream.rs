@@ -24,7 +24,7 @@ pub fn enumerate_result(params: Value, path: &str) -> Value {
 pub fn missing_read_turns_output(path: &str) -> std::process::Output {
     invoke_with_env(
         "session.read_turns",
-        session_params("ses_missing_contract_cluster_b"),
+        session_params("ses_missing_contract_session_projection"),
         &[("PATH", path)],
     )
 }

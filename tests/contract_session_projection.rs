@@ -1,11 +1,11 @@
 //! Declared roles: orchestration
 
-mod cluster_b;
+mod session_projection;
 #[allow(dead_code)]
 mod support;
 
-use cluster_b::*;
 use serde_json::{json, Value};
+use session_projection::*;
 use std::fs;
 use std::sync::Mutex;
 use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env};

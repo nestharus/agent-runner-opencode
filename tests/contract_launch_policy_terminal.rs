@@ -1,9 +1,9 @@
 //! Declared roles: orchestration
 
-mod cluster_a;
+mod launch_policy_terminal;
 mod support;
 
-use cluster_a::*;
+use launch_policy_terminal::*;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;

@@ -18,23 +18,23 @@ default = []
 contract-test-fixtures = []
 
 [[test]]
-name = "contract_cluster_a"
-path = "tests/contract_cluster_a.rs"
+name = "contract_launch_policy_terminal"
+path = "tests/contract_launch_policy_terminal.rs"
 required-features = ["contract-test-fixtures"]
 
 [[test]]
-name = "contract_cluster_b"
-path = "tests/contract_cluster_b.rs"
+name = "contract_session_projection"
+path = "tests/contract_session_projection.rs"
 required-features = ["contract-test-fixtures"]
 
 [[test]]
-name = "contract_cluster_c"
-path = "tests/contract_cluster_c.rs"
+name = "contract_quota_auth"
+path = "tests/contract_quota_auth.rs"
 required-features = ["contract-test-fixtures"]
 
 [[test]]
-name = "contract_cluster_d"
-path = "tests/contract_cluster_d.rs"
+name = "contract_control_plane_lifecycle"
+path = "tests/contract_control_plane_lifecycle.rs"
 required-features = ["contract-test-fixtures"]
 
 [dependencies]

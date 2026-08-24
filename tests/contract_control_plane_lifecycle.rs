@@ -1,10 +1,10 @@
 //! Declared roles: orchestration
 
-mod cluster_d;
+mod control_plane_lifecycle;
 #[allow(dead_code)]
 mod support;
 
-use cluster_d::*;
+use control_plane_lifecycle::*;
 use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Value};
 use std::fs;
