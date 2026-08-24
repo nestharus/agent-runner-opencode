@@ -2191,7 +2191,7 @@ fn launch_request_custody(root: &Path) -> RequestCustody {
         MAX_LAUNCH_REPLAY_RECORDS,
         LAUNCH_ORPHAN_RETENTION,
     )
-    .with_growing_active()
+    .with_elastic_active_index()
 }
 
 fn launch_custody_failure(request_id: &str, error: CustodyError) -> ProviderFailure {
@@ -3637,6 +3637,38 @@ mod custody_tests {
         );
         assert!(slots.len() >= live_launches);
         drop(locks);
+
+        let custody = launch_request_custody(directory.path());
+        for index in (INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS + 1)..=live_launches {
+            custody
+                .remove_active_marker(&directory.path().join(format!("{index:064x}.json")))
+                .expect("retire an ended launch reservation");
+        }
+        let active: Value = serde_json::from_slice(
+            &fs::read(directory.path().join(".custody-v2/active.json"))
+                .expect("compacted elastic active index"),
+        )
+        .expect("parse compacted elastic active index");
+        let slots = active["slots"].as_array().expect("active index slots");
+        assert_eq!(slots.len(), INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS);
+        assert_eq!(
+            slots
+                .iter()
+                .filter(|slot| slot["occupied"].as_u64() == Some(1))
+                .count(),
+            INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS
+        );
+        let schema: Value = serde_json::from_slice(
+            &fs::read(directory.path().join(".custody-v2/schema.json"))
+                .expect("elastic active schema"),
+        )
+        .expect("parse elastic active schema");
+        assert_eq!(schema["active_policy"], "elastic");
+        assert_eq!(
+            schema["initial_active_slots"],
+            INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS
+        );
+        assert!(schema.get("active_limit").is_none());
     }
 
     #[test]

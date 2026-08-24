@@ -9,7 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const INDEX_SCHEMA_VERSION: u64 = 4;
+const INDEX_SCHEMA_VERSION: u64 = 5;
+const BOUND_ACTIVE_INDEX_SCHEMA_VERSION: u64 = 4;
 const UNBOUND_ACTIVE_INDEX_SCHEMA_VERSION: u64 = 3;
 const PREDECESSOR_INDEX_SCHEMA_VERSION: u64 = 2;
 const MAX_INDEX_RECORD_BYTES: usize = 1024;
@@ -18,7 +19,7 @@ const MAX_REPLAY_EVICTION_PROBES: usize = 64;
 const EMPTY_ACTIVE_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ActiveSlot {
     occupied: u8,
     request_sha256: String,
@@ -44,7 +45,7 @@ pub(crate) enum ActiveReservation {
     Conflicting,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ActiveIndex {
     next_probe: usize,
     slots: Vec<ActiveSlot>,
@@ -93,18 +94,17 @@ struct ReplayDisplacement {
 }
 
 impl ActiveIndex {
-    fn empty(active_limit: usize) -> Self {
+    fn empty(active_slots: usize) -> Self {
         Self {
             next_probe: 0,
-            slots: (0..active_limit).map(|_| ActiveSlot::empty()).collect(),
+            slots: (0..active_slots).map(|_| ActiveSlot::empty()).collect(),
         }
     }
 
-    fn validate(&self, active_limit: usize, grow_active: bool) -> Result<(), CustodyError> {
-        let active_size_is_valid = if grow_active {
-            self.slots.len() >= active_limit
-        } else {
-            self.slots.len() == active_limit
+    fn validate(&self, policy: ActiveIndexPolicy) -> Result<(), CustodyError> {
+        let active_size_is_valid = match policy {
+            ActiveIndexPolicy::Fixed { limit } => self.slots.len() == limit,
+            ActiveIndexPolicy::Elastic { initial_slots } => self.slots.len() >= initial_slots,
         };
         if !active_size_is_valid
             || (!self.slots.is_empty() && self.next_probe >= self.slots.len())
@@ -166,7 +166,7 @@ impl ActiveIndex {
         &mut self,
         stem: String,
         binding_sha256: String,
-        grow_active: bool,
+        policy: ActiveIndexPolicy,
     ) -> Result<(), CustodyError> {
         if !valid_digest(&binding_sha256) {
             return Err(CustodyError::Invalid(
@@ -185,7 +185,7 @@ impl ActiveIndex {
         }
         let slot = match self.slots.iter_mut().find(|slot| slot.occupied == 0) {
             Some(slot) => slot,
-            None if grow_active => {
+            None if policy.is_elastic() => {
                 self.slots.push(ActiveSlot::empty());
                 self.slots
                     .last_mut()
@@ -199,13 +199,17 @@ impl ActiveIndex {
         Ok(())
     }
 
-    fn reserve_unbound(&mut self, stem: String, grow_active: bool) -> Result<(), CustodyError> {
+    fn reserve_unbound(
+        &mut self,
+        stem: String,
+        policy: ActiveIndexPolicy,
+    ) -> Result<(), CustodyError> {
         if self.contains(&stem) {
             return Ok(());
         }
         let slot = match self.slots.iter_mut().find(|slot| slot.occupied == 0) {
             Some(slot) => slot,
-            None if grow_active => {
+            None if policy.is_elastic() => {
                 self.slots.push(ActiveSlot::empty());
                 self.slots
                     .last_mut()
@@ -259,6 +263,32 @@ impl ActiveIndex {
         true
     }
 
+    fn compact_elastic(&mut self, policy: ActiveIndexPolicy) {
+        let ActiveIndexPolicy::Elastic { initial_slots } = policy else {
+            return;
+        };
+        let next_request = if self.slots.is_empty() {
+            None
+        } else {
+            (0..self.slots.len())
+                .map(|offset| (self.next_probe + offset) % self.slots.len())
+                .find(|index| self.slots[*index].occupied == 1)
+                .map(|index| self.slots[index].request_sha256.clone())
+        };
+        self.slots.retain(|slot| slot.occupied == 1);
+        while self.slots.len() < initial_slots {
+            self.slots.push(ActiveSlot::empty());
+        }
+        self.next_probe = next_request
+            .as_deref()
+            .and_then(|stem| {
+                self.slots
+                    .iter()
+                    .position(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
+            })
+            .unwrap_or(0);
+    }
+
     fn next_occupied(&mut self) -> Option<String> {
         if self.slots.is_empty() {
             return None;
@@ -284,6 +314,25 @@ impl ActiveIndex {
         {
             self.next_probe = index;
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveIndexPolicy {
+    Fixed { limit: usize },
+    Elastic { initial_slots: usize },
+}
+
+impl ActiveIndexPolicy {
+    fn initial_slots(self) -> usize {
+        match self {
+            Self::Fixed { limit } => limit,
+            Self::Elastic { initial_slots } => initial_slots,
+        }
+    }
+
+    fn is_elastic(self) -> bool {
+        matches!(self, Self::Elastic { .. })
     }
 }
 
@@ -315,8 +364,7 @@ pub(crate) struct RequestCustody {
     lock_root: PathBuf,
     index_root: PathBuf,
     state_byte_limit: usize,
-    active_limit: usize,
-    grow_active: bool,
+    active_policy: ActiveIndexPolicy,
     replay_slots: usize,
     orphan_retention: Duration,
 }
@@ -336,8 +384,9 @@ impl RequestCustody {
             lock_root,
             index_root,
             state_byte_limit,
-            active_limit,
-            grow_active: false,
+            active_policy: ActiveIndexPolicy::Fixed {
+                limit: active_limit,
+            },
             replay_slots,
             orphan_retention,
         }
@@ -348,8 +397,10 @@ impl RequestCustody {
     /// Launch uses this mode because active records describe independent
     /// runtime obligations, not a global concurrency budget. Quota refresh
     /// retains fixed-capacity behavior through the default constructor.
-    pub(crate) fn with_growing_active(mut self) -> Self {
-        self.grow_active = true;
+    pub(crate) fn with_elastic_active_index(mut self) -> Self {
+        self.active_policy = ActiveIndexPolicy::Elastic {
+            initial_slots: self.active_policy.initial_slots(),
+        };
         self
     }
 
@@ -393,6 +444,7 @@ impl RequestCustody {
             {
                 index.remove(&stem);
             }
+            index.compact_elastic(self.active_policy);
             self.write_active_index(&index)?;
         }
         Ok(index.active())
@@ -405,7 +457,7 @@ impl RequestCustody {
     ) -> Result<(), CustodyError> {
         let stem = required_digest_stem(state_path)?;
         let mut index = self.read_active_index()?;
-        index.reserve(stem, binding_sha256.to_string(), self.grow_active)?;
+        index.reserve(stem, binding_sha256.to_string(), self.active_policy)?;
         self.write_active_index(&index)
     }
 
@@ -476,6 +528,7 @@ impl RequestCustody {
         let stem = required_digest_stem(state_path)?;
         let mut index = self.read_active_index()?;
         if index.remove(&stem) {
+            index.compact_elastic(self.active_policy);
             self.write_active_index(&index)?;
         }
         Ok(())
@@ -512,22 +565,27 @@ impl RequestCustody {
             Ok(bytes) => {
                 let schema: Value = serde_json::from_slice(&bytes)
                     .map_err(|error| CustodyError::Invalid(error.to_string()))?;
-                if schema["active_limit"].as_u64() != Some(self.active_limit as u64)
-                    || schema["replay_slots"].as_u64() != Some(self.replay_slots as u64)
-                {
+                if schema["replay_slots"].as_u64() != Some(self.replay_slots as u64) {
                     return Err(CustodyError::Invalid(
                         "request custody index schema or bounds are inconsistent".to_string(),
                     ));
                 }
                 match schema["schema_version"].as_u64() {
                     Some(INDEX_SCHEMA_VERSION) => {
+                        self.validate_current_schema(&schema)?;
                         self.require_index_directory(&self.replay_root())?;
                         self.require_index_directory(&self.owner_root())?;
                     }
+                    Some(BOUND_ACTIVE_INDEX_SCHEMA_VERSION) => {
+                        self.validate_predecessor_active_slots(&schema)?;
+                        self.upgrade_bound_active_index(&schema_path)?;
+                    }
                     Some(UNBOUND_ACTIVE_INDEX_SCHEMA_VERSION) => {
+                        self.validate_predecessor_active_slots(&schema)?;
                         self.upgrade_unbound_active_index(&schema_path)?;
                     }
                     Some(PREDECESSOR_INDEX_SCHEMA_VERSION) => {
+                        self.validate_predecessor_active_slots(&schema)?;
                         self.upgrade_predecessor_index(&schema_path)?;
                     }
                     _ => {
@@ -569,9 +627,12 @@ impl RequestCustody {
             ],
         )?;
         let mut migrated = 0_usize;
-        let mut active_index = ActiveIndex::empty(self.active_limit);
+        let mut active_index = ActiveIndex::empty(self.active_policy.initial_slots());
         let mut replay_candidates = Vec::new();
-        let migration_limit = self.active_limit.saturating_add(self.replay_slots);
+        let migration_limit = self
+            .active_policy
+            .initial_slots()
+            .saturating_add(self.replay_slots);
         for entry in fs::read_dir(&self.lock_root)? {
             let entry = entry?;
             let lock_path = entry.path();
@@ -584,7 +645,7 @@ impl RequestCustody {
                 continue;
             }
             migrated += 1;
-            if !self.grow_active && migrated > migration_limit {
+            if !self.active_policy.is_elastic() && migrated > migration_limit {
                 return Err(CustodyError::Capacity);
             }
             let stem = required_digest_stem(&lock_path)?;
@@ -597,7 +658,7 @@ impl RequestCustody {
             if replay {
                 replay_candidates.push((record_modified(&state_path, &lock_path), stem));
             } else {
-                active_index.reserve_unbound(stem, self.grow_active)?;
+                active_index.reserve_unbound(stem, self.active_policy)?;
             }
         }
         replay_candidates.sort_by_key(|candidate| candidate.0);
@@ -607,15 +668,18 @@ impl RequestCustody {
                 return Err(CustodyError::Capacity);
             }
         }
-        self.write_json_atomic(
-            &schema_path,
-            &json!({
-                "schema_version": INDEX_SCHEMA_VERSION,
-                "active_limit": self.active_limit,
-                "replay_slots": self.replay_slots,
-            }),
-        )?;
+        self.write_current_schema(&schema_path)?;
         Ok(())
+    }
+
+    fn upgrade_bound_active_index(&self, schema_path: &Path) -> Result<(), CustodyError> {
+        self.require_index_directory(&self.replay_root())?;
+        self.require_index_directory(&self.owner_root())?;
+        self.prepare_temporary_root()?;
+        let mut active = self.read_active_index()?;
+        active.compact_elastic(self.active_policy);
+        self.write_active_index(&active)?;
+        self.write_current_schema(schema_path)
     }
 
     fn upgrade_unbound_active_index(&self, schema_path: &Path) -> Result<(), CustodyError> {
@@ -624,14 +688,7 @@ impl RequestCustody {
         self.prepare_temporary_root()?;
         let active = self.read_active_index()?;
         self.write_active_index(&active)?;
-        self.write_json_atomic(
-            schema_path,
-            &json!({
-                "schema_version": INDEX_SCHEMA_VERSION,
-                "active_limit": self.active_limit,
-                "replay_slots": self.replay_slots,
-            }),
-        )
+        self.write_current_schema(schema_path)
     }
 
     fn upgrade_predecessor_index(&self, schema_path: &Path) -> Result<(), CustodyError> {
@@ -708,14 +765,7 @@ impl RequestCustody {
         }
         let active = self.read_active_index()?;
         self.write_active_index(&active)?;
-        self.write_json_atomic(
-            schema_path,
-            &json!({
-                "schema_version": INDEX_SCHEMA_VERSION,
-                "active_limit": self.active_limit,
-                "replay_slots": self.replay_slots,
-            }),
-        )
+        self.write_current_schema(schema_path)
     }
 
     fn place_replay(&self, stem: &str, current_lock_path: &Path) -> Result<bool, CustodyError> {
@@ -1112,23 +1162,71 @@ impl RequestCustody {
         }
     }
 
+    fn validate_predecessor_active_slots(&self, schema: &Value) -> Result<(), CustodyError> {
+        if schema["active_limit"].as_u64() != Some(self.active_policy.initial_slots() as u64) {
+            return Err(CustodyError::Invalid(
+                "request custody predecessor active slot count is inconsistent".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_current_schema(&self, schema: &Value) -> Result<(), CustodyError> {
+        let matches = match self.active_policy {
+            ActiveIndexPolicy::Fixed { limit } => {
+                schema["active_policy"].as_str() == Some("fixed")
+                    && schema["active_limit"].as_u64() == Some(limit as u64)
+                    && schema.get("initial_active_slots").is_none()
+            }
+            ActiveIndexPolicy::Elastic { initial_slots } => {
+                schema["active_policy"].as_str() == Some("elastic")
+                    && schema["initial_active_slots"].as_u64() == Some(initial_slots as u64)
+                    && schema.get("active_limit").is_none()
+            }
+        };
+        if !matches {
+            return Err(CustodyError::Invalid(
+                "request custody active index policy is inconsistent".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn write_current_schema(&self, path: &Path) -> Result<(), CustodyError> {
+        let schema = match self.active_policy {
+            ActiveIndexPolicy::Fixed { limit } => json!({
+                "schema_version": INDEX_SCHEMA_VERSION,
+                "active_policy": "fixed",
+                "active_limit": limit,
+                "replay_slots": self.replay_slots,
+            }),
+            ActiveIndexPolicy::Elastic { initial_slots } => json!({
+                "schema_version": INDEX_SCHEMA_VERSION,
+                "active_policy": "elastic",
+                "initial_active_slots": initial_slots,
+                "replay_slots": self.replay_slots,
+            }),
+        };
+        self.write_json_atomic(path, &schema)
+    }
+
     fn read_active_index(&self) -> Result<ActiveIndex, CustodyError> {
-        let bytes = if self.grow_active {
+        let bytes = if self.active_policy.is_elastic() {
             fs::read(self.active_index_path())?
         } else {
             durable_fs::read_file_bounded(&self.active_index_path(), MAX_ACTIVE_INDEX_BYTES)?
         };
         let index: ActiveIndex = serde_json::from_slice(&bytes)
             .map_err(|error| CustodyError::Invalid(error.to_string()))?;
-        index.validate(self.active_limit, self.grow_active)?;
+        index.validate(self.active_policy)?;
         Ok(index)
     }
 
     fn write_active_index(&self, index: &ActiveIndex) -> Result<(), CustodyError> {
-        index.validate(self.active_limit, self.grow_active)?;
+        index.validate(self.active_policy)?;
         let value = serde_json::to_value(index)
             .map_err(|error| CustodyError::Invalid(error.to_string()))?;
-        if self.grow_active {
+        if self.active_policy.is_elastic() {
             self.write_json_atomic_unbounded(&self.active_index_path(), &value)
         } else {
             self.write_json_atomic_bounded(
@@ -1174,7 +1272,7 @@ impl RequestCustody {
         }
         let temporary_root = self.temporary_root();
         let mut temporary = tempfile::NamedTempFile::new_in(&temporary_root)?;
-        temporary.write_all(&bytes)?;
+        temporary.write_all(bytes)?;
         temporary.as_file_mut().sync_all()?;
         temporary
             .persist(path)
@@ -1451,6 +1549,84 @@ mod tests {
                 .expect("bound upgraded reservation"),
             ActiveReservation::Matching
         );
+    }
+
+    #[test]
+    fn schema_v4_elastic_index_migrates_and_discards_empty_high_water_slots() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let index_root = directory.path().join(".custody-v2");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            index_root.clone(),
+            1024,
+            2,
+            2,
+            Duration::from_secs(60),
+        )
+        .with_elastic_active_index();
+        custody
+            .maintain(&directory.path().join("initialize.lock"), |_| Ok(false))
+            .expect("initialize current elastic custody");
+
+        let first = format!("{:064x}", 1);
+        let second = format!("{:064x}", 2);
+        for stem in [&first, &second] {
+            fs::write(
+                directory.path().join(format!("{stem}.json")),
+                br#"{"phase":"prepared"}"#,
+            )
+            .expect("active request state");
+            fs::write(directory.path().join(format!("{stem}.lock")), b"")
+                .expect("active request lock");
+        }
+        fs::write(
+            index_root.join("active.json"),
+            serde_json::to_vec(&json!({
+                "next_probe": 1,
+                "slots": [
+                    {"occupied": 1, "request_sha256": first, "binding_sha256": format!("{:064x}", 101)},
+                    {"occupied": 0, "request_sha256": EMPTY_ACTIVE_DIGEST},
+                    {"occupied": 1, "request_sha256": second, "binding_sha256": format!("{:064x}", 102)},
+                    {"occupied": 0, "request_sha256": EMPTY_ACTIVE_DIGEST},
+                    {"occupied": 0, "request_sha256": EMPTY_ACTIVE_DIGEST},
+                ],
+            }))
+            .expect("serialize schema-v4 active index"),
+        )
+        .expect("schema-v4 active index");
+        fs::write(
+            index_root.join("schema.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": BOUND_ACTIVE_INDEX_SCHEMA_VERSION,
+                "active_limit": 2,
+                "replay_slots": 2,
+            }))
+            .expect("serialize schema-v4 custody"),
+        )
+        .expect("schema-v4 custody");
+
+        assert_eq!(
+            custody
+                .maintain(&directory.path().join("current.lock"), |_| Ok(false))
+                .expect("migrate schema-v4 elastic custody"),
+            2
+        );
+        let schema: Value = serde_json::from_slice(
+            &fs::read(index_root.join("schema.json")).expect("migrated schema"),
+        )
+        .expect("parse migrated schema");
+        assert_eq!(schema["schema_version"], INDEX_SCHEMA_VERSION);
+        assert_eq!(schema["active_policy"], "elastic");
+        assert_eq!(schema["initial_active_slots"], 2);
+        assert!(schema.get("active_limit").is_none());
+        let active: ActiveIndex = serde_json::from_slice(
+            &fs::read(index_root.join("active.json")).expect("compacted active index"),
+        )
+        .expect("parse compacted active index");
+        assert_eq!(active.slots.len(), 2);
+        assert_eq!(active.active(), 2);
+        assert_eq!(active.slots[active.next_probe].request_sha256, first);
     }
 
     #[test]
