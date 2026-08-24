@@ -17,12 +17,22 @@ metadata stamp, and the immutable build manifest under the account lock without
 rereading the whole executable. The stamp is persistence/incarnation evidence,
 not part of the semantic component identity. OpenCode is therefore unable to
 select a different implementation through a mutable numbered wrapper after
-admission. A changed executable, fixed argument, contract identity, or stable
-state-selection environment requires the native-identity rebind protocol.
+admission. When OpenCode performs a same-canonical-path auto-update, the
+provider holds the account lock, hashes the replacement, runs a bounded
+`--version` probe, and admits only a strictly forward numeric version from the
+existing admitted lineage. It atomically persists the replacement's exact
+hash, version-derived lineage ID, and metadata stamp before using it. This
+continuity path is unavailable for initial admission, path changes, downgrades,
+fixed-argument changes, contract changes, or state-selector changes; those
+remain fail-closed and require the native-identity rebind protocol. A static
+manifest entry may pre-admit an expected update but is not required for a
+forward same-path auto-update.
 Durable schema-v10 launch recovery records the same direct executable hash,
 manifest ID/version, constant-time admitted metadata stamp, fixed argument,
 contract identity, and state environment and validates them before list/export
-observation. Predecessor launch records
+observation. An operation admitted before an auto-update therefore retains its
+old exact recovery obligation instead of silently executing the successor.
+Predecessor launch records
 with manifest evidence but no stamp use a bounded content check during recovery;
 records without complete manifest evidence fail closed instead of executing an
 unbound wrapper. Setup uses the same boundary: it
@@ -50,7 +60,7 @@ an isolated numbered account has no explicit `XDG_DATA_HOME`, the provider binds
 environment variable is forwarded to the child for that invocation without
 becoming durable identity state. The provider adds the logical account identity
 as `OULIPOLY_OPENCODE_ACCOUNT` and invokes the canonical absolute executable.
-`PATH` resolves that reviewed executable for the current launch and is forwarded
+`PATH` resolves the admitted executable for the current launch and is forwarded
 unchanged for tools that the OpenCode turn executes, but it is not persisted or
 identity-bound. `--pure` excludes external plugins from the acting boundary.
 

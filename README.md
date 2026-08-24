@@ -770,8 +770,16 @@ invalid, or unapproved direct implementation, fails closed without publishing
 the upgrade. Initial admission, rebind, and predecessor upgrade stream the
 bounded executable hash once. A
 schema-v6 reuse compares the canonical path and an admitted size/inode/change
-metadata stamp under the account lock, then rechecks the immutable build
-manifest; it does not reread the entire executable for every native operation.
+metadata stamp under the account lock, then rechecks its admitted static or
+auto-update lineage identity; it does not reread the entire executable for
+every native operation. A changed stamp on the same canonical path enters one
+bounded exceptional path: the provider streams the replacement hash, runs a
+bounded `--version` probe, requires a strictly forward numeric version from the
+persisted admitted identity, and atomically publishes the replacement identity
+before continuing. Initial unknown executables, downgrades, path changes, and
+state-selector changes remain fail-closed. This lets OpenCode's native
+auto-update remain enabled without turning each forward update into an
+account-wide outage.
 The metadata stamp is persistence evidence and does not alter the component's
 semantic implementation identity. Durable launch
 records created as schema v10 carry the same direct program hash, manifest ID,
@@ -857,6 +865,11 @@ request with a named identity-lock result rather than waiting indefinitely.
 
 ### Rebind choreography
 
+This choreography applies to operator-selected path, state, rollback,
+non-forward, and quota-observer identity changes. A forward OpenCode auto-update
+at the already admitted canonical path uses the account-locked lineage advance
+described above and does not require a fleet-wide host admission pause.
+
 1. The host stops ordinary admission for capabilities that consume the selected
    profile/component identity. It gives every affected in-flight provider request
    a deadline of at most 20 seconds and waits one such drain interval.
@@ -870,8 +883,9 @@ request with a named identity-lock result rather than waiting indefinitely.
    advances that record to `awaiting_cutover` and binds its plan-request cycle,
    exact pre-cutover semantic identity, state-record digest, and component into
    the operation ID.
-4. A native-runtime replacement must already have a reviewed target-specific
-   entry in `contract/native-implementation-manifest-v1.json`. A quota-observer
+4. An operator-selected native-runtime replacement must already have a reviewed
+   target-specific entry in `contract/native-implementation-manifest-v1.json`.
+   A quota-observer
    replacement is a reviewed provider build whose adapter source and complete
    dependency lock produce the new identity. The corresponding rebuilt provider
    must be installed before validation. The operator stages only the selected replacement implementation without

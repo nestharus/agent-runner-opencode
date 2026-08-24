@@ -41,6 +41,37 @@ pub(crate) struct ApprovedImplementation {
     pub semantic_contract: String,
 }
 
+pub(crate) fn auto_update_implementation(
+    version: &str,
+    sha256: &str,
+    byte_length: usize,
+) -> Option<ApprovedImplementation> {
+    if parse_numeric_version(version).is_none()
+        || byte_length == 0
+        || sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(ApprovedImplementation {
+        id: format!("opencode-auto-update-{version}-{}", &sha256[..8]),
+        version: version.to_string(),
+        semantic_contract: "agent-runner-opencode.opencode-native-state/v1".to_string(),
+    })
+}
+
+pub(crate) fn parse_numeric_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(parsed)
+}
+
 pub(crate) fn approved_implementation(
     component: &str,
     sha256: &str,
@@ -123,7 +154,23 @@ pub(crate) fn approved_implementation(
 
 #[cfg(test)]
 mod tests {
-    use super::{approved_implementation, MANIFEST_CONTRACT, MANIFEST_JSON};
+    use super::{
+        approved_implementation, auto_update_implementation, parse_numeric_version,
+        MANIFEST_CONTRACT, MANIFEST_JSON,
+    };
+
+    #[test]
+    fn auto_update_identity_requires_exact_numeric_version_and_digest() {
+        let digest = "ab".repeat(32);
+        let admitted = auto_update_implementation("1.18.23", &digest, 42)
+            .expect("forward auto-update identity");
+
+        assert_eq!(admitted.id, "opencode-auto-update-1.18.23-abababab");
+        assert_eq!(parse_numeric_version("1.18.23"), Some((1, 18, 23)));
+        assert!(auto_update_implementation("latest", &digest, 42).is_none());
+        assert!(auto_update_implementation("1.18.23", "00", 42).is_none());
+        assert!(auto_update_implementation("1.18.23", &digest, 0).is_none());
+    }
 
     #[test]
     fn production_manifest_is_versioned_and_has_unique_complete_entries() {

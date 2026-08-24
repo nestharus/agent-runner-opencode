@@ -9,6 +9,7 @@
 //!       - exact launch-context admission against the durable account binding
 
 use crate::account::AccountProfile;
+use crate::child_custody::ChildCustody;
 use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
@@ -21,7 +22,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const NATIVE_RUNTIME_STATE_DIR: &str = "provider-state/opencode/native-runtimes";
@@ -44,6 +45,8 @@ const OPENCODE_BASH_DEFAULT_TIMEOUT_ENV: &str = "OPENCODE_EXPERIMENTAL_BASH_DEFA
 // remains the outer operation limit.
 const PROVIDER_BASH_DEFAULT_TIMEOUT_MS: &str = "2000000000";
 const NATIVE_RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTO_UPDATE_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTO_UPDATE_VERSION_OUTPUT_BYTES: usize = 4 * 1024;
 const MAX_NATIVE_RUNTIME_STATE_BYTES: usize = 1024 * 1024;
 const NATIVE_RUNTIME_IDENTITY_ENV_KEYS: &[&str] = &[
     "HOME",
@@ -388,13 +391,14 @@ fn candidate_context(
         runtime_identity_environment(&resolution_env),
         request_id,
     )?;
-    admit_candidate_program(account, program, execution_env, request_id)
+    admit_candidate_program(account, program, execution_env, None, request_id)
 }
 
 fn admit_candidate_program(
     account: &AccountProfile,
     program: PathBuf,
     execution_env: BTreeMap<String, String>,
+    auto_update_from: Option<&NativeRuntimeRecord>,
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
     if !durable_fs::is_executable_file(&program)
@@ -432,28 +436,40 @@ fn admit_candidate_program(
         &program_sha256,
         program_bytes,
     )
-    .map_err(|error| native_runtime_failure(request_id, error))?
-    .ok_or_else(|| {
-        ProviderFailure::conflict(
+    .map_err(|error| native_runtime_failure(request_id, error))?;
+    let approved = match (approved, auto_update_from) {
+        (Some(approved), _) => approved,
+        (None, Some(prior)) => admit_forward_auto_update(
+            account,
+            Path::new(program),
+            &execution_env,
+            &program_sha256,
+            program_bytes,
+            prior,
             request_id,
-            "native_runtime_implementation_unapproved",
-            format!(
-                "the direct OpenCode implementation for account {} is not in the reviewed native implementation manifest",
-                account.opencode_wrapper
-            ),
-            json!({
-                "account": account.opencode_wrapper,
-                "program": program,
-                "program_sha256": program_sha256,
-                "program_bytes": program_bytes,
-                "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
-            }),
-        )
-    })?;
+        )?,
+        (None, None) => {
+            return Err(unapproved_native_implementation(
+                account,
+                program,
+                &program_sha256,
+                program_bytes,
+                request_id,
+            ));
+        }
+    };
     if approved.semantic_contract != OPENCODE_NATIVE_CONTRACT_ID {
         return Err(native_runtime_failure(
             request_id,
             "the reviewed OpenCode implementation has the wrong semantic contract",
+        ));
+    }
+    let final_stamp = native_program_stamp(Path::new(program))
+        .map_err(|error| native_runtime_failure(request_id, error))?;
+    if final_stamp != program_stamp {
+        return Err(native_runtime_failure(
+            request_id,
+            "the direct OpenCode implementation changed before admission completed",
         ));
     }
     let fixed_args = OPENCODE_NATIVE_FIXED_ARGS
@@ -484,6 +500,150 @@ fn admit_candidate_program(
             identity_sha256,
         },
     })
+}
+
+fn admit_forward_auto_update(
+    account: &AccountProfile,
+    program: &Path,
+    execution_env: &BTreeMap<String, String>,
+    program_sha256: &str,
+    program_bytes: usize,
+    prior: &NativeRuntimeRecord,
+    request_id: &str,
+) -> Result<native_implementation_manifest::ApprovedImplementation, ProviderFailure> {
+    let prior_version =
+        native_implementation_manifest::parse_numeric_version(&prior.implementation_version)
+            .ok_or_else(|| {
+                native_runtime_failure(
+                    request_id,
+                    "the prior native implementation does not have a numeric auto-update version",
+                )
+            })?;
+    let version = probe_opencode_version(program, execution_env, request_id)?;
+    let observed_version = native_implementation_manifest::parse_numeric_version(&version)
+        .filter(|observed| *observed > prior_version)
+        .ok_or_else(|| {
+            ProviderFailure::conflict(
+                request_id,
+                "native_runtime_auto_update_not_forward",
+                format!(
+                    "account {} observed OpenCode version {version}, which is not newer than its bound version {}",
+                    account.opencode_wrapper, prior.implementation_version
+                ),
+                json!({
+                    "account": account.opencode_wrapper,
+                    "program": program,
+                    "bound_version": prior.implementation_version,
+                    "observed_version": version,
+                }),
+            )
+        })?;
+    let _ = observed_version;
+    native_implementation_manifest::auto_update_implementation(
+        &version,
+        program_sha256,
+        program_bytes,
+    )
+    .ok_or_else(|| {
+        native_runtime_failure(
+            request_id,
+            "the forward OpenCode auto-update identity is not canonical",
+        )
+    })
+}
+
+fn probe_opencode_version(
+    program: &Path,
+    execution_env: &BTreeMap<String, String>,
+    request_id: &str,
+) -> Result<String, ProviderFailure> {
+    let mut command = Command::new(program);
+    command
+        .arg("--version")
+        .env_clear()
+        .envs(execution_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().map_err(|error| {
+        native_runtime_failure(
+            request_id,
+            format!("failed to start OpenCode auto-update version probe: {error}"),
+        )
+    })?;
+    let output = ChildCustody::new(child)
+        .wait_with_bounded_output_timeout(
+            AUTO_UPDATE_VERSION_PROBE_TIMEOUT,
+            AUTO_UPDATE_VERSION_OUTPUT_BYTES,
+            AUTO_UPDATE_VERSION_OUTPUT_BYTES,
+        )
+        .map_err(|error| {
+            native_runtime_failure(
+                request_id,
+                format!("OpenCode auto-update version probe failed: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            native_runtime_failure(request_id, "OpenCode auto-update version probe timed out")
+        })?;
+    if output.stdout.len() > AUTO_UPDATE_VERSION_OUTPUT_BYTES
+        || output.stderr.len() > AUTO_UPDATE_VERSION_OUTPUT_BYTES
+    {
+        return Err(native_runtime_failure(
+            request_id,
+            "OpenCode auto-update version probe exceeded its output bound",
+        ));
+    }
+    if !output.status.success() {
+        return Err(native_runtime_failure(
+            request_id,
+            format!(
+                "OpenCode auto-update version probe exited with status {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    let version = std::str::from_utf8(&output.stdout)
+        .map(str::trim)
+        .map_err(|error| {
+            native_runtime_failure(
+                request_id,
+                format!("OpenCode auto-update version was not UTF-8: {error}"),
+            )
+        })?;
+    native_implementation_manifest::parse_numeric_version(version)
+        .map(|_| version.to_string())
+        .ok_or_else(|| {
+            native_runtime_failure(
+                request_id,
+                format!("OpenCode auto-update reported invalid version {version:?}"),
+            )
+        })
+}
+
+fn unapproved_native_implementation(
+    account: &AccountProfile,
+    program: &str,
+    program_sha256: &str,
+    program_bytes: usize,
+    request_id: &str,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "native_runtime_implementation_unapproved",
+        format!(
+            "the initial OpenCode implementation for account {} is not in the reviewed native implementation manifest; automatic lineage admission is available only for a forward same-path update of an existing binding",
+            account.opencode_wrapper
+        ),
+        json!({
+            "account": account.opencode_wrapper,
+            "program": program,
+            "program_sha256": program_sha256,
+            "program_bytes": program_bytes,
+            "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+        }),
+    )
 }
 
 fn native_execution_environment(
@@ -921,23 +1081,20 @@ fn preview_approved_same_path_replacement(
             "persisted native runtime byte length cannot be represented on this platform",
         )
     })?;
-    let prior = native_implementation_manifest::approved_implementation(
-        OPENCODE_NATIVE_PROGRAM,
+    let prior = recorded_implementation(
         &record.program_sha256,
         prior_bytes,
+        &record.implementation_manifest_id,
+        &record.implementation_version,
+        &record.native_contract_id,
     )
     .map_err(|error| native_runtime_failure(request_id, error))?
-    .filter(|approved| {
-        approved.id == record.implementation_manifest_id
-            && approved.version == record.implementation_version
-            && approved.semantic_contract == record.native_contract_id
-    })
     .ok_or_else(|| {
         ProviderFailure::conflict(
             request_id,
             "native_runtime_prior_implementation_unapproved",
             format!(
-                "account {} cannot advance from a persisted native implementation that is absent from the reviewed manifest",
+                "account {} cannot advance from a persisted native implementation outside the reviewed manifest and admitted auto-update lineage",
                 account.opencode_wrapper
             ),
             json!({
@@ -966,6 +1123,7 @@ fn preview_approved_same_path_replacement(
         account,
         PathBuf::from(&record.program),
         execution_env,
+        Some(record),
         request_id,
     )
 }
@@ -1106,6 +1264,33 @@ fn validate_current_runtime_implementation(
     })
 }
 
+fn recorded_implementation(
+    program_sha256: &str,
+    program_bytes: usize,
+    implementation_id: &str,
+    implementation_version: &str,
+    native_contract_id: &str,
+) -> Result<Option<native_implementation_manifest::ApprovedImplementation>, String> {
+    let implementation = native_implementation_manifest::approved_implementation(
+        OPENCODE_NATIVE_PROGRAM,
+        program_sha256,
+        program_bytes,
+    )?
+    .or_else(|| {
+        native_implementation_manifest::auto_update_implementation(
+            implementation_version,
+            program_sha256,
+            program_bytes,
+        )
+    });
+    Ok(implementation.filter(|implementation| {
+        implementation.id == implementation_id
+            && implementation.version == implementation_version
+            && implementation.semantic_contract == native_contract_id
+            && native_contract_id == OPENCODE_NATIVE_CONTRACT_ID
+    }))
+}
+
 pub(crate) fn validate_pinned_program(
     program: &Path,
     program_sha256: &str,
@@ -1121,22 +1306,16 @@ pub(crate) fn validate_pinned_program(
     if &observed_stamp != expected_stamp {
         return Err("the implementation metadata stamp changed after admission".to_string());
     }
-    let approved = native_implementation_manifest::approved_implementation(
-        OPENCODE_NATIVE_PROGRAM,
+    let approved = recorded_implementation(
         program_sha256,
         observed_stamp.byte_length as usize,
+        implementation_manifest_id,
+        implementation_version,
+        native_contract_id,
     )
     .map_err(|error| error.to_string())?
-    .ok_or_else(|| {
-        "the implementation identity is no longer in the reviewed manifest".to_string()
-    })?;
-    if approved.semantic_contract != native_contract_id
-        || native_contract_id != OPENCODE_NATIVE_CONTRACT_ID
-        || approved.id != implementation_manifest_id
-        || approved.version != implementation_version
-    {
-        return Err("the implementation manifest identity is inconsistent".to_string());
-    }
+    .ok_or_else(|| "the implementation identity is not an admitted runtime lineage".to_string())?;
+    let _ = approved;
     Ok(())
 }
 
@@ -1161,22 +1340,16 @@ pub(crate) fn validate_predecessor_pinned_program(
     {
         return Err("the implementation content changed after launch admission".to_string());
     }
-    let approved = native_implementation_manifest::approved_implementation(
-        OPENCODE_NATIVE_PROGRAM,
+    let approved = recorded_implementation(
         program_sha256,
         observed_bytes,
+        implementation_manifest_id,
+        implementation_version,
+        native_contract_id,
     )
     .map_err(|error| error.to_string())?
-    .ok_or_else(|| {
-        "the implementation identity is no longer in the reviewed manifest".to_string()
-    })?;
-    if approved.semantic_contract != native_contract_id
-        || native_contract_id != OPENCODE_NATIVE_CONTRACT_ID
-        || approved.id != implementation_manifest_id
-        || approved.version != implementation_version
-    {
-        return Err("the implementation manifest identity is inconsistent".to_string());
-    }
+    .ok_or_else(|| "the implementation identity is not an admitted runtime lineage".to_string())?;
+    let _ = approved;
     Ok(())
 }
 
@@ -1335,11 +1508,56 @@ fn native_runtime_state_capacity(request_id: &str, observed_bytes: usize) -> Pro
 #[cfg(test)]
 mod tests {
     use super::{
-        native_execution_environment, runtime_identity_environment,
-        OPENCODE_BASH_DEFAULT_TIMEOUT_ENV, PROVIDER_BASH_DEFAULT_TIMEOUT_MS,
+        admit_forward_auto_update, native_execution_environment, runtime_identity_environment,
+        NativeProgramStamp, NativeRuntimeRecord, OPENCODE_BASH_DEFAULT_TIMEOUT_ENV,
+        OPENCODE_NATIVE_CONTRACT_ID, PROVIDER_BASH_DEFAULT_TIMEOUT_MS,
     };
     use crate::account::ACCOUNTS;
     use std::collections::BTreeMap;
+
+    #[cfg(unix)]
+    #[test]
+    fn forward_auto_update_uses_bounded_version_probe_and_exact_digest_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("create auto-update probe directory");
+        let program = directory.path().join("opencode");
+        std::fs::write(&program, "#!/bin/sh\nprintf '1.18.23\\n'\n")
+            .expect("write auto-update version probe");
+        let mut permissions = std::fs::metadata(&program)
+            .expect("auto-update probe metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&program, permissions).expect("chmod auto-update probe");
+        let prior = NativeRuntimeRecord {
+            schema_version: 6,
+            account_wrapper: "opencode1".to_string(),
+            program: program.to_string_lossy().into_owned(),
+            program_sha256: "cd".repeat(32),
+            execution_env: BTreeMap::new(),
+            native_contract_id: OPENCODE_NATIVE_CONTRACT_ID.to_string(),
+            fixed_args: vec!["--pure".to_string()],
+            implementation_manifest_id: "opencode-1.18.22-test".to_string(),
+            implementation_version: "1.18.22".to_string(),
+            program_stamp: NativeProgramStamp::default(),
+            identity_sha256: "prior".to_string(),
+        };
+        let digest = "ab".repeat(32);
+
+        let admitted = admit_forward_auto_update(
+            &ACCOUNTS[0],
+            &program,
+            &BTreeMap::new(),
+            &digest,
+            42,
+            &prior,
+            "req-forward-auto-update",
+        )
+        .expect("admit forward auto-update");
+
+        assert_eq!(admitted.version, "1.18.23");
+        assert_eq!(admitted.id, "opencode-auto-update-1.18.23-abababab");
+    }
 
     #[test]
     fn provider_owns_a_finite_long_running_bash_timeout_fallback() {
