@@ -190,19 +190,21 @@ bindings, observations, reconciliation rules, and replay results.
 
 The active-index marker is itself a durable pre-state custody phase and binds
 both the request digest and the capability's complete attempted-input identity.
-Admission holds the capability capacity lock from maintenance through marker
+Admission holds the capability registration lock from maintenance through marker
 publication and creation of the request lock. An exact retry matches its
-existing marker before applying the active-capacity rejection and can resume
-even when every active slot is occupied; changed inputs conflict before they can
-inherit the reservation. If the reserving provider stops before creating either
-request state or its request lock, a successor holding the capacity lock can
+existing marker before a fixed-policy capability applies its active-capacity
+rejection and can resume even when every fixed slot is occupied; distributed
+launch custody has no corresponding population rejection. Changed inputs
+conflict before they can inherit the reservation. If the reserving provider
+stops before creating either request state or its request lock, a successor
+holding the registration lock can
 prove that no process still owns that pre-effect handoff and retire the marker;
 the exact request's current marker is preserved for that retry. Any marker with
 durable state, a live/young request lock, or replay ownership continues through
 the capability's normal reconciliation or retention rules and is never retired
 by this state-less pre-lock path. Schema-v3 active indexes upgrade in place;
 an unbound legacy marker can acquire a binding only when both state and request
-lock are absent under the capacity lock.
+lock are absent under the registration lock.
 
 ## Quota observation and credential refresh
 
@@ -403,15 +405,20 @@ marker. A bounded maintenance cursor and request-keyed tickets probe at most 16
 sequence positions and classify at most one queued request payload per
 admission. Live work is requeued, abandoned pre-state reservations are reaped,
 and normal terminal paths publish replay ownership and retire their own marker
-directly. Every marker, ticket, cursor, replay owner, and replay slot is bounded
-to 1 KiB, so no single bookkeeping record grows with active population.
+directly. Every marker, ticket, cursor, replay owner, physical-slot reservation,
+and replay slot is bounded to 1 KiB, so no single bookkeeping record grows with
+active population.
 Completed history uses a fixed 4,096-slot recent-replay ring, and every request
 state record is no larger than 256 KiB.
-The first custody access atomically upgrades a schema-v5 elastic index of at
+Setup performs a read-only preflight against the exact `host.data_root`, and the
+first custody access repeats it under the registration lock before mutation.
+The transition atomically upgrades a schema-v5 elastic index of at
 most 128 KiB and 512 slots to the distributed-marker schema, transfers only
 records whose native actor custody is durably terminal to replay, and creates
-markers and maintenance tickets for every unresolved obligation. This is a
-one-time predecessor transition envelope, not a schema-v6 runtime-population
+markers and maintenance tickets for every unresolved obligation. An indexless
+predecessor is separately bounded to 512 request locks, 2,048 directory entries,
+and 8 MiB of request state before its one-time conversion. These are predecessor
+transition envelopes, not a schema-v6 runtime-population
 limit. A larger schema-v5 installation must keep the schema-v5 provider active
 until direct terminal cleanup compacts it below the envelope; the diagnostic
 explicitly says not to delete provider sessions. Provider binaries that only
@@ -421,9 +428,12 @@ than deleting or rewriting live custody state.
 Cyclic slot replacement retires the oldest available completion without parsing
 replay payloads. Steady-state admission performs bounded request-keyed work and
 classifies at most one queued active payload per request; completion probes at
-most 64 compact ring slots. Durable request-keyed replay ownership is published
-before the sequenced head advances, making active-to-replay transfer
-crash-idempotent without skipping the oldest completion. State is retired only
+most 64 compact ring slots. A durable physical-slot reservation serializes a
+pending placement before its request-local owner and replay slot are published;
+an owner-less interrupted reservation is safely reclaimable because the active
+request remains authoritative, while a matching owner makes the slot exclusive
+until recovery completes. This makes active-to-replay transfer crash-idempotent
+even when another request completes between reservation and recovery. State is retired only
 after neither the replay ring nor the active index owns it, and predecessor
 duplicate slots are collapsed during the one-time bounded index upgrade.
 Prepared, submission-observed, and unresolved
@@ -431,7 +441,7 @@ records never age out because they may still own an effect. Those obligations
 remain recoverable without rejecting unrelated launch work, while routine
 completed history cannot make admission work proportional to replay history.
 Shared replay pins
-prevent cyclic eviction while an exact caller crosses from capacity admission
+prevent cyclic eviction while an exact caller crosses from registration
 to its request lock.
 
 ### Resumed-turn custody and recovery
@@ -758,7 +768,11 @@ read-only previews the same validation/upgrade selection as effect admission and
 checks auth at the runtime-bound path; any disagreement reports the profile not
 ready and requires the owned rebind/upgrade path. Ambient direct-`opencode` and
 current-build quota evidence is admission evidence only for a component with no
-persisted identity. Every declared caller `settings_id` must also resolve to a
+persisted identity. Setup also performs the read-only launch-custody predecessor
+preflight described above; detect remains non-installed, install exposes a
+blocking `verify_launch_custody_transition` step, and sync emits
+`launch_custody_migration_required` until the exact data root is safe to cut
+over. Every declared caller `settings_id` must also resolve to a
 valid exact persisted record. Numbered account names are catalog identities only;
 setup never resolves or executes them as wrappers. Logical profile readiness is
 derived from its selected runtime, observer, and effective auth evidence. The

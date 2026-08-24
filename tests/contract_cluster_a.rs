@@ -162,7 +162,7 @@ impl std::io::Write for FailAfterFirstLaunchEvent {
 
 #[test]
 #[cfg(unix)]
-fn contract_launch_exec_gate_prevents_unpublished_native_effect() {
+fn contract_native_effect_gate_prevents_unpublished_native_effect() {
     let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_script().to_string());
     let (gate_writer, inherited_gate) = UnixStream::pair().expect("create launch exec gate");
     let inherited_gate_fd = inherited_gate.as_raw_fd();
@@ -171,12 +171,12 @@ fn contract_launch_exec_gate_prevents_unpublished_native_effect() {
         .expect("clone inherited launch gate");
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_agent-runner-opencode"));
     command
-        .arg("__launch_exec_gate")
+        .arg("__native_effect_gate")
         .arg(fake_wrapper_path(fake_wrapper.dir()))
         .arg("run")
         .env_clear()
         .env(
-            "AGENT_RUNNER_OPENCODE_LAUNCH_GATE_FD",
+            "AGENT_RUNNER_OPENCODE_NATIVE_EFFECT_GATE_FD",
             inherited_gate_fd.to_string(),
         )
         .env("AGENT_RUNNER_OPENCODE_WRAPPER_LOG", fake_wrapper.log_path())

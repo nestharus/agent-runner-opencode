@@ -5,6 +5,7 @@ use crate::child_custody::ChildCustody;
 use crate::durable_fs;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope};
+use crate::launch;
 use crate::native_implementation_manifest;
 use crate::native_runtime;
 use crate::operation_bounds;
@@ -255,12 +256,14 @@ pub fn detect_params(
     let curl = quota_transport_evidence(host.deadline_unix_ms);
     let profiles = profile_evidence(host, data_root, profile_root, &opencode, &curl, request_id);
     let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
-    let installed = setup_installed(&profiles, &settings_store);
+    let launch_custody = launch_custody_readiness(host, &params);
+    let installed = setup_installed(&profiles, &settings_store, &launch_custody);
     Ok(detect_result(
         opencode,
         curl,
         profiles,
         settings_store,
+        launch_custody,
         installed,
     ))
 }
@@ -283,7 +286,8 @@ pub fn install_plan_params(
     let target = string_param(&params, "target").unwrap_or("local");
     let required_settings_ids = required_settings_ids(&params, request_id)?;
     let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
-    Ok(install_plan_result(target, &settings_store))
+    let launch_custody = launch_custody_readiness(host, &params);
+    Ok(install_plan_result(target, &settings_store, launch_custody))
 }
 
 pub fn sync_plan_params(
@@ -298,7 +302,8 @@ pub fn sync_plan_params(
         operations.extend(native_identity_rebind_operations(host, rebind, request_id)?);
     }
     let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
-    let diagnostics = sync_diagnostics(&params, &settings_store);
+    let launch_custody = launch_custody_readiness(host, &params);
+    let diagnostics = sync_diagnostics(&params, &settings_store, &launch_custody);
     Ok(sync_plan_result(operations, diagnostics))
 }
 
@@ -572,6 +577,7 @@ fn setup_warnings(
     curl: &Value,
     profiles: &[Value],
     settings_store: &SettingsTransitionReadiness,
+    launch_custody: &Value,
 ) -> Vec<Value> {
     let mut warnings = Vec::new();
     if !evidence_ready(opencode) {
@@ -611,10 +617,21 @@ fn setup_warnings(
     if let Some(message) = settings_store.blocking_message() {
         warnings.push(json!(message));
     }
+    if launch_custody["ready"] != true {
+        warnings.push(json!({
+            "code": "launch_custody_migration_required",
+            "message": launch_custody["blocking_error"],
+            "launch_custody": launch_custody,
+        }));
+    }
     warnings
 }
 
-fn sync_diagnostics(params: &Value, settings_store: &SettingsTransitionReadiness) -> Vec<Value> {
+fn sync_diagnostics(
+    params: &Value,
+    settings_store: &SettingsTransitionReadiness,
+    launch_custody: &Value,
+) -> Vec<Value> {
     let mut diagnostics = desired_profile_diagnostics(params);
     if params.get("settings_schema_id").and_then(Value::as_str) != Some("opencode.settings/v1") {
         diagnostics.push(settings_schema_mismatch_diagnostic());
@@ -625,6 +642,14 @@ fn sync_diagnostics(params: &Value, settings_store: &SettingsTransitionReadiness
             "path": "host.config_root",
             "message": message,
             "code": "settings_transition_blocked",
+        }));
+    }
+    if launch_custody["ready"] != true {
+        diagnostics.push(json!({
+            "severity": "error",
+            "path": "host.data_root",
+            "message": launch_custody["blocking_error"],
+            "code": "launch_custody_migration_required",
         }));
     }
     diagnostics
@@ -663,6 +688,18 @@ fn string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn launch_custody_readiness(host: &HostContext, params: &Value) -> Value {
+    match string_param(params, "data_root").or(host.data_root.as_deref()) {
+        Some(data_root) => launch::custody_transition_preflight(Path::new(data_root)),
+        None => json!({
+            "ready": false,
+            "format": "unknown",
+            "blocking_error": "setup cannot preflight launch custody because host.data_root is missing; provide the exact provider data root before install or sync",
+            "runtime_active_population_limit": null,
+        }),
+    }
 }
 
 /// Provider setup defaults to the exact record IDs used by the installed
@@ -747,8 +784,13 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-fn setup_installed(profiles: &[Value], settings_store: &SettingsTransitionReadiness) -> bool {
+fn setup_installed(
+    profiles: &[Value],
+    settings_store: &SettingsTransitionReadiness,
+    launch_custody: &Value,
+) -> bool {
     settings_store.ready
+        && launch_custody["ready"] == true
         && profiles
             .iter()
             .all(|profile| profile.get("profile_ready").and_then(Value::as_bool) == Some(true))
@@ -775,9 +817,16 @@ fn detect_result(
     curl: Value,
     profiles: Vec<Value>,
     settings_store: SettingsTransitionReadiness,
+    launch_custody: Value,
     installed: bool,
 ) -> Value {
-    let warnings = setup_warnings(&opencode, &curl, &profiles, &settings_store);
+    let warnings = setup_warnings(
+        &opencode,
+        &curl,
+        &profiles,
+        &settings_store,
+        &launch_custody,
+    );
     json!({
         "installed": installed,
         "binary": {
@@ -790,7 +839,11 @@ fn detect_result(
     })
 }
 
-fn install_plan_result(target: &str, settings_store: &SettingsTransitionReadiness) -> Value {
+fn install_plan_result(
+    target: &str,
+    settings_store: &SettingsTransitionReadiness,
+    launch_custody: Value,
+) -> Value {
     let quota_transport = quota_transport_install_step(target);
     json!({
         "steps": [
@@ -799,6 +852,12 @@ fn install_plan_result(target: &str, settings_store: &SettingsTransitionReadines
                 "target": target,
                 "blocking": !settings_store.ready,
                 "settings_store": settings_store.evidence(),
+            },
+            {
+                "kind": "verify_launch_custody_transition",
+                "target": target,
+                "blocking": launch_custody["ready"] != true,
+                "launch_custody": launch_custody,
             },
             {
                 "kind": "verify_reviewed_native_implementation",
@@ -2263,5 +2322,88 @@ mod identity_readiness_tests {
         assert_eq!(profile["quota_observer_ready"], false);
         assert!(profile["quota_observer_error"].is_string());
         assert_eq!(profile["profile_ready"], false);
+    }
+
+    #[test]
+    fn setup_plans_block_an_oversized_launch_custody_transition() {
+        let directory = tempfile::tempdir().expect("setup custody fixture");
+        let data_root = directory.path().to_string_lossy().into_owned();
+        let custody_root = directory
+            .path()
+            .join("provider-state/opencode/launch/requests/.custody-v2");
+        fs::create_dir_all(&custody_root).expect("predecessor custody root");
+        let empty_digest = "0".repeat(64);
+        let slots = (0..513)
+            .map(|_| {
+                json!({
+                    "occupied": 0,
+                    "request_sha256": empty_digest,
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            custody_root.join("schema.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 5,
+                "active_policy": "elastic",
+                "initial_active_slots": 64,
+                "replay_slots": 4096,
+            }))
+            .expect("predecessor schema"),
+        )
+        .expect("write predecessor schema");
+        fs::write(
+            custody_root.join("active.json"),
+            serde_json::to_vec(&json!({"next_probe": 0, "slots": slots}))
+                .expect("predecessor active index"),
+        )
+        .expect("write predecessor active index");
+        let host = HostContext {
+            app: "test".to_string(),
+            app_version: None,
+            platform: None,
+            working_directory: None,
+            config_root: Some(
+                directory
+                    .path()
+                    .join("config")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            data_root: Some(data_root),
+            env: None,
+            deadline_unix_ms: None,
+        };
+
+        let readiness = launch_custody_readiness(&host, &json!({}));
+        assert_eq!(readiness["ready"], false);
+        assert!(readiness["blocking_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("do not delete provider sessions")));
+
+        let plan = install_plan_params(&host, json!({"target": "local"}), "setup-custody-test")
+            .expect("blocked install plan");
+        let custody_step = plan["steps"]
+            .as_array()
+            .expect("install steps")
+            .iter()
+            .find(|step| step["kind"] == "verify_launch_custody_transition")
+            .expect("launch custody preflight step");
+        assert_eq!(custody_step["blocking"], true);
+
+        let sync = sync_plan_params(
+            &host,
+            json!({
+                "desired_profiles": [],
+                "settings_schema_id": "opencode.settings/v1",
+            }),
+            "setup-custody-sync-test",
+        )
+        .expect("blocked sync plan");
+        assert!(sync["diagnostics"]
+            .as_array()
+            .expect("sync diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "launch_custody_migration_required"));
     }
 }

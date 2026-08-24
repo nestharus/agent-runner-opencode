@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 #[cfg(unix)]
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus};
@@ -14,10 +14,9 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
 
+pub const NATIVE_EFFECT_GATE_ARG: &str = "__native_effect_gate";
 #[cfg(unix)]
-const EXEC_GATE_ARG: &str = "__launch_exec_gate";
-#[cfg(unix)]
-const EXEC_GATE_FD_ENV: &str = "AGENT_RUNNER_OPENCODE_LAUNCH_GATE_FD";
+pub const NATIVE_EFFECT_GATE_FD_ENV: &str = "AGENT_RUNNER_OPENCODE_NATIVE_EFFECT_GATE_FD";
 #[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);
 
@@ -56,7 +55,7 @@ impl GatedCommand {
         let inherited_gate_fd = inherited_gate.as_raw_fd();
         let retained_gate = inherited_gate.try_clone()?;
         let mut command = Command::new(gate_program);
-        command.arg(EXEC_GATE_ARG).arg(program).args(args);
+        command.arg(NATIVE_EFFECT_GATE_ARG).arg(program).args(args);
         unsafe {
             command.pre_exec(move || {
                 let _keep_gate_open = &retained_gate;
@@ -84,7 +83,7 @@ impl GatedCommand {
     pub(crate) fn spawn(mut self) -> io::Result<(Child, ExecGate)> {
         configure_process_group(&mut self.command);
         self.command.env(
-            EXEC_GATE_FD_ENV,
+            NATIVE_EFFECT_GATE_FD_ENV,
             self.inherited_gate.as_raw_fd().to_string(),
         );
         let child = self.command.spawn()?;
@@ -134,6 +133,50 @@ impl ExecGate {
     pub(crate) fn release(self) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(unix)]
+pub fn run_native_effect_gate(args: &[String]) -> i32 {
+    use std::fs::File;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let Some((program, program_args)) = args.get(2..).and_then(|args| args.split_first()) else {
+        eprintln!("native effect gate is missing its command");
+        return 126;
+    };
+    let gate_fd = match std::env::var(NATIVE_EFFECT_GATE_FD_ENV)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| *value >= 3)
+    {
+        Some(gate_fd) => gate_fd,
+        None => {
+            eprintln!("native effect gate has no valid inherited gate descriptor");
+            return 126;
+        }
+    };
+    let mut gate = unsafe { File::from_raw_fd(gate_fd) };
+    let mut release = [0_u8; 1];
+    if let Err(error) = gate.read_exact(&mut release) {
+        eprintln!("native effect gate closed before actor publication: {error}");
+        return 126;
+    }
+    if release != [1] {
+        eprintln!("native effect gate received an invalid release token");
+        return 126;
+    }
+    drop(gate);
+    std::env::remove_var(NATIVE_EFFECT_GATE_FD_ENV);
+    let error = Command::new(program).args(program_args).exec();
+    eprintln!("native effect gate could not execute native command: {error}");
+    126
+}
+
+#[cfg(not(unix))]
+pub fn run_native_effect_gate(_args: &[String]) -> i32 {
+    eprintln!("native effect gate requires Unix process-group custody");
+    126
 }
 
 pub(crate) fn actor_for_child(child: &Child) -> io::Result<ProcessGroupActor> {

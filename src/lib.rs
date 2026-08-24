@@ -35,3 +35,4 @@ pub mod terminal;
 
 pub use dispatch::handle_invocation;
 pub use dispatch::write_invocation;
+pub use native_process::{run_native_effect_gate, NATIVE_EFFECT_GATE_ARG};

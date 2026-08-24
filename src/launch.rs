@@ -37,7 +37,9 @@ use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata
 use crate::operation_bounds;
 use crate::path_guard;
 use crate::policy;
-use crate::request_custody::{ActiveReservation, CustodyError, RequestCustody};
+use crate::request_custody::{
+    ActiveReservation, CustodyError, RequestCustody, MAX_REPLAY_EVICTION_PROBES,
+};
 use crate::resume_observation::{
     self, DurableResumeObservationRequest, ResumeObservation, ResumeObservationRequest,
     RouteIdentity as ResumeRouteIdentity,
@@ -77,7 +79,7 @@ const LAUNCH_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const LAUNCH_REGISTRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const LAUNCH_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCH_STATE_SCHEMA_VERSION: u32 = 11;
-const INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS: usize = 64;
+const PREDECESSOR_ACTIVE_LAUNCH_REQUEST_SLOTS: usize = 64;
 const MAX_LAUNCH_REPLAY_RECORDS: usize = 4096;
 const MAX_LAUNCH_STATE_BYTES: usize = 256 * 1024;
 pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
@@ -402,25 +404,31 @@ pub(crate) fn stream<W: Write>(
         })?;
     }
     let result = stream_child(custody.child_mut(), &mut state, writer);
-    // Whole-process-group custody must be discharged before durable request
-    // custody can become replay-only. If this provider dies during cleanup,
-    // the active marker and the unsettled actor identity remain for an exact
-    // retry to recover.
-    drop(custody);
-    let actor_settlement = state.settle_actor_custody();
-    let replayable_request = actor_settlement
-        .as_ref()
-        .ok()
-        .and_then(|_| state.replayable_request_state());
-    drop(state);
-    actor_settlement?;
-    if let Some((state_path, replay_request_id)) = replayable_request {
-        let _ = retire_completed_launch_request(host, &state_path, &replay_request_id);
-    }
+    finalize_launch_actor_and_replay(host, custody, state)?;
     result.map(|exit_code| LaunchOutcome {
         exit_code,
         activity_targets: effective.activity_targets,
     })
+}
+
+/// Complete the actor-to-replay ownership transfer in its only authorized
+/// order. Whole-process-group custody is discharged first, actor terminality is
+/// then persisted while request custody remains active, and only that settled
+/// request may become replay-only. A stop anywhere before the last step leaves
+/// enough durable identity for the exact retry to resume cleanup.
+fn finalize_launch_actor_and_replay(
+    host: &HostContext,
+    custody: ChildCustody,
+    mut state: LaunchState,
+) -> Result<(), ProviderFailure> {
+    drop(custody);
+    state.settle_actor_custody()?;
+    let replayable_request = state.replayable_request_state();
+    drop(state);
+    if let Some((state_path, replay_request_id)) = replayable_request {
+        let _ = retire_completed_launch_request(host, &state_path, &replay_request_id);
+    }
+    Ok(())
 }
 
 pub(crate) fn attempted_activity_targets(params: &Value) -> ActivityTargets {
@@ -1659,9 +1667,11 @@ fn retire_orphan_launch_request_lock(
     let root = state_path
         .parent()
         .expect("launch state path always has a parent");
-    let capacity = open_launch_state_lock(&root.join(".capacity.lock"))
+    // Retain the predecessor filename so old and new provider binaries still
+    // serialize launch registration during a rolling replacement.
+    let registration = open_launch_state_lock(&root.join(".capacity.lock"))
         .map_err(|error| launch_state_failure(request_id, error))?;
-    if !operation_bounds::lock_exclusive_for(&capacity, LAUNCH_REGISTRATION_LOCK_TIMEOUT)
+    if !operation_bounds::lock_exclusive_for(&registration, LAUNCH_REGISTRATION_LOCK_TIMEOUT)
         .map_err(|error| launch_state_failure(request_id, error))?
     {
         return Err(launch_registration_lock_timeout(request_id));
@@ -2142,7 +2152,7 @@ fn acquire_launch_request_lock(
     reservation_binding_sha256: &str,
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
-    let capacity_lock = acquire_launch_capacity_lock(root, host, request_id)?;
+    let registration_lock = acquire_launch_registration_lock(root, host, request_id)?;
     let lock_path = state_path.with_extension("lock");
     let custody = launch_request_custody(root);
     let lock_exists = lock_path.exists();
@@ -2150,7 +2160,7 @@ fn acquire_launch_request_lock(
     let replay_owner_exists = custody
         .replay_owner_exists(state_path)
         .map_err(|error| launch_custody_failure(request_id, error))?;
-    maintain_launch_request_capacity(&custody, &lock_path, request_id)?;
+    maintain_launch_request_custody(&custody, &lock_path, request_id)?;
     let mut active_reservation = custody
         .active_reservation(state_path, reservation_binding_sha256)
         .map_err(|error| launch_custody_failure(request_id, error))?;
@@ -2204,7 +2214,7 @@ fn acquire_launch_request_lock(
             return Err(launch_state_failure(request_id, error));
         }
     };
-    drop(capacity_lock);
+    drop(registration_lock);
     let acquired =
         match operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
         {
@@ -2236,13 +2246,15 @@ fn acquire_launch_request_lock(
     Ok(lock)
 }
 
-fn acquire_launch_capacity_lock(
+fn acquire_launch_registration_lock(
     root: &Path,
     host: &HostContext,
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
     durable_fs::create_private_directories(root)
         .map_err(|error| launch_state_failure(request_id, error))?;
+    // This compatibility filename is a registration mutex, not a runtime
+    // population counter or process cap.
     let path = root.join(".capacity.lock");
     let lock =
         open_launch_state_lock(&path).map_err(|error| launch_state_failure(request_id, error))?;
@@ -2259,7 +2271,7 @@ fn acquire_launch_capacity_lock(
     Ok(lock)
 }
 
-fn maintain_launch_request_capacity(
+fn maintain_launch_request_custody(
     custody: &RequestCustody,
     current_lock_path: &Path,
     request_id: &str,
@@ -2277,7 +2289,7 @@ fn retire_completed_launch_request(
     let root = state_path
         .parent()
         .expect("launch request state path always has a parent");
-    let capacity_lock = acquire_launch_capacity_lock(root, host, request_id)?;
+    let registration_lock = acquire_launch_registration_lock(root, host, request_id)?;
     let custody = launch_request_custody(root);
     custody
         .maintain(Path::new(""), launch_request_bytes_are_replay)
@@ -2285,7 +2297,7 @@ fn retire_completed_launch_request(
     custody
         .publish_replay_and_retire_active(state_path, Path::new(""))
         .map_err(|error| launch_custody_failure(request_id, error))?;
-    drop(capacity_lock);
+    drop(registration_lock);
     Ok(())
 }
 
@@ -2308,21 +2320,43 @@ fn launch_request_bytes_are_replay(bytes: &[u8]) -> Result<bool, String> {
 }
 
 fn launch_request_custody(root: &Path) -> RequestCustody {
-    RequestCustody::new(
+    RequestCustody::new_distributed(
         root.to_path_buf(),
         root.to_path_buf(),
         root.join(".custody-v2"),
         MAX_LAUNCH_STATE_BYTES,
-        INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS,
+        PREDECESSOR_ACTIVE_LAUNCH_REQUEST_SLOTS,
         MAX_LAUNCH_REPLAY_RECORDS,
         LAUNCH_ORPHAN_RETENTION,
     )
-    .with_distributed_active_markers()
+}
+
+pub(crate) fn custody_transition_preflight(data_root: &Path) -> Value {
+    let root = data_root.join(LAUNCH_STATE_DIR);
+    let custody = launch_request_custody(&root);
+    match custody.transition_preflight() {
+        Ok(preflight) => json!({
+            "ready": preflight.blocker.is_none(),
+            "format": preflight.format,
+            "inspected_request_locks": preflight.request_locks,
+            "inspected_state_bytes": preflight.state_bytes,
+            "blocking_error": preflight.blocker,
+            "runtime_active_population_limit": null,
+            "note": "the envelope applies only to bounded one-time predecessor migration; current distributed launch custody has no fixed active-request population limit",
+        }),
+        Err(error) => json!({
+            "ready": false,
+            "format": "invalid_or_unreadable",
+            "blocking_error": error.to_string(),
+            "runtime_active_population_limit": null,
+            "note": "setup could not prove the exact launch-custody transition safe; keep the predecessor provider installed and do not delete provider sessions",
+        }),
+    }
 }
 
 fn launch_custody_failure(request_id: &str, error: CustodyError) -> ProviderFailure {
     match error {
-        CustodyError::Capacity => launch_state_capacity_exceeded(request_id),
+        CustodyError::Capacity => launch_replay_retention_unavailable(request_id),
         CustodyError::Invalid(error) => launch_state_invalid(request_id, error),
         CustodyError::Migration(error) => launch_custody_migration_required(request_id, error),
         CustodyError::Io(error) => launch_state_failure(request_id, error),
@@ -2353,7 +2387,7 @@ fn write_launch_request_state<T: Serialize>(
     let bytes =
         serde_json::to_vec(state).map_err(|error| launch_state_invalid(request_id, error))?;
     if bytes.len() > MAX_LAUNCH_STATE_BYTES {
-        return Err(launch_state_capacity_exceeded(request_id));
+        return Err(launch_state_record_too_large(request_id));
     }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| launch_state_failure(request_id, error))?;
@@ -2586,13 +2620,29 @@ fn launch_custody_migration_required(
     )
 }
 
-fn launch_state_capacity_exceeded(request_id: &str) -> ProviderFailure {
+fn launch_state_record_too_large(request_id: &str) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
-        "launch_state_capacity_exceeded",
+        "launch_state_record_too_large",
         format!(
-            "durable launch custody could not retain this request: an individual request exceeded {MAX_LAUNCH_STATE_BYTES} bytes or the {MAX_LAUNCH_REPLAY_RECORDS}-request completed replay ring could not evict a terminal entry; active launch requests do not have a fixed population limit"
+            "this launch request's durable state exceeds the {MAX_LAUNCH_STATE_BYTES}-byte per-request limit; this is an individual record-size error, not an active launch population or process cap"
         ),
+    )
+}
+
+fn launch_replay_retention_unavailable(request_id: &str) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "launch_replay_retention_temporarily_unavailable",
+        format!(
+            "durable launch completion could not find a safely evictable entry within its bounded {MAX_REPLAY_EVICTION_PROBES}-slot probe of the {MAX_LAUNCH_REPLAY_RECORDS}-request replay ring; retry after exact replay pins or interrupted completion handoffs settle; running launch requests and model processes do not have a fixed population limit"
+        ),
+        json!({
+            "retryable": true,
+            "active_launch_population_limit": null,
+            "replay_ring_records": MAX_LAUNCH_REPLAY_RECORDS,
+            "bounded_probe_records": MAX_REPLAY_EVICTION_PROBES,
+        }),
     )
 }
 
@@ -3861,7 +3911,7 @@ mod custody_tests {
         drop(locks);
 
         let custody = launch_request_custody(directory.path());
-        for index in (INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS + 1)..=live_launches {
+        for index in (PREDECESSOR_ACTIVE_LAUNCH_REQUEST_SLOTS + 1)..=live_launches {
             custody
                 .remove_active_marker(&directory.path().join(format!("{index:064x}.json")))
                 .expect("retire an ended launch reservation");
@@ -3870,7 +3920,7 @@ mod custody_tests {
             fs::read_dir(&active_root)
                 .expect("remaining distributed active markers")
                 .count(),
-            INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS
+            PREDECESSOR_ACTIVE_LAUNCH_REQUEST_SLOTS
         );
         let schema: Value = serde_json::from_slice(
             &fs::read(directory.path().join(".custody-v2/schema.json"))
@@ -3919,7 +3969,7 @@ mod custody_tests {
             .expect("completed launch record");
         }
 
-        let custody = RequestCustody::new(
+        let custody = RequestCustody::new_fixed(
             directory.path().to_path_buf(),
             directory.path().to_path_buf(),
             directory.path().join(".custody-v2"),
@@ -3928,7 +3978,7 @@ mod custody_tests {
             completed_records,
             LAUNCH_ORPHAN_RETENTION,
         );
-        let active = maintain_launch_request_capacity(
+        let active = maintain_launch_request_custody(
             &custody,
             &directory.path().join("new.lock"),
             "request-test",
@@ -3962,7 +4012,7 @@ mod custody_tests {
     #[test]
     fn interrupted_replay_handoff_is_idempotent_for_launch_requests() {
         let directory = tempfile::tempdir().expect("launch custody directory");
-        let custody = RequestCustody::new(
+        let custody = RequestCustody::new_fixed(
             directory.path().to_path_buf(),
             directory.path().to_path_buf(),
             directory.path().join(".custody-v2"),
@@ -4066,7 +4116,7 @@ mod custody_tests {
     #[test]
     fn steady_state_admission_classifies_one_queued_active_payload() {
         let directory = tempfile::tempdir().expect("launch custody directory");
-        let active_records = INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS;
+        let active_records = PREDECESSOR_ACTIVE_LAUNCH_REQUEST_SLOTS;
         for index in 0..active_records {
             let stem = format!("{index:064x}");
             fs::write(directory.path().join(format!("{stem}.lock")), b"")
@@ -4079,7 +4129,7 @@ mod custody_tests {
         }
 
         let custody = launch_request_custody(directory.path());
-        maintain_launch_request_capacity(
+        maintain_launch_request_custody(
             &custody,
             &directory.path().join("new.lock"),
             "request-test",
@@ -4112,7 +4162,7 @@ mod custody_tests {
             br#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#,
         )
         .expect("first replay state");
-        let custody = RequestCustody::new(
+        let custody = RequestCustody::new_fixed(
             directory.path().to_path_buf(),
             directory.path().to_path_buf(),
             directory.path().join(".pin-test-custody"),

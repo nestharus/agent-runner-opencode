@@ -783,7 +783,7 @@ fn quota_refresh_custody(
     let request_root = confined_quota_refresh_target(host, &root.join("requests"), request_id)?;
     durable_fs::create_private_directories(&request_root)
         .map_err(|error| quota_refresh_state_failure(request_id, error))?;
-    Ok(RequestCustody::new(
+    Ok(RequestCustody::new_fixed(
         request_root,
         lock_root.to_path_buf(),
         root.join(".custody-v2"),
@@ -1836,7 +1836,7 @@ mod custody_tests {
             .expect("committed quota record");
         }
 
-        let custody = RequestCustody::new(
+        let custody = RequestCustody::new_fixed(
             request_root,
             lock_root.clone(),
             root.join(".custody-v2"),
@@ -1877,7 +1877,7 @@ mod custody_tests {
         let lock_root = directory.path().join("locks");
         fs::create_dir_all(&request_root).expect("quota request root");
         fs::create_dir_all(&lock_root).expect("quota lock root");
-        let custody = RequestCustody::new(
+        let custody = RequestCustody::new_fixed(
             request_root.clone(),
             lock_root.clone(),
             directory.path().join(".custody-v2"),
