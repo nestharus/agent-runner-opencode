@@ -25,6 +25,10 @@ pub(crate) const MAX_REPLAY_EVICTION_PROBES: usize = 64;
 pub(crate) const MAX_ACTIVE_MAINTENANCE_PROBES: usize = 16;
 const EMPTY_ACTIVE_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+// Current distributed admissions publish only their request-local marker.
+// Older schema-v6 markers retain their finite maintenance sequence so a
+// rolling replacement can finish consuming the predecessor queue.
+const DIRECT_MAINTENANCE_SEQUENCE: u64 = u64::MAX;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ActiveSlot {
@@ -182,6 +186,12 @@ struct ReplayDisplacement {
     replay: ReplaySlot,
     pin: Option<(fs::File, PathBuf)>,
     _lock: fs::File,
+}
+
+enum ShardedReplaySlotOutcome {
+    Published,
+    Occupied,
+    Unavailable,
 }
 
 impl ActiveIndex {
@@ -599,6 +609,51 @@ impl RequestCustody {
         }
     }
 
+    /// Prove that independent request records may be used without taking the
+    /// predecessor transition lock. This check is read-only: a missing or old
+    /// representation returns `false`, while malformed current custody fails
+    /// closed instead of silently rebuilding it alongside live requests.
+    pub(crate) fn independent_requests_ready(&self) -> Result<bool, CustodyError> {
+        let preflight = self.transition_preflight()?;
+        if preflight.format != "current" || preflight.blocker.is_some() {
+            return Ok(false);
+        }
+        let schema_bytes = durable_fs::read_file_bounded(
+            &self.index_root.join("schema.json"),
+            MAX_INDEX_RECORD_BYTES,
+        )?;
+        let schema: Value = serde_json::from_slice(&schema_bytes)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        if self.active_policy.is_distributed()
+            && (schema["active_registration"].as_str() != Some("request_local")
+                || schema["replay_allocation"].as_str() != Some("hash_sharded"))
+        {
+            return Ok(false);
+        }
+        for root in [
+            self.replay_root(),
+            self.replay_slot_lock_root(),
+            self.owner_root(),
+            self.pin_root(),
+            self.temporary_root(),
+            self.active_root(),
+            self.maintenance_root(),
+        ] {
+            match fs::metadata(&root) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(CustodyError::Invalid(
+                        "request custody index child is not a directory".to_string(),
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(CustodyError::Io(error)),
+            }
+        }
+        self.read_maintenance_index()?;
+        Ok(!self.active_index_path().exists())
+    }
+
     fn preflight_indexless_transition(&self) -> Result<CustodyTransitionPreflight, CustodyError> {
         let entries = match fs::read_dir(&self.lock_root) {
             Ok(entries) => entries,
@@ -753,6 +808,21 @@ impl RequestCustody {
         self.write_active_index(&index)
     }
 
+    /// Reserve an independently keyed distributed marker without updating the
+    /// predecessor maintenance queue. Fixed-policy callers retain their
+    /// existing indexed reservation semantics.
+    pub(crate) fn reserve_independent_active(
+        &self,
+        state_path: &Path,
+        binding_sha256: &str,
+    ) -> Result<(), CustodyError> {
+        if !self.active_policy.is_distributed() {
+            return self.reserve_active(state_path, binding_sha256);
+        }
+        let stem = required_digest_stem(state_path)?;
+        self.reserve_independent_active_marker(&stem, binding_sha256)
+    }
+
     /// Report how the active index owns this exact request and attempt.
     ///
     /// Callers use this after `maintain` while still holding their registration
@@ -849,7 +919,9 @@ impl RequestCustody {
             if let Some(marker) = self.read_active_marker(&stem)? {
                 remove_file_if_present(&self.active_marker_path(&stem))?;
                 durable_fs::sync_directory(&self.active_root())?;
-                self.remove_maintenance_ticket(marker.maintenance_sequence)?;
+                if marker.maintenance_sequence != DIRECT_MAINTENANCE_SEQUENCE {
+                    self.remove_maintenance_ticket(marker.maintenance_sequence)?;
+                }
             }
             return Ok(());
         }
@@ -863,6 +935,7 @@ impl RequestCustody {
     /// Publish an exact terminal request into the replay ring, then retire only
     /// its active admission marker. The caller holds the capability registration
     /// lock and must not hold the request lock named by `current_lock_path`.
+    #[cfg(test)]
     pub(crate) fn publish_replay_and_retire_active(
         &self,
         state_path: &Path,
@@ -874,6 +947,117 @@ impl RequestCustody {
         }
         self.remove_active_marker(state_path)?;
         Ok(true)
+    }
+
+    /// Publish terminal history without a capability-wide registration lock.
+    /// Only completions selecting the same physical replay slot serialize.
+    /// Exhausting the bounded probes leaves the active request authoritative
+    /// for exact recovery instead of turning cleanup contention into a launch
+    /// failure.
+    pub(crate) fn publish_sharded_replay_and_retire_active(
+        &self,
+        state_path: &Path,
+    ) -> Result<bool, CustodyError> {
+        let stem = required_digest_stem(state_path)?;
+        if self.replay_slots == 0 {
+            return Err(CustodyError::Capacity);
+        }
+        if let Some(owner) = self.read_replay_owner(&stem)? {
+            let slot = owner.sequence % self.replay_slots as u64;
+            let Some(_slot_lock) = self.try_lock_replay_slot(slot)? else {
+                return Ok(false);
+            };
+            if !self.complete_replay_placement(&stem, &owner, Path::new(""), false)? {
+                return Ok(false);
+            }
+            self.remove_active_marker(state_path)?;
+            return Ok(true);
+        }
+
+        let start = u64::from_str_radix(&stem[stem.len() - 16..], 16)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?
+            % self.replay_slots as u64;
+        let mut replacement_slot = None;
+        for offset in 0..self.replay_slots.min(MAX_REPLAY_EVICTION_PROBES) {
+            let slot = (start + offset as u64) % self.replay_slots as u64;
+            match self.try_publish_sharded_replay_slot(&stem, slot, false)? {
+                ShardedReplaySlotOutcome::Published => {
+                    self.remove_active_marker(state_path)?;
+                    return Ok(true);
+                }
+                ShardedReplaySlotOutcome::Occupied => {
+                    replacement_slot.get_or_insert(slot);
+                }
+                ShardedReplaySlotOutcome::Unavailable => {}
+            }
+        }
+        if let Some(slot) = replacement_slot {
+            if matches!(
+                self.try_publish_sharded_replay_slot(&stem, slot, true)?,
+                ShardedReplaySlotOutcome::Published
+            ) {
+                self.remove_active_marker(state_path)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn try_publish_sharded_replay_slot(
+        &self,
+        stem: &str,
+        slot: u64,
+        allow_displacement: bool,
+    ) -> Result<ShardedReplaySlotOutcome, CustodyError> {
+        let Some(_slot_lock) = self.try_lock_replay_slot(slot)? else {
+            return Ok(ShardedReplaySlotOutcome::Unavailable);
+        };
+        if let Some(reservation) = self.read_replay_reservation(slot)? {
+            let owner = self.read_replay_owner(&reservation.request_sha256)?;
+            if owner.as_ref().is_some_and(|owner| {
+                owner.sequence == reservation.sequence && owner.displaced == reservation.displaced
+            }) {
+                return Ok(ShardedReplaySlotOutcome::Unavailable);
+            }
+            remove_file_if_present(&self.replay_reservation_path(slot))?;
+            durable_fs::sync_directory(&self.owner_root())?;
+        }
+        let prior = self.read_replay_slot(slot)?;
+        if prior
+            .as_ref()
+            .is_some_and(|prior| prior.request_sha256 == stem)
+        {
+            return Err(CustodyError::Invalid(
+                "request custody replay slot has no matching owner".to_string(),
+            ));
+        }
+        if prior.is_some() && !allow_displacement {
+            return Ok(ShardedReplaySlotOutcome::Occupied);
+        }
+        let displacement = match prior.as_ref() {
+            Some(prior) => match self.acquire_replay_displacement(prior, Path::new(""))? {
+                Some(displacement) => Some(displacement),
+                None => return Ok(ShardedReplaySlotOutcome::Unavailable),
+            },
+            None => None,
+        };
+        let owner = ReplayOwner {
+            sequence: slot,
+            displaced: prior.clone(),
+        };
+        self.write_replay_reservation(
+            slot,
+            &ReplayReservation {
+                sequence: slot,
+                request_sha256: stem.to_string(),
+                displaced: prior,
+            },
+        )?;
+        self.write_replay_owner(stem, &owner)?;
+        if !self.publish_replay_placement(stem, &owner, displacement)? {
+            return Ok(ShardedReplaySlotOutcome::Unavailable);
+        }
+        Ok(ShardedReplaySlotOutcome::Published)
     }
 
     #[cfg(test)]
@@ -921,6 +1105,7 @@ impl RequestCustody {
                     Some(INDEX_SCHEMA_VERSION) => {
                         self.validate_current_schema(&schema)?;
                         self.require_index_directory(&self.replay_root())?;
+                        self.prepare_replay_slot_lock_root()?;
                         self.require_index_directory(&self.owner_root())?;
                         if self.active_policy.is_distributed() {
                             self.require_index_directory(&self.active_root())?;
@@ -930,6 +1115,12 @@ impl RequestCustody {
                                 remove_file_if_present(&self.active_index_path())?;
                                 durable_fs::sync_directory(&self.index_root)?;
                             }
+                        }
+                        if self.active_policy.is_distributed()
+                            && (schema["active_registration"].as_str() != Some("request_local")
+                                || schema["replay_allocation"].as_str() != Some("hash_sharded"))
+                        {
+                            self.write_current_schema(&schema_path)?;
                         }
                     }
                     Some(POLICY_ACTIVE_INDEX_SCHEMA_VERSION) => {
@@ -985,6 +1176,7 @@ impl RequestCustody {
             &self.index_root,
             &[
                 self.replay_root(),
+                self.replay_slot_lock_root(),
                 self.owner_root(),
                 self.pin_root(),
                 self.temporary_root(),
@@ -1230,7 +1422,7 @@ impl RequestCustody {
             return Err(CustodyError::Capacity);
         }
         if let Some(owner) = self.read_replay_owner(stem)? {
-            return self.complete_replay_placement(stem, &owner, current_lock_path);
+            return self.complete_replay_placement(stem, &owner, current_lock_path, true);
         }
         let Some((owner, displacement)) = self.reserve_replay_owner(stem, current_lock_path)?
         else {
@@ -1308,8 +1500,11 @@ impl RequestCustody {
         stem: &str,
         owner: &ReplayOwner,
         current_lock_path: &Path,
+        advance_head: bool,
     ) -> Result<bool, CustodyError> {
-        self.advance_replay_head(owner)?;
+        if advance_head {
+            self.advance_replay_head(owner)?;
+        }
         let slot = owner.sequence % self.replay_slots as u64;
         let current = self.read_replay_slot(slot)?;
         let target_is_published = current.as_ref().is_some_and(|current| {
@@ -1331,13 +1526,21 @@ impl RequestCustody {
                 // and allocate the still-active terminal request afresh.
                 remove_file_if_present(&self.owner_path(stem))?;
                 durable_fs::sync_directory(&self.owner_root())?;
-                return self.place_replay(stem, current_lock_path);
+                return if advance_head {
+                    self.place_replay(stem, current_lock_path)
+                } else {
+                    Ok(false)
+                };
             }
             None => {
                 if !target_is_published && current != owner.displaced {
                     remove_file_if_present(&self.owner_path(stem))?;
                     durable_fs::sync_directory(&self.owner_root())?;
-                    return self.place_replay(stem, current_lock_path);
+                    return if advance_head {
+                        self.place_replay(stem, current_lock_path)
+                    } else {
+                        Ok(false)
+                    };
                 }
                 self.write_replay_reservation(
                     slot,
@@ -1570,6 +1773,23 @@ impl RequestCustody {
         self.index_root.join("replay")
     }
 
+    fn replay_slot_lock_root(&self) -> PathBuf {
+        self.index_root.join("replay-slot-locks")
+    }
+
+    fn replay_slot_lock_path(&self, slot: u64) -> PathBuf {
+        self.replay_slot_lock_root().join(format!("{slot:04}.lock"))
+    }
+
+    fn try_lock_replay_slot(&self, slot: u64) -> Result<Option<fs::File>, CustodyError> {
+        let lock = open_lock(&self.replay_slot_lock_path(slot))?;
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => Ok(Some(lock)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
     fn replay_slot_path(&self, slot: u64) -> PathBuf {
         self.replay_root().join(format!("{slot:04}.json"))
     }
@@ -1662,6 +1882,19 @@ impl RequestCustody {
         }
     }
 
+    fn prepare_replay_slot_lock_root(&self) -> Result<(), CustodyError> {
+        match fs::metadata(self.replay_slot_lock_root()) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => Err(CustodyError::Invalid(
+                "request custody replay slot lock root is not a directory".to_string(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_private_child_directory(&self.replay_slot_lock_root())
+            }
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
     fn read_active_marker(&self, stem: &str) -> Result<Option<ActiveMarker>, CustodyError> {
         if !valid_digest(stem) {
             return Err(CustodyError::Invalid(
@@ -1718,6 +1951,37 @@ impl RequestCustody {
             &ActiveMarker {
                 binding_sha256: Some(binding_sha256.to_string()),
                 maintenance_sequence: sequence,
+            },
+        )
+    }
+
+    fn reserve_independent_active_marker(
+        &self,
+        stem: &str,
+        binding_sha256: &str,
+    ) -> Result<(), CustodyError> {
+        if !valid_digest(binding_sha256) {
+            return Err(CustodyError::Invalid(
+                "request custody active marker binding is invalid".to_string(),
+            ));
+        }
+        if let Some(marker) = self.read_active_marker(stem)? {
+            return match marker.reservation(binding_sha256) {
+                ActiveReservation::Matching => Ok(()),
+                ActiveReservation::Unbound | ActiveReservation::Conflicting => {
+                    Err(CustodyError::Invalid(
+                        "request custody active marker conflicts with the attempted binding"
+                            .to_string(),
+                    ))
+                }
+                ActiveReservation::Absent => unreachable!("a loaded active marker is present"),
+            };
+        }
+        self.write_active_marker(
+            stem,
+            &ActiveMarker {
+                binding_sha256: Some(binding_sha256.to_string()),
+                maintenance_sequence: DIRECT_MAINTENANCE_SEQUENCE,
             },
         )
     }
@@ -1981,11 +2245,15 @@ impl RequestCustody {
                 "schema_version": INDEX_SCHEMA_VERSION,
                 "active_policy": "fixed",
                 "active_limit": limit,
+                "active_registration": "indexed",
+                "replay_allocation": "sequenced_ring",
                 "replay_slots": self.replay_slots,
             }),
             ActiveIndexPolicy::Distributed { .. } => json!({
                 "schema_version": INDEX_SCHEMA_VERSION,
                 "active_policy": "distributed",
+                "active_registration": "request_local",
+                "replay_allocation": "hash_sharded",
                 "maintenance_probe_limit": MAX_ACTIVE_MAINTENANCE_PROBES,
                 "replay_slots": self.replay_slots,
             }),
@@ -2052,15 +2320,17 @@ impl RequestCustody {
                 "request custody record parent is not a directory".to_string(),
             ));
         }
-        let temporary_root = self.temporary_root();
-        let mut temporary = tempfile::NamedTempFile::new_in(&temporary_root)?;
+        // Unique request and replay records may be published concurrently.
+        // Keeping the temporary in the destination directory preserves atomic
+        // rename semantics without making the shared migration scratch root a
+        // steady-state writer rendezvous.
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
         temporary.write_all(bytes)?;
         temporary.as_file_mut().sync_all()?;
         temporary
             .persist(path)
             .map_err(|error| CustodyError::Io(error.error))?;
         durable_fs::sync_directory(parent)?;
-        durable_fs::sync_directory(&temporary_root)?;
         Ok(())
     }
 }
@@ -2600,6 +2870,185 @@ mod tests {
             .replay_owner_exists(&first_state)
             .expect("first replay owner"));
         assert!(first_state.exists(), "terminal state remains replayable");
+    }
+
+    #[test]
+    fn sharded_terminal_handoffs_complete_concurrently_without_a_global_gate() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let root = directory.path().to_path_buf();
+        let custody = RequestCustody::new_distributed(
+            root.clone(),
+            root.clone(),
+            root.join(".custody-v2"),
+            1024,
+            64,
+            4096,
+            Duration::from_secs(60),
+        );
+        custody
+            .maintain(&root.join("initialize.lock"), |_| Ok(false))
+            .expect("initialize distributed custody");
+        let completions = 320;
+        for index in 1..=completions {
+            let stem = format!("{index:064x}");
+            let state = root.join(format!("{stem}.json"));
+            custody
+                .reserve_independent_active(&state, &format!("{:064x}", index + 10_000))
+                .expect("reserve independent active marker");
+            fs::write(&state, br#"{"terminal":true}"#).expect("terminal state");
+            fs::write(root.join(format!("{stem}.lock")), b"").expect("request lock");
+        }
+
+        let workers = (1..=completions)
+            .map(|index| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let custody = RequestCustody::new_distributed(
+                        root.clone(),
+                        root.clone(),
+                        root.join(".custody-v2"),
+                        1024,
+                        64,
+                        4096,
+                        Duration::from_secs(60),
+                    );
+                    let state = root.join(format!("{index:064x}.json"));
+                    assert!(custody
+                        .publish_sharded_replay_and_retire_active(&state)
+                        .expect("publish sharded replay"));
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("concurrent terminal handoff");
+        }
+
+        assert_eq!(
+            fs::read_dir(root.join(".custody-v2/active"))
+                .expect("active marker root")
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(root.join(".custody-v2/replay"))
+                .expect("replay root")
+                .count(),
+            completions
+        );
+    }
+
+    #[test]
+    fn interrupted_sharded_handoff_recovers_around_an_interleaved_completion() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let root = directory.path().to_path_buf();
+        let custody = RequestCustody::new_distributed(
+            root.clone(),
+            root.clone(),
+            root.join(".custody-v2"),
+            1024,
+            2,
+            4,
+            Duration::from_secs(60),
+        );
+        custody
+            .maintain(&root.join("initialize.lock"), |_| Ok(false))
+            .expect("initialize distributed custody");
+        let first = format!("{:064x}", 1);
+        let second = format!("{:064x}", 5);
+        let first_state = root.join(format!("{first}.json"));
+        let second_state = root.join(format!("{second}.json"));
+        for (state, binding) in [(&first_state, 101), (&second_state, 102)] {
+            custody
+                .reserve_independent_active(state, &format!("{binding:064x}"))
+                .expect("reserve active marker");
+            fs::write(state, br#"{"terminal":true}"#).expect("terminal state");
+            fs::write(state.with_extension("lock"), b"").expect("request lock");
+        }
+
+        let interrupted_slot = 1;
+        let owner = ReplayOwner {
+            sequence: interrupted_slot,
+            displaced: None,
+        };
+        custody
+            .write_replay_reservation(
+                interrupted_slot,
+                &ReplayReservation {
+                    sequence: interrupted_slot,
+                    request_sha256: first.clone(),
+                    displaced: None,
+                },
+            )
+            .expect("reserve physical slot before interruption");
+        custody
+            .write_replay_owner(&first, &owner)
+            .expect("publish request owner before interruption");
+
+        assert!(custody
+            .publish_sharded_replay_and_retire_active(&second_state)
+            .expect("interleaved completion uses another probe"));
+        assert!(custody
+            .publish_sharded_replay_and_retire_active(&first_state)
+            .expect("exact interrupted completion resumes its slot"));
+        for state in [&first_state, &second_state] {
+            assert!(custody
+                .replay_owner_exists(state)
+                .expect("durable replay owner"));
+        }
+        assert_eq!(
+            fs::read_dir(root.join(".custody-v2/active"))
+                .expect("active marker root")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn current_schema_enables_independent_requests_only_after_durable_bootstrap() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let root = directory.path().to_path_buf();
+        let index_root = root.join(".custody-v2");
+        let custody = RequestCustody::new_distributed(
+            root.clone(),
+            root,
+            index_root.clone(),
+            1024,
+            2,
+            4,
+            Duration::from_secs(60),
+        );
+        custody
+            .maintain(Path::new(""), |_| Ok(false))
+            .expect("initialize distributed custody");
+        let mut schema: Value = serde_json::from_slice(
+            &fs::read(index_root.join("schema.json")).expect("current schema"),
+        )
+        .expect("parse current schema");
+        schema
+            .as_object_mut()
+            .expect("schema object")
+            .remove("active_registration");
+        schema
+            .as_object_mut()
+            .expect("schema object")
+            .remove("replay_allocation");
+        fs::write(
+            index_root.join("schema.json"),
+            serde_json::to_vec(&schema).expect("serialize predecessor schema"),
+        )
+        .expect("simulate predecessor current schema");
+        fs::remove_dir(index_root.join("replay-slot-locks"))
+            .expect("simulate absent sharded lock root");
+
+        assert!(!custody
+            .independent_requests_ready()
+            .expect("read-only readiness check"));
+        custody
+            .maintain(Path::new(""), |_| Ok(false))
+            .expect("bootstrap independent request representation");
+        assert!(custody
+            .independent_requests_ready()
+            .expect("durable independent readiness"));
     }
 
     #[test]

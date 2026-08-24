@@ -188,23 +188,21 @@ Those shared mechanisms do not own a capability's route, session, credential,
 or terminal meaning. The quota and launch sections below define their separate
 bindings, observations, reconciliation rules, and replay results.
 
-The active-index marker is itself a durable pre-state custody phase and binds
-both the request digest and the capability's complete attempted-input identity.
-Admission holds the capability registration lock from maintenance through marker
-publication and creation of the request lock. An exact retry matches its
-existing marker before a fixed-policy capability applies its active-capacity
-rejection and can resume even when every fixed slot is occupied; distributed
-launch custody has no corresponding population rejection. Changed inputs
-conflict before they can inherit the reservation. If the reserving provider
-stops before creating either request state or its request lock, a successor
-holding the registration lock can
-prove that no process still owns that pre-effect handoff and retire the marker;
-the exact request's current marker is preserved for that retry. Any marker with
-durable state, a live/young request lock, or replay ownership continues through
-the capability's normal reconciliation or retention rules and is never retired
-by this state-less pre-lock path. Schema-v3 active indexes upgrade in place;
-an unbound legacy marker can acquire a binding only when both state and request
-lock are absent under the registration lock.
+The active marker is itself a durable pre-state custody phase and binds both the
+request digest and the capability's complete attempted-input identity. Fixed
+policy admission holds its capability registration lock from maintenance
+through marker publication and request-lock creation. Distributed launch
+admission instead creates and locks the exact request first, then publishes only
+that request's marker; the registration lock is used only for one-time schema
+transition. An exact retry matches its existing marker before a fixed-policy
+capability applies its active-capacity rejection and can resume even when every
+fixed slot is occupied; distributed launch custody has no corresponding
+population rejection. Changed inputs conflict before they can inherit the
+reservation. Predecessor state-less reservations remain reclaimable under the
+registration lock, while current request-local reservations are removed by
+normal pre-spawn abandonment, terminal handoff, or exact recovery. Schema-v3
+active indexes upgrade in place; an unbound legacy marker can acquire a binding
+only when both state and request lock are absent under the registration lock.
 
 ## Quota observation and credential refresh
 
@@ -401,15 +399,16 @@ native effect.
 Launch custody uses bounded request-keyed active markers rather than a shared
 active-population document; active launch population is not an admission or
 runtime concurrency limit. Exact admission reads or writes only that request's
-marker. A bounded maintenance cursor and request-keyed tickets probe at most 16
-sequence positions and classify at most one queued request payload per
-admission. Live work is requeued, abandoned pre-state reservations are reaped,
-and normal terminal paths publish replay ownership and retire their own marker
-directly. Every marker, ticket, cursor, replay owner, physical-slot reservation,
-and replay slot is bounded to 1 KiB, so no single bookkeeping record grows with
-active population.
-Completed history uses a fixed 4,096-slot recent-replay ring, and every request
-state record is no larger than 256 KiB.
+marker while holding its exact request lock. Legacy distributed markers retain
+their bounded maintenance tickets for transition recovery, but current launches
+do not update a shared admission cursor. Normal terminal paths inspect a
+deterministic set of at most 64 positions in a 4,096-slot replay table and lock
+only the selected physical slot before publishing replay ownership and retiring
+their marker.
+Every marker, legacy ticket, cursor, replay owner, physical-slot reservation,
+slot lock, and replay slot is bounded to 1 KiB, so neither a record nor a shared
+critical section grows with active population. Every request state record is no
+larger than 256 KiB.
 Setup performs a read-only preflight against the exact `host.data_root`, and the
 first custody access repeats it under the registration lock before mutation.
 The transition atomically upgrades a schema-v5 elastic index of at
@@ -419,17 +418,18 @@ markers and maintenance tickets for every unresolved obligation. An indexless
 predecessor is separately bounded to 512 request locks, 2,048 directory entries,
 and 8 MiB of request state before its one-time conversion. These are predecessor
 transition envelopes, not a schema-v6 runtime-population
-limit. A larger schema-v5 installation must keep the schema-v5 provider active
+limit. The current schema also durably declares request-local admission and
+hash-sharded replay allocation before steady-state callers bypass the transition
+lock. A larger schema-v5 installation must keep the schema-v5 provider active
 until direct terminal cleanup compacts it below the envelope; the diagnostic
 explicitly says not to delete provider sessions. Provider binaries that only
 understand earlier schemas must not be used afterward;
 rollback requires a provider build that can read the distributed schema rather
 than deleting or rewriting live custody state.
-Cyclic slot replacement retires the oldest available completion without parsing
-replay payloads. Steady-state admission performs bounded request-keyed work and
-classifies at most one queued active payload per request; completion probes at
-most 64 compact ring slots. A durable physical-slot reservation serializes a
-pending placement before its request-local owner and replay slot are published;
+Steady-state admission performs bounded request-keyed work and remains
+independent even while the predecessor transition lock is held; completion
+uses a bounded 64-position replay probe set. A durable physical-slot reservation
+serializes a pending placement before its request-local owner and replay slot are published;
 an owner-less interrupted reservation is safely reclaimable because the active
 request remains authoritative, while a matching owner makes the slot exclusive
 until recovery completes. This makes active-to-replay transfer crash-idempotent
@@ -440,9 +440,9 @@ Prepared, submission-observed, and unresolved
 records never age out because they may still own an effect. Those obligations
 remain recoverable without rejecting unrelated launch work, while routine
 completed history cannot make admission work proportional to replay history.
-Shared replay pins
-prevent cyclic eviction while an exact caller crosses from registration
-to its request lock.
+Shared replay pins prevent eviction while an exact caller crosses into its
+request lock. The per-slot locks make simultaneous terminal handoffs independent
+unless their bounded probe sets actually collide.
 
 ### Resumed-turn custody and recovery
 

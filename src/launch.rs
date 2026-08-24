@@ -404,7 +404,7 @@ pub(crate) fn stream<W: Write>(
         })?;
     }
     let result = stream_child(custody.child_mut(), &mut state, writer);
-    finalize_launch_actor_and_replay(host, custody, state)?;
+    finalize_launch_actor_and_replay(custody, state)?;
     result.map(|exit_code| LaunchOutcome {
         exit_code,
         activity_targets: effective.activity_targets,
@@ -417,7 +417,6 @@ pub(crate) fn stream<W: Write>(
 /// request may become replay-only. A stop anywhere before the last step leaves
 /// enough durable identity for the exact retry to resume cleanup.
 fn finalize_launch_actor_and_replay(
-    host: &HostContext,
     custody: ChildCustody,
     mut state: LaunchState,
 ) -> Result<(), ProviderFailure> {
@@ -426,7 +425,7 @@ fn finalize_launch_actor_and_replay(
     let replayable_request = state.replayable_request_state();
     drop(state);
     if let Some((state_path, replay_request_id)) = replayable_request {
-        let _ = retire_completed_launch_request(host, &state_path, &replay_request_id);
+        let _ = retire_completed_launch_request(&state_path, &replay_request_id);
     }
     Ok(())
 }
@@ -1667,15 +1666,6 @@ fn retire_orphan_launch_request_lock(
     let root = state_path
         .parent()
         .expect("launch state path always has a parent");
-    // Retain the predecessor filename so old and new provider binaries still
-    // serialize launch registration during a rolling replacement.
-    let registration = open_launch_state_lock(&root.join(".capacity.lock"))
-        .map_err(|error| launch_state_failure(request_id, error))?;
-    if !operation_bounds::lock_exclusive_for(&registration, LAUNCH_REGISTRATION_LOCK_TIMEOUT)
-        .map_err(|error| launch_state_failure(request_id, error))?
-    {
-        return Err(launch_registration_lock_timeout(request_id));
-    }
     if state_path.exists() {
         return Ok(());
     }
@@ -2152,21 +2142,40 @@ fn acquire_launch_request_lock(
     reservation_binding_sha256: &str,
     request_id: &str,
 ) -> Result<fs::File, ProviderFailure> {
-    let registration_lock = acquire_launch_registration_lock(root, host, request_id)?;
-    let lock_path = state_path.with_extension("lock");
     let custody = launch_request_custody(root);
-    let lock_exists = lock_path.exists();
+    ensure_launch_request_custody_ready(&custody, root, host, request_id)?;
+    let lock_path = state_path.with_extension("lock");
+    // A shared replay pin closes the interval before the exact request lock is
+    // acquired. Replay eviction must take this pin exclusively, so it cannot
+    // retire the state that this request is about to inspect.
+    let replay_pin = custody
+        .pin_existing(state_path)
+        .map_err(|error| launch_custody_failure(request_id, error))?;
+    let lock = open_launch_state_lock(&lock_path)
+        .map_err(|error| launch_state_failure(request_id, error))?;
+    let acquired =
+        match operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
+        {
+            Some(timeout) => operation_bounds::lock_exclusive_for(&lock, timeout)
+                .map_err(|error| launch_state_failure(request_id, error))?,
+            None => match fs2::FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) => return Err(launch_state_failure(request_id, error)),
+            },
+        };
+    if !acquired {
+        return Err(launch_request_lock_timeout(request_id));
+    }
     let state_exists = state_path.exists();
     let replay_owner_exists = custody
         .replay_owner_exists(state_path)
         .map_err(|error| launch_custody_failure(request_id, error))?;
-    maintain_launch_request_custody(&custody, &lock_path, request_id)?;
     let mut active_reservation = custody
         .active_reservation(state_path, reservation_binding_sha256)
         .map_err(|error| launch_custody_failure(request_id, error))?;
     if active_reservation == ActiveReservation::Unbound
         && admit_new
-        && !lock_exists
         && !state_exists
         && !replay_owner_exists
     {
@@ -2181,57 +2190,27 @@ fn acquire_launch_request_lock(
             "the active request reservation belongs to different launch inputs",
         ));
     }
-    let active_marker_exists = active_reservation != ActiveReservation::Absent;
+    // A crash after replay publication but before active-marker retirement is
+    // self-healing on the exact retry. The replay owner is already the durable
+    // terminal authority, so the older active marker no longer owns runtime
+    // custody.
+    if replay_owner_exists && active_reservation != ActiveReservation::Absent {
+        custody
+            .remove_active_marker(state_path)
+            .map_err(|error| launch_custody_failure(request_id, error))?;
+        active_reservation = ActiveReservation::Absent;
+    }
     let resumes_pre_state_reservation = admit_new
         && active_reservation == ActiveReservation::Matching
         && !state_exists
         && !replay_owner_exists;
     let observed_existing =
-        lock_exists || state_exists || replay_owner_exists || active_marker_exists;
+        state_exists || replay_owner_exists || active_reservation != ActiveReservation::Absent;
     let reserved = admit_new && !observed_existing;
     if reserved {
         custody
-            .reserve_active(state_path, reservation_binding_sha256)
+            .reserve_independent_active(state_path, reservation_binding_sha256)
             .map_err(|error| launch_custody_failure(request_id, error))?;
-    }
-    let replay_pin = if observed_existing {
-        Some(
-            custody
-                .pin_existing(state_path)
-                .map_err(|error| launch_custody_failure(request_id, error))?,
-        )
-    } else {
-        None
-    };
-    let lock = match open_launch_state_lock(&lock_path) {
-        Ok(lock) => lock,
-        Err(error) => {
-            if reserved {
-                custody
-                    .remove_active_marker(state_path)
-                    .map_err(|cleanup| launch_custody_failure(request_id, cleanup))?;
-            }
-            return Err(launch_state_failure(request_id, error));
-        }
-    };
-    drop(registration_lock);
-    let acquired =
-        match operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
-        {
-            Some(timeout) => operation_bounds::lock_exclusive_for(&lock, timeout)
-                .map_err(|error| launch_state_failure(request_id, error))?,
-            None => match fs2::FileExt::try_lock_exclusive(&lock) {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
-                Err(error) => return Err(launch_state_failure(request_id, error)),
-            },
-        };
-    if !acquired {
-        drop(lock);
-        if reserved {
-            retire_orphan_launch_request_lock(state_path, request_id)?;
-        }
-        return Err(launch_request_lock_timeout(request_id));
     }
     drop(replay_pin);
     custody
@@ -2246,6 +2225,29 @@ fn acquire_launch_request_lock(
     Ok(lock)
 }
 
+fn ensure_launch_request_custody_ready(
+    custody: &RequestCustody,
+    root: &Path,
+    host: &HostContext,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if custody
+        .independent_requests_ready()
+        .map_err(|error| launch_custody_failure(request_id, error))?
+    {
+        return Ok(());
+    }
+    let transition_lock = acquire_launch_registration_lock(root, host, request_id)?;
+    if !custody
+        .independent_requests_ready()
+        .map_err(|error| launch_custody_failure(request_id, error))?
+    {
+        maintain_launch_request_custody(custody, Path::new(""), request_id)?;
+    }
+    drop(transition_lock);
+    Ok(())
+}
+
 fn acquire_launch_registration_lock(
     root: &Path,
     host: &HostContext,
@@ -2253,8 +2255,8 @@ fn acquire_launch_registration_lock(
 ) -> Result<fs::File, ProviderFailure> {
     durable_fs::create_private_directories(root)
         .map_err(|error| launch_state_failure(request_id, error))?;
-    // This compatibility filename is a registration mutex, not a runtime
-    // population counter or process cap.
+    // Retain the predecessor filename for an on-disk compatible, one-time
+    // schema transition mutex. Current-schema launch admission never takes it.
     let path = root.join(".capacity.lock");
     let lock =
         open_launch_state_lock(&path).map_err(|error| launch_state_failure(request_id, error))?;
@@ -2266,7 +2268,7 @@ fn acquire_launch_registration_lock(
     if !operation_bounds::lock_exclusive_for(&lock, timeout)
         .map_err(|error| launch_state_failure(request_id, error))?
     {
-        return Err(launch_registration_lock_timeout(request_id));
+        return Err(launch_custody_transition_lock_timeout(request_id));
     }
     Ok(lock)
 }
@@ -2282,22 +2284,16 @@ fn maintain_launch_request_custody(
 }
 
 fn retire_completed_launch_request(
-    host: &HostContext,
     state_path: &Path,
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     let root = state_path
         .parent()
         .expect("launch request state path always has a parent");
-    let registration_lock = acquire_launch_registration_lock(root, host, request_id)?;
     let custody = launch_request_custody(root);
     custody
-        .maintain(Path::new(""), launch_request_bytes_are_replay)
+        .publish_sharded_replay_and_retire_active(state_path)
         .map_err(|error| launch_custody_failure(request_id, error))?;
-    custody
-        .publish_replay_and_retire_active(state_path, Path::new(""))
-        .map_err(|error| launch_custody_failure(request_id, error))?;
-    drop(registration_lock);
     Ok(())
 }
 
@@ -2654,11 +2650,11 @@ fn launch_request_lock_timeout(request_id: &str) -> ProviderFailure {
     )
 }
 
-fn launch_registration_lock_timeout(request_id: &str) -> ProviderFailure {
+fn launch_custody_transition_lock_timeout(request_id: &str) -> ProviderFailure {
     ProviderFailure::internal(
         request_id,
-        "launch_registration_lock_timeout",
-        "launch registration could not acquire its brief custody lock before the operation deadline; active model processes are not capped, no launch slot was consumed, and retrying this request is safe",
+        "launch_custody_transition_lock_timeout",
+        "launch custody could not finish its one-time on-disk schema transition before the operation deadline; this is not provider capacity, active model processes are not capped, no launch slot was consumed, and retrying this request is safe",
     )
 }
 
@@ -3869,6 +3865,13 @@ mod custody_tests {
         let directory = tempfile::tempdir().expect("launch custody directory");
         let live_launches = 320;
         let root = directory.path().to_path_buf();
+        let custody = launch_request_custody(&root);
+        custody
+            .maintain(&root.join("initialize.lock"), |_| Ok(false))
+            .expect("initialize distributed launch custody");
+        let predecessor_gate = open_launch_state_lock(&root.join(".capacity.lock"))
+            .expect("open predecessor transition gate");
+        fs2::FileExt::lock_exclusive(&predecessor_gate).expect("hold predecessor transition gate");
         let registrations = (1..=live_launches)
             .map(|index| {
                 let root = root.clone();
@@ -3901,6 +3904,7 @@ mod custody_tests {
             .into_iter()
             .map(|registration| registration.join().expect("concurrent launch registration"))
             .collect::<Vec<_>>();
+        drop(predecessor_gate);
         let active_root = directory.path().join(".custody-v2/active");
         assert_eq!(
             fs::read_dir(&active_root)
