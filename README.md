@@ -187,8 +187,8 @@ instead of silently discarding owner-selected launch policy.
 
 ## Shared request and native-effect custody
 
-`src/request_custody.rs` owns the bounded active/replay admission algorithm used
-by launch and `quota.refresh_auth`; `src/native_process.rs` and
+`src/request_custody.rs` owns the bounded-work active/replay custody mechanisms
+used by launch and `quota.refresh_auth`; `src/native_process.rs` and
 `src/child_custody.rs` own native actor publication, termination, and reaping.
 Those shared mechanisms do not own a capability's route, session, credential,
 or terminal meaning. The quota and launch sections below define their separate
@@ -205,8 +205,10 @@ capability applies its active-capacity rejection and can resume even when every
 fixed slot is occupied; distributed launch custody has no corresponding
 population rejection. Changed inputs conflict before they can inherit the
 reservation. Predecessor state-less reservations remain reclaimable under the
-registration lock, while current request-local reservations are removed by
-normal pre-spawn abandonment, terminal handoff, or exact recovery. Schema-v3
+registration lock. Current request-local reservations are removed by normal
+pre-spawn abandonment, terminal handoff, exact recovery, or bounded sharded
+maintenance that owns the exact request lock and proves a current gated
+prepared record never published an actor. Schema-v3
 active indexes upgrade in place; an unbound legacy marker can acquire a binding
 only when both state and request lock are absent under the registration lock.
 
@@ -412,6 +414,14 @@ do not update a shared admission cursor. Normal terminal paths inspect a
 deterministic set of at most 64 positions in a 4,096-slot replay table and lock
 only the selected physical slot before publishing replay ownership and retiring
 their marker.
+Current launches also participate in a best-effort pre-effect cleanup
+accelerator with 64 independently locked shards and at most two request digests
+per shard. Its complete shared record envelope is 16 KiB. A shard may retire a
+state only while holding its replay pin and exact request lock, and only when a
+current gated prepared record has no published actor. Busy shards never reject
+or defer a launch, actor-published and predecessor records remain exact-retry
+obligations, and the accelerator is not an active-population index or admission
+authority.
 Every marker, legacy ticket, cursor, replay owner, physical-slot reservation,
 slot lock, and replay slot is bounded to 1 KiB, so neither a record nor a shared
 critical section grows with active population. Every request state record is no
@@ -447,13 +457,24 @@ terminal handoff before interpreting its result; an owner alone never retires
 the active marker. State is retired only
 after neither the replay ring nor the active index owns it, and predecessor
 duplicate slots are collapsed during the one-time bounded index upgrade.
-Prepared, submission-observed, and unresolved
-records never age out because they may still own an effect. Those obligations
+Actor-published prepared, submission-observed, and unresolved records never age
+out because they may still own an effect. Those obligations
 remain recoverable without rejecting unrelated launch work, while routine
 completed history cannot make admission work proportional to replay history.
 Shared replay pins prevent eviction while an exact caller crosses into its
 request lock. The per-slot locks make simultaneous terminal handoffs independent
 unless their bounded probe sets actually collide.
+
+The provider deliberately does not own an aggregate process queue or runtime
+population cap. One provider invocation cannot see cross-provider demand,
+caller priority, host process/thread/file-descriptor headroom, or the recovery
+reserve needed by Agent Runner. Agent Runner or its execution host therefore
+owns aggregate admission, fairness, cancellation, and finite workload
+deadlines across provider accounts. That host policy must always admit exact
+retry and cleanup for already-owned effects. The provider owns request-local
+byte bounds, durable effect custody, bounded shared bookkeeping, and truthful
+setup metadata; it must not turn completed history or active request count into
+a provider-wide launch rejection.
 
 ### Resumed-turn custody and recovery
 

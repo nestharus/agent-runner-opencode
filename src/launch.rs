@@ -38,7 +38,8 @@ use crate::operation_bounds;
 use crate::path_guard;
 use crate::policy;
 use crate::request_custody::{
-    ActiveReservation, CustodyError, RequestCustody, MAX_REPLAY_EVICTION_PROBES,
+    ActiveReservation, CustodyError, RequestCustody, MAX_PRE_EFFECT_MAINTENANCE_BYTES,
+    MAX_REPLAY_EVICTION_PROBES, PRE_EFFECT_CANDIDATES_PER_SHARD, PRE_EFFECT_MAINTENANCE_SHARDS,
 };
 use crate::resume_observation::{
     self, DurableResumeObservationRequest, ResumeObservation, ResumeObservationRequest,
@@ -1183,6 +1184,7 @@ fn preflight_existing_launch_replay(
     match outcome {
         ExistingLaunchRetryOutcome::AuthoritativeNoEffect => {
             remove_launch_request_state(&state_path, request_id)?;
+            release_launch_pre_effect_candidate(&state_path);
             drop(lock);
             retire_orphan_launch_request_lock(&state_path, request_id)
         }
@@ -1381,6 +1383,7 @@ impl LaunchRequestGuard {
             &request_identity_sha256,
             request_id,
         )?;
+        register_launch_pre_effect_candidate(&root, &state_path);
         match durable_fs::read_file_bounded(&state_path, MAX_LAUNCH_STATE_BYTES) {
             Ok(bytes) => {
                 validate_launch_operation_kind(
@@ -1464,7 +1467,9 @@ impl LaunchRequestGuard {
             &self.state.request_id,
             &self.state.binding_sha256,
         )?;
-        write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
+        write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)?;
+        release_launch_pre_effect_candidate(&self.state_path);
+        Ok(())
     }
 
     fn settle_actor_custody(&mut self) -> Result<(), ProviderFailure> {
@@ -1498,6 +1503,7 @@ impl LaunchRequestGuard {
         let state_path = self.state_path.clone();
         let request_id = self.state.request_id.clone();
         remove_launch_request_state(&state_path, &request_id)?;
+        release_launch_pre_effect_candidate(&state_path);
         drop(self);
         retire_orphan_launch_request_lock(&state_path, &request_id)
     }
@@ -1529,6 +1535,7 @@ impl ResumeLaunchRequestGuard {
             &request_identity_sha256,
             request_id,
         )?;
+        register_launch_pre_effect_candidate(&root, &state_path);
         match durable_fs::read_file_bounded(&state_path, MAX_LAUNCH_STATE_BYTES) {
             Ok(bytes) => {
                 validate_launch_operation_kind(
@@ -1593,7 +1600,9 @@ impl ResumeLaunchRequestGuard {
             &self.state.request_id,
             &self.state.binding_sha256,
         )?;
-        write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
+        write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)?;
+        release_launch_pre_effect_candidate(&self.state_path);
+        Ok(())
     }
 
     fn settle_actor_custody(&mut self) -> Result<(), ProviderFailure> {
@@ -1642,6 +1651,7 @@ impl ResumeLaunchRequestGuard {
         let state_path = self.state_path.clone();
         let request_id = self.state.request_id.clone();
         remove_launch_request_state(&state_path, &request_id)?;
+        release_launch_pre_effect_candidate(&state_path);
         drop(self);
         retire_orphan_launch_request_lock(&state_path, &request_id)
     }
@@ -2324,6 +2334,51 @@ fn launch_request_bytes_are_replay(bytes: &[u8]) -> Result<bool, String> {
             .is_some())
 }
 
+fn launch_request_bytes_are_current_pre_effect(
+    request_sha256: &str,
+    bytes: &[u8],
+) -> Result<bool, String> {
+    let discriminator: LaunchOperationDiscriminator =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    match discriminator.operation_kind {
+        LaunchOperationKind::NewSession => {
+            let state: LaunchRequestState =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            Ok(state.schema_version >= 7
+                && state.schema_version <= LAUNCH_STATE_SCHEMA_VERSION
+                && sha256_hex(state.request_id.as_bytes()) == request_sha256
+                && state.phase == LaunchRequestPhase::Prepared
+                && state.actor_process_group_id.is_none()
+                && state.actor_process_group_incarnation.is_none())
+        }
+        LaunchOperationKind::Resume => {
+            let state: ResumeLaunchRequestState =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            Ok(state.schema_version >= 7
+                && state.schema_version <= LAUNCH_STATE_SCHEMA_VERSION
+                && sha256_hex(state.request_id.as_bytes()) == request_sha256
+                && state.phase == ResumeLaunchRequestPhase::Prepared
+                && state.actor_process_group_id.is_none()
+                && state.actor_process_group_incarnation.is_none())
+        }
+    }
+}
+
+fn register_launch_pre_effect_candidate(root: &Path, state_path: &Path) {
+    // This cleanup accelerator is deliberately not launch authority. A busy or
+    // damaged maintenance shard cannot reject independent work; exact request
+    // state remains the recovery source of truth.
+    let _ = launch_request_custody(root)
+        .register_pre_effect_candidate(state_path, launch_request_bytes_are_current_pre_effect);
+}
+
+fn release_launch_pre_effect_candidate(state_path: &Path) {
+    let root = state_path
+        .parent()
+        .expect("launch state path always has a parent");
+    let _ = launch_request_custody(root).release_pre_effect_candidate(state_path);
+}
+
 fn launch_request_custody(root: &Path) -> RequestCustody {
     RequestCustody::new_distributed(
         root.to_path_buf(),
@@ -2347,6 +2402,14 @@ pub(crate) fn custody_transition_preflight(data_root: &Path) -> Value {
             "inspected_state_bytes": preflight.state_bytes,
             "blocking_error": preflight.blocker,
             "runtime_active_population_limit": null,
+            "pre_effect_cleanup": {
+                "mode": "bounded_hash_sharded_best_effort",
+                "shards": PRE_EFFECT_MAINTENANCE_SHARDS,
+                "candidates_per_shard": PRE_EFFECT_CANDIDATES_PER_SHARD,
+                "maximum_shared_record_bytes": MAX_PRE_EFFECT_MAINTENANCE_BYTES,
+                "retirable_state": "current gated prepared request with no published actor",
+                "admission_limit": null,
+            },
             "note": "the envelope applies only to bounded one-time predecessor migration; current distributed launch custody has no fixed active-request population limit",
         }),
         Err(error) => json!({
@@ -2354,6 +2417,11 @@ pub(crate) fn custody_transition_preflight(data_root: &Path) -> Value {
             "format": "invalid_or_unreadable",
             "blocking_error": error.to_string(),
             "runtime_active_population_limit": null,
+            "pre_effect_cleanup": {
+                "mode": "bounded_hash_sharded_best_effort",
+                "maximum_shared_record_bytes": MAX_PRE_EFFECT_MAINTENANCE_BYTES,
+                "admission_limit": null,
+            },
             "note": "setup could not prove the exact launch-custody transition safe; keep the predecessor provider installed and do not delete provider sessions",
         }),
     }
@@ -4320,6 +4388,63 @@ mod custody_tests {
         );
         assert!(!first_state.exists());
         assert!(second_state.exists());
+    }
+
+    #[test]
+    fn pre_effect_cleanup_accepts_only_current_actorless_prepared_state() {
+        let request_id = "pre-effect-request";
+        let request_sha256 = sha256_hex(request_id.as_bytes());
+        let mut state = json!({
+            "schema_version": LAUNCH_STATE_SCHEMA_VERSION,
+            "operation_kind": "new_session",
+            "request_id": request_id,
+            "request_identity_sha256": "identity",
+            "binding_sha256": "binding",
+            "prompt_sha256": null,
+            "delivery_nonce": null,
+            "recovery": {
+                "program": "opencode",
+                "passthrough_env": {},
+                "declared_env_sha256": "environment",
+                "working_directory": "/tmp",
+                "provider_id": "openai",
+                "model_id": "gpt-5.6-luna",
+                "effort": "low"
+            },
+            "phase": "prepared",
+            "actor_process_group_id": null,
+            "actor_process_group_incarnation": null,
+            "actor_terminal_at_unix_ms": null,
+            "provider_session_id": null,
+            "terminal_status": null,
+            "prepared_at_unix_ms": 1,
+            "observed_at_unix_ms": null
+        });
+        let encoded = |state: &Value| serde_json::to_vec(state).expect("serialize launch state");
+
+        assert!(
+            launch_request_bytes_are_current_pre_effect(&request_sha256, &encoded(&state))
+                .expect("classify current actorless state")
+        );
+        state["actor_process_group_id"] = json!(123);
+        state["actor_process_group_incarnation"] = json!("incarnation");
+        assert!(
+            !launch_request_bytes_are_current_pre_effect(&request_sha256, &encoded(&state))
+                .expect("preserve actor-published state")
+        );
+        state["actor_process_group_id"] = Value::Null;
+        state["actor_process_group_incarnation"] = Value::Null;
+        state["schema_version"] = json!(6);
+        assert!(
+            !launch_request_bytes_are_current_pre_effect(&request_sha256, &encoded(&state))
+                .expect("preserve predecessor state")
+        );
+        state["schema_version"] = json!(LAUNCH_STATE_SCHEMA_VERSION);
+        assert!(!launch_request_bytes_are_current_pre_effect(
+            &sha256_hex(b"another-request"),
+            &encoded(&state)
+        )
+        .expect("preserve mismatched request state"));
     }
 }
 

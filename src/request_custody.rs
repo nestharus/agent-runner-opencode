@@ -23,6 +23,11 @@ const MAX_INDEXLESS_MIGRATION_DIRECTORY_ENTRIES: usize = 2_048;
 const MAX_INDEXLESS_MIGRATION_STATE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_REPLAY_EVICTION_PROBES: usize = 64;
 pub(crate) const MAX_ACTIVE_MAINTENANCE_PROBES: usize = 16;
+pub(crate) const PRE_EFFECT_MAINTENANCE_SHARDS: usize = 64;
+pub(crate) const PRE_EFFECT_CANDIDATES_PER_SHARD: usize = 2;
+pub(crate) const MAX_PRE_EFFECT_MAINTENANCE_BYTES: usize = 16 * 1024;
+const MAX_PRE_EFFECT_SHARD_BYTES: usize =
+    MAX_PRE_EFFECT_MAINTENANCE_BYTES / PRE_EFFECT_MAINTENANCE_SHARDS;
 const EMPTY_ACTIVE_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 // Current distributed admissions publish only their request-local marker.
@@ -119,6 +124,34 @@ impl MaintenanceIndex {
 #[derive(Debug, Deserialize, Serialize)]
 struct MaintenanceTicket {
     request_sha256: String,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct PreEffectMaintenanceShard {
+    candidates: Vec<String>,
+}
+
+impl PreEffectMaintenanceShard {
+    fn validate(&self) -> Result<(), CustodyError> {
+        let mut unique = HashSet::with_capacity(self.candidates.len());
+        if self.candidates.len() > PRE_EFFECT_CANDIDATES_PER_SHARD
+            || self
+                .candidates
+                .iter()
+                .any(|candidate| !valid_digest(candidate) || !unique.insert(candidate))
+        {
+            return Err(CustodyError::Invalid(
+                "request custody pre-effect maintenance shard is inconsistent".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+enum PreEffectCandidateOutcome {
+    Reaped,
+    NoLongerPreEffect,
+    Busy,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -821,6 +854,72 @@ impl RequestCustody {
         }
         let stem = required_digest_stem(state_path)?;
         self.reserve_independent_active_marker(&stem, binding_sha256)
+    }
+
+    /// Remember a short-lived pre-effect request in bounded, sharded cleanup
+    /// bookkeeping. A later request in the same shard may retire a prior state
+    /// only after it owns that request's replay pin and exact lock and the
+    /// capability classifier proves that no native effect was admitted.
+    ///
+    /// Contention never becomes admission pressure: a busy shard or candidate
+    /// simply leaves the current request untracked by this best-effort cleanup
+    /// accelerator. Exact request custody remains authoritative either way.
+    pub(crate) fn register_pre_effect_candidate(
+        &self,
+        state_path: &Path,
+        classify_pre_effect: impl Fn(&str, &[u8]) -> Result<bool, String>,
+    ) -> Result<(), CustodyError> {
+        if !self.active_policy.is_distributed() {
+            return Ok(());
+        }
+        let stem = required_digest_stem(state_path)?;
+        self.prepare_pre_effect_maintenance_roots()?;
+        let shard = pre_effect_shard(&stem)?;
+        let Some(_shard_lock) = self.try_lock_pre_effect_shard(shard)? else {
+            return Ok(());
+        };
+        let mut record = self.read_pre_effect_shard(shard)?;
+        let mut retained = Vec::with_capacity(PRE_EFFECT_CANDIDATES_PER_SHARD);
+        let mut current_present = false;
+        for candidate in record.candidates.drain(..) {
+            if candidate == stem {
+                current_present = true;
+                retained.push(candidate);
+                continue;
+            }
+            match self.try_reap_pre_effect_candidate(&candidate, &classify_pre_effect)? {
+                PreEffectCandidateOutcome::Reaped
+                | PreEffectCandidateOutcome::NoLongerPreEffect => {}
+                PreEffectCandidateOutcome::Busy => retained.push(candidate),
+            }
+        }
+        if !current_present && retained.len() < PRE_EFFECT_CANDIDATES_PER_SHARD {
+            retained.push(stem);
+        }
+        record.candidates = retained;
+        self.write_pre_effect_shard(shard, &record)
+    }
+
+    /// Remove this request from the optional pre-effect cleanup accelerator
+    /// after actor publication or ordinary pre-spawn abandonment. A stale
+    /// entry is harmless: its next observer rechecks durable request state
+    /// while owning the exact lock before it can retire anything.
+    pub(crate) fn release_pre_effect_candidate(
+        &self,
+        state_path: &Path,
+    ) -> Result<(), CustodyError> {
+        if !self.active_policy.is_distributed() {
+            return Ok(());
+        }
+        let stem = required_digest_stem(state_path)?;
+        self.prepare_pre_effect_maintenance_roots()?;
+        let shard = pre_effect_shard(&stem)?;
+        let Some(_shard_lock) = self.try_lock_pre_effect_shard(shard)? else {
+            return Ok(());
+        };
+        let mut record = self.read_pre_effect_shard(shard)?;
+        record.candidates.retain(|candidate| candidate != &stem);
+        self.write_pre_effect_shard(shard, &record)
     }
 
     /// Report how the active index owns this exact request and attempt.
@@ -1722,6 +1821,53 @@ impl RequestCustody {
         Ok(true)
     }
 
+    fn try_reap_pre_effect_candidate(
+        &self,
+        stem: &str,
+        classify_pre_effect: &impl Fn(&str, &[u8]) -> Result<bool, String>,
+    ) -> Result<PreEffectCandidateOutcome, CustodyError> {
+        let pin_path = self.pin_root().join(format!("{stem}.pin"));
+        let pin = match self.try_lock_pin_exclusive(stem)? {
+            Some(pin) => Some(pin),
+            None if pin_path.exists() => return Ok(PreEffectCandidateOutcome::Busy),
+            None => None,
+        };
+        let lock_path = self.lock_path(stem);
+        let lock = open_lock(&lock_path)?;
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(PreEffectCandidateOutcome::Busy)
+            }
+            Err(error) => return Err(CustodyError::Io(error)),
+        }
+        if self.read_replay_owner(stem)?.is_some() {
+            return Ok(PreEffectCandidateOutcome::NoLongerPreEffect);
+        }
+        let state_path = self.state_path(stem);
+        let bytes = match durable_fs::read_file_bounded(&state_path, self.state_byte_limit) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(CustodyError::Io(error)),
+        };
+        if let Some(bytes) = bytes.as_deref() {
+            if !classify_pre_effect(stem, bytes).map_err(CustodyError::Invalid)? {
+                return Ok(PreEffectCandidateOutcome::NoLongerPreEffect);
+            }
+            remove_file_if_present(&state_path)?;
+            durable_fs::sync_directory(&self.state_root)?;
+        }
+        self.remove_active_marker(&state_path)?;
+        remove_file_if_present(&lock_path)?;
+        if let Some((pin, pin_path)) = pin {
+            remove_file_if_present(&pin_path)?;
+            drop(pin);
+            durable_fs::sync_directory(&self.pin_root())?;
+        }
+        durable_fs::sync_directory(&self.lock_root)?;
+        Ok(PreEffectCandidateOutcome::Reaped)
+    }
+
     fn try_lock_pin_exclusive(
         &self,
         stem: &str,
@@ -1767,6 +1913,33 @@ impl RequestCustody {
 
     fn maintenance_ticket_path(&self, sequence: u64) -> PathBuf {
         self.maintenance_root().join(format!("{sequence:020}.json"))
+    }
+
+    fn pre_effect_maintenance_root(&self) -> PathBuf {
+        self.index_root.join("pre-effect-maintenance")
+    }
+
+    fn pre_effect_maintenance_lock_root(&self) -> PathBuf {
+        self.index_root.join("pre-effect-maintenance-locks")
+    }
+
+    fn pre_effect_shard_path(&self, shard: u64) -> PathBuf {
+        self.pre_effect_maintenance_root()
+            .join(format!("{shard:02}.json"))
+    }
+
+    fn pre_effect_shard_lock_path(&self, shard: u64) -> PathBuf {
+        self.pre_effect_maintenance_lock_root()
+            .join(format!("{shard:02}.lock"))
+    }
+
+    fn try_lock_pre_effect_shard(&self, shard: u64) -> Result<Option<fs::File>, CustodyError> {
+        let lock = open_lock(&self.pre_effect_shard_lock_path(shard))?;
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => Ok(Some(lock)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(CustodyError::Io(error)),
+        }
     }
 
     fn replay_root(&self) -> PathBuf {
@@ -1880,6 +2053,28 @@ impl RequestCustody {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn prepare_pre_effect_maintenance_roots(&self) -> Result<(), CustodyError> {
+        for root in [
+            self.pre_effect_maintenance_root(),
+            self.pre_effect_maintenance_lock_root(),
+        ] {
+            match fs::metadata(&root) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(CustodyError::Invalid(
+                        "request custody pre-effect maintenance root is not a directory"
+                            .to_string(),
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    create_private_child_directory(&root)?;
+                }
+                Err(error) => return Err(CustodyError::Io(error)),
+            }
+        }
+        Ok(())
     }
 
     fn prepare_replay_slot_lock_root(&self) -> Result<(), CustodyError> {
@@ -2050,6 +2245,41 @@ impl RequestCustody {
         remove_file_if_present(&self.maintenance_ticket_path(sequence))?;
         durable_fs::sync_directory(&self.maintenance_root())?;
         Ok(())
+    }
+
+    fn read_pre_effect_shard(&self, shard: u64) -> Result<PreEffectMaintenanceShard, CustodyError> {
+        match durable_fs::read_file_bounded(
+            &self.pre_effect_shard_path(shard),
+            MAX_PRE_EFFECT_SHARD_BYTES,
+        ) {
+            Ok(bytes) => {
+                let record: PreEffectMaintenanceShard = serde_json::from_slice(&bytes)
+                    .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+                record.validate()?;
+                Ok(record)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(PreEffectMaintenanceShard::default())
+            }
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
+    fn write_pre_effect_shard(
+        &self,
+        shard: u64,
+        record: &PreEffectMaintenanceShard,
+    ) -> Result<(), CustodyError> {
+        record.validate()?;
+        let path = self.pre_effect_shard_path(shard);
+        if record.candidates.is_empty() {
+            remove_file_if_present(&path)?;
+            durable_fs::sync_directory(&self.pre_effect_maintenance_root())?;
+            return Ok(());
+        }
+        let value = serde_json::to_value(record)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        self.write_json_atomic_bounded(&path, &value, MAX_PRE_EFFECT_SHARD_BYTES)
     }
 
     fn write_replay_head(&self, path: &Path, next_slot: u64) -> Result<(), CustodyError> {
@@ -2418,6 +2648,20 @@ fn required_digest_stem(path: &Path) -> Result<String, CustodyError> {
             ))
         })?;
     Ok(stem.to_string())
+}
+
+fn pre_effect_shard(stem: &str) -> Result<u64, CustodyError> {
+    if !valid_digest(stem) {
+        return Err(CustodyError::Invalid(
+            "request custody pre-effect candidate has an invalid digest".to_string(),
+        ));
+    }
+    let prefix = u16::from_str_radix(&stem[..4], 16).map_err(|error| {
+        CustodyError::Invalid(format!(
+            "request custody pre-effect candidate has an invalid digest prefix: {error}"
+        ))
+    })?;
+    Ok(u64::from(prefix) % PRE_EFFECT_MAINTENANCE_SHARDS as u64)
 }
 
 fn valid_digest(stem: &str) -> bool {
@@ -3156,6 +3400,111 @@ mod tests {
             .expect("bounded maintenance index");
         assert_eq!(maintenance.next_probe, 2);
         assert_eq!(maintenance.next_sequence, 3);
+    }
+
+    #[test]
+    fn sharded_pre_effect_maintenance_reaps_only_proven_unlocked_state() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let root = directory.path().to_path_buf();
+        let custody = RequestCustody::new_distributed(
+            root.clone(),
+            root.clone(),
+            root.join(".custody-v2"),
+            1024,
+            2,
+            2,
+            Duration::from_secs(60),
+        );
+        custody
+            .maintain(&root.join("initialize.lock"), |_| Ok(false))
+            .expect("initialize distributed custody");
+        let abandoned = root.join(format!("{:064x}.json", 1));
+        let successor = root.join(format!("{:064x}.json", 2));
+        custody
+            .reserve_independent_active(&abandoned, &format!("{:064x}", 101))
+            .expect("reserve abandoned pre-effect state");
+        fs::write(&abandoned, b"pre-effect").expect("write pre-effect state");
+        fs::write(abandoned.with_extension("lock"), b"").expect("write abandoned lock");
+        custody
+            .register_pre_effect_candidate(&abandoned, |_, bytes| Ok(bytes == b"pre-effect"))
+            .expect("register abandoned pre-effect state");
+
+        custody
+            .reserve_independent_active(&successor, &format!("{:064x}", 102))
+            .expect("reserve successor");
+        custody
+            .register_pre_effect_candidate(&successor, |_, bytes| Ok(bytes == b"pre-effect"))
+            .expect("successor reaps abandoned state");
+
+        assert!(!abandoned.exists());
+        assert!(!abandoned.with_extension("lock").exists());
+        assert_eq!(
+            custody
+                .active_reservation(&abandoned, &format!("{:064x}", 101))
+                .expect("abandoned marker retired"),
+            ActiveReservation::Absent
+        );
+        let shard = pre_effect_shard(
+            successor
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("successor digest"),
+        )
+        .expect("maintenance shard");
+        let record = custody
+            .read_pre_effect_shard(shard)
+            .expect("bounded maintenance record");
+        assert_eq!(record.candidates.len(), 1);
+        assert!(
+            fs::metadata(custody.pre_effect_shard_path(shard))
+                .expect("maintenance record metadata")
+                .len()
+                <= MAX_PRE_EFFECT_SHARD_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn sharded_pre_effect_maintenance_preserves_effect_capable_state() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let root = directory.path().to_path_buf();
+        let custody = RequestCustody::new_distributed(
+            root.clone(),
+            root.clone(),
+            root.join(".custody-v2"),
+            1024,
+            2,
+            2,
+            Duration::from_secs(60),
+        );
+        custody
+            .maintain(&root.join("initialize.lock"), |_| Ok(false))
+            .expect("initialize distributed custody");
+        let effect_capable = root.join(format!("{:064x}.json", 1));
+        let successor = root.join(format!("{:064x}.json", 2));
+        custody
+            .reserve_independent_active(&effect_capable, &format!("{:064x}", 101))
+            .expect("reserve effect-capable state");
+        fs::write(&effect_capable, b"effect-capable").expect("write effect-capable state");
+        fs::write(effect_capable.with_extension("lock"), b"").expect("write request lock");
+        custody
+            .register_pre_effect_candidate(&effect_capable, |_, bytes| Ok(bytes == b"pre-effect"))
+            .expect("register stale accelerator entry");
+
+        custody
+            .reserve_independent_active(&successor, &format!("{:064x}", 102))
+            .expect("reserve successor");
+        custody
+            .register_pre_effect_candidate(&successor, |_, bytes| Ok(bytes == b"pre-effect"))
+            .expect("inspect effect-capable state");
+
+        assert!(effect_capable.exists());
+        assert!(effect_capable.with_extension("lock").exists());
+        assert_eq!(
+            custody
+                .active_reservation(&effect_capable, &format!("{:064x}", 101))
+                .expect("effect-capable marker retained"),
+            ActiveReservation::Matching
+        );
     }
 
     #[test]

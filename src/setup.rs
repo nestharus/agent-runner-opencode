@@ -920,6 +920,15 @@ mod identity_readiness_tests {
 
         let readiness = launch_custody_readiness(&host, &json!({}));
         assert_eq!(readiness["ready"], false);
+        assert_eq!(readiness["runtime_active_population_limit"], Value::Null);
+        assert_eq!(
+            readiness["pre_effect_cleanup"]["maximum_shared_record_bytes"],
+            16 * 1024
+        );
+        assert_eq!(
+            readiness["pre_effect_cleanup"]["admission_limit"],
+            Value::Null
+        );
         assert!(readiness["blocking_error"]
             .as_str()
             .is_some_and(|message| message.contains("do not delete provider sessions")));
