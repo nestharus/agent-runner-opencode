@@ -21,10 +21,13 @@ sections own only the mechanisms reused across capabilities.
 | Account and settings identity, transactions, and migration | `src/account.rs`, `src/settings.rs`, `src/settings_definition.rs`, `src/migration.rs` |
 | Model catalog, runtime selection, and launch policy | `src/models.rs`, `src/runtime_selection.rs`, `src/policy.rs` |
 | Launch, new-session recovery, and resumed-turn recovery | `src/launch.rs`, `src/resume_observation.rs`, `src/terminal.rs` |
-| Session capture, canonical projection, and enumeration | `src/session.rs`, `src/opencode.rs` |
-| Quota observation and credential refresh settlement | `src/quota.rs`, `src/quota_adapter.rs`, `src/quota_observer.rs` |
+| Session capture and canonical projection | `src/session.rs`, `src/opencode.rs` |
+| Session enumeration and cursor custody | `src/session_enumeration.rs` |
+| Quota source and observation | `src/quota.rs`, `src/quota_adapter.rs`, `src/quota_observer.rs` |
+| Credential refresh settlement | `src/quota_auth_refresh.rs` |
 | Rotation assessment and materialization | `src/rotation.rs` |
-| Setup readiness and native-identity rebind | `src/setup.rs`, `src/native_runtime.rs`, `src/quota_observer.rs` |
+| Setup readiness | `src/setup.rs`, `src/native_runtime.rs`, `src/quota_observer.rs` |
+| Native-identity rebind | `src/native_identity_rebind.rs` |
 | Shared request/effect custody and native child ownership | `src/request_custody.rs`, `src/native_process.rs`, `src/child_custody.rs` |
 | Shared filesystem confinement and durable publication | `src/path_guard.rs`, `src/durable_fs.rs` |
 | Operational activity evidence | `src/activity.rs` |
