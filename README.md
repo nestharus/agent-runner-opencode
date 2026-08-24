@@ -350,9 +350,13 @@ before the gate can execute the native command. That attachment includes the
 group leader's platform process-start incarnation, so a later process group
 that reuses the same numeric ID cannot impersonate the admitted actor. Provider
 loss or publication failure closes an unreleased gate without admitting a
-native effect. Recovery refuses readmission while the published group and
-leader incarnation are live; once that actor is terminal (or a prepared record
-proves no actor was ever published), recovery
+native effect. Normal completion terminates the whole registered process group
+and durably records actor terminality before launch custody becomes replay-only.
+If the provider is lost after actor publication, an exact retry first acquires
+the abandoned request lock, terminates that exact recorded group incarnation,
+and durably discharges its custody before reconciling or readmitting work. A
+recycled numeric group ID is never signalled. Once that actor is terminal (or a
+prepared record proves no actor was ever published), recovery
 binds a matching session only when its user turn carries the provider-authored
 delivery identity embedded in that request's actual child payload, and readmits
 the request only after a
@@ -403,10 +407,15 @@ directly. Every marker, ticket, cursor, replay owner, and replay slot is bounded
 to 1 KiB, so no single bookkeeping record grows with active population.
 Completed history uses a fixed 4,096-slot recent-replay ring, and every request
 state record is no larger than 256 KiB.
-The first custody access atomically upgrades schema-v5 elastic indexes to the
-distributed-marker schema, transfers terminal records to replay, and creates
-markers and maintenance tickets for every unresolved obligation. Provider
-binaries that only understand earlier schemas must not be used afterward;
+The first custody access atomically upgrades a schema-v5 elastic index of at
+most 128 KiB and 512 slots to the distributed-marker schema, transfers only
+records whose native actor custody is durably terminal to replay, and creates
+markers and maintenance tickets for every unresolved obligation. This is a
+one-time predecessor transition envelope, not a schema-v6 runtime-population
+limit. A larger schema-v5 installation must keep the schema-v5 provider active
+until direct terminal cleanup compacts it below the envelope; the diagnostic
+explicitly says not to delete provider sessions. Provider binaries that only
+understand earlier schemas must not be used afterward;
 rollback requires a provider build that can read the distributed schema rather
 than deleting or rewriting live custody state.
 Cyclic slot replacement retires the oldest available completion without parsing
@@ -446,7 +455,9 @@ terminal, submission-observed, or unresolved record may perform one bounded
 750 ms export in that original context.
 If it cannot prove safe readmission, the record becomes durable `unresolved`;
 exact retries re-run that same bounded observer without resubmitting the turn.
-A still-live prior process group blocks reconciliation and readmission.
+A still-live process group whose in-process owner was lost is terminated by an
+exact retry under the abandoned request lock before reconciliation or
+readmission.
 A later completion moves the original record into terminal replay custody; an
 authoritative no-effect observation can safely retire an `unresolved` record
 for exact readmission. Submission evidence without completion remains owned and

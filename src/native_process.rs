@@ -155,6 +155,75 @@ pub(crate) fn actor_is_terminal_or_recycled(actor: &ProcessGroupActor) -> io::Re
     }
 }
 
+/// Discharge custody for a durably recorded process-group incarnation after
+/// its in-process owner has been lost. A changed leader incarnation proves the
+/// numeric process-group identity was recycled and must not be signalled. A
+/// missing leader while the group remains live is the original orphaned group:
+/// a new group with that number cannot exist without a leader whose PID equals
+/// the PGID.
+#[cfg(unix)]
+pub(crate) fn terminate_process_group_actor(actor: &ProcessGroupActor) -> io::Result<()> {
+    if !process_group_actor_requires_signal(actor)? {
+        return Ok(());
+    }
+    let pgid = i32::try_from(actor.process_group_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "native process-group identity exceeds the platform PID range",
+        )
+    })?;
+    send_process_group_signal_checked(-pgid, SIGTERM)?;
+    std::thread::sleep(TERMINATION_GRACE);
+    if !process_group_actor_requires_signal(actor)? {
+        return Ok(());
+    }
+    send_process_group_signal_checked(-pgid, SIGKILL)?;
+    for _ in 0..10 {
+        if !process_group_actor_requires_signal(actor)? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if process_group_actor_requires_signal(actor)? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "native process group remains live after termination",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_group_actor_requires_signal(actor: &ProcessGroupActor) -> io::Result<bool> {
+    if !process_group_is_live(actor.process_group_id) {
+        return Ok(false);
+    }
+    match process_group_incarnation(actor.process_group_id) {
+        Ok(incarnation) => Ok(incarnation == actor.incarnation),
+        Err(error) if !process_group_is_live(actor.process_group_id) => Ok(false),
+        Err(error) if process_group_leader_is_missing(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn terminate_process_group_actor(_actor: &ProcessGroupActor) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable process-group recovery requires Unix process custody",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_leader_is_missing(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_group_leader_is_missing(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ESRCH)
+}
+
 #[cfg(unix)]
 pub(crate) fn terminate_process_group_child(child: &mut Child) -> Option<ExitStatus> {
     let pgid = -(child.id() as i32);
@@ -352,6 +421,18 @@ fn send_process_group_signal(pgid: i32, signal: i32) {
 }
 
 #[cfg(unix)]
+fn send_process_group_signal_checked(pgid: i32, signal: i32) -> io::Result<()> {
+    if unsafe { kill(pgid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(unix)]
 const SIGTERM: i32 = 15;
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
@@ -369,4 +450,28 @@ unsafe extern "C" {
     fn getpid() -> i32;
     fn getppid() -> i32;
     fn prctl(option: i32, arg2: i32, arg3: usize, arg4: usize, arg5: usize) -> i32;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_actor_recovery_terminates_a_group_after_its_leader_exits() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 </dev/null >/dev/null 2>&1 & exit 0");
+        configure_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn orphanable process group");
+        let actor = actor_for_child(&child).expect("capture durable actor identity");
+        child.wait().expect("process-group leader exits");
+        assert!(
+            process_group_is_live(actor.process_group_id),
+            "background descendant retains the original process group"
+        );
+
+        terminate_process_group_actor(&actor).expect("terminate orphaned process group");
+        assert!(!process_group_is_live(actor.process_group_id));
+    }
 }

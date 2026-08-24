@@ -837,6 +837,7 @@ fn quota_refresh_custody_failure(request_id: &str, error: CustodyError) -> Provi
     match error {
         CustodyError::Capacity => quota_refresh_state_capacity_exceeded(request_id),
         CustodyError::Invalid(error) => quota_refresh_operation_invalid(request_id, error),
+        CustodyError::Migration(error) => quota_refresh_operation_invalid(request_id, error),
         CustodyError::Io(error) => quota_refresh_state_failure(request_id, error),
     }
 }

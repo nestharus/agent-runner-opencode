@@ -8,6 +8,15 @@
 //!       - opencode sessionID metadata to LaunchMarkerEvent
 //!       - declared params.env entries and host-linkage env to env-cleared child env
 //!       - process terminal status to LaunchExitEvent
+//!
+//! intrinsic_surface_declarations:
+//!   - component: src/launch.rs
+//!     role: intrinsic-surface
+//!     Domain: launch effect custody and exact-retry recovery
+//!     Owns:
+//!       - request-keyed new-session and resumed-turn state machines
+//!       - durable native process-group admission, recovery, and discharge
+//!       - authoritative no-effect, reconciliation, and replay decisions
 
 use crate::account::profile_for_wrapper_reference;
 use crate::activity::ActivityTargets;
@@ -19,8 +28,9 @@ use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 use crate::native_process::GatedCommand;
 use crate::native_process::{
     process_group_incarnation as launch_process_incarnation,
-    process_group_is_live as launch_process_group_is_live,
+    process_group_is_live as launch_process_group_is_live, terminate_process_group_actor,
     terminate_process_group_child as terminate_child, ExecGate as LaunchExecGate,
+    ProcessGroupActor,
 };
 use crate::native_runtime;
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
@@ -66,7 +76,7 @@ const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
 const LAUNCH_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const LAUNCH_REGISTRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const LAUNCH_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const LAUNCH_STATE_SCHEMA_VERSION: u32 = 10;
+const LAUNCH_STATE_SCHEMA_VERSION: u32 = 11;
 const INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS: usize = 64;
 const MAX_LAUNCH_REPLAY_RECORDS: usize = 4096;
 const MAX_LAUNCH_STATE_BYTES: usize = 256 * 1024;
@@ -121,6 +131,8 @@ struct LaunchRequestState {
     actor_process_group_id: Option<u32>,
     #[serde(default)]
     actor_process_group_incarnation: Option<String>,
+    #[serde(default)]
+    actor_terminal_at_unix_ms: Option<u64>,
     provider_session_id: Option<String>,
     terminal_status: Option<Value>,
     prepared_at_unix_ms: u64,
@@ -194,6 +206,8 @@ struct ResumeLaunchRequestState {
     actor_process_group_id: Option<u32>,
     #[serde(default)]
     actor_process_group_incarnation: Option<String>,
+    #[serde(default)]
+    actor_terminal_at_unix_ms: Option<u64>,
     terminal_status: Option<Value>,
     prepared_at_unix_ms: u64,
     observed_at_unix_ms: Option<u64>,
@@ -388,8 +402,18 @@ pub(crate) fn stream<W: Write>(
         })?;
     }
     let result = stream_child(custody.child_mut(), &mut state, writer);
-    let replayable_request = state.replayable_request_state();
+    // Whole-process-group custody must be discharged before durable request
+    // custody can become replay-only. If this provider dies during cleanup,
+    // the active marker and the unsettled actor identity remain for an exact
+    // retry to recover.
+    drop(custody);
+    let actor_settlement = state.settle_actor_custody();
+    let replayable_request = actor_settlement
+        .as_ref()
+        .ok()
+        .and_then(|_| state.replayable_request_state());
     drop(state);
+    actor_settlement?;
     if let Some((state_path, replay_request_id)) = replayable_request {
         let _ = retire_completed_launch_request(host, &state_path, &replay_request_id);
     }
@@ -1183,6 +1207,15 @@ fn interpret_existing_new_session_retry(
             &state,
         ));
     }
+    if settle_recorded_launch_actor(
+        state.actor_process_group_id,
+        state.actor_process_group_incarnation.as_deref(),
+        &mut state.actor_terminal_at_unix_ms,
+        request_id,
+        &state.binding_sha256,
+    )? {
+        write_launch_request_state(state_path, &state, request_id)?;
+    }
     match state.phase {
         LaunchRequestPhase::SessionObserved => {
             Err(launch_session_reconciliation_required(request_id, &state))
@@ -1192,12 +1225,6 @@ fn interpret_existing_new_session_retry(
         }
         LaunchRequestPhase::Prepared => {
             validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
-            require_prior_actor_terminal(
-                state.actor_process_group_id,
-                state.actor_process_group_incarnation.as_deref(),
-                request_id,
-                &state.binding_sha256,
-            )?;
             match recover_prepared_launch(host, &state, declared_env, request_id)? {
                 PreparedLaunchRecovery::NoEffectObserved => {
                     Ok(ExistingLaunchRetryOutcome::AuthoritativeNoEffect)
@@ -1248,6 +1275,15 @@ fn interpret_existing_resume_retry(
     request_id: &str,
     declared_env: &BTreeMap<String, String>,
 ) -> Result<ExistingLaunchRetryOutcome, ProviderFailure> {
+    if settle_recorded_launch_actor(
+        state.actor_process_group_id,
+        state.actor_process_group_incarnation.as_deref(),
+        &mut state.actor_terminal_at_unix_ms,
+        request_id,
+        &state.binding_sha256,
+    )? {
+        write_launch_request_state(state_path, &state, request_id)?;
+    }
     match state.phase {
         ResumeLaunchRequestPhase::CompletionObserved => {
             Err(resume_launch_reconciliation_required(request_id, &state))
@@ -1255,12 +1291,6 @@ fn interpret_existing_resume_retry(
         ResumeLaunchRequestPhase::SubmissionObserved | ResumeLaunchRequestPhase::Unresolved => {
             validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
             let prior_phase = state.phase;
-            require_prior_actor_terminal(
-                state.actor_process_group_id,
-                state.actor_process_group_incarnation.as_deref(),
-                request_id,
-                &state.binding_sha256,
-            )?;
             let recovered = observe_durable_resume(
                 &state.observation,
                 &state.recovery,
@@ -1290,14 +1320,6 @@ fn interpret_existing_resume_retry(
         ResumeLaunchRequestPhase::Prepared
         | ResumeLaunchRequestPhase::TerminalWithoutSubmission => {
             validate_launch_recovery_environment(&state.recovery, declared_env, request_id)?;
-            if state.phase == ResumeLaunchRequestPhase::Prepared {
-                require_prior_actor_terminal(
-                    state.actor_process_group_id,
-                    state.actor_process_group_incarnation.as_deref(),
-                    request_id,
-                    &state.binding_sha256,
-                )?;
-            }
             let recovered = observe_durable_resume(
                 &state.observation,
                 &state.recovery,
@@ -1386,6 +1408,7 @@ impl LaunchRequestGuard {
             phase: LaunchRequestPhase::Prepared,
             actor_process_group_id: None,
             actor_process_group_incarnation: None,
+            actor_terminal_at_unix_ms: None,
             provider_session_id: None,
             terminal_status: None,
             prepared_at_unix_ms: now_unix_ms(),
@@ -1435,6 +1458,19 @@ impl LaunchRequestGuard {
             &self.state.binding_sha256,
         )?;
         write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
+    }
+
+    fn settle_actor_custody(&mut self) -> Result<(), ProviderFailure> {
+        if settle_recorded_launch_actor(
+            self.state.actor_process_group_id,
+            self.state.actor_process_group_incarnation.as_deref(),
+            &mut self.state.actor_terminal_at_unix_ms,
+            &self.state.request_id,
+            &self.state.binding_sha256,
+        )? {
+            write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)?;
+        }
+        Ok(())
     }
 
     fn observe_terminal_without_session(
@@ -1524,6 +1560,7 @@ impl ResumeLaunchRequestGuard {
             phase: ResumeLaunchRequestPhase::Prepared,
             actor_process_group_id: None,
             actor_process_group_incarnation: None,
+            actor_terminal_at_unix_ms: None,
             terminal_status: None,
             prepared_at_unix_ms: now_unix_ms(),
             observed_at_unix_ms: None,
@@ -1550,6 +1587,19 @@ impl ResumeLaunchRequestGuard {
             &self.state.binding_sha256,
         )?;
         write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)
+    }
+
+    fn settle_actor_custody(&mut self) -> Result<(), ProviderFailure> {
+        if settle_recorded_launch_actor(
+            self.state.actor_process_group_id,
+            self.state.actor_process_group_incarnation.as_deref(),
+            &mut self.state.actor_terminal_at_unix_ms,
+            &self.state.request_id,
+            &self.state.binding_sha256,
+        )? {
+            write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)?;
+        }
+        Ok(())
     }
 
     fn settle(
@@ -1825,6 +1875,7 @@ fn observe_launch_actor(
     }
 }
 
+#[cfg(test)]
 fn require_prior_actor_terminal(
     process_group_id: Option<u32>,
     process_group_incarnation: Option<&str>,
@@ -1865,6 +1916,47 @@ fn require_prior_actor_terminal(
             &format!("the live process group leader incarnation could not be verified: {error}"),
         )),
     }
+}
+
+/// Settle a recorded native actor only while the caller owns the exact launch
+/// request lock (or has just dropped its in-process `ChildCustody`). That
+/// ownership distinction makes it safe to terminate a still-live incarnation:
+/// another provider cannot still be its responsible supervisor.
+fn settle_recorded_launch_actor(
+    process_group_id: Option<u32>,
+    process_group_incarnation: Option<&str>,
+    actor_terminal_at_unix_ms: &mut Option<u64>,
+    request_id: &str,
+    binding_sha256: &str,
+) -> Result<bool, ProviderFailure> {
+    if actor_terminal_at_unix_ms.is_some() {
+        return Ok(false);
+    }
+    let Some(process_group_id) = process_group_id else {
+        *actor_terminal_at_unix_ms = Some(now_unix_ms());
+        return Ok(true);
+    };
+    if !launch_process_group_is_live(process_group_id) {
+        *actor_terminal_at_unix_ms = Some(now_unix_ms());
+        return Ok(true);
+    }
+    let Some(incarnation) = process_group_incarnation else {
+        return Err(launch_actor_reconciliation_required(
+            request_id,
+            binding_sha256,
+            Some(process_group_id),
+            "a live predecessor process group has no durable incarnation and cannot be terminated safely",
+        ));
+    };
+    terminate_process_group_actor(&ProcessGroupActor {
+        process_group_id,
+        incarnation: incarnation.to_string(),
+    })
+    .map_err(|error| {
+        launch_actor_cleanup_failed(request_id, binding_sha256, process_group_id, error)
+    })?;
+    *actor_terminal_at_unix_ms = Some(now_unix_ms());
+    Ok(true)
 }
 
 fn recover_prepared_launch(
@@ -2199,7 +2291,7 @@ fn retire_completed_launch_request(
 
 fn launch_request_bytes_are_replay(bytes: &[u8]) -> Result<bool, String> {
     let state: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-    Ok(matches!(
+    let terminal_phase = matches!(
         state.get("phase").and_then(Value::as_str),
         Some(
             "session_observed"
@@ -2207,7 +2299,12 @@ fn launch_request_bytes_are_replay(bytes: &[u8]) -> Result<bool, String> {
                 | "completion_observed"
                 | "terminal_without_submission"
         )
-    ))
+    );
+    Ok(terminal_phase
+        && state
+            .get("actor_terminal_at_unix_ms")
+            .and_then(Value::as_u64)
+            .is_some())
 }
 
 fn launch_request_custody(root: &Path) -> RequestCustody {
@@ -2227,6 +2324,7 @@ fn launch_custody_failure(request_id: &str, error: CustodyError) -> ProviderFail
     match error {
         CustodyError::Capacity => launch_state_capacity_exceeded(request_id),
         CustodyError::Invalid(error) => launch_state_invalid(request_id, error),
+        CustodyError::Migration(error) => launch_custody_migration_required(request_id, error),
         CustodyError::Io(error) => launch_state_failure(request_id, error),
     }
 }
@@ -2336,7 +2434,7 @@ fn validate_launch_request_state(
                 .is_some_and(|nonce| !nonce.trim().is_empty())
                 && state.actor_process_group_incarnation.is_none()
         }
-        7 | 8 | 9 | LAUNCH_STATE_SCHEMA_VERSION => {
+        7..=LAUNCH_STATE_SCHEMA_VERSION => {
             state
                 .delivery_nonce
                 .as_deref()
@@ -2366,6 +2464,7 @@ fn validate_launch_request_state(
         && (state.schema_version < LAUNCH_STATE_SCHEMA_VERSION
             || launch_recovery_identity_is_current(&state.recovery))
         && state.actor_process_group_id.is_none_or(|id| id > 0)
+        && state.actor_terminal_at_unix_ms.is_none_or(|time| time > 0)
         && phase_valid
     {
         return Ok(());
@@ -2409,7 +2508,7 @@ fn validate_resume_launch_request_state(
                 .is_some_and(|nonce| !nonce.trim().is_empty())
                 && state.actor_process_group_incarnation.is_none()
         }
-        7 | 8 | 9 | LAUNCH_STATE_SCHEMA_VERSION => {
+        7..=LAUNCH_STATE_SCHEMA_VERSION => {
             observation
                 .delivery_nonce
                 .as_deref()
@@ -2445,6 +2544,7 @@ fn validate_resume_launch_request_state(
         && (state.schema_version < LAUNCH_STATE_SCHEMA_VERSION
             || launch_recovery_identity_is_current(&state.recovery))
         && state.actor_process_group_id.is_none_or(|id| id > 0)
+        && state.actor_terminal_at_unix_ms.is_none_or(|time| time > 0)
         && phase_valid
     {
         return Ok(());
@@ -2468,6 +2568,21 @@ fn launch_state_invalid(request_id: &str, error: impl std::fmt::Display) -> Prov
         request_id,
         "launch_state_invalid",
         format!("durable launch request state is invalid: {error}"),
+    )
+}
+
+fn launch_custody_migration_required(
+    request_id: &str,
+    error: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "launch_custody_migration_required",
+        format!("launch custody requires a bounded predecessor transition: {error}"),
+        json!({
+            "retryable_after_predecessor_cleanup": true,
+            "active_schema_v6_population_limit": null,
+        }),
     )
 }
 
@@ -2598,6 +2713,21 @@ fn launch_actor_reconciliation_required(
     )
 }
 
+fn launch_actor_cleanup_failed(
+    request_id: &str,
+    binding_sha256: &str,
+    process_group_id: u32,
+    error: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "launch_actor_cleanup_failed",
+        format!(
+            "native process-group {process_group_id} custody for binding {binding_sha256} could not be discharged: {error}; the durable launch request remains active and retrying this exact request will retry cleanup without submitting independent work"
+        ),
+    )
+}
+
 fn resume_launch_request_reuse_conflict(
     request_id: &str,
     attempted_request_identity_sha256: &str,
@@ -2722,12 +2852,25 @@ impl LaunchState {
         self.projection_admitted = false;
     }
 
+    fn settle_actor_custody(&mut self) -> Result<(), ProviderFailure> {
+        if let Some(launch_request) = self.launch_request.as_mut() {
+            return launch_request.settle_actor_custody();
+        }
+        if let Some(resume_launch_request) = self.resume_launch_request.as_mut() {
+            return resume_launch_request.settle_actor_custody();
+        }
+        Ok(())
+    }
+
     fn replayable_request_state(&self) -> Option<(PathBuf, String)> {
         if let Some(launch_request) = self.launch_request.as_ref() {
-            if matches!(
-                launch_request.state.phase,
-                LaunchRequestPhase::SessionObserved | LaunchRequestPhase::TerminalWithoutSession
-            ) {
+            if launch_request.state.actor_terminal_at_unix_ms.is_some()
+                && matches!(
+                    launch_request.state.phase,
+                    LaunchRequestPhase::SessionObserved
+                        | LaunchRequestPhase::TerminalWithoutSession
+                )
+            {
                 return Some((
                     launch_request.state_path.clone(),
                     launch_request.state.request_id.clone(),
@@ -2735,11 +2878,15 @@ impl LaunchState {
             }
         }
         let resume_launch_request = self.resume_launch_request.as_ref()?;
-        matches!(
-            resume_launch_request.state.phase,
-            ResumeLaunchRequestPhase::CompletionObserved
-                | ResumeLaunchRequestPhase::TerminalWithoutSubmission
-        )
+        (resume_launch_request
+            .state
+            .actor_terminal_at_unix_ms
+            .is_some()
+            && matches!(
+                resume_launch_request.state.phase,
+                ResumeLaunchRequestPhase::CompletionObserved
+                    | ResumeLaunchRequestPhase::TerminalWithoutSubmission
+            ))
         .then(|| {
             (
                 resume_launch_request.state_path.clone(),
@@ -3656,6 +3803,18 @@ mod custody_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn replay_classification_requires_durable_actor_terminality() {
+        assert!(
+            !launch_request_bytes_are_replay(br#"{"phase":"session_observed"}"#)
+                .expect("classify unsettled terminal phase")
+        );
+        assert!(launch_request_bytes_are_replay(
+            br#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#
+        )
+        .expect("classify actor-settled terminal phase"));
+    }
+
+    #[test]
     fn launch_admission_grows_beyond_the_initial_active_index() {
         let directory = tempfile::tempdir().expect("launch custody directory");
         let live_launches = 320;
@@ -3755,7 +3914,7 @@ mod custody_tests {
                 .expect("launch request lock");
             fs::write(
                 directory.path().join(format!("{stem}.json")),
-                br#"{"phase":"session_observed"}"#,
+                br#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#,
             )
             .expect("completed launch record");
         }
@@ -3827,8 +3986,11 @@ mod custody_tests {
             1
         );
 
-        fs::write(&first_state, br#"{"phase":"session_observed"}"#)
-            .expect("complete first launch state");
+        fs::write(
+            &first_state,
+            br#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#,
+        )
+        .expect("complete first launch state");
         assert!(custody
             .publish_replay_without_retiring_active(
                 &first_state,
@@ -3850,7 +4012,7 @@ mod custody_tests {
         );
         assert_eq!(
             fs::read_to_string(&first_state).expect("recover first launch terminal"),
-            r#"{"phase":"session_observed"}"#
+            r#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#
         );
 
         for index in 2..=3 {
@@ -3858,8 +4020,11 @@ mod custody_tests {
             let state = directory.path().join(format!("{stem}.json"));
             fs::write(directory.path().join(format!("{stem}.lock")), b"")
                 .expect("later launch request lock");
-            fs::write(&state, br#"{"phase":"session_observed"}"#)
-                .expect("later completed launch state");
+            fs::write(
+                &state,
+                br#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#,
+            )
+            .expect("later completed launch state");
             custody
                 .reserve_active(&state, &stem)
                 .expect("reserve later launch request");
@@ -3942,7 +4107,11 @@ mod custody_tests {
         let first = format!("{:064x}", 1);
         let first_state = directory.path().join(format!("{first}.json"));
         fs::write(directory.path().join(format!("{first}.lock")), b"").expect("first replay lock");
-        fs::write(&first_state, br#"{"phase":"session_observed"}"#).expect("first replay state");
+        fs::write(
+            &first_state,
+            br#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#,
+        )
+        .expect("first replay state");
         let custody = RequestCustody::new(
             directory.path().to_path_buf(),
             directory.path().to_path_buf(),
@@ -3969,7 +4138,11 @@ mod custody_tests {
         let second_state = directory.path().join(format!("{second}.json"));
         fs::write(directory.path().join(format!("{second}.lock")), b"")
             .expect("second replay lock");
-        fs::write(&second_state, br#"{"phase":"session_observed"}"#).expect("second replay state");
+        fs::write(
+            &second_state,
+            br#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#,
+        )
+        .expect("second replay state");
         custody
             .reserve_active(&second_state, &second)
             .expect("reserve second completion");
@@ -4098,6 +4271,7 @@ mod recovery_tests {
             phase: LaunchRequestPhase::Prepared,
             actor_process_group_id: None,
             actor_process_group_incarnation: None,
+            actor_terminal_at_unix_ms: None,
             provider_session_id: None,
             terminal_status: None,
             prepared_at_unix_ms: 20,

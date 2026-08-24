@@ -279,6 +279,41 @@ fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss
         "1\n",
         "the first invocation should create exactly one provider session"
     );
+    let data_root = std::path::Path::new(
+        request["host"]["data_root"]
+            .as_str()
+            .expect("launch data root"),
+    );
+    let request_stem = agent_runner_opencode::encoding::sha256_hex(
+        request["request_id"]
+            .as_str()
+            .expect("launch request id")
+            .as_bytes(),
+    );
+    let state_root = data_root.join("provider-state/opencode/launch/requests");
+    let durable_state: Value = serde_json::from_slice(
+        &fs::read(state_root.join(format!("{request_stem}.json")))
+            .expect("read terminal launch state"),
+    )
+    .expect("parse terminal launch state");
+    assert!(
+        durable_state["actor_terminal_at_unix_ms"].is_number(),
+        "native process-group custody must be durably terminal before replay handoff"
+    );
+    assert!(
+        !state_root
+            .join(".custody-v2/active")
+            .join(format!("{request_stem}.json"))
+            .exists(),
+        "terminal actor proof authorizes exact active-marker retirement"
+    );
+    assert!(
+        state_root
+            .join(".custody-v2/owners")
+            .join(format!("{request_stem}.json"))
+            .exists(),
+        "terminal actor proof transfers the request to replay custody"
+    );
     runtime.delete_settings_record();
 
     let replay = json_stdout(&support::invoke_with_request("launch", request));

@@ -7,6 +7,13 @@
 //!       - opencode export to provider session responses
 //!       - canonical transcript byte serialization
 //!       - session replace unsupported boundary
+//!   - component: src/session.rs
+//!     role: intrinsic-surface
+//!     Domain: durable session-enumeration snapshot custody
+//!     Owns:
+//!       - bounded native session population capture
+//!       - request-bound immutable snapshot and initial-page replay
+//!       - cursor identity, advancement, retention, and terminal claims
 //!
 //! adapter_declarations:
 //!   - component: src/session.rs

@@ -16,6 +16,8 @@ const UNBOUND_ACTIVE_INDEX_SCHEMA_VERSION: u64 = 3;
 const PREDECESSOR_INDEX_SCHEMA_VERSION: u64 = 2;
 const MAX_INDEX_RECORD_BYTES: usize = 1024;
 const MAX_ACTIVE_INDEX_BYTES: usize = 16 * 1024;
+const MAX_POLICY_ACTIVE_INDEX_MIGRATION_BYTES: usize = 128 * 1024;
+const MAX_POLICY_ACTIVE_INDEX_MIGRATION_SLOTS: usize = 512;
 const MAX_REPLAY_EVICTION_PROBES: usize = 64;
 pub(crate) const MAX_ACTIVE_MAINTENANCE_PROBES: usize = 16;
 const EMPTY_ACTIVE_DIGEST: &str =
@@ -358,6 +360,7 @@ impl ActiveIndexPolicy {
 pub(crate) enum CustodyError {
     Io(std::io::Error),
     Invalid(String),
+    Migration(String),
     Capacity,
 }
 
@@ -366,6 +369,7 @@ impl std::fmt::Display for CustodyError {
         match self {
             Self::Io(error) => write!(formatter, "{error}"),
             Self::Invalid(message) => formatter.write_str(message),
+            Self::Migration(message) => formatter.write_str(message),
             Self::Capacity => formatter.write_str("request custody reached its supported bound"),
         }
     }
@@ -863,6 +867,13 @@ impl RequestCustody {
         self.prepare_temporary_root()?;
         let active = self.read_active_index()?;
         if self.active_policy.is_distributed() {
+            if active.slots.len() > MAX_POLICY_ACTIVE_INDEX_MIGRATION_SLOTS {
+                return Err(CustodyError::Migration(format!(
+                    "schema-v5 launch custody has {} slots, above the supported one-time migration envelope of {}; keep the schema-v5 provider installed until direct terminal cleanup compacts completed launch custody below that envelope, then retry the upgrade; do not delete provider sessions (schema-v6 runtime population itself has no fixed limit)",
+                    active.slots.len(),
+                    MAX_POLICY_ACTIVE_INDEX_MIGRATION_SLOTS
+                )));
+            }
             self.prepare_distributed_roots()?;
             for slot in active.slots.iter().filter(|slot| slot.occupied == 1) {
                 let replay = match durable_fs::read_file_bounded(
@@ -1669,7 +1680,15 @@ impl RequestCustody {
 
     fn read_active_index(&self) -> Result<ActiveIndex, CustodyError> {
         let bytes = if self.active_policy.is_distributed() {
-            fs::read(self.active_index_path())?
+            let path = self.active_index_path();
+            let bytes = fs::metadata(&path)?.len();
+            if bytes > MAX_POLICY_ACTIVE_INDEX_MIGRATION_BYTES as u64 {
+                return Err(CustodyError::Migration(format!(
+                    "predecessor launch custody index is {bytes} bytes, above the supported {}-byte one-time migration envelope; keep the predecessor provider installed until direct terminal cleanup compacts completed launch custody below that envelope, then retry the upgrade; do not delete provider sessions (distributed runtime custody has no fixed population limit)",
+                    MAX_POLICY_ACTIVE_INDEX_MIGRATION_BYTES
+                )));
+            }
+            durable_fs::read_file_bounded(&path, MAX_POLICY_ACTIVE_INDEX_MIGRATION_BYTES)?
         } else {
             durable_fs::read_file_bounded(&self.active_index_path(), MAX_ACTIVE_INDEX_BYTES)?
         };
@@ -2102,6 +2121,70 @@ mod tests {
         assert!(
             !index_root.join("active.json").exists(),
             "current-schema recovery removes only the obsolete predecessor index"
+        );
+    }
+
+    #[test]
+    fn schema_v5_transition_envelope_fails_before_mutating_predecessor_custody() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let index_root = directory.path().join(".custody-v2");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            index_root.clone(),
+            1024,
+            2,
+            2,
+            Duration::from_secs(60),
+        )
+        .with_distributed_active_markers();
+        custody
+            .maintain(&directory.path().join("initialize.lock"), |_| Ok(false))
+            .expect("initialize current custody");
+        let active = ActiveIndex {
+            next_probe: 0,
+            slots: (0..=MAX_POLICY_ACTIVE_INDEX_MIGRATION_SLOTS)
+                .map(|index| ActiveSlot {
+                    occupied: 1,
+                    request_sha256: format!("{index:064x}"),
+                    binding_sha256: Some(format!("{:064x}", index + 10_000)),
+                })
+                .collect(),
+        };
+        fs::write(
+            index_root.join("active.json"),
+            serde_json::to_vec(&active).expect("serialize predecessor active index"),
+        )
+        .expect("publish predecessor active index");
+        fs::write(
+            index_root.join("schema.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": POLICY_ACTIVE_INDEX_SCHEMA_VERSION,
+                "active_policy": "elastic",
+                "initial_active_slots": 2,
+                "replay_slots": 2,
+            }))
+            .expect("serialize predecessor schema"),
+        )
+        .expect("publish predecessor schema");
+
+        let error = custody
+            .maintain(&directory.path().join("current.lock"), |_| Ok(false))
+            .expect_err("oversized predecessor population requires reduction first");
+        assert!(error
+            .to_string()
+            .contains("do not delete provider sessions"));
+        let schema: Value = serde_json::from_slice(
+            &fs::read(index_root.join("schema.json")).expect("predecessor schema remains"),
+        )
+        .expect("parse predecessor schema");
+        assert_eq!(schema["schema_version"], POLICY_ACTIVE_INDEX_SCHEMA_VERSION);
+        assert!(index_root.join("active.json").exists());
+        assert_eq!(
+            fs::read_dir(index_root.join("active"))
+                .expect("distributed marker root")
+                .count(),
+            0
         );
     }
 
