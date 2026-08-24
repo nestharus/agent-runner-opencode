@@ -663,12 +663,14 @@ and target platform are source-included in
 `contract/native-implementation-manifest-v1.json`; a different implementation
 is rejected until a reviewed manifest update and provider rebuild explicitly
 admits it. Every inherited and request-declared environment variable is
-forwarded for the current invocation. Only `HOME`, `PATH`, `XDG_DATA_HOME`, the
-provider Bash timeout, and the logical account marker select the durable runtime
-identity; no other variable is persisted or can cause an account-binding
-conflict. A different state-selector environment or changed direct
-implementation is rejected before another native effect rather than silently
-addressing a second state namespace with the same account/session labels.
+forwarded for the current invocation. `PATH` resolves the reviewed executable
+and is then forwarded to OpenCode and its tools without being persisted. Only
+`HOME`, `XDG_DATA_HOME`, the provider Bash timeout, and the logical account
+marker select the durable runtime identity; no other variable is persisted or
+can cause an account-binding conflict. A different state-selector environment
+or changed direct implementation is rejected before another native effect
+rather than silently addressing a second state namespace with the same
+account/session labels.
 
 ### Runtime timeout policy
 
@@ -684,15 +686,16 @@ occupancy, with the finite per-Bash fallback as the ceiling.
 ### Predecessor runtime upgrades
 
 Predecessor schema-v1 wrapper, schema-v2 direct runtime, schema-v3
-manifest-bound runtime, and schema-v4 full-environment records are validated,
-then atomically replaced under the per-account runtime lock with the schema-v5
-manifest-bound `opencode` identity and metadata stamp before the first new native
-effect. The schema-v4 transition also removes accidentally persisted
-per-invocation variables. A missing or changed predecessor implementation, or a
-missing, invalid, or unapproved direct implementation, fails closed without
-publishing the upgrade. Initial admission, rebind, and predecessor upgrade
-stream the bounded executable hash once. A
-schema-v5 reuse compares the canonical path and an admitted size/inode/change
+manifest-bound runtime, schema-v4 full-environment, and schema-v5 PATH-bound
+records are validated, then atomically replaced under the per-account runtime
+lock with the schema-v6 manifest-bound `opencode` identity and metadata stamp
+before the first new native effect. The schema-v4 transition removes
+accidentally persisted per-invocation variables, and the schema-v5 transition
+removes `PATH`. A missing or changed predecessor implementation, or a missing,
+invalid, or unapproved direct implementation, fails closed without publishing
+the upgrade. Initial admission, rebind, and predecessor upgrade stream the
+bounded executable hash once. A
+schema-v6 reuse compares the canonical path and an admitted size/inode/change
 metadata stamp under the account lock, then rechecks the immutable build
 manifest; it does not reread the entire executable for every native operation.
 The metadata stamp is persistence evidence and does not alter the component's

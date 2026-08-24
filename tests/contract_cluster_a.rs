@@ -969,6 +969,23 @@ fn contract_native_runtime_identity_is_shared_across_capabilities() {
         conflict_response["error"]["code"],
         "native_runtime_context_conflict"
     );
+    assert!(conflict_response["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("native executable is bound to")));
+    assert!(conflict_response["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("state selectors differ: HOME")));
+    assert_eq!(
+        conflict_response["error"]["details"]["bound_program"],
+        fs::canonicalize(admitted_wrapper.dir().join("opencode"))
+            .expect("canonical admitted OpenCode")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        conflict_response["error"]["details"]["conflicting_state_selectors"][0]["key"],
+        "HOME"
+    );
 }
 
 #[test]
@@ -1053,13 +1070,13 @@ fn contract_native_runtime_scrubs_schema_v4_environment_without_rebinding() {
         &fs::read(&state_path).expect("read upgraded native runtime identity"),
     )
     .expect("parse upgraded native runtime identity");
-    assert_eq!(upgraded["schema_version"], 5);
+    assert_eq!(upgraded["schema_version"], 6);
     assert_eq!(
         upgraded["execution_env"].as_object().map(|env| env.len()),
-        Some(4)
+        Some(3)
     );
     assert!(upgraded["execution_env"].get("HOME").is_some());
-    assert!(upgraded["execution_env"].get("PATH").is_some());
+    assert!(upgraded["execution_env"].get("PATH").is_none());
     assert!(upgraded["execution_env"]
         .get("OULIPOLY_OPENCODE_ACCOUNT")
         .is_some());
@@ -1072,6 +1089,103 @@ fn contract_native_runtime_scrubs_schema_v4_environment_without_rebinding() {
     assert!(upgraded["execution_env"]
         .get("PER_INVOCATION_ENV")
         .is_none());
+}
+
+#[test]
+fn contract_native_runtime_migrates_schema_v5_path_and_forwards_current_path() {
+    let runtime = IsolatedLaunchSettings::new();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(env_probe_opencode_script());
+    let neutral_path = tempfile::tempdir().expect("create neutral PATH directory");
+    let first_path = format!(
+        "{}:{}",
+        fake_wrapper.dir().to_string_lossy(),
+        neutral_path.path().to_string_lossy()
+    );
+    let second_path = format!(
+        "{}:{}",
+        neutral_path.path().to_string_lossy(),
+        fake_wrapper.dir().to_string_lossy()
+    );
+    let home = tempfile::tempdir().expect("create native runtime HOME");
+    let home_path = home.path().to_string_lossy().into_owned();
+    let first_log = fake_wrapper.dir().join("schema-v5-first.log");
+    let first_log_path = first_log.to_string_lossy().into_owned();
+    let first_launch = invoke_with_host_and_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", first_path.as_str()),
+                ("HOME", home_path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_WRAPPER_LOG", first_log_path.as_str()),
+            ],
+        ),
+        runtime.host_overrides(),
+        &[("PATH", first_path.as_str()), ("HOME", home_path.as_str())],
+    );
+    assert_output_success(&first_launch, "initial schema-v6 runtime launch");
+
+    let state_path = runtime
+        .data_root()
+        .join("provider-state/opencode/native-runtimes/opencode1.json");
+    let mut schema_v5: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read initial native runtime identity"),
+    )
+    .expect("parse initial native runtime identity");
+    schema_v5["schema_version"] = json!(5);
+    schema_v5["execution_env"]["PATH"] = json!(first_path);
+    schema_v5["identity_sha256"] = json!(agent_runner_opencode::encoding::sha256_hex(
+        json!({
+            "account_wrapper": schema_v5["account_wrapper"].clone(),
+            "program": schema_v5["program"].clone(),
+            "program_sha256": schema_v5["program_sha256"].clone(),
+            "execution_env": schema_v5["execution_env"].clone(),
+            "native_contract_id": schema_v5["native_contract_id"].clone(),
+            "fixed_args": schema_v5["fixed_args"].clone(),
+            "implementation_manifest_id": schema_v5["implementation_manifest_id"].clone(),
+            "implementation_version": schema_v5["implementation_version"].clone(),
+        })
+        .to_string()
+        .as_bytes(),
+    ));
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&schema_v5).expect("serialize schema-v5 runtime identity"),
+    )
+    .expect("write schema-v5 runtime identity");
+
+    let second_log = fake_wrapper.dir().join("schema-v6-second.log");
+    let second_log_path = second_log.to_string_lossy().into_owned();
+    let second_launch = invoke_with_host_and_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", second_path.as_str()),
+                ("HOME", home_path.as_str()),
+                (
+                    "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                    second_log_path.as_str(),
+                ),
+            ],
+        ),
+        runtime.host_overrides(),
+        &[("PATH", second_path.as_str()), ("HOME", home_path.as_str())],
+    );
+    assert_output_success(
+        &second_launch,
+        "launch after schema-v5 PATH identity migration",
+    );
+
+    let upgraded: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read upgraded native runtime identity"),
+    )
+    .expect("parse upgraded native runtime identity");
+    assert_eq!(upgraded["schema_version"], 6);
+    assert!(upgraded["execution_env"].get("PATH").is_none());
+    assert!(fs::read_to_string(&second_log)
+        .expect("read second launch environment log")
+        .contains(format!("path={second_path}\n").as_str()));
 }
 
 #[test]
@@ -1103,7 +1217,8 @@ fn contract_native_runtime_binds_direct_opencode_implementation() {
         &fs::read(&state_path).expect("read direct native runtime identity"),
     )
     .expect("parse direct native runtime identity");
-    assert_eq!(state["schema_version"], 5);
+    assert_eq!(state["schema_version"], 6);
+    assert!(state["execution_env"].get("PATH").is_none());
     assert!(state["execution_env"].get("CONTEXT_SELECTOR").is_none());
     assert_eq!(
         state["program_stamp"]["byte_length"],
@@ -1228,7 +1343,8 @@ fn contract_native_runtime_upgrades_predecessor_wrapper_binding_before_effect() 
         &fs::read(&state_path).expect("read upgraded native runtime binding"),
     )
     .expect("parse upgraded native runtime binding");
-    assert_eq!(upgraded["schema_version"], 5);
+    assert_eq!(upgraded["schema_version"], 6);
+    assert!(upgraded["execution_env"].get("PATH").is_none());
     assert!(upgraded["execution_env"].get("CONTEXT_SELECTOR").is_none());
     assert!(upgraded["program_stamp"]["byte_length"]
         .as_u64()

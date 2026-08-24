@@ -25,7 +25,8 @@ use std::process::Command;
 use std::time::Duration;
 
 const NATIVE_RUNTIME_STATE_DIR: &str = "provider-state/opencode/native-runtimes";
-const NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 5;
+const NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 6;
+const PATH_BOUND_NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 5;
 const FULL_ENV_NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 4;
 const MANIFEST_NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 3;
 const DIRECT_NATIVE_RUNTIME_SCHEMA_VERSION: u32 = 2;
@@ -46,7 +47,6 @@ const NATIVE_RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_NATIVE_RUNTIME_STATE_BYTES: usize = 1024 * 1024;
 const NATIVE_RUNTIME_IDENTITY_ENV_KEYS: &[&str] = &[
     "HOME",
-    "PATH",
     "XDG_DATA_HOME",
     OPENCODE_BASH_DEFAULT_TIMEOUT_ENV,
     "OULIPOLY_OPENCODE_ACCOUNT",
@@ -119,7 +119,7 @@ pub(crate) fn resolve_for_account_with_timeout(
     if let Some(record) = read_runtime_record(host, account, request_id)? {
         return activate_runtime_record(host, account, record, request_id);
     }
-    let context = candidate_context(account, ambient_stable_environment(), request_id)?;
+    let context = candidate_context(account, ambient_environment(), request_id)?;
     write_runtime_context(host, account, &context, request_id)?;
     Ok(context)
 }
@@ -203,9 +203,8 @@ pub fn resolve_for_launch(
             ),
         ));
     }
-    let requested_environment =
-        native_execution_environment(account, stable_launch_environment(declared_env), request_id)?;
-    let requested_program = resolve_program(OPENCODE_NATIVE_PROGRAM, &requested_environment)
+    let launch_environment = launch_environment(declared_env);
+    let requested_program = resolve_program(OPENCODE_NATIVE_PROGRAM, &launch_environment)
         .ok_or_else(|| {
             native_runtime_failure(
                 request_id,
@@ -215,32 +214,81 @@ pub fn resolve_for_launch(
                 ),
             )
         })?;
+    let requested_environment = native_execution_environment(
+        account,
+        runtime_identity_environment(&launch_environment),
+        request_id,
+    )?;
     let timeout =
         operation_bounds::remaining_timeout(host.deadline_unix_ms, NATIVE_RUNTIME_LOCK_TIMEOUT)
             .unwrap_or(Duration::ZERO);
     let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
     if let Some(record) = read_runtime_record(host, account, request_id)? {
         let context = activate_runtime_record(host, account, record, request_id)?;
-        if Path::new(context.program()) != requested_program
-            || context.stable_execution_env() != &requested_environment
-        {
+        let program_changed = Path::new(context.program()) != requested_program;
+        let state_selector_conflicts = NATIVE_RUNTIME_IDENTITY_ENV_KEYS
+            .iter()
+            .filter(|key| {
+                context.stable_execution_env().get(**key) != requested_environment.get(**key)
+            })
+            .map(|key| {
+                json!({
+                    "key": key,
+                    "bound": context.stable_execution_env().get(*key),
+                    "attempted": requested_environment.get(*key),
+                })
+            })
+            .collect::<Vec<_>>();
+        if program_changed || !state_selector_conflicts.is_empty() {
+            let mut differences = Vec::new();
+            if program_changed {
+                differences.push(format!(
+                    "native executable is bound to {:?}, but the current PATH resolves {:?}",
+                    context.program(),
+                    requested_program
+                ));
+            }
+            if !state_selector_conflicts.is_empty() {
+                differences.push(format!(
+                    "state selectors differ: {}",
+                    state_selector_conflicts
+                        .iter()
+                        .map(|conflict| {
+                            let key = conflict["key"].as_str().unwrap_or("unknown");
+                            let bound = conflict["bound"]
+                                .as_str()
+                                .map(|value| format!("{value:?}"))
+                                .unwrap_or_else(|| "<unset>".to_string());
+                            let attempted = conflict["attempted"]
+                                .as_str()
+                                .map(|value| format!("{value:?}"))
+                                .unwrap_or_else(|| "<unset>".to_string());
+                            format!("{key} (bound {bound}, attempted {attempted})")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             return Err(ProviderFailure::conflict(
                 request_id,
                 "native_runtime_context_conflict",
                 format!(
-                    "account {} is already bound to a different native executable or state environment",
-                    account.opencode_wrapper
+                    "account {} runtime context conflict: {}",
+                    account.opencode_wrapper,
+                    differences.join("; ")
                 ),
                 json!({
                     "account": account.opencode_wrapper,
+                    "bound_program": context.program(),
                     "attempted_program": requested_program,
+                    "conflicting_state_selectors": state_selector_conflicts,
                     "bound_runtime_identity_sha256": context.identity_sha256(),
                 }),
             ));
         }
         return Ok(context);
     }
-    let candidate = candidate_context(account, requested_environment, request_id)?;
+    let candidate = candidate_context(account, launch_environment, request_id)?;
     write_runtime_context(host, account, &candidate, request_id)?;
     Ok(candidate)
 }
@@ -265,6 +313,11 @@ impl NativeRuntimeContext {
         // namespace. Keep them authoritative while forwarding every other
         // inherited or request-declared variable to the child unchanged.
         environment.extend(self.record.execution_env.clone());
+        if self.record.account_wrapper == "opencode1"
+            && !self.record.execution_env.contains_key("XDG_DATA_HOME")
+        {
+            environment.remove("XDG_DATA_HOME");
+        }
         environment
     }
 
@@ -460,21 +513,19 @@ fn native_execution_environment(
     Ok(execution_env)
 }
 
-pub(crate) fn ambient_stable_environment() -> BTreeMap<String, String> {
-    runtime_identity_environment(&ambient_environment())
-}
-
-fn stable_launch_environment(declared_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+fn launch_environment(declared_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut environment = ambient_environment();
     environment.extend(declared_env.clone());
     // A non-empty request environment is authoritative about an intentionally
     // absent XDG_DATA_HOME (Agent Runner uses that to select account one's
     // default namespace). PATH and HOME may still fall back to the provider
-    // process for direct callers that send a partial environment.
+    // process for direct callers that send a partial environment. PATH is used
+    // only to resolve the reviewed executable and is forwarded per invocation;
+    // it is never part of the durable runtime identity.
     if !declared_env.is_empty() && !declared_env.contains_key("XDG_DATA_HOME") {
         environment.remove("XDG_DATA_HOME");
     }
-    runtime_identity_environment(&environment)
+    environment
 }
 
 fn ambient_environment() -> BTreeMap<String, String> {
@@ -596,20 +647,20 @@ fn validate_runtime_record_identity(
     request_id: &str,
 ) -> Result<(), ProviderFailure> {
     let identity_sha256 = match record.schema_version {
-        NATIVE_RUNTIME_SCHEMA_VERSION | FULL_ENV_NATIVE_RUNTIME_SCHEMA_VERSION => {
-            runtime_identity_sha256(
-                &record.account_wrapper,
-                &record.program,
-                &record.program_sha256,
-                &record.execution_env,
-                &record.native_contract_id,
-                &record.fixed_args,
-                (
-                    &record.implementation_manifest_id,
-                    &record.implementation_version,
-                ),
-            )
-        }
+        NATIVE_RUNTIME_SCHEMA_VERSION
+        | PATH_BOUND_NATIVE_RUNTIME_SCHEMA_VERSION
+        | FULL_ENV_NATIVE_RUNTIME_SCHEMA_VERSION => runtime_identity_sha256(
+            &record.account_wrapper,
+            &record.program,
+            &record.program_sha256,
+            &record.execution_env,
+            &record.native_contract_id,
+            &record.fixed_args,
+            (
+                &record.implementation_manifest_id,
+                &record.implementation_version,
+            ),
+        ),
         MANIFEST_NATIVE_RUNTIME_SCHEMA_VERSION => manifest_runtime_identity_sha256(
             &record.account_wrapper,
             &record.program,
@@ -642,7 +693,9 @@ fn validate_runtime_record_identity(
         || record.identity_sha256 != identity_sha256
         || (matches!(
             record.schema_version,
-            NATIVE_RUNTIME_SCHEMA_VERSION | FULL_ENV_NATIVE_RUNTIME_SCHEMA_VERSION
+            NATIVE_RUNTIME_SCHEMA_VERSION
+                | PATH_BOUND_NATIVE_RUNTIME_SCHEMA_VERSION
+                | FULL_ENV_NATIVE_RUNTIME_SCHEMA_VERSION
         ) && (record.native_contract_id != OPENCODE_NATIVE_CONTRACT_ID
             || record.fixed_args
                 != OPENCODE_NATIVE_FIXED_ARGS
@@ -751,7 +804,10 @@ fn preview_runtime_record_activation(
         validate_current_runtime_implementation(&record, account, request_id)?;
         return Ok(NativeRuntimeContext { record });
     }
-    if record.schema_version == FULL_ENV_NATIVE_RUNTIME_SCHEMA_VERSION {
+    if matches!(
+        record.schema_version,
+        PATH_BOUND_NATIVE_RUNTIME_SCHEMA_VERSION | FULL_ENV_NATIVE_RUNTIME_SCHEMA_VERSION
+    ) {
         validate_current_runtime_implementation(&record, account, request_id)?;
         let execution_env = native_execution_environment(
             account,
@@ -895,7 +951,7 @@ fn validate_predecessor_runtime_implementation(
         // The predecessor wrapper is retained only as authenticated transition
         // evidence. It is never executed by this provider; candidate_context
         // must independently admit the reviewed direct implementation before
-        // activate_runtime_record publishes the schema-v5 successor.
+        // activate_runtime_record publishes the schema-v6 successor.
         return Ok(PredecessorImplementationAdmission {
             program_stamp,
             approved: None,
@@ -933,7 +989,9 @@ fn validate_predecessor_runtime_implementation(
     }
     if matches!(
         record.schema_version,
-        NATIVE_RUNTIME_SCHEMA_VERSION | FULL_ENV_NATIVE_RUNTIME_SCHEMA_VERSION
+        NATIVE_RUNTIME_SCHEMA_VERSION
+            | PATH_BOUND_NATIVE_RUNTIME_SCHEMA_VERSION
+            | FULL_ENV_NATIVE_RUNTIME_SCHEMA_VERSION
     ) && (record.implementation_manifest_id != approved.id
         || record.implementation_version != approved.version)
     {
@@ -1252,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_excludes_per_invocation_environment() {
+    fn runtime_identity_excludes_per_invocation_environment_and_path() {
         let environment = BTreeMap::from([
             ("HOME".to_string(), "/tmp/home".to_string()),
             ("PATH".to_string(), "/tmp/bin".to_string()),
@@ -1265,7 +1323,7 @@ mod tests {
         let identity_environment = runtime_identity_environment(&environment);
 
         assert_eq!(identity_environment.get("HOME"), environment.get("HOME"));
-        assert_eq!(identity_environment.get("PATH"), environment.get("PATH"));
+        assert!(!identity_environment.contains_key("PATH"));
         assert!(!identity_environment.contains_key("PER_INVOCATION_ENV"));
     }
 }

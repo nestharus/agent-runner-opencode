@@ -32,26 +32,27 @@ account identities. Per-account setup readiness is the conjunction of that one
 direct-runtime result and the account's declared auth-file evidence.
 
 Schema-v1 wrapper, schema-v2 direct native-runtime, schema-v3 manifest-bound,
-and schema-v4 full-environment bindings are bounded transition inputs only. The
-provider validates their recorded implementation evidence and requires the
-currently selected direct implementation to be manifest-approved. While holding
-the account runtime lock, it persists the schema-v5 manifest-bound identity and
-metadata stamp before any new native effect. Schema-v4 activation also removes
-accidentally persisted per-invocation values while holding the account lock. It
-never uses the schema-v1 wrapper as the acting implementation after the
+schema-v4 full-environment, and schema-v5 PATH-bound bindings are bounded
+transition inputs only. The provider validates their recorded implementation
+evidence and requires the currently selected direct implementation to be
+manifest-approved. While holding the account runtime lock, it persists the
+schema-v6 manifest-bound identity and metadata stamp before any new native
+effect. Schema-v4 activation removes accidentally persisted per-invocation
+values, and schema-v5 activation removes `PATH`, while holding the account lock.
+It never uses the schema-v1 wrapper as the acting implementation after the
 upgrade-capable provider is installed.
 
 The bound environment identifies the executable and native state namespace.
-`HOME`, `PATH`, `XDG_DATA_HOME`, the provider Bash-timeout policy, and the
-logical account marker are its only persisted selectors. If
+`HOME`, `XDG_DATA_HOME`, the provider Bash-timeout policy, and the logical
+account marker are its only persisted selectors. If
 an isolated numbered account has no explicit `XDG_DATA_HOME`, the provider binds
 `$HOME/.opencodeN` for account N. Every other inherited or request-declared
 environment variable is forwarded to the child for that invocation without
 becoming durable identity state. The provider adds the logical account identity
-as `OULIPOLY_OPENCODE_ACCOUNT` and invokes the canonical absolute executable;
-`PATH` remains identity-bound for tools that an OpenCode turn may itself execute,
-but does not select the OpenCode executable after admission. `--pure` excludes
-external plugins from the acting boundary.
+as `OULIPOLY_OPENCODE_ACCOUNT` and invokes the canonical absolute executable.
+`PATH` resolves that reviewed executable for the current launch and is forwarded
+unchanged for tools that the OpenCode turn executes, but it is not persisted or
+identity-bound. `--pure` excludes external plugins from the acting boundary.
 
 Agent Runner launches favor completion of long-running agent work over
 OpenCode's shorter implicit per-Bash cutoff. The provider therefore owns a

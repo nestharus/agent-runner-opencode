@@ -454,6 +454,7 @@ pub fn slow_opencode_script(exit_code: i32) -> String {
 pub fn env_probe_opencode_script() -> String {
     "#!/bin/sh\n\
 {\n\
+  printf 'path=%s\\n' \"${PATH-}\"\n\
   printf 'declared=%s\\n' \"${DECLARED_CHILD_ENV-}\"\n\
   printf 'xdg=%s\\n' \"${XDG_DATA_HOME-}\"\n\
   printf 'oulipoly_data=%s\\n' \"${OULIPOLY_DATA_DIR-<unset>}\"\n\
