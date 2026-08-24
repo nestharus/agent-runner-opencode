@@ -999,7 +999,7 @@ fn contract_quota_refresh_auth_does_not_repeat_an_unsettled_native_effect() {
 }
 
 #[test]
-fn contract_quota_refresh_waits_for_descendants_after_auth_leader_exit() {
+fn contract_quota_refresh_terminates_descendants_after_auth_leader_exit() {
     let runtime = IsolatedQuotaSettings::new();
     let home = HomeFixture::new("agent-runner-opencode-quota-descendant-home");
     let auth_path =
@@ -1037,62 +1037,28 @@ fn contract_quota_refresh_waits_for_descendants_after_auth_leader_exit() {
             agent_runner_opencode::encoding::sha256_hex(request_id.as_bytes())
         ));
 
-    let first = support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &env);
-    assert!(matches!(first.status.code(), Some(1 | 2)));
-    let first_response = json_stdout(&first);
-    support::assert_valid(
-        &first_response,
-        "quota.schema.json#/$defs/QuotaRefreshAuthErrorResponse",
+    let result = success_result(
+        support::invoke_with_request_and_env("quota.refresh_auth", request, &env),
+        "quota.schema.json#/$defs/QuotaRefreshAuthResponse",
+        "quota.schema.json#/$defs/QuotaRefreshAuthResult",
     );
-    assert!(matches!(
-        first_response["error"]["code"].as_str(),
-        Some("quota_refresh_actor_active" | "quota_refresh_actor_unverifiable")
-    ));
-    let admitted: serde_json::Value = serde_json::from_slice(
+    assert_refresh_auth_result(&result);
+    let committed: serde_json::Value = serde_json::from_slice(
         &std::fs::read(&operation_path).expect("read descendant-bound quota operation"),
     )
     .expect("parse descendant-bound quota operation");
-    assert_eq!(admitted["phase"], "native_effect_admitted");
-    assert!(admitted["actor_terminal_at_unix_ms"].is_null());
-    assert_eq!(
-        optional_usage_log(&usage_log)
-            .matches("auth argv=auth list")
-            .count(),
-        1
-    );
-
-    std::fs::write(&release_marker, b"release\n").expect("release auth descendant");
-    let started = std::time::Instant::now();
-    let settled = loop {
-        let retry =
-            support::invoke_with_request_and_env("quota.refresh_auth", request.clone(), &env);
-        let response = json_stdout(&retry);
-        match response["error"]["code"].as_str() {
-            Some("quota_refresh_reconciliation_required") => break response,
-            Some("quota_refresh_actor_active" | "quota_refresh_actor_unverifiable")
-                if started.elapsed() < std::time::Duration::from_secs(5) =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            other => panic!("unexpected descendant-settlement response: {other:?}: {response}"),
-        }
-    };
-    support::assert_valid(
-        &settled,
-        "quota.schema.json#/$defs/QuotaRefreshAuthErrorResponse",
-    );
-    let unresolved: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&operation_path).expect("read settled descendant quota operation"),
-    )
-    .expect("parse settled descendant quota operation");
-    assert_eq!(unresolved["phase"], "reconciliation_required");
-    assert!(unresolved["actor_terminal_at_unix_ms"].is_number());
+    assert_eq!(committed["phase"], "committed");
+    assert!(committed["actor_terminal_at_unix_ms"].is_number());
     assert_eq!(
         optional_usage_log(&usage_log)
             .matches("auth argv=auth list")
             .count(),
         1,
-        "descendant settlement must not repeat native auth"
+        "whole-group cleanup must not repeat native auth"
+    );
+    assert!(
+        !release_marker.exists(),
+        "the provider must terminate the descendant instead of waiting for external release"
     );
 }
 

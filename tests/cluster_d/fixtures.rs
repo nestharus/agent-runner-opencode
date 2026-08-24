@@ -276,9 +276,8 @@ impl RotationOpencodeFixture {
             .expect("release the synthetic hanging import");
     }
 
-    pub fn release_import_descendant(&self) {
-        fs::write(&self.import_descendant_release_marker, b"release\n")
-            .expect("release the synthetic import descendant");
+    pub fn import_descendant_release_was_requested(&self) -> bool {
+        self.import_descendant_release_marker.exists()
     }
 
     pub fn restore_target_export(&self) {

@@ -187,6 +187,7 @@ pub(crate) fn actor_for_child(child: &Child) -> io::Result<ProcessGroupActor> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn actor_is_terminal_or_recycled(actor: &ProcessGroupActor) -> io::Result<bool> {
     if !process_group_is_live(actor.process_group_id) {
         return Ok(true);

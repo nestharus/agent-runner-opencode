@@ -262,15 +262,16 @@ follow-up instead of remaining monopolized by the stalled process.
 The auth command uses the same gated process-group custody as launch: the
 provider durably records the group leader and its boot/process incarnation
 before releasing native execution, and Linux additionally kills the group when
-its provider parent dies. After provider interruption, an exact retry keeps the
-request in `native_effect_admitted` while that exact incarnation is live and
-will not accept a credential digest until the group is proven terminal or its
-numeric ID is proven recycled. This makes the post-effect credential snapshot
-a successor to terminal actor custody rather than a competing observation of a
-still-running mutator. The same whole-group proof is required after an ordinary
-direct-leader return: successful leader status and closed output pipes alone do
-not publish terminal custody while a same-group descendant remains live, and
-the authoritative successor credential snapshot is taken only after that proof.
+its provider parent dies. After provider interruption, an exact retry acquires
+the abandoned request lock, terminates that exact recorded group incarnation,
+and durably discharges actor custody before it can accept a credential digest;
+a recycled numeric group ID is never signalled. This makes the post-effect
+credential snapshot a successor to terminal actor custody rather than a
+competing observation of a still-running mutator. The same whole-group cleanup
+is required after an ordinary direct-leader return: successful leader status
+and closed output pipes alone do not publish terminal custody while a same-group
+descendant remains live, and the authoritative successor credential snapshot
+is taken only after that descendant is terminated and the group is discharged.
 That authorized follow-up reuses the original request and adds
 `params.context.reconciliation` with the `accept_current_credentials`
 disposition and the lowercase SHA-256 of the current bound credential file.
@@ -512,11 +513,13 @@ import durably advances that operation with the observed target session before
 decision and materialization receipts are finalized. Native import stdout is
 strictly decoded. Import execution starts behind the provider exec gate: the
 prepared operation durably binds the exact process-group incarnation before the
-gate is released, and recovery must prove that actor terminal or recycled before
-it may treat any target export as stable or finalize a receipt. Thus provider
-loss cannot leave a still-live import actor outside the shared result. Ordinary
-leader completion uses that same whole-group proof, so a descendant cannot keep
-import authority after the provider publishes terminal custody. The
+gate is released. Recovery under the exact rotation binding lock terminates
+that recorded actor and proves it terminal or recycled before it may treat any
+target export as stable or finalize a receipt; a recycled numeric group ID is
+never signalled. Thus provider loss cannot leave a still-live import actor
+outside the shared result. Ordinary leader completion uses that same
+whole-group cleanup, so a descendant cannot keep import authority after the
+provider publishes terminal custody. The
 reported session ID is only a candidate: the provider
 durably adds that candidate to the prepared operation before any later deadline
 checkpoint, then exports that exact target and verifies its identity and

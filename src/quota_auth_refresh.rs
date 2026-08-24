@@ -12,7 +12,7 @@ use crate::account::{profile_for_wrapper_reference, AccountProfile};
 use crate::durable_fs;
 use crate::encoding::{bounded_text_bytes, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure};
-use crate::native_process::{actor_is_terminal_or_recycled, ProcessGroupActor};
+use crate::native_process::{terminate_process_group_actor, ProcessGroupActor};
 use crate::native_runtime::{self, NativeRuntimeContext};
 use crate::opencode::{
     OpencodeAuthEffect, OpencodeAuthFailure, OpencodeAuthObservation,
@@ -143,7 +143,7 @@ pub fn refresh_auth_params(
                     }
                     QuotaRefreshOperationPhase::NativeEffectAdmitted => {
                         let mut unresolved = operation;
-                        require_quota_refresh_actor_terminal(&mut unresolved, request_id)?;
+                        settle_quota_refresh_actor(&mut unresolved, request_id)?;
                         require_quota_refresh_reconciliation(
                             &mut unresolved,
                             "provider_interrupted_after_effect_admission",
@@ -157,7 +157,9 @@ pub fn refresh_auth_params(
                         ));
                     }
                     QuotaRefreshOperationPhase::ReconciliationRequired => {
-                        require_quota_refresh_actor_terminal(&mut operation, request_id)?;
+                        if settle_quota_refresh_actor(&mut operation, request_id)? {
+                            write_quota_refresh_operation(host, &operation, request_id)?;
+                        }
                         if let Some(reconciliation) = parsed.reconciliation() {
                             return reconcile_quota_refresh_operation(
                                 host,
@@ -228,11 +230,11 @@ pub fn refresh_auth_params(
             publish_quota_refresh_actor(host, &mut operation, prepared.actor(), request_id)?;
             match prepared.observe_leader(native_timeout) {
                 Ok(pending) => {
-                    require_quota_refresh_actor_terminal(&mut operation, request_id)?;
+                    settle_quota_refresh_actor(&mut operation, request_id)?;
                     pending.observe_terminal_credentials()
                 }
                 Err(error) => {
-                    require_quota_refresh_actor_terminal(&mut operation, request_id)?;
+                    settle_quota_refresh_actor(&mut operation, request_id)?;
                     Err(error)
                 }
             }
@@ -1040,38 +1042,21 @@ fn quota_refresh_reconciliation_not_required(request_id: &str) -> ProviderFailur
     )
 }
 
-fn quota_refresh_actor_active(
-    request_id: &str,
-    operation: &QuotaRefreshOperation,
-) -> ProviderFailure {
-    ProviderFailure::conflict(
-        request_id,
-        "quota_refresh_actor_active",
-        "the previously admitted native auth actor is still running; credential reconciliation is not yet safe",
-        json!({
-            "binding_sha256": operation.binding_sha256,
-            "actor_process_group_id": operation.actor_process_group_id,
-            "actor_process_group_incarnation": operation.actor_process_group_incarnation,
-            "recovery": "wait for the exact native actor incarnation to become terminal, then retry the original request before reconciling credentials",
-        }),
-    )
-}
-
-fn quota_refresh_actor_unverifiable(
+fn quota_refresh_actor_cleanup_failed(
     request_id: &str,
     operation: &QuotaRefreshOperation,
     error: impl std::fmt::Display,
 ) -> ProviderFailure {
     ProviderFailure::conflict(
         request_id,
-        "quota_refresh_actor_unverifiable",
-        "the provider cannot prove that the previously admitted native auth actor is terminal",
+        "quota_refresh_actor_cleanup_failed",
+        "the provider could not terminate and prove discharge of the exact native auth actor recorded by this request; no credential reconciliation was accepted",
         json!({
             "binding_sha256": operation.binding_sha256,
             "actor_process_group_id": operation.actor_process_group_id,
             "actor_process_group_incarnation": operation.actor_process_group_incarnation,
             "failure": error.to_string(),
-            "recovery": "restore process-incarnation observation and retry; do not accept credential state while the admitted actor may still run",
+            "recovery": "retry this unchanged quota.refresh_auth request; the provider will safely ignore a recycled process-group identity and will not accept credential state until the recorded actor is terminal",
         }),
     )
 }
@@ -1210,12 +1195,15 @@ fn publish_quota_refresh_actor(
     write_quota_refresh_operation(host, operation, request_id)
 }
 
-fn require_quota_refresh_actor_terminal(
+/// Settle the durably recorded auth actor while the caller owns the exact
+/// request lock. If the original in-process supervisor was lost, that lock is
+/// the exclusive successor authority for terminating the recorded incarnation.
+fn settle_quota_refresh_actor(
     operation: &mut QuotaRefreshOperation,
     request_id: &str,
-) -> Result<(), ProviderFailure> {
+) -> Result<bool, ProviderFailure> {
     if operation.actor_terminal_at_unix_ms.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let (Some(process_group_id), Some(incarnation)) = (
         operation.actor_process_group_id,
@@ -1230,16 +1218,10 @@ fn require_quota_refresh_actor_terminal(
         process_group_id,
         incarnation: incarnation.clone(),
     };
-    match actor_is_terminal_or_recycled(&actor) {
-        Ok(true) => {
-            operation.actor_terminal_at_unix_ms = Some(now_unix_ms());
-            Ok(())
-        }
-        Ok(false) => Err(quota_refresh_actor_active(request_id, operation)),
-        Err(error) => Err(quota_refresh_actor_unverifiable(
-            request_id, operation, error,
-        )),
-    }
+    terminate_process_group_actor(&actor)
+        .map_err(|error| quota_refresh_actor_cleanup_failed(request_id, operation, error))?;
+    operation.actor_terminal_at_unix_ms = Some(now_unix_ms());
+    Ok(true)
 }
 
 fn refresh_succeeded(refresh: &Result<OpencodeAuthObservation, OpencodeAuthFailure>) -> bool {
@@ -1449,7 +1431,7 @@ mod custody_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn credential_reconciliation_waits_for_the_exact_native_actor() {
+    fn terminal_auth_actor_is_durably_settled_once() {
         let mut command = ProcessCommand::new("/bin/sleep");
         command.arg("30");
         configure_process_group(&mut command);
@@ -1461,54 +1443,41 @@ mod custody_tests {
         operation.actor_process_group_incarnation = Some(actor.incarnation);
         operation.actor_terminal_at_unix_ms = None;
 
-        let active = require_quota_refresh_actor_terminal(&mut operation, "request-1")
-            .expect_err("live actor must block credential reconciliation");
-        assert_eq!(active.code, "quota_refresh_actor_active");
-        assert!(operation.actor_terminal_at_unix_ms.is_none());
-
         actor_child.kill().expect("terminate quota actor");
         actor_child.wait().expect("reap quota actor");
-        require_quota_refresh_actor_terminal(&mut operation, "request-1")
-            .expect("terminal actor permits credential reconciliation");
+        assert!(settle_quota_refresh_actor(&mut operation, "request-1")
+            .expect("terminal actor permits credential reconciliation"));
         assert!(operation.actor_terminal_at_unix_ms.is_some());
+        assert!(!settle_quota_refresh_actor(&mut operation, "request-1")
+            .expect("terminal settlement is idempotent"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn quota_does_not_treat_leader_exit_as_group_terminality() {
+    fn quota_retry_terminates_a_recorded_group_after_its_leader_exits() {
         let mut command = ProcessCommand::new("/bin/sh");
         command
-            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!"])
-            .stdout(Stdio::piped())
+            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & exit 0"])
+            .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_process_group(&mut command);
-        let child = command.spawn().expect("spawn quota group leader");
+        let mut child = command.spawn().expect("spawn quota group leader");
         let actor = actor_for_child(&child).expect("identify quota process group");
-        let output = child
-            .wait_with_output()
-            .expect("observe successful direct leader exit");
-        assert!(output.status.success());
-        let descendant_pid = String::from_utf8(output.stdout)
-            .expect("descendant pid output")
-            .trim()
-            .parse::<i32>()
-            .expect("descendant pid");
+        let recorded_actor = actor.clone();
+        assert!(child.wait().expect("observe direct leader exit").success());
         let mut operation =
             quota_custody_operation(1, QuotaRefreshOperationPhase::NativeEffectAdmitted);
         operation.actor_process_group_id = Some(actor.process_group_id);
         operation.actor_process_group_incarnation = Some(actor.incarnation);
         operation.actor_terminal_at_unix_ms = None;
 
-        let unsettled = require_quota_refresh_actor_terminal(&mut operation, "request-1")
-            .expect_err("a live same-group descendant must block credential settlement");
-        unsafe {
-            libc::kill(descendant_pid, libc::SIGKILL);
-        }
-        assert!(matches!(
-            unsettled.code,
-            "quota_refresh_actor_active" | "quota_refresh_actor_unverifiable"
-        ));
-        assert!(operation.actor_terminal_at_unix_ms.is_none());
+        assert!(settle_quota_refresh_actor(&mut operation, "request-1")
+            .expect("exact retry terminates the orphaned process group"));
+        assert!(operation.actor_terminal_at_unix_ms.is_some());
+        assert!(
+            crate::native_process::actor_is_terminal_or_recycled(&recorded_actor)
+                .expect("verify quota actor terminality")
+        );
     }
 
     #[test]

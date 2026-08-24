@@ -5,7 +5,7 @@ use crate::activity::ActivityTargets;
 use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
-use crate::native_process::{actor_is_terminal_or_recycled, ProcessGroupActor};
+use crate::native_process::{terminate_process_group_actor, ProcessGroupActor};
 use crate::native_runtime;
 use crate::opencode::{self, OpencodeExportError};
 use crate::operation_bounds;
@@ -1460,7 +1460,7 @@ fn execute_or_reconcile_prepared_operation(
             request_id,
         );
     }
-    require_rotation_import_actor_terminal(operation, request_id)?;
+    settle_rotation_import_actor(operation, request_id)?;
     write_rotation_operation(host, binding, operation, request_id)?;
     reconcile_prepared_operation(
         host,
@@ -1504,7 +1504,7 @@ fn admit_and_observe_import(
     if let Ok(target_session_id) = observed.as_deref() {
         preserve_import_candidate(host, binding, operation, target_session_id, request_id)?;
     }
-    require_rotation_import_actor_terminal(operation, request_id)?;
+    settle_rotation_import_actor(operation, request_id)?;
     if let Err(error) = write_rotation_operation(host, binding, operation, request_id) {
         return Err(rotation_recovery_required(
             request_id,
@@ -1560,12 +1560,15 @@ fn publish_rotation_import_actor(
     Ok(())
 }
 
-fn require_rotation_import_actor_terminal(
+/// Settle the durably recorded import actor while the caller owns the exact
+/// rotation binding lock. The lock transfers cleanup authority from a lost
+/// in-process supervisor without permitting a sibling retry to signal it.
+fn settle_rotation_import_actor(
     operation: &mut RotationOperation,
     request_id: &str,
-) -> Result<(), ProviderFailure> {
+) -> Result<bool, ProviderFailure> {
     if operation.import_actor_terminal_at_unix_ms.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let (Some(process_group_id), Some(incarnation)) = (
         operation.import_actor_process_group_id,
@@ -1580,16 +1583,10 @@ fn require_rotation_import_actor_terminal(
         process_group_id,
         incarnation: incarnation.clone(),
     };
-    match actor_is_terminal_or_recycled(&actor) {
-        Ok(true) => {
-            operation.import_actor_terminal_at_unix_ms = Some(now_unix_ms());
-            Ok(())
-        }
-        Ok(false) => Err(rotation_import_actor_active(request_id, operation)),
-        Err(error) => Err(rotation_import_actor_unverifiable(
-            request_id, operation, error,
-        )),
-    }
+    terminate_process_group_actor(&actor)
+        .map_err(|error| rotation_import_actor_cleanup_failed(request_id, operation, error))?;
+    operation.import_actor_terminal_at_unix_ms = Some(now_unix_ms());
+    Ok(true)
 }
 
 fn reconcile_prepared_operation(
@@ -2387,35 +2384,21 @@ fn rotation_recovery_required(
     )
 }
 
-fn rotation_import_actor_active(
-    request_id: &str,
-    operation: &RotationOperation,
-) -> ProviderFailure {
-    ProviderFailure::conflict(
-        request_id,
-        "rotation_import_actor_active",
-        "rotation recovery is blocked while the exact native import actor remains live",
-        json!({
-            "import_actor_process_group_id": operation.import_actor_process_group_id,
-            "import_actor_process_group_incarnation": operation.import_actor_process_group_incarnation,
-            "required_action": "retry the unchanged materialization after the native import actor is terminal or recycled",
-        }),
-    )
-}
-
-fn rotation_import_actor_unverifiable(
+fn rotation_import_actor_cleanup_failed(
     request_id: &str,
     operation: &RotationOperation,
     error: impl std::fmt::Display,
 ) -> ProviderFailure {
-    ProviderFailure::internal(
+    ProviderFailure::conflict(
         request_id,
-        "rotation_import_actor_unverifiable",
-        format!(
-            "could not verify terminal custody for rotation import actor {:?}/{:?}: {error}",
-            operation.import_actor_process_group_id,
-            operation.import_actor_process_group_incarnation
-        ),
+        "rotation_import_actor_cleanup_failed",
+        "the provider could not terminate and prove discharge of the exact native import actor recorded by this materialization; no target reconciliation or receipt was accepted",
+        json!({
+            "import_actor_process_group_id": operation.import_actor_process_group_id,
+            "import_actor_process_group_incarnation": operation.import_actor_process_group_incarnation,
+            "failure": error.to_string(),
+            "recovery": "retry this unchanged rotation.materialize request; the provider will safely ignore a recycled process-group identity and will not reconcile a target until the recorded actor is terminal",
+        }),
     )
 }
 
@@ -2474,7 +2457,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn rotation_recovery_waits_for_the_exact_import_actor() {
+    fn terminal_import_actor_is_durably_settled_once() {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
         configure_process_group(&mut command);
@@ -2500,38 +2483,30 @@ mod tests {
             imported_at_unix_ms: None,
         };
 
-        let active = require_rotation_import_actor_terminal(&mut operation, "request-test")
-            .expect_err("live import actor must block rotation recovery");
-        assert_eq!(active.code, "rotation_import_actor_active");
-        assert!(operation.import_actor_terminal_at_unix_ms.is_none());
-
         child.kill().expect("terminate rotation import actor");
         child.wait().expect("reap rotation import actor");
-        require_rotation_import_actor_terminal(&mut operation, "request-test")
-            .expect("terminal import actor permits rotation recovery");
+        assert!(settle_rotation_import_actor(&mut operation, "request-test")
+            .expect("terminal import actor permits rotation recovery"));
         assert!(operation.import_actor_terminal_at_unix_ms.is_some());
+        assert!(
+            !settle_rotation_import_actor(&mut operation, "request-test")
+                .expect("terminal settlement is idempotent")
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn rotation_does_not_treat_leader_exit_as_group_terminality() {
+    fn rotation_retry_terminates_a_recorded_group_after_its_leader_exits() {
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!"])
-            .stdout(Stdio::piped())
+            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & exit 0"])
+            .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_process_group(&mut command);
-        let child = command.spawn().expect("spawn rotation group leader");
+        let mut child = command.spawn().expect("spawn rotation group leader");
         let actor = actor_for_child(&child).expect("identify rotation process group");
-        let output = child
-            .wait_with_output()
-            .expect("observe successful direct leader exit");
-        assert!(output.status.success());
-        let descendant_pid = String::from_utf8(output.stdout)
-            .expect("descendant pid output")
-            .trim()
-            .parse::<i32>()
-            .expect("descendant pid");
+        let recorded_actor = actor.clone();
+        assert!(child.wait().expect("observe direct leader exit").success());
         let mut operation = RotationOperation {
             schema_version: ROTATION_OPERATION_SCHEMA_VERSION,
             binding_sha256: "binding".to_string(),
@@ -2552,15 +2527,12 @@ mod tests {
             imported_at_unix_ms: None,
         };
 
-        let unsettled = require_rotation_import_actor_terminal(&mut operation, "request-test")
-            .expect_err("a live same-group descendant must block rotation settlement");
-        unsafe {
-            libc::kill(descendant_pid, libc::SIGKILL);
-        }
-        assert!(matches!(
-            unsettled.code,
-            "rotation_import_actor_active" | "rotation_import_actor_unverifiable"
-        ));
-        assert!(operation.import_actor_terminal_at_unix_ms.is_none());
+        assert!(settle_rotation_import_actor(&mut operation, "request-test")
+            .expect("exact retry terminates the orphaned import process group"));
+        assert!(operation.import_actor_terminal_at_unix_ms.is_some());
+        assert!(
+            crate::native_process::actor_is_terminal_or_recycled(&recorded_actor)
+                .expect("verify rotation actor terminality")
+        );
     }
 }
