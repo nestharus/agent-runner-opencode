@@ -2190,15 +2190,24 @@ fn acquire_launch_request_lock(
             "the active request reservation belongs to different launch inputs",
         ));
     }
-    // A crash after replay publication but before active-marker retirement is
-    // self-healing on the exact retry. The replay owner is already the durable
-    // terminal authority, so the older active marker no longer owns runtime
-    // custody.
-    if replay_owner_exists && active_reservation != ActiveReservation::Absent {
-        custody
-            .remove_active_marker(state_path)
-            .map_err(|error| launch_custody_failure(request_id, error))?;
-        active_reservation = ActiveReservation::Absent;
+    // Exact retry is the durable successor for a terminal handoff that could
+    // not finish its bounded replay probes or stopped after publishing an
+    // owner. Never retire the active marker merely because an owner exists:
+    // first finish the physical placement (or preserve both authorities for a
+    // later retry).
+    if state_exists && (replay_owner_exists || active_reservation != ActiveReservation::Absent) {
+        let bytes = durable_fs::read_file_bounded(state_path, MAX_LAUNCH_STATE_BYTES)
+            .map_err(|error| launch_state_failure(request_id, error))?;
+        if launch_request_bytes_are_replay(&bytes)
+            .map_err(|error| launch_state_invalid(request_id, error))?
+        {
+            custody
+                .publish_sharded_replay_and_retire_active(state_path)
+                .map_err(|error| launch_custody_failure(request_id, error))?;
+            active_reservation = custody
+                .active_reservation(state_path, reservation_binding_sha256)
+                .map_err(|error| launch_custody_failure(request_id, error))?;
+        }
     }
     let resumes_pre_state_reservation = admit_new
         && active_reservation == ActiveReservation::Matching
@@ -3950,12 +3959,93 @@ mod custody_tests {
                 );
             }
         }
+
         assert!(
             fs::metadata(directory.path().join(".custody-v2/maintenance.json"))
                 .expect("bounded maintenance cursor")
                 .len()
                 <= 1024
         );
+    }
+
+    #[test]
+    fn exact_retry_repairs_a_terminal_handoff_after_all_probes_were_pinned() {
+        let directory = tempfile::tempdir().expect("launch custody directory");
+        let root = directory.path().to_path_buf();
+        let custody = launch_request_custody(&root);
+        custody
+            .maintain(Path::new(""), |_| Ok(false))
+            .expect("initialize distributed launch custody");
+        let mut pins = Vec::new();
+        for index in 0..MAX_REPLAY_EVICTION_PROBES {
+            let stem = format!("{index:064x}");
+            let state = root.join(format!("{stem}.json"));
+            custody
+                .reserve_independent_active(&state, &format!("{:064x}", index + 1_000))
+                .expect("reserve replay filler");
+            fs::write(
+                &state,
+                br#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#,
+            )
+            .expect("terminal replay filler");
+            fs::write(state.with_extension("lock"), b"").expect("replay filler lock");
+            assert!(custody
+                .publish_sharded_replay_and_retire_active(&state)
+                .expect("publish replay filler"));
+            pins.push(custody.pin_existing(&state).expect("pin replay filler"));
+        }
+        let target_stem = format!("{:064x}", MAX_LAUNCH_REPLAY_RECORDS);
+        let target_state = root.join(format!("{target_stem}.json"));
+        let target_binding = format!("{:064x}", 99_999);
+        custody
+            .reserve_independent_active(&target_state, &target_binding)
+            .expect("reserve target launch");
+        fs::write(
+            &target_state,
+            br#"{"phase":"session_observed","actor_terminal_at_unix_ms":1}"#,
+        )
+        .expect("target terminal state");
+        fs::write(target_state.with_extension("lock"), b"").expect("target request lock");
+        assert!(!custody
+            .publish_sharded_replay_and_retire_active(&target_state)
+            .expect("all replay probes are pinned"));
+        assert_eq!(
+            custody
+                .active_reservation(&target_state, &target_binding)
+                .expect("target remains active"),
+            ActiveReservation::Matching
+        );
+
+        drop(pins);
+        let host = HostContext {
+            app: "test".to_string(),
+            app_version: None,
+            platform: None,
+            working_directory: None,
+            config_root: None,
+            data_root: None,
+            env: None,
+            deadline_unix_ms: None,
+        };
+        let lock = acquire_launch_request_lock(
+            &host,
+            &root,
+            &target_state,
+            false,
+            &target_binding,
+            "repair-terminal-handoff",
+        )
+        .expect("exact retry repairs terminal replay");
+        assert_eq!(
+            custody
+                .active_reservation(&target_state, &target_binding)
+                .expect("terminal active marker retired"),
+            ActiveReservation::Absent
+        );
+        assert!(custody
+            .replay_owner_exists(&target_state)
+            .expect("target replay owner"));
+        drop(lock);
     }
 
     #[test]

@@ -148,6 +148,11 @@ struct EnumerationSnapshotManifest {
     terminal_claim_request_sha256: Option<String>,
 }
 
+struct EnumerationSnapshotRetention {
+    retained: usize,
+    oldest_terminal: Option<(u64, PathBuf)>,
+}
+
 struct CapturedSession {
     provider_session_id: Option<String>,
     source: &'static str,
@@ -840,7 +845,7 @@ fn persist_enumeration_snapshot(
     let snapshot_id = initial_enumeration_snapshot_id(&initial_request_sha256);
     let root = enumeration_snapshot_root(host, request_id)?;
     let _lock = acquire_enumeration_snapshot_lock(host, &root, request_id)?;
-    let retained = prune_enumeration_snapshots(host, &root, request_id)?;
+    let retention = prune_enumeration_snapshots(host, &root, request_id)?;
     if let Some(page) = claimed_initial_snapshot_page_locked(
         host,
         &root,
@@ -857,11 +862,18 @@ fn persist_enumeration_snapshot(
             .map_err(|error| session_snapshot_failure(request_id, error))?;
         durable_fs::sync_directory(&root)
             .map_err(|error| session_snapshot_failure(request_id, error))?;
-    } else if retained >= MAX_ENUMERATION_SNAPSHOTS {
-        return Err(session_snapshot_capacity_failure(
-            request_id,
-            "the active session enumeration snapshot limit is reached; retry after an earlier cursor expires",
-        ));
+    } else if retention.retained >= MAX_ENUMERATION_SNAPSHOTS {
+        if let Some((_, terminal)) = retention.oldest_terminal {
+            fs::remove_dir_all(&terminal)
+                .map_err(|error| session_snapshot_failure(request_id, error))?;
+            durable_fs::sync_directory(&root)
+                .map_err(|error| session_snapshot_failure(request_id, error))?;
+        } else {
+            return Err(session_snapshot_capacity_failure(
+                request_id,
+                "all retained session enumeration snapshots still own active cursors; retry after a cursor reaches its terminal page or expires",
+            ));
+        }
     }
     durable_fs::create_private_directories(&snapshot_root)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
@@ -1238,9 +1250,10 @@ fn prune_enumeration_snapshots(
     host: &crate::envelope::HostContext,
     root: &Path,
     request_id: &str,
-) -> Result<usize, ProviderFailure> {
+) -> Result<EnumerationSnapshotRetention, ProviderFailure> {
     let mut retained = 0_usize;
     let mut visited = 0_usize;
+    let mut oldest_terminal: Option<(u64, PathBuf)> = None;
     for entry in fs::read_dir(root).map_err(|error| session_snapshot_failure(request_id, error))? {
         let entry = entry.map_err(|error| session_snapshot_failure(request_id, error))?;
         if !entry
@@ -1258,12 +1271,11 @@ fn prune_enumeration_snapshots(
             ));
         }
         let path = confined_enumeration_snapshot_target(host, &entry.path(), request_id)?;
-        let expired_or_partial = snapshot_manifest(&path, request_id)
-            .map(|manifest| {
-                manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
-                    || manifest.expires_at_unix_ms < now_unix_ms()
-            })
-            .unwrap_or(true);
+        let manifest = snapshot_manifest(&path, request_id);
+        let expired_or_partial = manifest.as_ref().map_or(true, |manifest| {
+            manifest.schema_version != SESSION_ENUMERATION_SNAPSHOT_SCHEMA_VERSION
+                || manifest.expires_at_unix_ms < now_unix_ms()
+        });
         if expired_or_partial {
             fs::remove_dir_all(&path)
                 .map_err(|error| session_snapshot_failure(request_id, error))?;
@@ -1271,9 +1283,20 @@ fn prune_enumeration_snapshots(
                 .map_err(|error| session_snapshot_failure(request_id, error))?;
         } else {
             retained += 1;
+            let manifest = manifest.expect("retained snapshot has a readable manifest");
+            if manifest.terminal_claim_request_sha256.is_some()
+                && oldest_terminal.as_ref().is_none_or(|(created, candidate)| {
+                    (manifest.created_at_unix_ms, path.as_path()) < (*created, candidate.as_path())
+                })
+            {
+                oldest_terminal = Some((manifest.created_at_unix_ms, path));
+            }
         }
     }
-    Ok(retained)
+    Ok(EnumerationSnapshotRetention {
+        retained,
+        oldest_terminal,
+    })
 }
 
 fn snapshot_manifest(

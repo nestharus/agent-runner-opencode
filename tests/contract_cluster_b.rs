@@ -746,7 +746,7 @@ fn contract_session_enumerate_rejects_cursor_from_expired_recreated_snapshot() {
 }
 
 #[test]
-fn contract_terminal_snapshot_replay_is_bounded_and_expiry_reclaims_capacity() {
+fn contract_terminal_snapshot_replay_is_bounded_and_terminal_eviction_preserves_throughput() {
     let _path_environment = PATH_ENVIRONMENT_LOCK.lock().expect("lock process PATH");
     let fake_opencode = FakeOpencodeSessionList::with_output("[]", "", 0);
     let path = prepend_path(fake_opencode.dir());
@@ -775,23 +775,6 @@ fn contract_terminal_snapshot_replay_is_bounded_and_expiry_reclaims_capacity() {
         assert_empty_enumerate_result(&result);
         first_request.get_or_insert(request);
     }
-    let overflow_request = support::validated_request_envelope(
-        "session.enumerate",
-        session_enumerate_params(),
-        host.clone(),
-        "session.schema.json#/$defs/SessionEnumerateRequest",
-    );
-    support::ensure_default_runtime_settings(&overflow_request);
-    let overflow = assert_error_envelope(support::invoke_with_request_and_env(
-        "session.enumerate",
-        overflow_request.clone(),
-        &env,
-    ));
-    assert_eq!(
-        overflow["error"]["code"],
-        "session_enumeration_snapshot_capacity_exceeded"
-    );
-
     fs::remove_file(fake_opencode.log_path()).expect("clear capacity native-list evidence");
     let exact_replay = success_result(
         support::invoke_with_request_and_env(
@@ -808,30 +791,21 @@ fn contract_terminal_snapshot_replay_is_bounded_and_expiry_reclaims_capacity() {
         "capacity saturation must not deny or relist an exact retained terminal request"
     );
 
-    let snapshot_root = data_root.join("provider-state/opencode/session-enumeration-snapshots");
-    let expired_snapshot = fs::read_dir(&snapshot_root)
-        .expect("read terminal snapshot capacity root")
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .expect("retained terminal snapshot")
-        .path();
-    let manifest_path = expired_snapshot.join("manifest.json");
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(&manifest_path).expect("read terminal snapshot manifest"))
-            .expect("parse terminal snapshot manifest");
-    manifest["expires_at_unix_ms"] = json!(0);
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec(&manifest).expect("encode expired terminal snapshot manifest"),
-    )
-    .expect("expire one terminal snapshot");
-
-    let reclaimed = success_result(
+    let overflow_request = support::validated_request_envelope(
+        "session.enumerate",
+        session_enumerate_params(),
+        host.clone(),
+        "session.schema.json#/$defs/SessionEnumerateRequest",
+    );
+    support::ensure_default_runtime_settings(&overflow_request);
+    let admitted = success_result(
         support::invoke_with_request_and_env("session.enumerate", overflow_request, &env),
         "session.schema.json#/$defs/SessionEnumerateResponse",
         "session.schema.json#/$defs/SessionEnumerateResult",
     );
-    assert_empty_enumerate_result(&reclaimed);
+    assert_empty_enumerate_result(&admitted);
+
+    let snapshot_root = data_root.join("provider-state/opencode/session-enumeration-snapshots");
     assert_eq!(
         fs::read_dir(&snapshot_root)
             .expect("read reclaimed snapshot capacity root")
@@ -839,7 +813,7 @@ fn contract_terminal_snapshot_replay_is_bounded_and_expiry_reclaims_capacity() {
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
             .count(),
         32,
-        "expiry must reclaim one slot before admitting the waiting terminal request"
+        "the oldest terminal replay must be evicted before admitting useful new work"
     );
 
     fs::remove_dir_all(&data_root).expect("remove terminal snapshot capacity data root");

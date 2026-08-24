@@ -977,7 +977,7 @@ impl RequestCustody {
         let start = u64::from_str_radix(&stem[stem.len() - 16..], 16)
             .map_err(|error| CustodyError::Invalid(error.to_string()))?
             % self.replay_slots as u64;
-        let mut replacement_slot = None;
+        let mut replacement_slots = Vec::new();
         for offset in 0..self.replay_slots.min(MAX_REPLAY_EVICTION_PROBES) {
             let slot = (start + offset as u64) % self.replay_slots as u64;
             match self.try_publish_sharded_replay_slot(&stem, slot, false)? {
@@ -986,12 +986,12 @@ impl RequestCustody {
                     return Ok(true);
                 }
                 ShardedReplaySlotOutcome::Occupied => {
-                    replacement_slot.get_or_insert(slot);
+                    replacement_slots.push(slot);
                 }
                 ShardedReplaySlotOutcome::Unavailable => {}
             }
         }
-        if let Some(slot) = replacement_slot {
+        for slot in replacement_slots {
             if matches!(
                 self.try_publish_sharded_replay_slot(&stem, slot, true)?,
                 ShardedReplaySlotOutcome::Published
@@ -3001,6 +3001,59 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn sharded_replay_tries_every_replacement_when_the_first_is_pinned() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let root = directory.path().to_path_buf();
+        let custody = RequestCustody::new_distributed(
+            root.clone(),
+            root.clone(),
+            root.join(".custody-v2"),
+            1024,
+            2,
+            2,
+            Duration::from_secs(60),
+        );
+        custody
+            .maintain(Path::new(""), |_| Ok(false))
+            .expect("initialize distributed custody");
+        let mut states = Vec::new();
+        for index in 1..=2 {
+            let stem = format!("{index:064x}");
+            let state = root.join(format!("{stem}.json"));
+            custody
+                .reserve_independent_active(&state, &format!("{:064x}", index + 100))
+                .expect("reserve terminal request");
+            fs::write(&state, br#"{"terminal":true}"#).expect("terminal state");
+            fs::write(state.with_extension("lock"), b"").expect("request lock");
+            assert!(custody
+                .publish_sharded_replay_and_retire_active(&state)
+                .expect("fill replay slot"));
+            states.push(state);
+        }
+        let pin = custody
+            .pin_existing(&states[0])
+            .expect("pin the first replacement");
+        let third = root.join(format!("{:064x}.json", 3));
+        custody
+            .reserve_independent_active(&third, &format!("{:064x}", 103))
+            .expect("reserve third request");
+        fs::write(&third, br#"{"terminal":true}"#).expect("third terminal state");
+        fs::write(third.with_extension("lock"), b"").expect("third request lock");
+
+        assert!(custody
+            .publish_sharded_replay_and_retire_active(&third)
+            .expect("search every replacement candidate"));
+        assert!(custody
+            .replay_owner_exists(&states[0])
+            .expect("pinned replay remains"));
+        assert!(custody
+            .replay_owner_exists(&third)
+            .expect("new replay is published"));
+        assert!(!states[1].exists(), "the unpinned replacement is retired");
+        drop(pin);
     }
 
     #[test]

@@ -428,12 +428,16 @@ rollback requires a provider build that can read the distributed schema rather
 than deleting or rewriting live custody state.
 Steady-state admission performs bounded request-keyed work and remains
 independent even while the predecessor transition lock is held; completion
-uses a bounded 64-position replay probe set. A durable physical-slot reservation
+uses a bounded 64-position replay probe set, preferring an empty position before
+trying every occupied replacement in that set. A durable physical-slot reservation
 serializes a pending placement before its request-local owner and replay slot are published;
 an owner-less interrupted reservation is safely reclaimable because the active
 request remains authoritative, while a matching owner makes the slot exclusive
 until recovery completes. This makes active-to-replay transfer crash-idempotent
-even when another request completes between reservation and recovery. State is retired only
+even when another request completes between reservation and recovery. If every
+probe is temporarily pinned or locked, the exact request retry resumes the same
+terminal handoff before interpreting its result; an owner alone never retires
+the active marker. State is retired only
 after neither the replay ring nor the active index owns it, and predecessor
 duplicate slots are collapsed during the one-time bounded index upgrade.
 Prepared, submission-observed, and unresolved
@@ -575,8 +579,9 @@ exact page retry can replay that claim until its successor is admitted, while a
 different request using the consumed or older cursor is rejected instead of
 publishing a successor that another terminal handoff can retire. Page size and
 admitted population are each capped at 256, list capture at 2 MiB, each row at
-64 KiB, and each snapshot at 4 MiB. At most 32 active or terminal-replay
-snapshots are retained for 15 minutes; continuation cursors read only
+64 KiB, and each snapshot at 4 MiB. At most 32 snapshots are retained;
+nonterminal cursors keep their slots for up to 15 minutes, while new useful work
+evicts the oldest terminal replay before reporting capacity. Continuation cursors read only
 the requested rows from one packed row file using manifest-bound offsets and
 per-row hashes. Snapshot manifests have one shared 32 KiB publication/read
 ceiling, large enough for the complete 256-row offset and hash population, and
@@ -587,11 +592,12 @@ transaction per row. Before the terminal page is exposed, its manifest durably
 claims that handoff for the exact continuation request; a different terminal
 consumer, older cursor, or initial retry cannot reuse the snapshot while that
 claim is live. The one-way provider invocation has no consumer receipt
-acknowledgement, so local response write and flush do not retire the terminal
-snapshot. The exact terminal request can replay its immutable result throughout
-the bounded 15-minute window, including when the response was lost after a
-successful provider-local flush; expiry maintenance retires it. This preserves
-consumer recovery without adding an unbounded result population.
+acknowledgement, so local response write and flush do not immediately retire the
+terminal snapshot. The exact terminal request can replay its immutable result
+while retained, including when the response was lost after a successful
+provider-local flush; age or bounded terminal-replay displacement retires it.
+This preserves a useful recovery window without allowing successful terminal
+requests to exhaust new enumeration throughput.
 An above-bound native population fails explicitly.
 
 ## Settings transactions and migration
