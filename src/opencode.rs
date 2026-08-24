@@ -20,8 +20,12 @@ use crate::shell::ShellOutput;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 #[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -612,18 +616,17 @@ fn run_export_command(
     mut command: Command,
     timeout: Duration,
 ) -> Result<OpencodeExport, OpencodeExportError> {
-    let mut stdout = tempfile::tempfile().map_err(export_capture_error)?;
+    let mut stdout = bounded_regular_export_capture()?;
     let stdout_writer = stdout.try_clone().map_err(export_capture_error)?;
     command
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::piped());
-    constrain_export_file_size(&mut command);
     let child = command.spawn().map_err(export_spawn_error)?;
     let output = ChildCustody::new(child)
         .wait_with_bounded_output_timeout(timeout, 0, MAX_NATIVE_COMMAND_OUTPUT_BYTES)
         .map_err(export_spawn_error)?
         .ok_or(OpencodeExportError::TimedOut)?;
-    let stdout_bytes = stdout.metadata().map_err(export_capture_error)?.len() as usize;
+    let stdout_bytes = stdout.stream_position().map_err(export_capture_error)? as usize;
     validate_bounded_export_output(&output, stdout_bytes)?;
     validate_export_status(&output)?;
     stdout
@@ -631,10 +634,35 @@ fn run_export_command(
         .map_err(export_capture_error)?;
     let mut bytes = Vec::with_capacity(stdout_bytes);
     (&mut stdout)
-        .take(MAX_EXPORT_OUTPUT_BYTES.saturating_add(1) as u64)
+        .take(stdout_bytes as u64)
         .read_to_end(&mut bytes)
         .map_err(export_capture_error)?;
     parse_export_stdout(&bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_regular_export_capture() -> Result<std::fs::File, OpencodeExportError> {
+    let name = CString::new("agent-runner-opencode-export").expect("static memfd name");
+    let descriptor =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if descriptor == -1 {
+        return Err(export_capture_error(std::io::Error::last_os_error()));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    file.set_len(MAX_EXPORT_OUTPUT_BYTES.saturating_add(1) as u64)
+        .map_err(export_capture_error)?;
+    let seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } == -1 {
+        return Err(export_capture_error(std::io::Error::last_os_error()));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(export_capture_error)?;
+    Ok(file)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bounded_regular_export_capture() -> Result<std::fs::File, OpencodeExportError> {
+    tempfile::tempfile().map_err(export_capture_error)
 }
 
 #[cfg(not(unix))]
@@ -859,7 +887,13 @@ fn validate_bounded_export_output(
     output: &std::process::Output,
     stdout_bytes: usize,
 ) -> Result<(), OpencodeExportError> {
-    if stdout_bytes > MAX_EXPORT_OUTPUT_BYTES {
+    // A writer that crosses the sealed capture boundary can receive a short write
+    // before it advances into the sentinel byte. Treat a failed writer that filled
+    // the supported region as capacity exhaustion too; a successful export whose
+    // output is exactly the bound remains valid.
+    if stdout_bytes > MAX_EXPORT_OUTPUT_BYTES
+        || (stdout_bytes == MAX_EXPORT_OUTPUT_BYTES && !output.status.success())
+    {
         return Err(OpencodeExportError::OutputTooLarge {
             stream: "stdout",
             maximum_bytes: MAX_EXPORT_OUTPUT_BYTES,
@@ -872,25 +906,6 @@ fn validate_bounded_export_output(
         });
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn constrain_export_file_size(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    let maximum_with_sentinel = MAX_EXPORT_OUTPUT_BYTES.saturating_add(1) as libc::rlim_t;
-    unsafe {
-        command.pre_exec(move || {
-            let limit = libc::rlimit {
-                rlim_cur: maximum_with_sentinel,
-                rlim_max: maximum_with_sentinel,
-            };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
 }
 
 fn validate_bounded_import_output(
@@ -1245,6 +1260,31 @@ mod tests {
         OpencodeSessionDirectory, OpencodeSessionListError, OpencodeSessionListRow,
         PendingOpencodeAuthObservation, ShellOutput, MAX_NATIVE_EVENT_LINE_BYTES,
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_regular_export_capture_tracks_written_length() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::process::{Command, Stdio};
+
+        let mut capture = super::bounded_regular_export_capture().expect("create capture");
+        let writer = capture.try_clone().expect("clone capture");
+        let status = Command::new("/bin/sh")
+            .args(["-c", "printf abc"])
+            .stdout(Stdio::from(writer))
+            .status()
+            .expect("run writer");
+        assert!(status.success());
+        let written = capture.stream_position().expect("capture position");
+        capture.seek(SeekFrom::Start(0)).expect("rewind capture");
+        let mut bytes = Vec::new();
+        (&mut capture)
+            .take(written)
+            .read_to_end(&mut bytes)
+            .expect("read capture");
+        assert_eq!(written, 3);
+        assert_eq!(bytes, b"abc");
+    }
 
     #[test]
     fn event_parser_bounds_partial_lines_and_recovers_at_the_next_frame() {

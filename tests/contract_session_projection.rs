@@ -137,6 +137,45 @@ fn contract_session_read_turns_uses_regular_file_for_export_stdout() {
     assert_first_read_turns_result(&result);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn contract_session_read_turns_does_not_limit_native_side_files() {
+    let session_id = fixture_session_id();
+    let (fake_opencode, side_file) = FakeOpencodeExport::with_large_side_file(session_id);
+    let path = prepend_path(fake_opencode.dir());
+
+    let result = read_turns_result(session_params(session_id), &path);
+
+    assert_first_read_turns_result(&result);
+    assert_eq!(
+        fs::metadata(side_file).expect("side-file metadata").len(),
+        17 * 1024 * 1024
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn contract_session_read_turns_reports_oversized_export_stdout() {
+    let session_id = fixture_session_id();
+    let fake_opencode = FakeOpencodeExport::oversized_stdout(session_id);
+    let path = prepend_path(fake_opencode.dir());
+
+    let response = assert_error_envelope(invoke_with_env(
+        "session.read_turns",
+        session_params(session_id),
+        &[("PATH", path.as_str())],
+    ));
+
+    assert_eq!(
+        response["error"]["code"],
+        "opencode_export_capacity_exceeded"
+    );
+    assert!(response["error"]["message"]
+        .as_str()
+        .expect("error message string")
+        .contains("export stdout"));
+}
+
 #[test]
 fn contract_session_read_turns_projects_bounded_user_observation() {
     let session_id = fixture_session_id();

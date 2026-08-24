@@ -231,6 +231,32 @@ impl FakeOpencodeExport {
         crate::support::write_fake_opencode_dispatcher(&dir);
         Self { dir }
     }
+
+    pub fn with_large_side_file(session_id: &str) -> (Self, PathBuf) {
+        let dir = unique_temp_dir("agent-runner-opencode-contract-session-export");
+        let wrapper_path = dir.join("opencode1");
+        let side_file = dir.join("opencode.db-wal");
+        fs::create_dir_all(&dir).expect("create side-file fake opencode dir");
+        fs::write(
+            &wrapper_path,
+            large_side_file_opencode_export_script(session_id, &side_file),
+        )
+        .expect("write side-file fake opencode1 export wrapper");
+        make_fake_opencode_export_executable(&wrapper_path);
+        crate::support::write_fake_opencode_dispatcher(&dir);
+        (Self { dir }, side_file)
+    }
+
+    pub fn oversized_stdout(session_id: &str) -> Self {
+        let dir = unique_temp_dir("agent-runner-opencode-contract-session-export");
+        let wrapper_path = dir.join("opencode1");
+        fs::create_dir_all(&dir).expect("create oversized fake opencode dir");
+        fs::write(&wrapper_path, oversized_opencode_export_script(session_id))
+            .expect("write oversized fake opencode1 export wrapper");
+        make_fake_opencode_export_executable(&wrapper_path);
+        crate::support::write_fake_opencode_dispatcher(&dir);
+        Self { dir }
+    }
 }
 
 #[cfg(unix)]
@@ -418,6 +444,34 @@ printf 'unsupported fake opencode invocation\n' >&2\n\
 exit 64\n",
         shell_single_quote(session_id),
         shell_single_quote(OPENCODE_EXPORT_RAW)
+    )
+}
+
+pub fn large_side_file_opencode_export_script(session_id: &str, side_file: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ] && [ \"${{2:-}}\" = {} ]; then\n\
+  /bin/dd if=/dev/zero of={} bs=1048576 count=17 2>/dev/null || exit 73\n\
+  printf '%s' {}\n\
+  exit 0\n\
+fi\n\
+printf 'unsupported fake opencode invocation\n' >&2\n\
+exit 64\n",
+        shell_single_quote(session_id),
+        shell_single_quote(&side_file.to_string_lossy()),
+        shell_single_quote(OPENCODE_EXPORT_RAW)
+    )
+}
+
+pub fn oversized_opencode_export_script(session_id: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"export\" ] && [ \"${{2:-}}\" = {} ]; then\n\
+  exec /bin/dd if=/dev/zero bs=1048576 count=17 2>/dev/null\n\
+fi\n\
+printf 'unsupported fake opencode invocation\n' >&2\n\
+exit 64\n",
+        shell_single_quote(session_id)
     )
 }
 
