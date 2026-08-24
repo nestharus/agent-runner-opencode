@@ -64,6 +64,7 @@ const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
 const LAUNCH_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const LAUNCH_REGISTRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const LAUNCH_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCH_STATE_SCHEMA_VERSION: u32 = 10;
 const INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS: usize = 64;
@@ -386,7 +387,13 @@ pub(crate) fn stream<W: Write>(
             spawn_failure(request_id, "release durably registered launch actor", error)
         })?;
     }
-    stream_child(custody.child_mut(), &mut state, writer).map(|exit_code| LaunchOutcome {
+    let result = stream_child(custody.child_mut(), &mut state, writer);
+    let replayable_request = state.replayable_request_state();
+    drop(state);
+    if let Some((state_path, replay_request_id)) = replayable_request {
+        let _ = retire_completed_launch_request(host, &state_path, &replay_request_id);
+    }
+    result.map(|exit_code| LaunchOutcome {
         exit_code,
         activity_targets: effective.activity_targets,
     })
@@ -1604,10 +1611,10 @@ fn retire_orphan_launch_request_lock(
         .expect("launch state path always has a parent");
     let capacity = open_launch_state_lock(&root.join(".capacity.lock"))
         .map_err(|error| launch_state_failure(request_id, error))?;
-    if !operation_bounds::lock_exclusive_for(&capacity, LAUNCH_STATE_LOCK_TIMEOUT)
+    if !operation_bounds::lock_exclusive_for(&capacity, LAUNCH_REGISTRATION_LOCK_TIMEOUT)
         .map_err(|error| launch_state_failure(request_id, error))?
     {
-        return Err(launch_state_lock_timeout(request_id));
+        return Err(launch_registration_lock_timeout(request_id));
     }
     if state_path.exists() {
         return Ok(());
@@ -2122,7 +2129,7 @@ fn acquire_launch_request_lock(
         if reserved {
             retire_orphan_launch_request_lock(state_path, request_id)?;
         }
-        return Err(launch_state_lock_timeout(request_id));
+        return Err(launch_request_lock_timeout(request_id));
     }
     drop(replay_pin);
     custody
@@ -2147,13 +2154,15 @@ fn acquire_launch_capacity_lock(
     let path = root.join(".capacity.lock");
     let lock =
         open_launch_state_lock(&path).map_err(|error| launch_state_failure(request_id, error))?;
-    let timeout =
-        operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
-            .unwrap_or(Duration::ZERO);
+    let timeout = operation_bounds::remaining_timeout(
+        host.deadline_unix_ms,
+        LAUNCH_REGISTRATION_LOCK_TIMEOUT,
+    )
+    .unwrap_or(Duration::ZERO);
     if !operation_bounds::lock_exclusive_for(&lock, timeout)
         .map_err(|error| launch_state_failure(request_id, error))?
     {
-        return Err(launch_state_lock_timeout(request_id));
+        return Err(launch_registration_lock_timeout(request_id));
     }
     Ok(lock)
 }
@@ -2166,6 +2175,26 @@ fn maintain_launch_request_capacity(
     custody
         .maintain(current_lock_path, launch_request_bytes_are_replay)
         .map_err(|error| launch_custody_failure(request_id, error))
+}
+
+fn retire_completed_launch_request(
+    host: &HostContext,
+    state_path: &Path,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let root = state_path
+        .parent()
+        .expect("launch request state path always has a parent");
+    let capacity_lock = acquire_launch_capacity_lock(root, host, request_id)?;
+    let custody = launch_request_custody(root);
+    custody
+        .maintain(Path::new(""), launch_request_bytes_are_replay)
+        .map_err(|error| launch_custody_failure(request_id, error))?;
+    custody
+        .publish_replay_and_retire_active(state_path, Path::new(""))
+        .map_err(|error| launch_custody_failure(request_id, error))?;
+    drop(capacity_lock);
+    Ok(())
 }
 
 fn launch_request_bytes_are_replay(bytes: &[u8]) -> Result<bool, String> {
@@ -2191,7 +2220,7 @@ fn launch_request_custody(root: &Path) -> RequestCustody {
         MAX_LAUNCH_REPLAY_RECORDS,
         LAUNCH_ORPHAN_RETENTION,
     )
-    .with_elastic_active_index()
+    .with_distributed_active_markers()
 }
 
 fn launch_custody_failure(request_id: &str, error: CustodyError) -> ProviderFailure {
@@ -2452,11 +2481,19 @@ fn launch_state_capacity_exceeded(request_id: &str) -> ProviderFailure {
     )
 }
 
-fn launch_state_lock_timeout(request_id: &str) -> ProviderFailure {
+fn launch_request_lock_timeout(request_id: &str) -> ProviderFailure {
     ProviderFailure::internal(
         request_id,
-        "launch_state_lock_timeout",
-        "durable launch state lock could not be acquired before the operation deadline",
+        "launch_request_lock_timeout",
+        "this exact launch request is still being handled by another provider process; retrying the same request is safe after that process finishes",
+    )
+}
+
+fn launch_registration_lock_timeout(request_id: &str) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "launch_registration_lock_timeout",
+        "launch registration could not acquire its brief custody lock before the operation deadline; active model processes are not capped, no launch slot was consumed, and retrying this request is safe",
     )
 }
 
@@ -2683,6 +2720,32 @@ impl LaunchState {
     fn attach_resume_launch_request(&mut self, launch_request: ResumeLaunchRequestGuard) {
         self.resume_launch_request = Some(launch_request);
         self.projection_admitted = false;
+    }
+
+    fn replayable_request_state(&self) -> Option<(PathBuf, String)> {
+        if let Some(launch_request) = self.launch_request.as_ref() {
+            if matches!(
+                launch_request.state.phase,
+                LaunchRequestPhase::SessionObserved | LaunchRequestPhase::TerminalWithoutSession
+            ) {
+                return Some((
+                    launch_request.state_path.clone(),
+                    launch_request.state.request_id.clone(),
+                ));
+            }
+        }
+        let resume_launch_request = self.resume_launch_request.as_ref()?;
+        matches!(
+            resume_launch_request.state.phase,
+            ResumeLaunchRequestPhase::CompletionObserved
+                | ResumeLaunchRequestPhase::TerminalWithoutSubmission
+        )
+        .then(|| {
+            (
+                resume_launch_request.state_path.clone(),
+                resume_launch_request.state.request_id.clone(),
+            )
+        })
     }
 
     fn handle_drain_message<W: Write>(
@@ -3595,47 +3658,47 @@ mod custody_tests {
     #[test]
     fn launch_admission_grows_beyond_the_initial_active_index() {
         let directory = tempfile::tempdir().expect("launch custody directory");
-        let host = HostContext {
-            app: "test".to_string(),
-            app_version: None,
-            platform: None,
-            working_directory: None,
-            config_root: None,
-            data_root: None,
-            env: None,
-            deadline_unix_ms: None,
-        };
         let live_launches = 320;
-        let mut locks = Vec::with_capacity(live_launches);
-        for index in 1..=live_launches {
-            let binding = format!("{index:064x}");
-            let state = directory.path().join(format!("{index:064x}.json"));
-            locks.push(
-                acquire_launch_request_lock(
-                    &host,
-                    directory.path(),
-                    &state,
-                    true,
-                    &binding,
-                    &format!("request-{index}"),
-                )
-                .expect("admit an independent live launch"),
-            );
-        }
-        let active: Value = serde_json::from_slice(
-            &fs::read(directory.path().join(".custody-v2/active.json"))
-                .expect("growing active index"),
-        )
-        .expect("parse growing active index");
-        let slots = active["slots"].as_array().expect("active index slots");
+        let root = directory.path().to_path_buf();
+        let registrations = (1..=live_launches)
+            .map(|index| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let host = HostContext {
+                        app: "test".to_string(),
+                        app_version: None,
+                        platform: None,
+                        working_directory: None,
+                        config_root: None,
+                        data_root: None,
+                        env: None,
+                        deadline_unix_ms: None,
+                    };
+                    let binding = format!("{index:064x}");
+                    let state = root.join(format!("{index:064x}.json"));
+                    acquire_launch_request_lock(
+                        &host,
+                        &root,
+                        &state,
+                        true,
+                        &binding,
+                        &format!("request-{index}"),
+                    )
+                    .expect("admit an independent live launch")
+                })
+            })
+            .collect::<Vec<_>>();
+        let locks = registrations
+            .into_iter()
+            .map(|registration| registration.join().expect("concurrent launch registration"))
+            .collect::<Vec<_>>();
+        let active_root = directory.path().join(".custody-v2/active");
         assert_eq!(
-            slots
-                .iter()
-                .filter(|slot| slot["occupied"].as_u64() == Some(1))
+            fs::read_dir(&active_root)
+                .expect("distributed active markers")
                 .count(),
             live_launches
         );
-        assert!(slots.len() >= live_launches);
         drop(locks);
 
         let custody = launch_request_custody(directory.path());
@@ -3644,17 +3707,9 @@ mod custody_tests {
                 .remove_active_marker(&directory.path().join(format!("{index:064x}.json")))
                 .expect("retire an ended launch reservation");
         }
-        let active: Value = serde_json::from_slice(
-            &fs::read(directory.path().join(".custody-v2/active.json"))
-                .expect("compacted elastic active index"),
-        )
-        .expect("parse compacted elastic active index");
-        let slots = active["slots"].as_array().expect("active index slots");
-        assert_eq!(slots.len(), INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS);
         assert_eq!(
-            slots
-                .iter()
-                .filter(|slot| slot["occupied"].as_u64() == Some(1))
+            fs::read_dir(&active_root)
+                .expect("remaining distributed active markers")
                 .count(),
             INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS
         );
@@ -3663,12 +3718,31 @@ mod custody_tests {
                 .expect("elastic active schema"),
         )
         .expect("parse elastic active schema");
-        assert_eq!(schema["active_policy"], "elastic");
+        assert_eq!(schema["active_policy"], "distributed");
         assert_eq!(
-            schema["initial_active_slots"],
-            INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS
+            schema["maintenance_probe_limit"],
+            crate::request_custody::MAX_ACTIVE_MAINTENANCE_PROBES
         );
+        assert!(schema.get("initial_active_slots").is_none());
         assert!(schema.get("active_limit").is_none());
+        for root in [
+            &active_root,
+            &directory.path().join(".custody-v2/maintenance"),
+        ] {
+            for entry in fs::read_dir(root).expect("bounded distributed records") {
+                let entry = entry.expect("distributed record entry");
+                assert!(
+                    entry.metadata().expect("distributed record metadata").len() <= 1024,
+                    "every distributed custody record remains independently bounded"
+                );
+            }
+        }
+        assert!(
+            fs::metadata(directory.path().join(".custody-v2/maintenance.json"))
+                .expect("bounded maintenance cursor")
+                .len()
+                <= 1024
+        );
     }
 
     #[test]
@@ -3825,7 +3899,7 @@ mod custody_tests {
     }
 
     #[test]
-    fn steady_state_admission_classifies_one_active_payload() {
+    fn steady_state_admission_classifies_one_queued_active_payload() {
         let directory = tempfile::tempdir().expect("launch custody directory");
         let active_records = INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS;
         for index in 0..active_records {
@@ -3854,11 +3928,11 @@ mod custody_tests {
                 launch_request_bytes_are_replay(bytes)
             })
             .expect("maintain compact active custody");
-        assert_eq!(active, active_records);
+        assert_eq!(active, 0);
         assert_eq!(
             active_parses.load(Ordering::Relaxed),
             1,
-            "steady-state admission must classify at most one active payload"
+            "steady-state admission must classify at most one queued active payload"
         );
     }
 

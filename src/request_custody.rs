@@ -9,13 +9,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-const INDEX_SCHEMA_VERSION: u64 = 5;
+const INDEX_SCHEMA_VERSION: u64 = 6;
+const POLICY_ACTIVE_INDEX_SCHEMA_VERSION: u64 = 5;
 const BOUND_ACTIVE_INDEX_SCHEMA_VERSION: u64 = 4;
 const UNBOUND_ACTIVE_INDEX_SCHEMA_VERSION: u64 = 3;
 const PREDECESSOR_INDEX_SCHEMA_VERSION: u64 = 2;
 const MAX_INDEX_RECORD_BYTES: usize = 1024;
 const MAX_ACTIVE_INDEX_BYTES: usize = 16 * 1024;
 const MAX_REPLAY_EVICTION_PROBES: usize = 64;
+pub(crate) const MAX_ACTIVE_MAINTENANCE_PROBES: usize = 16;
 const EMPTY_ACTIVE_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -49,6 +51,65 @@ pub(crate) enum ActiveReservation {
 struct ActiveIndex {
     next_probe: usize,
     slots: Vec<ActiveSlot>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ActiveMarker {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding_sha256: Option<String>,
+    maintenance_sequence: u64,
+}
+
+impl ActiveMarker {
+    fn validate(&self) -> Result<(), CustodyError> {
+        if self
+            .binding_sha256
+            .as_deref()
+            .is_some_and(|binding| !valid_digest(binding))
+        {
+            return Err(CustodyError::Invalid(
+                "request custody active marker binding is invalid".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reservation(&self, binding_sha256: &str) -> ActiveReservation {
+        match self.binding_sha256.as_deref() {
+            Some(binding) if binding == binding_sha256 => ActiveReservation::Matching,
+            Some(_) => ActiveReservation::Conflicting,
+            None => ActiveReservation::Unbound,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MaintenanceIndex {
+    next_probe: u64,
+    next_sequence: u64,
+}
+
+impl MaintenanceIndex {
+    fn empty() -> Self {
+        Self {
+            next_probe: 0,
+            next_sequence: 0,
+        }
+    }
+
+    fn validate(&self) -> Result<(), CustodyError> {
+        if self.next_probe > self.next_sequence {
+            return Err(CustodyError::Invalid(
+                "request custody maintenance index is inconsistent".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MaintenanceTicket {
+    request_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -104,7 +165,9 @@ impl ActiveIndex {
     fn validate(&self, policy: ActiveIndexPolicy) -> Result<(), CustodyError> {
         let active_size_is_valid = match policy {
             ActiveIndexPolicy::Fixed { limit } => self.slots.len() == limit,
-            ActiveIndexPolicy::Elastic { initial_slots } => self.slots.len() >= initial_slots,
+            ActiveIndexPolicy::Distributed {
+                predecessor_initial_slots,
+            } => self.slots.len() >= predecessor_initial_slots,
         };
         if !active_size_is_valid
             || (!self.slots.is_empty() && self.next_probe >= self.slots.len())
@@ -162,12 +225,7 @@ impl ActiveIndex {
         }
     }
 
-    fn reserve(
-        &mut self,
-        stem: String,
-        binding_sha256: String,
-        policy: ActiveIndexPolicy,
-    ) -> Result<(), CustodyError> {
+    fn reserve(&mut self, stem: String, binding_sha256: String) -> Result<(), CustodyError> {
         if !valid_digest(&binding_sha256) {
             return Err(CustodyError::Invalid(
                 "request custody active reservation binding is invalid".to_string(),
@@ -185,12 +243,6 @@ impl ActiveIndex {
         }
         let slot = match self.slots.iter_mut().find(|slot| slot.occupied == 0) {
             Some(slot) => slot,
-            None if policy.is_elastic() => {
-                self.slots.push(ActiveSlot::empty());
-                self.slots
-                    .last_mut()
-                    .expect("the growing active index contains the appended slot")
-            }
             None => return Err(CustodyError::Capacity),
         };
         slot.occupied = 1;
@@ -199,22 +251,12 @@ impl ActiveIndex {
         Ok(())
     }
 
-    fn reserve_unbound(
-        &mut self,
-        stem: String,
-        policy: ActiveIndexPolicy,
-    ) -> Result<(), CustodyError> {
+    fn reserve_unbound(&mut self, stem: String) -> Result<(), CustodyError> {
         if self.contains(&stem) {
             return Ok(());
         }
         let slot = match self.slots.iter_mut().find(|slot| slot.occupied == 0) {
             Some(slot) => slot,
-            None if policy.is_elastic() => {
-                self.slots.push(ActiveSlot::empty());
-                self.slots
-                    .last_mut()
-                    .expect("the growing active index contains the appended slot")
-            }
             None => return Err(CustodyError::Capacity),
         };
         slot.occupied = 1;
@@ -263,32 +305,6 @@ impl ActiveIndex {
         true
     }
 
-    fn compact_elastic(&mut self, policy: ActiveIndexPolicy) {
-        let ActiveIndexPolicy::Elastic { initial_slots } = policy else {
-            return;
-        };
-        let next_request = if self.slots.is_empty() {
-            None
-        } else {
-            (0..self.slots.len())
-                .map(|offset| (self.next_probe + offset) % self.slots.len())
-                .find(|index| self.slots[*index].occupied == 1)
-                .map(|index| self.slots[index].request_sha256.clone())
-        };
-        self.slots.retain(|slot| slot.occupied == 1);
-        while self.slots.len() < initial_slots {
-            self.slots.push(ActiveSlot::empty());
-        }
-        self.next_probe = next_request
-            .as_deref()
-            .and_then(|stem| {
-                self.slots
-                    .iter()
-                    .position(|slot| slot.occupied == 1 && slot.request_sha256 == stem)
-            })
-            .unwrap_or(0);
-    }
-
     fn next_occupied(&mut self) -> Option<String> {
         if self.slots.is_empty() {
             return None;
@@ -320,19 +336,21 @@ impl ActiveIndex {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActiveIndexPolicy {
     Fixed { limit: usize },
-    Elastic { initial_slots: usize },
+    Distributed { predecessor_initial_slots: usize },
 }
 
 impl ActiveIndexPolicy {
     fn initial_slots(self) -> usize {
         match self {
             Self::Fixed { limit } => limit,
-            Self::Elastic { initial_slots } => initial_slots,
+            Self::Distributed {
+                predecessor_initial_slots,
+            } => predecessor_initial_slots,
         }
     }
 
-    fn is_elastic(self) -> bool {
-        matches!(self, Self::Elastic { .. })
+    fn is_distributed(self) -> bool {
+        matches!(self, Self::Distributed { .. })
     }
 }
 
@@ -392,14 +410,14 @@ impl RequestCustody {
         }
     }
 
-    /// Allow active request custody to grow beyond its initial compact index.
-    ///
-    /// Launch uses this mode because active records describe independent
-    /// runtime obligations, not a global concurrency budget. Quota refresh
-    /// retains fixed-capacity behavior through the default constructor.
-    pub(crate) fn with_elastic_active_index(mut self) -> Self {
-        self.active_policy = ActiveIndexPolicy::Elastic {
-            initial_slots: self.active_policy.initial_slots(),
+    /// Represent each active request independently instead of imposing a
+    /// shared-population bound. Launch uses this mode because active records
+    /// describe independent runtime obligations, not a global concurrency
+    /// budget. Quota refresh retains fixed-capacity behavior through the
+    /// default constructor.
+    pub(crate) fn with_distributed_active_markers(mut self) -> Self {
+        self.active_policy = ActiveIndexPolicy::Distributed {
+            predecessor_initial_slots: self.active_policy.initial_slots(),
         };
         self
     }
@@ -412,7 +430,11 @@ impl RequestCustody {
         current_lock_path: &Path,
         classify_replay: impl Fn(&[u8]) -> Result<bool, String>,
     ) -> Result<usize, CustodyError> {
-        self.initialize(&classify_replay)?;
+        self.initialize(current_lock_path, &classify_replay)?;
+        if self.active_policy.is_distributed() {
+            self.maintain_distributed(current_lock_path, &classify_replay)?;
+            return Ok(0);
+        }
         let mut index = self.read_active_index()?;
         if let Some(stem) = index.next_occupied() {
             let state_path = self.state_path(&stem);
@@ -444,10 +466,76 @@ impl RequestCustody {
             {
                 index.remove(&stem);
             }
-            index.compact_elastic(self.active_policy);
             self.write_active_index(&index)?;
         }
         Ok(index.active())
+    }
+
+    fn maintain_distributed(
+        &self,
+        current_lock_path: &Path,
+        classify_replay: &impl Fn(&[u8]) -> Result<bool, String>,
+    ) -> Result<(), CustodyError> {
+        let mut maintenance = self.read_maintenance_index()?;
+        let mut write_index = false;
+        for _ in 0..MAX_ACTIVE_MAINTENANCE_PROBES {
+            if maintenance.next_probe >= maintenance.next_sequence {
+                break;
+            }
+            let sequence = maintenance.next_probe;
+            maintenance.next_probe += 1;
+            write_index = true;
+            let Some(ticket) = self.read_maintenance_ticket(sequence)? else {
+                continue;
+            };
+            let Some(mut marker) = self.read_active_marker(&ticket.request_sha256)? else {
+                self.remove_maintenance_ticket(sequence)?;
+                break;
+            };
+            if marker.maintenance_sequence != sequence {
+                self.remove_maintenance_ticket(sequence)?;
+                break;
+            }
+            let state_path = self.state_path(&ticket.request_sha256);
+            let lock_path = self.lock_path(&ticket.request_sha256);
+            let state = match durable_fs::read_file_bounded(&state_path, self.state_byte_limit) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(CustodyError::Io(error)),
+            };
+            let mut retained = true;
+            if let Some(bytes) = state {
+                if classify_replay(&bytes).map_err(CustodyError::Invalid)?
+                    && self.place_replay(&ticket.request_sha256, current_lock_path)?
+                {
+                    self.remove_active_marker(&state_path)?;
+                    retained = false;
+                }
+            } else if self.read_replay_owner(&ticket.request_sha256)?.is_none()
+                && (!lock_path.exists() || record_expired(&lock_path, self.orphan_retention))
+                && self.remove_abandoned_active(
+                    &ticket.request_sha256,
+                    &lock_path,
+                    current_lock_path,
+                )?
+            {
+                self.remove_active_marker(&state_path)?;
+                retained = false;
+            }
+            if retained {
+                let next_sequence =
+                    self.enqueue_maintenance(&ticket.request_sha256, &mut maintenance)?;
+                marker.maintenance_sequence = next_sequence;
+                self.write_active_marker(&ticket.request_sha256, &marker)?;
+                self.remove_maintenance_ticket(sequence)?;
+                write_index = false;
+            }
+            break;
+        }
+        if write_index {
+            self.write_maintenance_index(&maintenance)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn reserve_active(
@@ -456,8 +544,11 @@ impl RequestCustody {
         binding_sha256: &str,
     ) -> Result<(), CustodyError> {
         let stem = required_digest_stem(state_path)?;
+        if self.active_policy.is_distributed() {
+            return self.reserve_active_marker(&stem, binding_sha256);
+        }
         let mut index = self.read_active_index()?;
-        index.reserve(stem, binding_sha256.to_string(), self.active_policy)?;
+        index.reserve(stem, binding_sha256.to_string())?;
         self.write_active_index(&index)
     }
 
@@ -477,6 +568,13 @@ impl RequestCustody {
                 "request custody active reservation binding is invalid".to_string(),
             ));
         }
+        if self.active_policy.is_distributed() {
+            return Ok(self
+                .read_active_marker(&stem)?
+                .map_or(ActiveReservation::Absent, |marker| {
+                    marker.reservation(binding_sha256)
+                }));
+        }
         Ok(self.read_active_index()?.reservation(&stem, binding_sha256))
     }
 
@@ -489,6 +587,26 @@ impl RequestCustody {
         binding_sha256: &str,
     ) -> Result<(), CustodyError> {
         let stem = required_digest_stem(state_path)?;
+        if self.active_policy.is_distributed() {
+            let mut marker = self.read_active_marker(&stem)?.ok_or_else(|| {
+                CustodyError::Invalid(
+                    "request custody active marker disappeared before binding".to_string(),
+                )
+            })?;
+            match marker.reservation(binding_sha256) {
+                ActiveReservation::Matching => return Ok(()),
+                ActiveReservation::Conflicting => {
+                    return Err(CustodyError::Invalid(
+                        "request custody active marker conflicts with the attempted binding"
+                            .to_string(),
+                    ))
+                }
+                ActiveReservation::Absent => unreachable!("a loaded active marker is present"),
+                ActiveReservation::Unbound => {}
+            }
+            marker.binding_sha256 = Some(binding_sha256.to_string());
+            return self.write_active_marker(&stem, &marker);
+        }
         let mut index = self.read_active_index()?;
         index.bind_unbound(&stem, binding_sha256)?;
         self.write_active_index(&index)
@@ -526,12 +644,35 @@ impl RequestCustody {
 
     pub(crate) fn remove_active_marker(&self, state_path: &Path) -> Result<(), CustodyError> {
         let stem = required_digest_stem(state_path)?;
+        if self.active_policy.is_distributed() {
+            if let Some(marker) = self.read_active_marker(&stem)? {
+                remove_file_if_present(&self.active_marker_path(&stem))?;
+                durable_fs::sync_directory(&self.active_root())?;
+                self.remove_maintenance_ticket(marker.maintenance_sequence)?;
+            }
+            return Ok(());
+        }
         let mut index = self.read_active_index()?;
         if index.remove(&stem) {
-            index.compact_elastic(self.active_policy);
             self.write_active_index(&index)?;
         }
         Ok(())
+    }
+
+    /// Publish an exact terminal request into the replay ring, then retire only
+    /// its active admission marker. The caller holds the capability capacity
+    /// lock and must not hold the request lock named by `current_lock_path`.
+    pub(crate) fn publish_replay_and_retire_active(
+        &self,
+        state_path: &Path,
+        current_lock_path: &Path,
+    ) -> Result<bool, CustodyError> {
+        let stem = required_digest_stem(state_path)?;
+        if !self.place_replay(&stem, current_lock_path)? {
+            return Ok(false);
+        }
+        self.remove_active_marker(state_path)?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -558,6 +699,7 @@ impl RequestCustody {
 
     fn initialize(
         &self,
+        current_lock_path: &Path,
         classify_replay: &impl Fn(&[u8]) -> Result<bool, String>,
     ) -> Result<(), CustodyError> {
         let schema_path = self.index_root.join("schema.json");
@@ -575,6 +717,23 @@ impl RequestCustody {
                         self.validate_current_schema(&schema)?;
                         self.require_index_directory(&self.replay_root())?;
                         self.require_index_directory(&self.owner_root())?;
+                        if self.active_policy.is_distributed() {
+                            self.require_index_directory(&self.active_root())?;
+                            self.require_index_directory(&self.maintenance_root())?;
+                            self.read_maintenance_index()?;
+                            if self.active_index_path().exists() {
+                                remove_file_if_present(&self.active_index_path())?;
+                                durable_fs::sync_directory(&self.index_root)?;
+                            }
+                        }
+                    }
+                    Some(POLICY_ACTIVE_INDEX_SCHEMA_VERSION) => {
+                        self.validate_policy_index_schema(&schema)?;
+                        self.upgrade_policy_active_index(
+                            &schema_path,
+                            current_lock_path,
+                            classify_replay,
+                        )?;
                     }
                     Some(BOUND_ACTIVE_INDEX_SCHEMA_VERSION) => {
                         self.validate_predecessor_active_slots(&schema)?;
@@ -624,10 +783,16 @@ impl RequestCustody {
                 self.owner_root(),
                 self.pin_root(),
                 self.temporary_root(),
+                self.active_root(),
+                self.maintenance_root(),
             ],
         )?;
+        if self.active_policy.is_distributed() {
+            self.write_maintenance_index(&MaintenanceIndex::empty())?;
+        }
         let mut migrated = 0_usize;
-        let mut active_index = ActiveIndex::empty(self.active_policy.initial_slots());
+        let mut active_index = (!self.active_policy.is_distributed())
+            .then(|| ActiveIndex::empty(self.active_policy.initial_slots()));
         let mut replay_candidates = Vec::new();
         let migration_limit = self
             .active_policy
@@ -645,7 +810,7 @@ impl RequestCustody {
                 continue;
             }
             migrated += 1;
-            if !self.active_policy.is_elastic() && migrated > migration_limit {
+            if !self.active_policy.is_distributed() && migrated > migration_limit {
                 return Err(CustodyError::Capacity);
             }
             let stem = required_digest_stem(&lock_path)?;
@@ -657,12 +822,27 @@ impl RequestCustody {
             };
             if replay {
                 replay_candidates.push((record_modified(&state_path, &lock_path), stem));
+            } else if self.active_policy.is_distributed() {
+                let mut maintenance = self.read_maintenance_index()?;
+                let sequence = self.enqueue_maintenance(&stem, &mut maintenance)?;
+                self.write_active_marker(
+                    &stem,
+                    &ActiveMarker {
+                        binding_sha256: None,
+                        maintenance_sequence: sequence,
+                    },
+                )?;
             } else {
-                active_index.reserve_unbound(stem, self.active_policy)?;
+                active_index
+                    .as_mut()
+                    .expect("indexed custody has an active index")
+                    .reserve_unbound(stem)?;
             }
         }
         replay_candidates.sort_by_key(|candidate| candidate.0);
-        self.write_active_index(&active_index)?;
+        if let Some(active_index) = active_index.as_ref() {
+            self.write_active_index(active_index)?;
+        }
         for (_, stem) in replay_candidates {
             if !self.place_replay(&stem, Path::new(""))? {
                 return Err(CustodyError::Capacity);
@@ -672,14 +852,54 @@ impl RequestCustody {
         Ok(())
     }
 
+    fn upgrade_policy_active_index(
+        &self,
+        schema_path: &Path,
+        current_lock_path: &Path,
+        classify_replay: &impl Fn(&[u8]) -> Result<bool, String>,
+    ) -> Result<(), CustodyError> {
+        self.require_index_directory(&self.replay_root())?;
+        self.require_index_directory(&self.owner_root())?;
+        self.prepare_temporary_root()?;
+        let active = self.read_active_index()?;
+        if self.active_policy.is_distributed() {
+            self.prepare_distributed_roots()?;
+            for slot in active.slots.iter().filter(|slot| slot.occupied == 1) {
+                let replay = match durable_fs::read_file_bounded(
+                    &self.state_path(&slot.request_sha256),
+                    self.state_byte_limit,
+                ) {
+                    Ok(bytes) => classify_replay(&bytes).map_err(CustodyError::Invalid)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(CustodyError::Io(error)),
+                };
+                if replay && self.place_replay(&slot.request_sha256, current_lock_path)? {
+                    continue;
+                }
+                let mut maintenance = self.read_maintenance_index()?;
+                let sequence = self.enqueue_maintenance(&slot.request_sha256, &mut maintenance)?;
+                self.write_active_marker(
+                    &slot.request_sha256,
+                    &ActiveMarker {
+                        binding_sha256: slot.binding_sha256.clone(),
+                        maintenance_sequence: sequence,
+                    },
+                )?;
+            }
+            self.write_current_schema(schema_path)?;
+            remove_file_if_present(&self.active_index_path())?;
+            durable_fs::sync_directory(&self.index_root)?;
+            return Ok(());
+        }
+        self.publish_active_representation(active, schema_path)
+    }
+
     fn upgrade_bound_active_index(&self, schema_path: &Path) -> Result<(), CustodyError> {
         self.require_index_directory(&self.replay_root())?;
         self.require_index_directory(&self.owner_root())?;
         self.prepare_temporary_root()?;
-        let mut active = self.read_active_index()?;
-        active.compact_elastic(self.active_policy);
-        self.write_active_index(&active)?;
-        self.write_current_schema(schema_path)
+        let active = self.read_active_index()?;
+        self.publish_active_representation(active, schema_path)
     }
 
     fn upgrade_unbound_active_index(&self, schema_path: &Path) -> Result<(), CustodyError> {
@@ -687,8 +907,7 @@ impl RequestCustody {
         self.require_index_directory(&self.owner_root())?;
         self.prepare_temporary_root()?;
         let active = self.read_active_index()?;
-        self.write_active_index(&active)?;
-        self.write_current_schema(schema_path)
+        self.publish_active_representation(active, schema_path)
     }
 
     fn upgrade_predecessor_index(&self, schema_path: &Path) -> Result<(), CustodyError> {
@@ -764,6 +983,32 @@ impl RequestCustody {
             durable_fs::sync_directory(&self.replay_root())?;
         }
         let active = self.read_active_index()?;
+        self.publish_active_representation(active, schema_path)
+    }
+
+    fn publish_active_representation(
+        &self,
+        active: ActiveIndex,
+        schema_path: &Path,
+    ) -> Result<(), CustodyError> {
+        if self.active_policy.is_distributed() {
+            self.prepare_distributed_roots()?;
+            for slot in active.slots.iter().filter(|slot| slot.occupied == 1) {
+                let mut maintenance = self.read_maintenance_index()?;
+                let sequence = self.enqueue_maintenance(&slot.request_sha256, &mut maintenance)?;
+                self.write_active_marker(
+                    &slot.request_sha256,
+                    &ActiveMarker {
+                        binding_sha256: slot.binding_sha256.clone(),
+                        maintenance_sequence: sequence,
+                    },
+                )?;
+            }
+            self.write_current_schema(schema_path)?;
+            remove_file_if_present(&self.active_index_path())?;
+            durable_fs::sync_directory(&self.index_root)?;
+            return Ok(());
+        }
         self.write_active_index(&active)?;
         self.write_current_schema(schema_path)
     }
@@ -938,7 +1183,7 @@ impl RequestCustody {
         {
             return Ok(());
         }
-        if self.read_active_index()?.contains(stem) {
+        if self.active_contains(stem)? {
             if owner.is_some() {
                 remove_file_if_present(&self.owner_path(stem))?;
                 durable_fs::sync_directory(&self.owner_root())?;
@@ -959,6 +1204,13 @@ impl RequestCustody {
             durable_fs::sync_directory(&self.owner_root())?;
         }
         Ok(())
+    }
+
+    fn active_contains(&self, stem: &str) -> Result<bool, CustodyError> {
+        if self.active_policy.is_distributed() {
+            return Ok(self.read_active_marker(stem)?.is_some());
+        }
+        Ok(self.read_active_index()?.contains(stem))
     }
 
     fn remove_abandoned_active(
@@ -1019,6 +1271,26 @@ impl RequestCustody {
         self.index_root.join("active.json")
     }
 
+    fn active_root(&self) -> PathBuf {
+        self.index_root.join("active")
+    }
+
+    fn active_marker_path(&self, stem: &str) -> PathBuf {
+        self.active_root().join(format!("{stem}.json"))
+    }
+
+    fn maintenance_root(&self) -> PathBuf {
+        self.index_root.join("maintenance")
+    }
+
+    fn maintenance_index_path(&self) -> PathBuf {
+        self.index_root.join("maintenance.json")
+    }
+
+    fn maintenance_ticket_path(&self, sequence: u64) -> PathBuf {
+        self.maintenance_root().join(format!("{sequence:020}.json"))
+    }
+
     fn replay_root(&self) -> PathBuf {
         self.index_root.join("replay")
     }
@@ -1071,6 +1343,168 @@ impl RequestCustody {
         if visited != 0 {
             durable_fs::sync_directory(&root)?;
         }
+        Ok(())
+    }
+
+    fn prepare_active_root(&self) -> Result<(), CustodyError> {
+        match fs::metadata(self.active_root()) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => Err(CustodyError::Invalid(
+                "request custody active marker root is not a directory".to_string(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_private_child_directory(&self.active_root())
+            }
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
+    fn prepare_distributed_roots(&self) -> Result<(), CustodyError> {
+        self.prepare_active_root()?;
+        match fs::metadata(self.maintenance_root()) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(CustodyError::Invalid(
+                    "request custody maintenance root is not a directory".to_string(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_private_child_directory(&self.maintenance_root())?;
+            }
+            Err(error) => return Err(CustodyError::Io(error)),
+        }
+        match self.read_maintenance_index() {
+            Ok(_) => Ok(()),
+            Err(CustodyError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.write_maintenance_index(&MaintenanceIndex::empty())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_active_marker(&self, stem: &str) -> Result<Option<ActiveMarker>, CustodyError> {
+        if !valid_digest(stem) {
+            return Err(CustodyError::Invalid(
+                "request custody active marker has an invalid digest".to_string(),
+            ));
+        }
+        match durable_fs::read_file_bounded(&self.active_marker_path(stem), MAX_INDEX_RECORD_BYTES)
+        {
+            Ok(bytes) => {
+                let marker: ActiveMarker = serde_json::from_slice(&bytes)
+                    .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+                marker.validate()?;
+                Ok(Some(marker))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
+    fn write_active_marker(&self, stem: &str, marker: &ActiveMarker) -> Result<(), CustodyError> {
+        if !valid_digest(stem) {
+            return Err(CustodyError::Invalid(
+                "request custody active marker has an invalid digest".to_string(),
+            ));
+        }
+        marker.validate()?;
+        let value = serde_json::to_value(marker)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        self.write_json_atomic(&self.active_marker_path(stem), &value)
+    }
+
+    fn reserve_active_marker(&self, stem: &str, binding_sha256: &str) -> Result<(), CustodyError> {
+        if !valid_digest(binding_sha256) {
+            return Err(CustodyError::Invalid(
+                "request custody active marker binding is invalid".to_string(),
+            ));
+        }
+        if let Some(marker) = self.read_active_marker(stem)? {
+            return match marker.reservation(binding_sha256) {
+                ActiveReservation::Matching => Ok(()),
+                ActiveReservation::Unbound | ActiveReservation::Conflicting => {
+                    Err(CustodyError::Invalid(
+                        "request custody active marker conflicts with the attempted binding"
+                            .to_string(),
+                    ))
+                }
+                ActiveReservation::Absent => unreachable!("a loaded active marker is present"),
+            };
+        }
+        let mut maintenance = self.read_maintenance_index()?;
+        let sequence = self.enqueue_maintenance(stem, &mut maintenance)?;
+        self.write_active_marker(
+            stem,
+            &ActiveMarker {
+                binding_sha256: Some(binding_sha256.to_string()),
+                maintenance_sequence: sequence,
+            },
+        )
+    }
+
+    fn read_maintenance_index(&self) -> Result<MaintenanceIndex, CustodyError> {
+        let bytes =
+            durable_fs::read_file_bounded(&self.maintenance_index_path(), MAX_INDEX_RECORD_BYTES)?;
+        let index: MaintenanceIndex = serde_json::from_slice(&bytes)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        index.validate()?;
+        Ok(index)
+    }
+
+    fn write_maintenance_index(&self, index: &MaintenanceIndex) -> Result<(), CustodyError> {
+        index.validate()?;
+        let value = serde_json::to_value(index)
+            .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        self.write_json_atomic(&self.maintenance_index_path(), &value)
+    }
+
+    fn enqueue_maintenance(
+        &self,
+        stem: &str,
+        index: &mut MaintenanceIndex,
+    ) -> Result<u64, CustodyError> {
+        if !valid_digest(stem) || index.next_sequence == u64::MAX {
+            return Err(CustodyError::Invalid(
+                "request custody maintenance sequence is exhausted or invalid".to_string(),
+            ));
+        }
+        let sequence = index.next_sequence;
+        let value = serde_json::to_value(MaintenanceTicket {
+            request_sha256: stem.to_string(),
+        })
+        .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        self.write_json_atomic(&self.maintenance_ticket_path(sequence), &value)?;
+        index.next_sequence += 1;
+        self.write_maintenance_index(index)?;
+        Ok(sequence)
+    }
+
+    fn read_maintenance_ticket(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<MaintenanceTicket>, CustodyError> {
+        match durable_fs::read_file_bounded(
+            &self.maintenance_ticket_path(sequence),
+            MAX_INDEX_RECORD_BYTES,
+        ) {
+            Ok(bytes) => {
+                let ticket: MaintenanceTicket = serde_json::from_slice(&bytes)
+                    .map_err(|error| CustodyError::Invalid(error.to_string()))?;
+                if !valid_digest(&ticket.request_sha256) {
+                    return Err(CustodyError::Invalid(
+                        "request custody maintenance ticket is invalid".to_string(),
+                    ));
+                }
+                Ok(Some(ticket))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(CustodyError::Io(error)),
+        }
+    }
+
+    fn remove_maintenance_ticket(&self, sequence: u64) -> Result<(), CustodyError> {
+        remove_file_if_present(&self.maintenance_ticket_path(sequence))?;
+        durable_fs::sync_directory(&self.maintenance_root())?;
         Ok(())
     }
 
@@ -1171,6 +1605,27 @@ impl RequestCustody {
         Ok(())
     }
 
+    fn validate_policy_index_schema(&self, schema: &Value) -> Result<(), CustodyError> {
+        let matches = match self.active_policy {
+            ActiveIndexPolicy::Fixed { limit } => {
+                schema["active_policy"].as_str() == Some("fixed")
+                    && schema["active_limit"].as_u64() == Some(limit as u64)
+            }
+            ActiveIndexPolicy::Distributed {
+                predecessor_initial_slots: initial_slots,
+            } => {
+                schema["active_policy"].as_str() == Some("elastic")
+                    && schema["initial_active_slots"].as_u64() == Some(initial_slots as u64)
+            }
+        };
+        if !matches {
+            return Err(CustodyError::Invalid(
+                "request custody predecessor active policy is inconsistent".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_current_schema(&self, schema: &Value) -> Result<(), CustodyError> {
         let matches = match self.active_policy {
             ActiveIndexPolicy::Fixed { limit } => {
@@ -1178,10 +1633,12 @@ impl RequestCustody {
                     && schema["active_limit"].as_u64() == Some(limit as u64)
                     && schema.get("initial_active_slots").is_none()
             }
-            ActiveIndexPolicy::Elastic { initial_slots } => {
-                schema["active_policy"].as_str() == Some("elastic")
-                    && schema["initial_active_slots"].as_u64() == Some(initial_slots as u64)
+            ActiveIndexPolicy::Distributed { .. } => {
+                schema["active_policy"].as_str() == Some("distributed")
+                    && schema["maintenance_probe_limit"].as_u64()
+                        == Some(MAX_ACTIVE_MAINTENANCE_PROBES as u64)
                     && schema.get("active_limit").is_none()
+                    && schema.get("initial_active_slots").is_none()
             }
         };
         if !matches {
@@ -1200,10 +1657,10 @@ impl RequestCustody {
                 "active_limit": limit,
                 "replay_slots": self.replay_slots,
             }),
-            ActiveIndexPolicy::Elastic { initial_slots } => json!({
+            ActiveIndexPolicy::Distributed { .. } => json!({
                 "schema_version": INDEX_SCHEMA_VERSION,
-                "active_policy": "elastic",
-                "initial_active_slots": initial_slots,
+                "active_policy": "distributed",
+                "maintenance_probe_limit": MAX_ACTIVE_MAINTENANCE_PROBES,
                 "replay_slots": self.replay_slots,
             }),
         };
@@ -1211,7 +1668,7 @@ impl RequestCustody {
     }
 
     fn read_active_index(&self) -> Result<ActiveIndex, CustodyError> {
-        let bytes = if self.active_policy.is_elastic() {
+        let bytes = if self.active_policy.is_distributed() {
             fs::read(self.active_index_path())?
         } else {
             durable_fs::read_file_bounded(&self.active_index_path(), MAX_ACTIVE_INDEX_BYTES)?
@@ -1223,24 +1680,15 @@ impl RequestCustody {
     }
 
     fn write_active_index(&self, index: &ActiveIndex) -> Result<(), CustodyError> {
+        if self.active_policy.is_distributed() {
+            return Err(CustodyError::Invalid(
+                "distributed request custody cannot publish a shared active index".to_string(),
+            ));
+        }
         index.validate(self.active_policy)?;
         let value = serde_json::to_value(index)
             .map_err(|error| CustodyError::Invalid(error.to_string()))?;
-        if self.active_policy.is_elastic() {
-            self.write_json_atomic_unbounded(&self.active_index_path(), &value)
-        } else {
-            self.write_json_atomic_bounded(
-                &self.active_index_path(),
-                &value,
-                MAX_ACTIVE_INDEX_BYTES,
-            )
-        }
-    }
-
-    fn write_json_atomic_unbounded(&self, path: &Path, value: &Value) -> Result<(), CustodyError> {
-        let bytes =
-            serde_json::to_vec(value).map_err(|error| CustodyError::Invalid(error.to_string()))?;
-        self.write_bytes_atomic(path, &bytes)
+        self.write_json_atomic_bounded(&self.active_index_path(), &value, MAX_ACTIVE_INDEX_BYTES)
     }
 
     fn write_json_atomic(&self, path: &Path, value: &Value) -> Result<(), CustodyError> {
@@ -1552,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_elastic_index_migrates_and_discards_empty_high_water_slots() {
+    fn schema_v5_elastic_index_migrates_to_distributed_markers() {
         let directory = tempfile::tempdir().expect("request custody directory");
         let index_root = directory.path().join(".custody-v2");
         let custody = RequestCustody::new(
@@ -1564,7 +2012,7 @@ mod tests {
             2,
             Duration::from_secs(60),
         )
-        .with_elastic_active_index();
+        .with_distributed_active_markers();
         custody
             .maintain(&directory.path().join("initialize.lock"), |_| Ok(false))
             .expect("initialize current elastic custody");
@@ -1598,35 +2046,168 @@ mod tests {
         fs::write(
             index_root.join("schema.json"),
             serde_json::to_vec(&json!({
-                "schema_version": BOUND_ACTIVE_INDEX_SCHEMA_VERSION,
-                "active_limit": 2,
+                "schema_version": POLICY_ACTIVE_INDEX_SCHEMA_VERSION,
+                "active_policy": "elastic",
+                "initial_active_slots": 2,
                 "replay_slots": 2,
             }))
             .expect("serialize schema-v4 custody"),
         )
-        .expect("schema-v4 custody");
+        .expect("schema-v5 custody");
 
         assert_eq!(
             custody
                 .maintain(&directory.path().join("current.lock"), |_| Ok(false))
-                .expect("migrate schema-v4 elastic custody"),
-            2
+                .expect("migrate schema-v5 elastic custody"),
+            0
         );
         let schema: Value = serde_json::from_slice(
             &fs::read(index_root.join("schema.json")).expect("migrated schema"),
         )
         .expect("parse migrated schema");
         assert_eq!(schema["schema_version"], INDEX_SCHEMA_VERSION);
-        assert_eq!(schema["active_policy"], "elastic");
-        assert_eq!(schema["initial_active_slots"], 2);
+        assert_eq!(schema["active_policy"], "distributed");
+        assert!(schema.get("initial_active_slots").is_none());
         assert!(schema.get("active_limit").is_none());
-        let active: ActiveIndex = serde_json::from_slice(
-            &fs::read(index_root.join("active.json")).expect("compacted active index"),
+        assert!(!index_root.join("active.json").exists());
+        assert_eq!(
+            fs::read_dir(index_root.join("active"))
+                .expect("distributed active markers")
+                .count(),
+            2
+        );
+        assert_eq!(
+            custody
+                .active_reservation(
+                    &directory.path().join(format!("{first}.json")),
+                    &format!("{:064x}", 101)
+                )
+                .expect("first migrated active marker"),
+            ActiveReservation::Matching
+        );
+        assert_eq!(
+            custody
+                .active_reservation(
+                    &directory.path().join(format!("{second}.json")),
+                    &format!("{:064x}", 102)
+                )
+                .expect("second migrated active marker"),
+            ActiveReservation::Matching
+        );
+        fs::write(index_root.join("active.json"), b"stale predecessor index")
+            .expect("simulate interruption after schema publication");
+        custody
+            .maintain(&directory.path().join("current.lock"), |_| Ok(false))
+            .expect("finish predecessor index cleanup");
+        assert!(
+            !index_root.join("active.json").exists(),
+            "current-schema recovery removes only the obsolete predecessor index"
+        );
+    }
+
+    #[test]
+    fn distributed_terminal_handoff_retires_only_the_exact_active_marker() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            directory.path().join(".custody-v2"),
+            1024,
+            2,
+            2,
+            Duration::from_secs(60),
         )
-        .expect("parse compacted active index");
-        assert_eq!(active.slots.len(), 2);
-        assert_eq!(active.active(), 2);
-        assert_eq!(active.slots[active.next_probe].request_sha256, first);
+        .with_distributed_active_markers();
+        custody
+            .maintain(&directory.path().join("initialize.lock"), |_| Ok(false))
+            .expect("initialize distributed custody");
+        let first = format!("{:064x}", 1);
+        let second = format!("{:064x}", 2);
+        let first_state = directory.path().join(format!("{first}.json"));
+        let second_state = directory.path().join(format!("{second}.json"));
+        custody
+            .reserve_active(&first_state, &format!("{:064x}", 101))
+            .expect("reserve first marker");
+        custody
+            .reserve_active(&second_state, &format!("{:064x}", 102))
+            .expect("reserve second marker");
+        fs::write(&first_state, br#"{"terminal":true}"#).expect("first terminal state");
+        fs::write(directory.path().join(format!("{first}.lock")), b"").expect("first request lock");
+
+        assert!(custody
+            .publish_replay_and_retire_active(&first_state, Path::new(""))
+            .expect("publish exact terminal replay"));
+        assert_eq!(
+            custody
+                .active_reservation(&first_state, &format!("{:064x}", 101))
+                .expect("retired first active marker"),
+            ActiveReservation::Absent
+        );
+        assert_eq!(
+            custody
+                .active_reservation(&second_state, &format!("{:064x}", 102))
+                .expect("retained second active marker"),
+            ActiveReservation::Matching
+        );
+        assert!(custody
+            .replay_owner_exists(&first_state)
+            .expect("first replay owner"));
+        assert!(first_state.exists(), "terminal state remains replayable");
+    }
+
+    #[test]
+    fn distributed_maintenance_requeues_live_work_and_reaps_abandoned_pre_state() {
+        let directory = tempfile::tempdir().expect("request custody directory");
+        let custody = RequestCustody::new(
+            directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
+            directory.path().join(".custody-v2"),
+            1024,
+            2,
+            2,
+            Duration::from_secs(60),
+        )
+        .with_distributed_active_markers();
+        custody
+            .maintain(&directory.path().join("initialize.lock"), |_| Ok(false))
+            .expect("initialize distributed custody");
+        let first = directory.path().join(format!("{:064x}.json", 1));
+        let second = directory.path().join(format!("{:064x}.json", 2));
+        let first_binding = format!("{:064x}", 101);
+        let second_binding = format!("{:064x}", 102);
+        custody
+            .reserve_active(&first, &first_binding)
+            .expect("reserve live work");
+        custody
+            .reserve_active(&second, &second_binding)
+            .expect("reserve abandoned pre-state work");
+        fs::write(&first, br#"{"phase":"prepared"}"#).expect("live request state");
+        fs::write(first.with_extension("lock"), b"").expect("live request lock");
+
+        custody
+            .maintain(&directory.path().join("current.lock"), |_| Ok(false))
+            .expect("requeue live request");
+        custody
+            .maintain(&directory.path().join("current.lock"), |_| Ok(false))
+            .expect("reap abandoned request");
+
+        assert_eq!(
+            custody
+                .active_reservation(&first, &first_binding)
+                .expect("retained live marker"),
+            ActiveReservation::Matching
+        );
+        assert_eq!(
+            custody
+                .active_reservation(&second, &second_binding)
+                .expect("retired abandoned marker"),
+            ActiveReservation::Absent
+        );
+        let maintenance = custody
+            .read_maintenance_index()
+            .expect("bounded maintenance index");
+        assert_eq!(maintenance.next_probe, 2);
+        assert_eq!(maintenance.next_sequence, 3);
     }
 
     #[test]

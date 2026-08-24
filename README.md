@@ -392,21 +392,26 @@ identity and any durable session, terminal, or resume observation before
 consulting mutable live settings. Current settings admission occurs only when
 there is no prior operation or authoritative recovery proved that it had no
 native effect.
-Launch custody uses an elastic active index with an initial compact 64-slot
-allocation and grows it when additional independent obligations arrive; active
-launch population is not an admission or runtime concurrency limit. Its durable
-schema identifies that elastic policy separately from quota refresh's fixed
-admission limit, and retired empty slots are compacted so a historical
-concurrency peak does not become permanent admission work. Completed history
-uses a fixed 4,096-slot recent-replay ring, and every request record is no larger
-than 256 KiB.
-The first custody access atomically upgrades schema-v4 indexes to this policy-
-explicit schema. Provider binaries that only understand schema v4 must not be
-used afterward; rollback requires a provider build that can read the policy-
-explicit schema rather than deleting or rewriting live custody state.
+Launch custody uses bounded request-keyed active markers rather than a shared
+active-population document; active launch population is not an admission or
+runtime concurrency limit. Exact admission reads or writes only that request's
+marker. A bounded maintenance cursor and request-keyed tickets probe at most 16
+sequence positions and classify at most one queued request payload per
+admission. Live work is requeued, abandoned pre-state reservations are reaped,
+and normal terminal paths publish replay ownership and retire their own marker
+directly. Every marker, ticket, cursor, replay owner, and replay slot is bounded
+to 1 KiB, so no single bookkeeping record grows with active population.
+Completed history uses a fixed 4,096-slot recent-replay ring, and every request
+state record is no larger than 256 KiB.
+The first custody access atomically upgrades schema-v5 elastic indexes to the
+distributed-marker schema, transfers terminal records to replay, and creates
+markers and maintenance tickets for every unresolved obligation. Provider
+binaries that only understand earlier schemas must not be used afterward;
+rollback requires a provider build that can read the distributed schema rather
+than deleting or rewriting live custody state.
 Cyclic slot replacement retires the oldest available completion without parsing
-replay payloads. Steady-state admission reads the current compact active index
-and classifies at most one active payload per request; completion probes at
+replay payloads. Steady-state admission performs bounded request-keyed work and
+classifies at most one queued active payload per request; completion probes at
 most 64 compact ring slots. Durable request-keyed replay ownership is published
 before the sequenced head advances, making active-to-replay transfer
 crash-idempotent without skipping the oldest completion. State is retired only
