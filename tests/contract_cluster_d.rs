@@ -9,6 +9,10 @@ use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Value};
 use std::fs;
 use std::fs::OpenOptions;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use support::{
@@ -16,6 +20,50 @@ use support::{
 };
 
 static IO_INTENSIVE_CONTRACT_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn setpgid(pid: i32, pgid: i32) -> i32;
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_orphaned_rotation_actor() -> (u32, String) {
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("sleep 30 </dev/null >/dev/null 2>&1 & /bin/sleep 0.2; exit 0");
+    unsafe {
+        command.pre_exec(|| {
+            if setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut leader = command.spawn().expect("spawn orphanable rotation actor");
+    let process_group_id = leader.id();
+    let stat = fs::read_to_string(format!("/proc/{process_group_id}/stat"))
+        .expect("read rotation actor process stat");
+    let command_end = stat.rfind(')').expect("process stat command terminator");
+    let start_ticks = stat[command_end + 1..]
+        .split_whitespace()
+        .nth(19)
+        .expect("process stat start-time field")
+        .parse::<u64>()
+        .expect("process stat start ticks");
+    let boot_id =
+        fs::read_to_string("/proc/sys/kernel/random/boot_id").expect("read kernel boot identity");
+    let incarnation = format!("linux:{}:{start_ticks}", boot_id.trim());
+    assert!(leader.wait().expect("rotation actor leader exit").success());
+    assert!(unsafe { kill(-(process_group_id as i32), 0) } == 0);
+    (process_group_id, incarnation)
+}
+
+#[cfg(target_os = "linux")]
+fn rotation_process_group_is_live(process_group_id: u32) -> bool {
+    (unsafe { kill(-(process_group_id as i32), 0) }) == 0
+}
 
 fn lock_io_intensive_contract() -> MutexGuard<'static, ()> {
     IO_INTENSIVE_CONTRACT_LOCK
@@ -3310,6 +3358,79 @@ fn contract_rotation_reconciles_settings_changed_after_import_without_reimport()
     );
     assert_eq!(replayed, materialized);
     assert_eq!(opencode.import_count(), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn contract_rotation_settles_recorded_actor_before_changed_settings() {
+    let host = HostRoots::new("agent-runner-opencode-rotation-actor-before-settings");
+    let opencode = RotationOpencodeFixture::with_post_import_finalization_fault();
+    let (settings_id, version) = create_rotation_settings(&host, "opencode2");
+    let assessment = assess_rotation_with_settings(&host, &settings_id);
+    let selection = rotation_authorized_settings_selection(&assessment);
+    let materialize = materialize_rotation_with_settings(&selection);
+    let path = opencode.path_env();
+
+    let first = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        materialize.clone(),
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(first["error"]["code"], "rotation_recovery_required");
+    assert_eq!(opencode.import_count(), 1);
+    opencode.restore_operation_state_writes(host.data_root());
+
+    let operation_root = host
+        .data_root()
+        .join("provider-state/opencode/rotation/operations");
+    let operation_path = fs::read_dir(&operation_root)
+        .expect("rotation operation directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("prepared rotation operation");
+    let (process_group_id, incarnation) = spawn_orphaned_rotation_actor();
+    let mut operation: Value = serde_json::from_slice(
+        &fs::read(&operation_path).expect("read prepared rotation operation"),
+    )
+    .expect("prepared rotation operation JSON");
+    operation["import_actor_process_group_id"] = json!(process_group_id);
+    operation["import_actor_process_group_incarnation"] = json!(incarnation);
+    operation["import_actor_terminal_at_unix_ms"] = Value::Null;
+    fs::write(
+        &operation_path,
+        serde_json::to_vec_pretty(&operation).expect("encode actor-bound rotation operation"),
+    )
+    .expect("publish actor-bound rotation operation");
+
+    update_rotation_settings(&host, &settings_id, &version, "opencode3");
+    let response = error_response(invoke_validated_with_host_and_env(
+        "rotation.materialize",
+        materialize,
+        host.overrides(),
+        "rotation.schema.json#/$defs/RotationMaterializeRequest",
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        response["error"]["code"],
+        "rotation_settings_reconciliation_required"
+    );
+    assert!(
+        !rotation_process_group_is_live(process_group_id),
+        "settings reconciliation must not precede recorded-actor cleanup"
+    );
+    let settled: Value = serde_json::from_slice(
+        &fs::read(&operation_path).expect("read actor-settled rotation operation"),
+    )
+    .expect("actor-settled rotation operation JSON");
+    assert!(settled["import_actor_terminal_at_unix_ms"].is_number());
+    assert_eq!(
+        opencode.import_count(),
+        1,
+        "actor cleanup must not reimport"
+    );
 }
 
 #[test]

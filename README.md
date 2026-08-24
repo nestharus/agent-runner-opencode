@@ -515,9 +515,11 @@ strictly decoded. Import execution starts behind the provider exec gate: the
 prepared operation durably binds the exact process-group incarnation before the
 gate is released. Recovery under the exact rotation binding lock terminates
 that recorded actor and proves it terminal or recycled before it may treat any
-target export as stable or finalize a receipt; a recycled numeric group ID is
-never signalled. Thus provider loss cannot leave a still-live import actor
-outside the shared result. Ordinary leader completion uses that same
+mutable settings selection, current runtime resolution, target export, or
+receipt as authoritative. Its terminal proof is durable before those fallible
+dependencies are consulted, and a recycled numeric group ID is never
+signalled. Thus provider loss cannot leave a still-live import actor outside
+the shared result. Ordinary leader completion uses that same
 whole-group cleanup, so a descendant cannot keep import authority after the
 provider publishes terminal custody. The
 reported session ID is only a candidate: the provider

@@ -146,17 +146,14 @@ pub fn materialize_params(
     let binding =
         materialization_rotation_binding(&params, host, provider_instance_id, request_id)?;
     let _binding_lock = acquire_rotation_binding_lock(host, &binding, &budget, request_id)?;
-    let capacity_lock = acquire_rotation_capacity_lock(host, &budget, request_id)?;
-    budget.checkpoint(request_id)?;
-    let capacity = maintain_rotation_capacity(host, &binding, &budget, request_id)?;
     if let Some(result) = read_materialization_receipt(host, &binding, request_id)? {
         budget.checkpoint(request_id)?;
         return Ok(result);
     }
     budget.checkpoint(request_id)?;
     if let Some(mut operation) = read_rotation_operation(host, &binding, request_id)? {
-        drop(capacity_lock);
-        budget.checkpoint(request_id)?;
+        settle_existing_rotation_actor(host, &binding, &mut operation, request_id)?;
+        read_rotation_operation_artifact(host, &operation, request_id)?;
         validate_rotation_settings_for_operation(host, &params, &binding, &operation, request_id)?;
         if operation.phase == RotationOperationPhase::Prepared {
             let target_runtime = native_runtime::resolve_for_account_with_timeout(
@@ -179,6 +176,9 @@ pub fn materialize_params(
             host, &params, &binding, &operation, &budget, request_id,
         );
     }
+    let capacity_lock = acquire_rotation_capacity_lock(host, &budget, request_id)?;
+    budget.checkpoint(request_id)?;
+    let capacity = maintain_rotation_capacity(host, &binding, &budget, request_id)?;
     let reservation_path = rotation_reservation_path(host, &binding, request_id)?;
     let reservation_exists = reservation_path.exists();
     if !reservation_exists
@@ -1348,12 +1348,11 @@ fn read_rotation_operation(
     };
     let operation: RotationOperation = serde_json::from_slice(&bytes)
         .map_err(|error| rotation_operation_invalid(request_id, error))?;
-    validate_rotation_operation(host, binding, &operation, request_id)?;
+    validate_rotation_operation(binding, &operation, request_id)?;
     Ok(Some(operation))
 }
 
 fn validate_rotation_operation(
-    host: &HostContext,
     binding: &RotationBinding,
     operation: &RotationOperation,
     request_id: &str,
@@ -1395,6 +1394,12 @@ fn validate_rotation_operation(
         || operation.authorization_id.trim().is_empty()
         || operation.assessment_request_id.trim().is_empty()
         || operation.materialization_request_id.trim().is_empty()
+        || operation.artifact_path.trim().is_empty()
+        || operation.artifact_sha256.len() != 64
+        || !operation
+            .artifact_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
         || operation.boundary.trim().is_empty()
         || !phase_valid
     {
@@ -1403,7 +1408,7 @@ fn validate_rotation_operation(
             "operation identity or phase is inconsistent",
         ));
     }
-    read_rotation_operation_artifact(host, operation, request_id).map(|_| ())
+    Ok(())
 }
 
 fn read_rotation_operation_artifact(
@@ -1460,8 +1465,12 @@ fn execute_or_reconcile_prepared_operation(
             request_id,
         );
     }
-    settle_rotation_import_actor(operation, request_id)?;
-    write_rotation_operation(host, binding, operation, request_id)?;
+    if operation.import_actor_terminal_at_unix_ms.is_none() {
+        return Err(rotation_operation_invalid(
+            request_id,
+            "an existing import actor reached target reconciliation before terminal proof was durable",
+        ));
+    }
     reconcile_prepared_operation(
         host,
         params,
@@ -1471,6 +1480,26 @@ fn execute_or_reconcile_prepared_operation(
         budget,
         request_id,
     )
+}
+
+/// Accept cleanup custody for a previously admitted actor before consulting
+/// mutable settings or runtime state. The caller owns the exact binding lock,
+/// so no live provider can still be supervising this recorded incarnation.
+fn settle_existing_rotation_actor(
+    host: &HostContext,
+    binding: &RotationBinding,
+    operation: &mut RotationOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    if operation.import_actor_process_group_id.is_none()
+        || operation.import_actor_terminal_at_unix_ms.is_some()
+    {
+        return Ok(());
+    }
+    if !settle_rotation_import_actor(operation, request_id)? {
+        return Ok(());
+    }
+    write_rotation_actor_terminal(host, binding, operation, request_id)
 }
 
 fn admit_and_observe_import(
@@ -1505,17 +1534,7 @@ fn admit_and_observe_import(
         preserve_import_candidate(host, binding, operation, target_session_id, request_id)?;
     }
     settle_rotation_import_actor(operation, request_id)?;
-    if let Err(error) = write_rotation_operation(host, binding, operation, request_id) {
-        return Err(rotation_recovery_required(
-            request_id,
-            binding,
-            operation,
-            None,
-            Some(format!(
-                "native import actor became terminal but its terminal proof could not be persisted: {error:?}"
-            )),
-        ));
-    }
+    write_rotation_actor_terminal(host, binding, operation, request_id)?;
     let target_session_id = match observed {
         Ok(target_session_id) => target_session_id,
         Err(error) => {
@@ -1540,6 +1559,17 @@ fn admit_and_observe_import(
         budget,
         request_id,
     )
+}
+
+fn write_rotation_actor_terminal(
+    host: &HostContext,
+    binding: &RotationBinding,
+    operation: &RotationOperation,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    write_rotation_operation(host, binding, operation, request_id).map_err(|error| {
+        rotation_import_actor_terminal_persistence_failed(request_id, operation, error)
+    })
 }
 
 fn publish_rotation_import_actor(
@@ -2398,6 +2428,24 @@ fn rotation_import_actor_cleanup_failed(
             "import_actor_process_group_incarnation": operation.import_actor_process_group_incarnation,
             "failure": error.to_string(),
             "recovery": "retry this unchanged rotation.materialize request; the provider will safely ignore a recycled process-group identity and will not reconcile a target until the recorded actor is terminal",
+        }),
+    )
+}
+
+fn rotation_import_actor_terminal_persistence_failed(
+    request_id: &str,
+    operation: &RotationOperation,
+    error: impl std::fmt::Debug,
+) -> ProviderFailure {
+    ProviderFailure::conflict(
+        request_id,
+        "rotation_import_actor_terminal_persistence_failed",
+        "the exact native import actor is terminal, but the provider could not durably publish that proof; no settings or target reconciliation and no receipt was accepted",
+        json!({
+            "import_actor_process_group_id": operation.import_actor_process_group_id,
+            "import_actor_process_group_incarnation": operation.import_actor_process_group_incarnation,
+            "failure": format!("{error:?}"),
+            "recovery": "restore writable provider rotation state, then retry this unchanged rotation.materialize request; the terminal actor will not be signalled again and reconciliation remains blocked until its terminal proof is durable",
         }),
     )
 }
