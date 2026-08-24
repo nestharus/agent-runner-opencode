@@ -122,6 +122,23 @@ impl ProviderFailure {
         )
     }
 
+    pub fn retryable_conflict(
+        request_id: impl Into<String>,
+        code: &'static str,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        provider_failure(
+            request_id,
+            CATEGORY_CONFLICT,
+            code,
+            message,
+            details,
+            true,
+            2,
+        )
+    }
+
     pub fn internal(
         request_id: impl Into<String>,
         code: &'static str,

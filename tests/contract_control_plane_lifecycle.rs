@@ -1925,6 +1925,120 @@ fn contract_setup_detect_rejects_ambient_readiness_when_persisted_runtime_disagr
 }
 
 #[test]
+fn contract_setup_detect_gates_only_accounts_selected_by_declared_callers() {
+    let host = HostRoots::new("agent-runner-opencode-setup-selected-account-readiness");
+    let toolchain = FakeToolchain::new();
+    let home = HomeFixture::new("agent-runner-opencode-setup-selected-account-readiness-home");
+    home.write_all_opencode_auths();
+    fs::remove_file(home.path.join(opencode_auth_relatives()[4]))
+        .expect("remove unselected opencode5 auth fixture");
+    success_result(
+        invoke_validated_with_host(
+            "settings.migrate",
+            json!({ "dry_run": false, "legacy": legacy_fixture() }),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsMigrateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsMigrateResponse",
+        "settings.schema.json#/$defs/SettingsMigrateResult",
+    );
+    write_native_runtime_identity(host.data_root(), &toolchain, "opencode5");
+    let unselected_runtime_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(
+            host.data_root()
+                .join("provider-state/opencode/native-runtimes/opencode5.lock"),
+        )
+        .expect("open unselected runtime lock");
+    fs2::FileExt::lock_exclusive(&unselected_runtime_lock).expect("hold unselected runtime lock");
+    let path = prepend_path(toolchain.dir());
+    let mut params = setup_detect_data_root_params(&path_string(host.data_root()));
+    params["settings_id"] = json!("opencode");
+
+    let detect = success_result(
+        invoke_validated_with_host_and_env(
+            "setup.detect",
+            params,
+            host.overrides(),
+            "setup.schema.json#/$defs/SetupDetectRequest",
+            &[("PATH", path.as_str()), ("HOME", home.path_str())],
+        ),
+        "setup.schema.json#/$defs/SetupDetectResponse",
+        "setup.schema.json#/$defs/SetupDetectResult",
+    );
+
+    assert_eq!(detect["installed"], true);
+    let profiles = detect["profiles"].as_array().expect("setup profiles");
+    let selected = profiles
+        .iter()
+        .find(|profile| profile["profile"] == "opencode1")
+        .expect("selected opencode1 profile");
+    assert_eq!(selected["selected_for_activation"], true);
+    assert_eq!(selected["profile_ready"], true);
+    let unselected = profiles
+        .iter()
+        .find(|profile| profile["profile"] == "opencode5")
+        .expect("unselected opencode5 profile");
+    assert_eq!(unselected["selected_for_activation"], false);
+    assert_eq!(unselected["profile_ready"], false);
+    assert_eq!(unselected["native_runtime_observation_busy"], true);
+}
+
+#[test]
+fn contract_setup_detect_reports_selected_identity_contention_as_retryable() {
+    let host = HostRoots::new("agent-runner-opencode-setup-selected-account-busy");
+    let toolchain = FakeToolchain::new();
+    let home = HomeFixture::new("agent-runner-opencode-setup-selected-account-busy-home");
+    home.write_all_opencode_auths();
+    success_result(
+        invoke_validated_with_host(
+            "settings.migrate",
+            json!({ "dry_run": false, "legacy": legacy_fixture() }),
+            host.overrides(),
+            "settings.schema.json#/$defs/SettingsMigrateRequest",
+        ),
+        "settings.schema.json#/$defs/SettingsMigrateResponse",
+        "settings.schema.json#/$defs/SettingsMigrateResult",
+    );
+    write_native_runtime_identity(host.data_root(), &toolchain, "opencode1");
+    let runtime_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(
+            host.data_root()
+                .join("provider-state/opencode/native-runtimes/opencode1.lock"),
+        )
+        .expect("open selected runtime lock");
+    fs2::FileExt::lock_exclusive(&runtime_lock).expect("hold selected runtime lock");
+    let path = prepend_path(toolchain.dir());
+    let mut params = setup_detect_data_root_params(&path_string(host.data_root()));
+    params["settings_id"] = json!("opencode");
+
+    let failed = error_response(invoke_validated_with_host_and_env(
+        "setup.detect",
+        params,
+        host.overrides(),
+        "setup.schema.json#/$defs/SetupDetectRequest",
+        &[("PATH", path.as_str()), ("HOME", home.path_str())],
+    ));
+
+    assert_eq!(failed["error"]["code"], "setup_profile_observation_busy");
+    assert_eq!(failed["error"]["retryable"], true);
+    assert_eq!(
+        failed["error"]["details"]["busy_profiles"][0]["profile"],
+        "opencode1"
+    );
+    assert!(failed["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("no negative installed state was reported")));
+}
+
+#[test]
 fn contract_setup_sync_accepts_only_declared_account_references() {
     let host = HostRoots::new("agent-runner-opencode-setup-account-admission");
     let result = success_result(

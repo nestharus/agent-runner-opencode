@@ -120,7 +120,12 @@ opaque caller ID, `params.settings_ids` declares the complete caller population,
 and their absence selects the installed Agent Runner compatibility population
 `opencode`, `opencode2`, ... `opencode5`. An absent or empty store is therefore
 `activation_required`, never ready. Provider-wide `installed=true` requires
-both store compatibility and caller activation to pass; install plans expose
+store compatibility, caller activation, and the account dependencies selected
+by those exact caller records to pass. Problems in non-selected catalog
+accounts remain visible profile diagnostics but do not make the declared caller
+population unavailable. A selected profile identity lock held by concurrent
+healthy work produces the retryable `setup_profile_observation_busy` response
+instead of publishing a false negative installed state. Install plans expose
 the exact required and missing IDs as a blocking step, and sync plans emit an
 error diagnostic until migration or explicit record configuration completes.
 The declared caller population input is bounded at 4,096 so setup can diagnose
@@ -807,8 +812,10 @@ admits a credential mutation.
 
 ## Setup dependency readiness
 
-`setup.detect` reports provider-wide `installed=true` only after every logical
-account agrees with the identities its effect paths will use. When an account
+`setup.detect` reports provider-wide `installed=true` only after every account
+selected by the declared caller settings population agrees with the identities
+its effect paths will use; all catalog accounts remain in the diagnostic
+projection. When an account
 already has a durable native-runtime or quota-observer record, detection
 read-only previews the same validation/upgrade selection as effect admission and
 checks auth at the runtime-bound path; any disagreement reports the profile not

@@ -49,12 +49,27 @@ pub fn detect_params(
     let data_root = string_param(&params, "data_root").or(host.data_root.as_deref());
     let profile_root = string_param(&params, "profile_root");
     let required_settings_ids = required_settings_ids(&params, request_id)?;
+    let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
+    let required_profiles = settings_store.required_account_wrappers();
     let opencode = executable_evidence("opencode", host.deadline_unix_ms);
     let curl = quota_transport_evidence(host.deadline_unix_ms);
-    let profiles = profile_evidence(host, data_root, profile_root, &opencode, &curl, request_id);
-    let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
+    let profiles = profile_evidence(
+        host,
+        data_root,
+        profile_root,
+        &opencode,
+        &curl,
+        required_profiles,
+        request_id,
+    );
+    fail_if_required_profile_observation_busy(&profiles, required_profiles, request_id)?;
     let launch_custody = launch_custody_readiness(host, &params);
-    let installed = setup_installed(&profiles, &settings_store, &launch_custody);
+    let installed = setup_installed(
+        &profiles,
+        required_profiles,
+        &settings_store,
+        &launch_custody,
+    );
     Ok(detect_result(
         opencode,
         curl,
@@ -243,6 +258,7 @@ fn profile_evidence(
     profile_root: Option<&str>,
     opencode: &Value,
     quota_transport: &Value,
+    required_profiles: &[String],
     request_id: &str,
 ) -> Vec<Value> {
     let ambient_native_runtime_ready = evidence_ready(opencode);
@@ -254,12 +270,16 @@ fn profile_evidence(
     ACCOUNTS
         .iter()
         .map(|account| {
+            let selected_for_activation = required_profiles
+                .iter()
+                .any(|profile| profile == account.opencode_wrapper);
             let (
                 native_runtime_ready,
                 native_runtime_source,
                 native_runtime_identity,
                 auth_path,
                 native_runtime_error,
+                native_runtime_observation_busy,
             ) = if durable_identity_available {
                 match native_runtime::resolve_existing_for_setup(host, account, request_id) {
                     Ok(Some(runtime)) => (
@@ -268,6 +288,7 @@ fn profile_evidence(
                         Some(runtime.identity_sha256().to_string()),
                         runtime.expand_path(account.opencode_auth_path),
                         None,
+                        false,
                     ),
                     Ok(None) => (
                         ambient_native_runtime_ready,
@@ -275,14 +296,19 @@ fn profile_evidence(
                         None,
                         expand_tilde(account.opencode_auth_path),
                         None,
-                    ),
-                    Err(error) => (
                         false,
-                        "persisted",
-                        None,
-                        expand_tilde(account.opencode_auth_path),
-                        Some(format!("{}: {}", error.code, error.message)),
                     ),
+                    Err(error) => {
+                        let busy = error.code == "native_runtime_lock_timeout";
+                        (
+                            false,
+                            "persisted",
+                            None,
+                            expand_tilde(account.opencode_auth_path),
+                            Some(format!("{}: {}", error.code, error.message)),
+                            busy,
+                        )
+                    }
                 }
             } else {
                 (
@@ -291,6 +317,7 @@ fn profile_evidence(
                     None,
                     expand_tilde(account.opencode_auth_path),
                     None,
+                    false,
                 )
             };
             let (
@@ -298,21 +325,27 @@ fn profile_evidence(
                 quota_observer_source,
                 quota_observer_identity,
                 quota_observer_error,
+                quota_observer_observation_busy,
             ) = if durable_identity_available {
                 match quota_observer::resolve_existing_for_setup(host, account, request_id) {
-                    Ok(Some(identity)) => (true, "persisted", Some(identity), None),
+                    Ok(Some(identity)) => (true, "persisted", Some(identity), None, false),
                     Ok(None) => (
                         ambient_quota_observer_ready,
                         "ambient_admission",
                         None,
                         None,
-                    ),
-                    Err(error) => (
                         false,
-                        "persisted",
-                        None,
-                        Some(format!("{}: {}", error.code, error.message)),
                     ),
+                    Err(error) => {
+                        let busy = error.code == "quota_observer_lock_timeout";
+                        (
+                            false,
+                            "persisted",
+                            None,
+                            Some(format!("{}: {}", error.code, error.message)),
+                            busy,
+                        )
+                    }
                 }
             } else {
                 (
@@ -320,6 +353,7 @@ fn profile_evidence(
                     "ambient_admission",
                     None,
                     None,
+                    false,
                 )
             };
             let auth_present = auth_file_present(&auth_path);
@@ -327,15 +361,18 @@ fn profile_evidence(
                 "profile": account.opencode_wrapper,
                 "logical_account": account.opencode_wrapper,
                 "logical_account_present": true,
+                "selected_for_activation": selected_for_activation,
                 "native_runtime": "opencode",
                 "native_runtime_ready": native_runtime_ready,
                 "native_runtime_identity_source": native_runtime_source,
                 "native_runtime_identity_sha256": native_runtime_identity,
                 "native_runtime_error": native_runtime_error,
+                "native_runtime_observation_busy": native_runtime_observation_busy,
                 "quota_observer_ready": quota_observer_ready,
                 "quota_observer_identity_source": quota_observer_source,
                 "quota_observer_identity_sha256": quota_observer_identity,
                 "quota_observer_error": quota_observer_error,
+                "quota_observer_observation_busy": quota_observer_observation_busy,
                 "opencode_auth_path": account.opencode_auth_path,
                 "effective_opencode_auth_path": auth_path.display().to_string(),
                 "opencode_auth_present": auth_present,
@@ -346,6 +383,48 @@ fn profile_evidence(
             })
         })
         .collect()
+}
+
+fn fail_if_required_profile_observation_busy(
+    profiles: &[Value],
+    required_profiles: &[String],
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let busy = profiles
+        .iter()
+        .filter_map(|profile| {
+            let name = profile.get("profile")?.as_str()?;
+            if !required_profiles.iter().any(|required| required == name) {
+                return None;
+            }
+            let mut components = Vec::new();
+            if profile["native_runtime_observation_busy"] == true {
+                components.push("native_runtime");
+            }
+            if profile["quota_observer_observation_busy"] == true {
+                components.push("quota_observer");
+            }
+            (!components.is_empty()).then(|| {
+                json!({
+                    "profile": name,
+                    "components": components,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if busy.is_empty() {
+        return Ok(());
+    }
+    Err(ProviderFailure::retryable_conflict(
+        request_id,
+        "setup_profile_observation_busy",
+        "setup could not take a consistent readiness snapshot because a selected profile identity is being updated by another operation; no negative installed state was reported, so retry setup.detect after the concurrent operation completes",
+        json!({
+            "busy_profiles": busy,
+            "required_profiles": required_profiles,
+            "required_action": "retry setup.detect after the concurrent profile operation completes",
+        }),
+    ))
 }
 
 fn auth_summary(profiles: &[Value]) -> String {
@@ -585,6 +664,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 fn setup_installed(
     profiles: &[Value],
+    required_profiles: &[String],
     settings_store: &SettingsTransitionReadiness,
     launch_custody: &Value,
 ) -> bool {
@@ -592,6 +672,12 @@ fn setup_installed(
         && launch_custody["ready"] == true
         && profiles
             .iter()
+            .filter(|profile| {
+                profile
+                    .get("profile")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| required_profiles.iter().any(|required| required == name))
+            })
             .all(|profile| profile.get("profile_ready").and_then(Value::as_bool) == Some(true))
 }
 
@@ -851,6 +937,7 @@ mod identity_readiness_tests {
             None,
             &ambient_ready,
             &ambient_ready,
+            &["opencode1".to_string()],
             "setup-identity-test",
         );
         let profile = profiles

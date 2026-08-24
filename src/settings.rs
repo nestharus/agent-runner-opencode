@@ -20,7 +20,7 @@ use crate::path_guard;
 use crate::settings_definition::{model_name_value, validate_values, wrapper_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -267,6 +267,7 @@ pub(crate) struct SettingsTransitionReadiness {
     record_count: Option<usize>,
     required_settings_ids: Vec<String>,
     missing_settings_ids: Vec<String>,
+    required_account_wrappers: Vec<String>,
 }
 
 impl SettingsTransitionReadiness {
@@ -280,6 +281,7 @@ impl SettingsTransitionReadiness {
             "record_count": self.record_count,
             "required_settings_ids": self.required_settings_ids,
             "missing_settings_ids": self.missing_settings_ids,
+            "required_profiles": self.required_account_wrappers,
             "maximum_current_bytes": MAX_SETTINGS_STORE_BYTES,
             "maximum_current_records": MAX_SETTINGS_RECORDS,
             "maximum_predecessor_bytes": MAX_PREDECESSOR_SETTINGS_STORE_BYTES,
@@ -293,6 +295,10 @@ impl SettingsTransitionReadiness {
         } else {
             self.message.as_deref()
         }
+    }
+
+    pub(crate) fn required_account_wrappers(&self) -> &[String] {
+        &self.required_account_wrappers
     }
 }
 
@@ -668,6 +674,7 @@ fn settings_store_readiness(
             record_count: Some(store.records.len()),
             required_settings_ids: required_settings_ids.to_vec(),
             missing_settings_ids: Vec::new(),
+            required_account_wrappers: Vec::new(),
         };
     }
     let valid_records = store
@@ -676,13 +683,17 @@ fn settings_store_readiness(
         .map(|record| {
             (
                 record.id.as_str(),
-                settings_valid(&validate_values(&record.values)),
+                (
+                    settings_valid(&validate_values(&record.values)),
+                    settings_value_account(&record.values)
+                        .map(|account| account.opencode_wrapper.to_string()),
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();
     let missing_settings_ids = required_settings_ids
         .iter()
-        .filter(|required| valid_records.get(required.as_str()) != Some(&true))
+        .filter(|required| !matches!(valid_records.get(required.as_str()), Some((true, Some(_)))))
         .cloned()
         .collect::<Vec<_>>();
     if !missing_settings_ids.is_empty() {
@@ -693,6 +704,13 @@ fn settings_store_readiness(
             store.records.len(),
         );
     }
+    let required_account_wrappers = required_settings_ids
+        .iter()
+        .filter_map(|required| valid_records.get(required.as_str()))
+        .filter_map(|(_, account)| account.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     SettingsTransitionReadiness {
         ready: true,
         state: if store.predecessor_capacity_recovery {
@@ -706,6 +724,7 @@ fn settings_store_readiness(
         record_count: Some(store.records.len()),
         required_settings_ids: required_settings_ids.to_vec(),
         missing_settings_ids,
+        required_account_wrappers,
     }
 }
 
@@ -732,6 +751,7 @@ fn settings_activation_required(
         record_count: Some(record_count),
         required_settings_ids: required_settings_ids.to_vec(),
         missing_settings_ids: missing,
+        required_account_wrappers: Vec::new(),
     }
 }
 
@@ -750,6 +770,7 @@ fn transition_failure(failure: ProviderFailure) -> SettingsTransitionReadiness {
         record_count: None,
         required_settings_ids: Vec::new(),
         missing_settings_ids: Vec::new(),
+        required_account_wrappers: Vec::new(),
     }
 }
 
