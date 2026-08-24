@@ -62,7 +62,7 @@ pub struct NativeRuntimeContext {
     record: NativeRuntimeRecord,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct NativeRuntimeRecord {
     schema_version: u32,
     account_wrapper: String,
@@ -388,6 +388,15 @@ fn candidate_context(
         runtime_identity_environment(&resolution_env),
         request_id,
     )?;
+    admit_candidate_program(account, program, execution_env, request_id)
+}
+
+fn admit_candidate_program(
+    account: &AccountProfile,
+    program: PathBuf,
+    execution_env: BTreeMap<String, String>,
+    request_id: &str,
+) -> Result<NativeRuntimeContext, ProviderFailure> {
     if !durable_fs::is_executable_file(&program)
         .map_err(|error| native_runtime_failure(request_id, error))?
     {
@@ -786,9 +795,8 @@ fn activate_runtime_record(
     record: NativeRuntimeRecord,
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
-    let prior_schema_version = record.schema_version;
-    let activated = preview_runtime_record_activation(account, record, request_id)?;
-    if prior_schema_version != NATIVE_RUNTIME_SCHEMA_VERSION {
+    let activated = preview_runtime_record_activation(account, record.clone(), request_id)?;
+    if activated.record != record {
         write_runtime_context(host, account, &activated, request_id)?;
     }
     Ok(activated)
@@ -801,8 +809,10 @@ fn preview_runtime_record_activation(
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
     validate_runtime_record_identity(&record, account, request_id)?;
     if record.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
-        validate_current_runtime_implementation(&record, account, request_id)?;
-        return Ok(NativeRuntimeContext { record });
+        return match validate_current_runtime_implementation(&record, account, request_id) {
+            Ok(()) => Ok(NativeRuntimeContext { record }),
+            Err(_) => preview_approved_same_path_replacement(account, &record, request_id),
+        };
     }
     if matches!(
         record.schema_version,
@@ -898,6 +908,66 @@ fn preview_runtime_record_activation(
             identity_sha256,
         },
     })
+}
+
+fn preview_approved_same_path_replacement(
+    account: &AccountProfile,
+    record: &NativeRuntimeRecord,
+    request_id: &str,
+) -> Result<NativeRuntimeContext, ProviderFailure> {
+    let prior_bytes = usize::try_from(record.program_stamp.byte_length).map_err(|_| {
+        native_runtime_failure(
+            request_id,
+            "persisted native runtime byte length cannot be represented on this platform",
+        )
+    })?;
+    let prior = native_implementation_manifest::approved_implementation(
+        OPENCODE_NATIVE_PROGRAM,
+        &record.program_sha256,
+        prior_bytes,
+    )
+    .map_err(|error| native_runtime_failure(request_id, error))?
+    .filter(|approved| {
+        approved.id == record.implementation_manifest_id
+            && approved.version == record.implementation_version
+            && approved.semantic_contract == record.native_contract_id
+    })
+    .ok_or_else(|| {
+        ProviderFailure::conflict(
+            request_id,
+            "native_runtime_prior_implementation_unapproved",
+            format!(
+                "account {} cannot advance from a persisted native implementation that is absent from the reviewed manifest",
+                account.opencode_wrapper
+            ),
+            json!({
+                "account": account.opencode_wrapper,
+                "program": record.program,
+                "persisted_program_sha256": record.program_sha256,
+                "persisted_implementation_manifest_id": record.implementation_manifest_id,
+                "manifest_contract": native_implementation_manifest::MANIFEST_CONTRACT,
+            }),
+        )
+    })?;
+    if prior.semantic_contract != OPENCODE_NATIVE_CONTRACT_ID {
+        return Err(native_runtime_failure(
+            request_id,
+            "persisted native runtime has the wrong semantic contract",
+        ));
+    }
+    let mut resolution_env = ambient_environment();
+    resolution_env.extend(record.execution_env.clone());
+    let execution_env = native_execution_environment(
+        account,
+        runtime_identity_environment(&resolution_env),
+        request_id,
+    )?;
+    admit_candidate_program(
+        account,
+        PathBuf::from(&record.program),
+        execution_env,
+        request_id,
+    )
 }
 
 struct PredecessorImplementationAdmission {

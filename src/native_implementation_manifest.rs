@@ -180,6 +180,16 @@ mod tests {
         .expect("current production OpenCode identity is approved");
         assert_eq!(approved.id, "opencode-1.18.21-linux-x86_64-c9485f62");
         assert_eq!(approved.version, "1.18.21");
+
+        let approved = approved_implementation(
+            "opencode",
+            "168f763fad45b30b8e508bb6fadf152c2888c0235dc4759fcb60a778c16ef768",
+            184_584_320,
+        )
+        .expect("valid manifest")
+        .expect("reviewed OpenCode update identity is approved");
+        assert_eq!(approved.id, "opencode-1.18.22-linux-x86_64-168f763f");
+        assert_eq!(approved.version, "1.18.22");
     }
 
     #[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]

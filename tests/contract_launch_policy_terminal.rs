@@ -1224,7 +1224,7 @@ fn contract_native_runtime_migrates_schema_v5_path_and_forwards_current_path() {
 }
 
 #[test]
-fn contract_native_runtime_binds_direct_opencode_implementation() {
+fn contract_native_runtime_rebinds_reviewed_same_path_replacement() {
     let runtime = IsolatedLaunchSettings::new();
     let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_runtime_identity_script());
     let path = prepend_path(fake_wrapper.dir());
@@ -1291,8 +1291,25 @@ fn contract_native_runtime_binds_direct_opencode_implementation() {
         "the numbered account wrapper must not be the acting implementation"
     );
 
-    fs::write(fake_wrapper.dir().join("opencode"), "#!/bin/sh\nexit 17\n")
-        .expect("replace direct OpenCode implementation");
+    let prior_program_sha256 = state["program_sha256"]
+        .as_str()
+        .expect("prior program digest")
+        .to_string();
+    let prior_runtime_identity = state["identity_sha256"]
+        .as_str()
+        .expect("prior runtime identity")
+        .to_string();
+
+    fs::write(
+        fake_wrapper.dir().join("opencode"),
+        "#!/bin/sh\n\
+if [ \"$1\" = \"--pure\" ]; then shift; fi\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf '{\"info\":{\"id\":\"%s\",\"title\":\"reviewed replacement\"},\"messages\":[]}\\n' \"$2\"\n\
+fi\n\
+exit 0\n",
+    )
+    .expect("replace direct OpenCode implementation");
     make_executable(&fake_wrapper.dir().join("opencode"));
     let export = support::invoke_validated_with_host_and_env(
         "session.export",
@@ -1304,11 +1321,14 @@ fn contract_native_runtime_binds_direct_opencode_implementation() {
         "session.schema.json#/$defs/SessionExportRequest",
         &[("PATH", path.as_str()), ("HOME", home_path.as_str())],
     );
-    let response = json_stdout(&export);
-    assert_eq!(
-        response["error"]["code"],
-        "native_runtime_implementation_changed"
-    );
+    assert_output_success(&export, "export after reviewed same-path replacement");
+    let rebound: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read rebound native runtime identity"),
+    )
+    .expect("parse rebound native runtime identity");
+    assert_ne!(rebound["program_sha256"], prior_program_sha256);
+    assert_ne!(rebound["identity_sha256"], prior_runtime_identity);
+    assert_eq!(rebound["program"], state["program"]);
 }
 
 #[test]
