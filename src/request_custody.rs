@@ -100,9 +100,14 @@ impl ActiveIndex {
         }
     }
 
-    fn validate(&self, active_limit: usize) -> Result<(), CustodyError> {
-        if self.slots.len() != active_limit
-            || (active_limit != 0 && self.next_probe >= active_limit)
+    fn validate(&self, active_limit: usize, grow_active: bool) -> Result<(), CustodyError> {
+        let active_size_is_valid = if grow_active {
+            self.slots.len() >= active_limit
+        } else {
+            self.slots.len() == active_limit
+        };
+        if !active_size_is_valid
+            || (!self.slots.is_empty() && self.next_probe >= self.slots.len())
             || self.slots.iter().any(|slot| {
                 !matches!(slot.occupied, 0 | 1)
                     || !valid_digest(&slot.request_sha256)
@@ -118,7 +123,7 @@ impl ActiveIndex {
                 "request custody active index is inconsistent".to_string(),
             ));
         }
-        let mut occupied = HashSet::with_capacity(active_limit);
+        let mut occupied = HashSet::with_capacity(self.slots.len());
         if self
             .slots
             .iter()
@@ -157,7 +162,12 @@ impl ActiveIndex {
         }
     }
 
-    fn reserve(&mut self, stem: String, binding_sha256: String) -> Result<(), CustodyError> {
+    fn reserve(
+        &mut self,
+        stem: String,
+        binding_sha256: String,
+        grow_active: bool,
+    ) -> Result<(), CustodyError> {
         if !valid_digest(&binding_sha256) {
             return Err(CustodyError::Invalid(
                 "request custody active reservation binding is invalid".to_string(),
@@ -173,26 +183,36 @@ impl ActiveIndex {
             }
             ActiveReservation::Absent => {}
         }
-        let slot = self
-            .slots
-            .iter_mut()
-            .find(|slot| slot.occupied == 0)
-            .ok_or(CustodyError::Capacity)?;
+        let slot = match self.slots.iter_mut().find(|slot| slot.occupied == 0) {
+            Some(slot) => slot,
+            None if grow_active => {
+                self.slots.push(ActiveSlot::empty());
+                self.slots
+                    .last_mut()
+                    .expect("the growing active index contains the appended slot")
+            }
+            None => return Err(CustodyError::Capacity),
+        };
         slot.occupied = 1;
         slot.request_sha256 = stem;
         slot.binding_sha256 = Some(binding_sha256);
         Ok(())
     }
 
-    fn reserve_unbound(&mut self, stem: String) -> Result<(), CustodyError> {
+    fn reserve_unbound(&mut self, stem: String, grow_active: bool) -> Result<(), CustodyError> {
         if self.contains(&stem) {
             return Ok(());
         }
-        let slot = self
-            .slots
-            .iter_mut()
-            .find(|slot| slot.occupied == 0)
-            .ok_or(CustodyError::Capacity)?;
+        let slot = match self.slots.iter_mut().find(|slot| slot.occupied == 0) {
+            Some(slot) => slot,
+            None if grow_active => {
+                self.slots.push(ActiveSlot::empty());
+                self.slots
+                    .last_mut()
+                    .expect("the growing active index contains the appended slot")
+            }
+            None => return Err(CustodyError::Capacity),
+        };
         slot.occupied = 1;
         slot.request_sha256 = stem;
         slot.binding_sha256 = None;
@@ -296,6 +316,7 @@ pub(crate) struct RequestCustody {
     index_root: PathBuf,
     state_byte_limit: usize,
     active_limit: usize,
+    grow_active: bool,
     replay_slots: usize,
     orphan_retention: Duration,
 }
@@ -316,9 +337,20 @@ impl RequestCustody {
             index_root,
             state_byte_limit,
             active_limit,
+            grow_active: false,
             replay_slots,
             orphan_retention,
         }
+    }
+
+    /// Allow active request custody to grow beyond its initial compact index.
+    ///
+    /// Launch uses this mode because active records describe independent
+    /// runtime obligations, not a global concurrency budget. Quota refresh
+    /// retains fixed-capacity behavior through the default constructor.
+    pub(crate) fn with_growing_active(mut self) -> Self {
+        self.grow_active = true;
+        self
     }
 
     /// Advance bounded custody maintenance while the capability's capacity
@@ -373,7 +405,7 @@ impl RequestCustody {
     ) -> Result<(), CustodyError> {
         let stem = required_digest_stem(state_path)?;
         let mut index = self.read_active_index()?;
-        index.reserve(stem, binding_sha256.to_string())?;
+        index.reserve(stem, binding_sha256.to_string(), self.grow_active)?;
         self.write_active_index(&index)
     }
 
@@ -552,7 +584,7 @@ impl RequestCustody {
                 continue;
             }
             migrated += 1;
-            if migrated > migration_limit {
+            if !self.grow_active && migrated > migration_limit {
                 return Err(CustodyError::Capacity);
             }
             let stem = required_digest_stem(&lock_path)?;
@@ -565,7 +597,7 @@ impl RequestCustody {
             if replay {
                 replay_candidates.push((record_modified(&state_path, &lock_path), stem));
             } else {
-                active_index.reserve_unbound(stem)?;
+                active_index.reserve_unbound(stem, self.grow_active)?;
             }
         }
         replay_candidates.sort_by_key(|candidate| candidate.0);
@@ -1081,19 +1113,36 @@ impl RequestCustody {
     }
 
     fn read_active_index(&self) -> Result<ActiveIndex, CustodyError> {
-        let bytes =
-            durable_fs::read_file_bounded(&self.active_index_path(), MAX_ACTIVE_INDEX_BYTES)?;
+        let bytes = if self.grow_active {
+            fs::read(self.active_index_path())?
+        } else {
+            durable_fs::read_file_bounded(&self.active_index_path(), MAX_ACTIVE_INDEX_BYTES)?
+        };
         let index: ActiveIndex = serde_json::from_slice(&bytes)
             .map_err(|error| CustodyError::Invalid(error.to_string()))?;
-        index.validate(self.active_limit)?;
+        index.validate(self.active_limit, self.grow_active)?;
         Ok(index)
     }
 
     fn write_active_index(&self, index: &ActiveIndex) -> Result<(), CustodyError> {
-        index.validate(self.active_limit)?;
+        index.validate(self.active_limit, self.grow_active)?;
         let value = serde_json::to_value(index)
             .map_err(|error| CustodyError::Invalid(error.to_string()))?;
-        self.write_json_atomic_bounded(&self.active_index_path(), &value, MAX_ACTIVE_INDEX_BYTES)
+        if self.grow_active {
+            self.write_json_atomic_unbounded(&self.active_index_path(), &value)
+        } else {
+            self.write_json_atomic_bounded(
+                &self.active_index_path(),
+                &value,
+                MAX_ACTIVE_INDEX_BYTES,
+            )
+        }
+    }
+
+    fn write_json_atomic_unbounded(&self, path: &Path, value: &Value) -> Result<(), CustodyError> {
+        let bytes =
+            serde_json::to_vec(value).map_err(|error| CustodyError::Invalid(error.to_string()))?;
+        self.write_bytes_atomic(path, &bytes)
     }
 
     fn write_json_atomic(&self, path: &Path, value: &Value) -> Result<(), CustodyError> {
@@ -1111,6 +1160,10 @@ impl RequestCustody {
         if bytes.len() > byte_limit {
             return Err(CustodyError::Capacity);
         }
+        self.write_bytes_atomic(path, &bytes)
+    }
+
+    fn write_bytes_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), CustodyError> {
         let parent = path.parent().ok_or_else(|| {
             CustodyError::Invalid("request custody record has no parent".to_string())
         })?;

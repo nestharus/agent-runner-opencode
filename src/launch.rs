@@ -66,7 +66,7 @@ const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
 const LAUNCH_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const LAUNCH_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCH_STATE_SCHEMA_VERSION: u32 = 10;
-const MAX_ACTIVE_LAUNCH_REQUEST_RECORDS: usize = 64;
+const INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS: usize = 64;
 const MAX_LAUNCH_REPLAY_RECORDS: usize = 4096;
 const MAX_LAUNCH_STATE_BYTES: usize = 256 * 1024;
 pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
@@ -2051,7 +2051,7 @@ fn acquire_launch_request_lock(
     let replay_owner_exists = custody
         .replay_owner_exists(state_path)
         .map_err(|error| launch_custody_failure(request_id, error))?;
-    let active = maintain_launch_request_capacity(&custody, &lock_path, request_id)?;
+    maintain_launch_request_capacity(&custody, &lock_path, request_id)?;
     let mut active_reservation = custody
         .active_reservation(state_path, reservation_binding_sha256)
         .map_err(|error| launch_custody_failure(request_id, error))?;
@@ -2080,9 +2080,6 @@ fn acquire_launch_request_lock(
     let observed_existing =
         lock_exists || state_exists || replay_owner_exists || active_marker_exists;
     let reserved = admit_new && !observed_existing;
-    if reserved && active >= MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
-        return Err(launch_state_capacity_exceeded(request_id));
-    }
     if reserved {
         custody
             .reserve_active(state_path, reservation_binding_sha256)
@@ -2190,10 +2187,11 @@ fn launch_request_custody(root: &Path) -> RequestCustody {
         root.to_path_buf(),
         root.join(".custody-v2"),
         MAX_LAUNCH_STATE_BYTES,
-        MAX_ACTIVE_LAUNCH_REQUEST_RECORDS,
+        INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS,
         MAX_LAUNCH_REPLAY_RECORDS,
         LAUNCH_ORPHAN_RETENTION,
     )
+    .with_growing_active()
 }
 
 fn launch_custody_failure(request_id: &str, error: CustodyError) -> ProviderFailure {
@@ -2449,7 +2447,7 @@ fn launch_state_capacity_exceeded(request_id: &str) -> ProviderFailure {
         request_id,
         "launch_state_capacity_exceeded",
         format!(
-            "durable launch custody has reached its supported {MAX_ACTIVE_LAUNCH_REQUEST_RECORDS}-request active bound or {MAX_LAUNCH_REPLAY_RECORDS}-request completed replay bound; reconcile unresolved requests or allow the bounded recent-replay pool to retire its oldest completion"
+            "durable launch custody could not retain this request: an individual request exceeded {MAX_LAUNCH_STATE_BYTES} bytes or the {MAX_LAUNCH_REPLAY_RECORDS}-request completed replay ring could not evict a terminal entry; active launch requests do not have a fixed population limit"
         ),
     )
 }
@@ -3595,40 +3593,8 @@ mod custody_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn exact_retry_resumes_pre_lock_reservation_at_active_capacity() {
+    fn launch_admission_grows_beyond_the_initial_active_index() {
         let directory = tempfile::tempdir().expect("launch custody directory");
-        let custody = launch_request_custody(directory.path());
-        assert_eq!(
-            custody
-                .maintain(
-                    &directory.path().join("initialize.lock"),
-                    launch_request_bytes_are_replay,
-                )
-                .expect("initialize launch custody"),
-            0
-        );
-        let target_binding = format!("{:064x}", 1);
-        let target_state = directory.path().join(format!("{:064x}.json", 1));
-        for index in 1..=MAX_ACTIVE_LAUNCH_REQUEST_RECORDS {
-            let binding = format!("{index:064x}");
-            custody
-                .reserve_active(
-                    &directory.path().join(format!("{index:064x}.json")),
-                    &binding,
-                )
-                .expect("fill launch active reservations");
-        }
-        let overflow_binding = format!("{:064x}", MAX_ACTIVE_LAUNCH_REQUEST_RECORDS + 1);
-        assert!(matches!(
-            custody.reserve_active(
-                &directory.path().join(format!(
-                    "{:064x}.json",
-                    MAX_ACTIVE_LAUNCH_REQUEST_RECORDS + 1
-                )),
-                &overflow_binding,
-            ),
-            Err(CustodyError::Capacity)
-        ));
         let host = HostContext {
             app: "test".to_string(),
             app_version: None,
@@ -3639,20 +3605,38 @@ mod custody_tests {
             env: None,
             deadline_unix_ms: None,
         };
-
-        let lock = acquire_launch_request_lock(
-            &host,
-            directory.path(),
-            &target_state,
-            true,
-            &target_binding,
-            "request-exact-retry",
+        let live_launches = 320;
+        let mut locks = Vec::with_capacity(live_launches);
+        for index in 1..=live_launches {
+            let binding = format!("{index:064x}");
+            let state = directory.path().join(format!("{index:064x}.json"));
+            locks.push(
+                acquire_launch_request_lock(
+                    &host,
+                    directory.path(),
+                    &state,
+                    true,
+                    &binding,
+                    &format!("request-{index}"),
+                )
+                .expect("admit an independent live launch"),
+            );
+        }
+        let active: Value = serde_json::from_slice(
+            &fs::read(directory.path().join(".custody-v2/active.json"))
+                .expect("growing active index"),
         )
-        .expect("exact retry resumes its pre-lock reservation at capacity");
-        assert!(!target_state.exists());
-        drop(lock);
-        retire_orphan_launch_request_lock(&target_state, "request-exact-retry")
-            .expect("retire resumed pre-state launch reservation");
+        .expect("parse growing active index");
+        let slots = active["slots"].as_array().expect("active index slots");
+        assert_eq!(
+            slots
+                .iter()
+                .filter(|slot| slot["occupied"].as_u64() == Some(1))
+                .count(),
+            live_launches
+        );
+        assert!(slots.len() >= live_launches);
+        drop(locks);
     }
 
     #[test]
@@ -3811,7 +3795,7 @@ mod custody_tests {
     #[test]
     fn steady_state_admission_classifies_one_active_payload() {
         let directory = tempfile::tempdir().expect("launch custody directory");
-        let active_records = MAX_ACTIVE_LAUNCH_REQUEST_RECORDS;
+        let active_records = INITIAL_ACTIVE_LAUNCH_REQUEST_SLOTS;
         for index in 0..active_records {
             let stem = format!("{index:064x}");
             fs::write(directory.path().join(format!("{stem}.lock")), b"")

@@ -392,8 +392,10 @@ identity and any durable session, terminal, or resume observation before
 consulting mutable live settings. Current settings admission occurs only when
 there is no prior operation or authoritative recovery proved that it had no
 native effect.
-Launch custody reserves 64 records for active obligations independently of a
-fixed 4,096-slot recent-replay ring; every record is no larger than 256 KiB.
+Launch custody starts with a compact 64-slot active index and grows it when
+additional independent obligations arrive; active launch population is not an
+admission or runtime concurrency limit. Completed history uses a fixed
+4,096-slot recent-replay ring, and every request record is no larger than 256 KiB.
 Cyclic slot replacement retires the oldest available completion without parsing
 replay payloads. Steady-state admission reads one fixed-shape compact active
 index and classifies at most one active payload per request; completion probes at
@@ -403,10 +405,10 @@ crash-idempotent without skipping the oldest completion. State is retired only
 after neither the replay ring nor the active index owns it, and predecessor
 duplicate slots are collapsed during the one-time bounded index upgrade.
 Prepared, submission-observed, and unresolved
-records never age out because they may still own an effect. New work fails at
-the active cap until those live obligations are reconciled, but routine
-completed history cannot consume its admission reserve or make admission work
-proportional to active payload volume or replay history. Shared replay pins
+records never age out because they may still own an effect. Those obligations
+remain recoverable without rejecting unrelated launch work, while routine
+completed history cannot make admission work proportional to replay history.
+Shared replay pins
 prevent cyclic eviction while an exact caller crosses from capacity admission
 to its request lock.
 
