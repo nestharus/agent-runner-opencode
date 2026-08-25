@@ -64,6 +64,14 @@ as `OULIPOLY_OPENCODE_ACCOUNT` and invokes the canonical absolute executable.
 unchanged for tools that the OpenCode turn executes, but it is not persisted or
 identity-bound. `--pure` excludes external plugins from the acting boundary.
 
+A current-schema account record whose selected state root is exactly the
+canonical root declared for a different configured numbered account is a
+recoverable cross-account binding. Under the account lock, the provider may
+replace only that selector with the current account's exact declared canonical
+root while preserving provider state. This exception does not admit a custom,
+unknown, ambiguous, or undeclared selector change; those remain fail-closed and
+require the native-identity rebind protocol.
+
 Agent Runner launches favor completion of long-running agent work over
 OpenCode's shorter implicit per-Bash cutoff. The provider therefore owns a
 finite fallback of `2000000000` milliseconds (about 23.1 days) for
