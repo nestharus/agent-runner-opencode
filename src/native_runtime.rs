@@ -65,6 +65,37 @@ pub struct NativeRuntimeContext {
     record: NativeRuntimeRecord,
 }
 
+pub(crate) struct SetupNativeRuntimeIdentity {
+    pub(crate) context: NativeRuntimeContext,
+    pub(crate) source: SetupIdentitySource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SetupIdentitySource {
+    Persisted,
+    ActivationPreview,
+}
+
+impl SetupIdentitySource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::ActivationPreview => "activation_preview",
+        }
+    }
+}
+
+fn setup_identity_source(
+    persisted: &NativeRuntimeRecord,
+    preview: &NativeRuntimeRecord,
+) -> SetupIdentitySource {
+    if preview == persisted {
+        SetupIdentitySource::Persisted
+    } else {
+        SetupIdentitySource::ActivationPreview
+    }
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct NativeRuntimeRecord {
     schema_version: u32,
@@ -144,12 +175,17 @@ pub(crate) fn resolve_existing_for_setup(
     host: &HostContext,
     account: &AccountProfile,
     request_id: &str,
-) -> Result<Option<NativeRuntimeContext>, ProviderFailure> {
+) -> Result<Option<SetupNativeRuntimeIdentity>, ProviderFailure> {
     let _lock = acquire_runtime_lock(host, account, Duration::ZERO, request_id)?;
     let Some(record) = read_runtime_record(host, account, request_id)? else {
         return Ok(None);
     };
-    preview_runtime_record_activation(account, record, request_id).map(Some)
+    let preview = preview_runtime_record_activation(account, record.clone(), request_id)?;
+    let source = setup_identity_source(&record, &preview.record);
+    Ok(Some(SetupNativeRuntimeIdentity {
+        context: preview,
+        source,
+    }))
 }
 
 pub(crate) fn persisted_identity_evidence(
@@ -1587,12 +1623,41 @@ fn native_runtime_state_capacity(request_id: &str, observed_bytes: usize) -> Pro
 mod tests {
     use super::{
         admit_forward_auto_update, cross_account_state_selector_owner, merge_launch_environment,
-        native_execution_environment, runtime_identity_environment, NativeProgramStamp,
-        NativeRuntimeRecord, OPENCODE_BASH_DEFAULT_TIMEOUT_ENV, OPENCODE_NATIVE_CONTRACT_ID,
+        native_execution_environment, runtime_identity_environment, setup_identity_source,
+        NativeProgramStamp, NativeRuntimeRecord, SetupIdentitySource,
+        OPENCODE_BASH_DEFAULT_TIMEOUT_ENV, OPENCODE_NATIVE_CONTRACT_ID,
         PROVIDER_BASH_DEFAULT_TIMEOUT_MS,
     };
     use crate::account::ACCOUNTS;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn setup_distinguishes_persisted_identity_from_activation_preview() {
+        let persisted = NativeRuntimeRecord {
+            schema_version: 6,
+            account_wrapper: "opencode1".to_string(),
+            program: "/opt/opencode".to_string(),
+            program_sha256: "ab".repeat(32),
+            execution_env: BTreeMap::new(),
+            native_contract_id: OPENCODE_NATIVE_CONTRACT_ID.to_string(),
+            fixed_args: vec!["--pure".to_string()],
+            implementation_manifest_id: "opencode-test".to_string(),
+            implementation_version: "1.0.0".to_string(),
+            program_stamp: NativeProgramStamp::default(),
+            identity_sha256: "persisted".to_string(),
+        };
+        assert_eq!(
+            setup_identity_source(&persisted, &persisted),
+            SetupIdentitySource::Persisted
+        );
+
+        let mut preview = persisted.clone();
+        preview.identity_sha256 = "prospective".to_string();
+        assert_eq!(
+            setup_identity_source(&persisted, &preview),
+            SetupIdentitySource::ActivationPreview
+        );
+    }
 
     #[cfg(unix)]
     #[test]

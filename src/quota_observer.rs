@@ -57,7 +57,38 @@ pub struct QuotaObserverContext {
     record: QuotaObserverRecord,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct SetupQuotaObserverIdentity {
+    pub(crate) identity_sha256: String,
+    pub(crate) source: SetupIdentitySource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SetupIdentitySource {
+    Persisted,
+    ActivationPreview,
+}
+
+impl SetupIdentitySource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::ActivationPreview => "activation_preview",
+        }
+    }
+}
+
+fn setup_identity_source(
+    persisted: &QuotaObserverRecord,
+    preview: &QuotaObserverRecord,
+) -> SetupIdentitySource {
+    if preview == persisted {
+        SetupIdentitySource::Persisted
+    } else {
+        SetupIdentitySource::ActivationPreview
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct QuotaObserverRecord {
     schema_version: u32,
     observer_contract: String,
@@ -160,13 +191,17 @@ pub(crate) fn resolve_existing_for_setup(
     host: &HostContext,
     account: &AccountProfile,
     request_id: &str,
-) -> Result<Option<String>, ProviderFailure> {
+) -> Result<Option<SetupQuotaObserverIdentity>, ProviderFailure> {
     let _lock = acquire_observer_lock(host, account, Duration::ZERO, request_id)?;
     let Some(record) = read_observer_record(host, account, request_id)? else {
         return Ok(None);
     };
-    preview_observer_record_activation(account, record, request_id)
-        .map(|context| Some(context.identity_sha256().to_string()))
+    let preview = preview_observer_record_activation(account, record.clone(), request_id)?;
+    let source = setup_identity_source(&record, &preview.record);
+    Ok(Some(SetupQuotaObserverIdentity {
+        identity_sha256: preview.identity_sha256().to_string(),
+        source,
+    }))
 }
 
 fn read_persisted_identity_evidence(
@@ -767,5 +802,16 @@ mod tests {
         assert!(!context.record.implementation_manifest_id.is_empty());
         validate_observer_record(&context.record, &ACCOUNTS[0], "observer-unit")
             .expect("validate source-included observer identity");
+
+        assert_eq!(
+            setup_identity_source(&context.record, &context.record),
+            SetupIdentitySource::Persisted
+        );
+        let mut preview = context.record.clone();
+        preview.identity_sha256 = "prospective".to_string();
+        assert_eq!(
+            setup_identity_source(&context.record, &preview),
+            SetupIdentitySource::ActivationPreview
+        );
     }
 }
