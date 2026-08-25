@@ -282,11 +282,11 @@ fn profile_evidence(
                 native_runtime_observation_busy,
             ) = if durable_identity_available {
                 match native_runtime::resolve_existing_for_setup(host, account, request_id) {
-                    Ok(Some(runtime)) => (
+                    Ok(Some(resolved)) => (
                         true,
-                        "persisted",
-                        Some(runtime.identity_sha256().to_string()),
-                        runtime.expand_path(account.opencode_auth_path),
+                        resolved.source.as_str(),
+                        Some(resolved.context.identity_sha256().to_string()),
+                        resolved.context.expand_path(account.opencode_auth_path),
                         None,
                         false,
                     ),
@@ -328,7 +328,13 @@ fn profile_evidence(
                 quota_observer_observation_busy,
             ) = if durable_identity_available {
                 match quota_observer::resolve_existing_for_setup(host, account, request_id) {
-                    Ok(Some(identity)) => (true, "persisted", Some(identity), None, false),
+                    Ok(Some(resolved)) => (
+                        true,
+                        resolved.source.as_str(),
+                        Some(resolved.identity_sha256),
+                        None,
+                        false,
+                    ),
                     Ok(None) => (
                         ambient_quota_observer_ready,
                         "ambient_admission",
