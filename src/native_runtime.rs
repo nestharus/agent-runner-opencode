@@ -8,7 +8,7 @@
 //!       - full executable admission at bind/rebind and constant-time metadata validation on reuse
 //!       - exact launch-context admission against the durable account binding
 
-use crate::account::AccountProfile;
+use crate::account::{AccountProfile, ACCOUNTS};
 use crate::child_custody::ChildCustody;
 use crate::durable_fs;
 use crate::encoding::sha256_hex;
@@ -122,7 +122,7 @@ pub(crate) fn resolve_for_account_with_timeout(
     if let Some(record) = read_runtime_record(host, account, request_id)? {
         return activate_runtime_record(host, account, record, request_id);
     }
-    let context = candidate_context(account, ambient_environment(), request_id)?;
+    let context = candidate_context(account, launch_environment(&BTreeMap::new()), request_id)?;
     write_runtime_context(host, account, &context, request_id)?;
     Ok(context)
 }
@@ -276,7 +276,7 @@ pub fn resolve_for_launch(
                 request_id,
                 "native_runtime_context_conflict",
                 format!(
-                    "account {} runtime context conflict: {}",
+                    "account {} runtime context conflict: {}. The provider will not switch a durable account to a different state namespace implicitly; correct the account's configured launch environment or use the environment already shown as bound",
                     account.opencode_wrapper,
                     differences.join("; ")
                 ),
@@ -683,15 +683,22 @@ fn native_execution_environment(
 }
 
 fn launch_environment(declared_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut environment = ambient_environment();
+    merge_launch_environment(ambient_environment(), declared_env)
+}
+
+fn merge_launch_environment(
+    mut environment: BTreeMap<String, String>,
+    declared_env: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
     environment.extend(declared_env.clone());
-    // A non-empty request environment is authoritative about an intentionally
-    // absent XDG_DATA_HOME (Agent Runner uses that to select account one's
-    // default namespace). PATH and HOME may still fall back to the provider
-    // process for direct callers that send a partial environment. PATH is used
-    // only to resolve the reviewed executable and is forwarded per invocation;
-    // it is never part of the durable runtime identity.
-    if !declared_env.is_empty() && !declared_env.contains_key("XDG_DATA_HOME") {
+    // The request environment is the only authority for a state selector. A
+    // provider process can itself be launched from inside another numbered
+    // OpenCode account and therefore inherit that account's XDG_DATA_HOME.
+    // Treating that process ambient as launch intent can permanently bind one
+    // logical account to another account's state root. Every non-selector
+    // ambient variable remains available and every declared variable is still
+    // forwarded without an allowlist.
+    if !declared_env.contains_key("XDG_DATA_HOME") {
         environment.remove("XDG_DATA_HOME");
     }
     environment
@@ -968,6 +975,7 @@ fn preview_runtime_record_activation(
     request_id: &str,
 ) -> Result<NativeRuntimeContext, ProviderFailure> {
     validate_runtime_record_identity(&record, account, request_id)?;
+    let record = repair_cross_account_state_selector(account, record, request_id)?;
     if record.schema_version == NATIVE_RUNTIME_SCHEMA_VERSION {
         return match validate_current_runtime_implementation(&record, account, request_id) {
             Ok(()) => Ok(NativeRuntimeContext { record }),
@@ -1068,6 +1076,76 @@ fn preview_runtime_record_activation(
             identity_sha256,
         },
     })
+}
+
+fn repair_cross_account_state_selector(
+    account: &AccountProfile,
+    mut record: NativeRuntimeRecord,
+    request_id: &str,
+) -> Result<NativeRuntimeRecord, ProviderFailure> {
+    if record.schema_version != NATIVE_RUNTIME_SCHEMA_VERSION
+        || cross_account_state_selector_owner(account, &record.execution_env).is_none()
+    {
+        return Ok(record);
+    }
+
+    if account.opencode_index == 1 {
+        record.execution_env.remove("XDG_DATA_HOME");
+    } else {
+        let state_root = canonical_numbered_account_state_root(account, &record.execution_env)
+            .ok_or_else(|| {
+                native_runtime_failure(
+                    request_id,
+                    format!(
+                        "account {} cannot repair a cross-account XDG_DATA_HOME binding because its persisted HOME selector is absent",
+                        account.opencode_wrapper
+                    ),
+                )
+            })?;
+        record
+            .execution_env
+            .insert("XDG_DATA_HOME".to_string(), state_root);
+    }
+    record.identity_sha256 = runtime_identity_sha256(
+        &record.account_wrapper,
+        &record.program,
+        &record.program_sha256,
+        &record.execution_env,
+        &record.native_contract_id,
+        &record.fixed_args,
+        (
+            &record.implementation_manifest_id,
+            &record.implementation_version,
+        ),
+    );
+    Ok(record)
+}
+
+fn cross_account_state_selector_owner(
+    account: &AccountProfile,
+    execution_env: &BTreeMap<String, String>,
+) -> Option<&'static AccountProfile> {
+    let selected = execution_env.get("XDG_DATA_HOME")?;
+    ACCOUNTS.iter().find(|candidate| {
+        candidate.opencode_index != account.opencode_index
+            && canonical_numbered_account_state_root(candidate, execution_env).as_ref()
+                == Some(selected)
+    })
+}
+
+fn canonical_numbered_account_state_root(
+    account: &AccountProfile,
+    execution_env: &BTreeMap<String, String>,
+) -> Option<String> {
+    if account.opencode_index <= 1 {
+        return None;
+    }
+    Some(
+        Path::new(execution_env.get("HOME")?)
+            .join(format!(".opencode{}", account.opencode_index))
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn preview_approved_same_path_replacement(
@@ -1508,9 +1586,10 @@ fn native_runtime_state_capacity(request_id: &str, observed_bytes: usize) -> Pro
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_forward_auto_update, native_execution_environment, runtime_identity_environment,
-        NativeProgramStamp, NativeRuntimeRecord, OPENCODE_BASH_DEFAULT_TIMEOUT_ENV,
-        OPENCODE_NATIVE_CONTRACT_ID, PROVIDER_BASH_DEFAULT_TIMEOUT_MS,
+        admit_forward_auto_update, cross_account_state_selector_owner, merge_launch_environment,
+        native_execution_environment, runtime_identity_environment, NativeProgramStamp,
+        NativeRuntimeRecord, OPENCODE_BASH_DEFAULT_TIMEOUT_ENV, OPENCODE_NATIVE_CONTRACT_ID,
+        PROVIDER_BASH_DEFAULT_TIMEOUT_MS,
     };
     use crate::account::ACCOUNTS;
     use std::collections::BTreeMap;
@@ -1613,5 +1692,75 @@ mod tests {
         assert_eq!(identity_environment.get("HOME"), environment.get("HOME"));
         assert!(!identity_environment.contains_key("PATH"));
         assert!(!identity_environment.contains_key("PER_INVOCATION_ENV"));
+    }
+
+    #[test]
+    fn undeclared_ambient_xdg_cannot_select_another_accounts_state() {
+        let ambient = BTreeMap::from([
+            (
+                "XDG_DATA_HOME".to_string(),
+                "/tmp/home/.opencode5".to_string(),
+            ),
+            (
+                "APPLICATION_SPECIFIC_ENV".to_string(),
+                "preserved".to_string(),
+            ),
+        ]);
+
+        let environment = merge_launch_environment(ambient, &BTreeMap::new());
+
+        assert!(!environment.contains_key("XDG_DATA_HOME"));
+        assert_eq!(
+            environment
+                .get("APPLICATION_SPECIFIC_ENV")
+                .map(String::as_str),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn declared_xdg_and_arbitrary_environment_are_preserved_without_an_allowlist() {
+        let environment = merge_launch_environment(
+            BTreeMap::from([("AMBIENT_CUSTOM_ENV".to_string(), "ambient".to_string())]),
+            &BTreeMap::from([
+                ("XDG_DATA_HOME".to_string(), "/tmp/custom-state".to_string()),
+                ("DECLARED_CUSTOM_ENV".to_string(), "declared".to_string()),
+            ]),
+        );
+
+        assert_eq!(
+            environment.get("XDG_DATA_HOME").map(String::as_str),
+            Some("/tmp/custom-state")
+        );
+        assert_eq!(
+            environment.get("AMBIENT_CUSTOM_ENV").map(String::as_str),
+            Some("ambient")
+        );
+        assert_eq!(
+            environment.get("DECLARED_CUSTOM_ENV").map(String::as_str),
+            Some("declared")
+        );
+    }
+
+    #[test]
+    fn cross_account_state_selector_detection_is_narrow() {
+        let account_one_environment = BTreeMap::from([
+            ("HOME".to_string(), "/tmp/home".to_string()),
+            (
+                "XDG_DATA_HOME".to_string(),
+                "/tmp/home/.opencode5".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            cross_account_state_selector_owner(&ACCOUNTS[0], &account_one_environment)
+                .map(|account| account.opencode_wrapper),
+            Some("opencode5")
+        );
+
+        let custom_environment = BTreeMap::from([
+            ("HOME".to_string(), "/tmp/home".to_string()),
+            ("XDG_DATA_HOME".to_string(), "/tmp/custom-state".to_string()),
+        ]);
+        assert!(cross_account_state_selector_owner(&ACCOUNTS[0], &custom_environment).is_none());
     }
 }

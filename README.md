@@ -749,7 +749,13 @@ marker select the durable runtime identity; no other variable is persisted or
 can cause an account-binding conflict. A different state-selector environment
 or changed direct implementation is rejected before another native effect
 rather than silently addressing a second state namespace with the same
-account/session labels.
+account/session labels. State-selector intent comes from the declared launch
+environment, never from the provider process's ambient `XDG_DATA_HOME`; this
+prevents a provider invoked from inside one numbered account from binding a
+different logical account to that state root. Existing current-schema records
+that contain the exact canonical state root of a different declared account
+are repaired atomically under the account lock without deleting provider
+state. Custom state roots remain durable and are not rewritten.
 
 ### Runtime timeout policy
 

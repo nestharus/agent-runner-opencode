@@ -1024,6 +1024,134 @@ fn contract_native_runtime_identity_is_shared_across_capabilities() {
 }
 
 #[test]
+fn contract_native_runtime_repairs_cross_account_state_binding_without_deleting_state() {
+    let runtime = IsolatedLaunchSettings::new();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let home = tempfile::tempdir().expect("create native runtime HOME");
+    let home_path = home.path().to_string_lossy().into_owned();
+    let first_log = fake_wrapper.dir().join("first-launch.log");
+    let first_log_path = first_log.to_string_lossy().into_owned();
+    let first_launch = invoke_with_host_and_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                ("HOME", home_path.as_str()),
+                ("AGENT_RUNNER_OPENCODE_WRAPPER_LOG", first_log_path.as_str()),
+            ],
+        ),
+        runtime.host_overrides(),
+        &[("PATH", path.as_str()), ("HOME", home_path.as_str())],
+    );
+    assert_output_success(&first_launch, "initial native runtime launch");
+
+    let state_path = runtime
+        .data_root()
+        .join("provider-state/opencode/native-runtimes/opencode1.json");
+    let mut poisoned: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read initial native runtime identity"),
+    )
+    .expect("parse initial native runtime identity");
+    let other_account_state = home.path().join(".opencode5");
+    poisoned["execution_env"]["XDG_DATA_HOME"] = json!(other_account_state.to_string_lossy());
+    poisoned["identity_sha256"] = json!(agent_runner_opencode::encoding::sha256_hex(
+        json!({
+            "account_wrapper": poisoned["account_wrapper"].clone(),
+            "program": poisoned["program"].clone(),
+            "program_sha256": poisoned["program_sha256"].clone(),
+            "execution_env": poisoned["execution_env"].clone(),
+            "native_contract_id": poisoned["native_contract_id"].clone(),
+            "fixed_args": poisoned["fixed_args"].clone(),
+            "implementation_manifest_id": poisoned["implementation_manifest_id"].clone(),
+            "implementation_version": poisoned["implementation_version"].clone(),
+        })
+        .to_string()
+        .as_bytes(),
+    ));
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&poisoned).expect("serialize poisoned runtime identity"),
+    )
+    .expect("write poisoned runtime identity");
+
+    let second_log = fake_wrapper.dir().join("second-launch.log");
+    let second_log_path = second_log.to_string_lossy().into_owned();
+    let second_launch = invoke_with_host_and_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                ("HOME", home_path.as_str()),
+                (
+                    "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                    second_log_path.as_str(),
+                ),
+            ],
+        ),
+        runtime.host_overrides(),
+        &[
+            ("PATH", path.as_str()),
+            ("HOME", home_path.as_str()),
+            (
+                "XDG_DATA_HOME",
+                other_account_state.to_string_lossy().as_ref(),
+            ),
+        ],
+    );
+    assert_output_success(
+        &second_launch,
+        "launch after automatic cross-account state repair",
+    );
+
+    let repaired: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read repaired native runtime identity"),
+    )
+    .expect("parse repaired native runtime identity");
+    assert!(repaired["execution_env"].get("XDG_DATA_HOME").is_none());
+    assert_ne!(repaired["identity_sha256"], poisoned["identity_sha256"]);
+}
+
+#[test]
+fn contract_non_launch_admission_ignores_provider_process_xdg_state() {
+    let runtime = IsolatedLaunchSettings::new();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_runtime_identity_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let home = tempfile::tempdir().expect("create native runtime HOME");
+    let home_path = home.path().to_string_lossy().into_owned();
+    let other_account_state = home.path().join(".opencode5");
+    let other_account_state_path = other_account_state.to_string_lossy().into_owned();
+
+    let export = support::invoke_validated_with_host_and_env(
+        "session.export",
+        serde_json::json!({
+            "settings_id": "opencode1",
+            "session_id": "ses_non_launch_admission",
+        }),
+        runtime.host_overrides(),
+        "session.schema.json#/$defs/SessionExportRequest",
+        &[
+            ("PATH", path.as_str()),
+            ("HOME", home_path.as_str()),
+            ("XDG_DATA_HOME", other_account_state_path.as_str()),
+            ("CONTEXT_SELECTOR", "runtime-a"),
+        ],
+    );
+    assert_output_success(&export, "non-launch runtime admission");
+
+    let state_path = runtime
+        .data_root()
+        .join("provider-state/opencode/native-runtimes/opencode1.json");
+    let state: Value = serde_json::from_slice(
+        &fs::read(&state_path).expect("read non-launch native runtime identity"),
+    )
+    .expect("parse non-launch native runtime identity");
+    assert!(state["execution_env"].get("XDG_DATA_HOME").is_none());
+}
+
+#[test]
 fn contract_native_runtime_scrubs_schema_v4_environment_without_rebinding() {
     let runtime = IsolatedLaunchSettings::new();
     let fake_wrapper = FakeOpencodeWrapper::with_script(fake_wrapper_log_only_script());
