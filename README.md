@@ -788,7 +788,8 @@ bounded exceptional path: the provider streams the replacement hash, runs a
 bounded `--version` probe, requires a strictly forward numeric version from the
 persisted admitted identity, and atomically publishes the replacement identity
 before continuing. Initial unknown executables, downgrades, path changes, and
-state-selector changes remain fail-closed. This lets OpenCode's native
+state-selector changes other than the narrow declared-account canonical-root
+repair described above remain fail-closed. This lets OpenCode's native
 auto-update remain enabled without turning each forward update into an
 account-wide outage.
 The metadata stamp is persistence evidence and does not alter the component's
