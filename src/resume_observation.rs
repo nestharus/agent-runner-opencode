@@ -1,4 +1,4 @@
-//! Declared roles: observer, validator, mapper
+//! Declared roles: observer, validator, mapper, parser
 //! intrinsic_surface_declarations:
 //!   - component: src/resume_observation.rs
 //!     role: intrinsic-surface
@@ -12,6 +12,7 @@ use crate::encoding::sha256_hex;
 use crate::opencode::{self, OpencodeEventMetadata, OpencodeExport, OpencodeMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -339,6 +340,31 @@ pub(crate) fn strip_trailing_delivery_marker<'a>(
     trimmed[..start].trim_end()
 }
 
+pub(crate) fn strip_quoted_launch_delivery_marker(text: &str) -> Cow<'_, str> {
+    const QUOTED_MARKER_PREFIX: &str = "\" \"[OULIPOLY-DELIVERY ";
+    const QUOTED_MARKER_SUFFIX: &str = "]\"";
+
+    let trimmed = text.trim();
+    let Some(encoded) = trimmed.strip_prefix('"') else {
+        return Cow::Borrowed(text);
+    };
+    let Some(marker_start) = encoded.rfind(QUOTED_MARKER_PREFIX) else {
+        return Cow::Borrowed(text);
+    };
+    let marker = &encoded[marker_start + QUOTED_MARKER_PREFIX.len()..];
+    let Some(nonce) = marker.strip_suffix(QUOTED_MARKER_SUFFIX) else {
+        return Cow::Borrowed(text);
+    };
+    if nonce.len() != 64
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(encoded[..marker_start].replace("\\\"", "\""))
+}
+
 pub(crate) fn message_has_delivery_nonce(message: &OpencodeMessage, delivery_nonce: &str) -> bool {
     message_contains_delivery_nonce(message, delivery_nonce)
 }
@@ -346,8 +372,8 @@ pub(crate) fn message_has_delivery_nonce(message: &OpencodeMessage, delivery_non
 #[cfg(test)]
 mod tests {
     use super::{
-        observation_from_export, strip_trailing_delivery_marker, text_sha256_matches,
-        ResumeCompletion, ResumeMatchIdentity,
+        observation_from_export, strip_quoted_launch_delivery_marker,
+        strip_trailing_delivery_marker, text_sha256_matches, ResumeCompletion, ResumeMatchIdentity,
     };
     use crate::encoding::sha256_hex;
     use crate::opencode;
@@ -395,6 +421,24 @@ mod tests {
                 "aaaaaaaa99999999aaaaaaaa99999999aaaaaaaa99999999aaaaaaaa99999999"
             ),
             authored
+        );
+    }
+
+    #[test]
+    fn quoted_launch_delivery_marker_stripping_recovers_the_logical_payload() {
+        let payload = "mailbox body\npath: \"/tmp/result\"\n[END OULIPOLY NOTIFICATIONS]";
+        let persisted = format!(
+            "\"{}\" \"[OULIPOLY-DELIVERY {}]\"",
+            payload.replace('"', "\\\""),
+            "a".repeat(64)
+        );
+
+        assert_eq!(strip_quoted_launch_delivery_marker(&persisted), payload);
+        assert_eq!(
+            strip_quoted_launch_delivery_marker(
+                "user text\n[OULIPOLY-DELIVERY bbbbbbbb99999999bbbbbbbb99999999bbbbbbbb99999999bbbbbbbb99999999]"
+            ),
+            "user text\n[OULIPOLY-DELIVERY bbbbbbbb99999999bbbbbbbb99999999bbbbbbbb99999999bbbbbbbb99999999]"
         );
     }
 

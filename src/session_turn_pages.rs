@@ -1596,11 +1596,13 @@ impl<'a> SourceAdapter<'a> {
             }
             if projection == TurnProjection::UserObservation {
                 let persisted_text = normalized_text(&body);
+                let launch_normalized_text =
+                    crate::resume_observation::strip_quoted_launch_delivery_marker(&persisted_text);
                 let expected_delivery_nonce = expected_delivery_nonce.expect(
                     "validated user observation token binding has an expected delivery nonce",
                 );
                 let logical_text = crate::resume_observation::strip_trailing_delivery_marker(
-                    &persisted_text,
+                    &launch_normalized_text,
                     expected_delivery_nonce,
                 );
                 if logical_text != persisted_text {
