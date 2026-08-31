@@ -3,6 +3,22 @@
 Standalone OpenCode provider CLI for the `oulipoly.provider/v1` external
 provider contract.
 
+## Installed configuration
+
+An installed provider can use an adjacent `config.toml` with absolute paths:
+
+```toml
+opencode_bin = "/home/example/.opencode/bin/opencode"
+agent_bash_bin = "/home/example/.config/oulipoly-agent-runner/agent-bash/agent-bash"
+agent_runner_bin = "/home/example/.config/oulipoly-agent-runner/runner/oulipoly-agent-runner"
+```
+
+The executable path is canonicalized before locating the file, allowing a `~/.local/bin` symlink
+without placing configuration in `bin`. A present file is authoritative and invalid content is a
+startup error. When the file is absent, OpenCode resolution falls back to
+`AGENT_RUNNER_OPENCODE_BIN`/`PATH`, while child-tool paths fall back to `AGENT_BASH_BIN` and
+`AGENT_BASH_AGENT_RUNNER_BIN` when those variables are set.
+
 OpenCode owns every account-scoped boundary: model launch, sessions, native
 session export/import for account rotation, authentication, and quota
 attribution. Quota is read from the selected wrapper's native OpenCode auth
@@ -21,7 +37,8 @@ sections own only the mechanisms reused across capabilities.
 | Account and settings identity, transactions, and migration | `src/account.rs`, `src/settings.rs`, `src/settings_definition.rs`, `src/migration.rs` |
 | Model catalog, runtime selection, and launch policy | `src/models.rs`, `src/runtime_selection.rs`, `src/policy.rs` |
 | Launch, new-session recovery, and resumed-turn recovery | `src/launch.rs`, `src/resume_observation.rs`, `src/terminal.rs` |
-| Session capture and canonical projection | `src/session.rs`, `src/opencode.rs` |
+| Session capture and canonical export | `src/session.rs`, `src/opencode.rs` |
+| Bounded session-turn paging | `src/session_turn_pages.rs` |
 | Session enumeration and cursor custody | `src/session_enumeration.rs` |
 | Quota source and observation | `src/quota.rs`, `src/quota_adapter.rs`, `src/quota_observer.rs` |
 | Credential refresh settlement | `src/quota_auth_refresh.rs` |
@@ -329,7 +346,20 @@ helpers remain direct children. One custody boundary is installed immediately
 after every manual spawn and owns termination and reaping on every fallible
 return until a successful wait discharges it. Drain queues are bounded. Raw
 stdout/stderr bytes are projected once and are not separately retained for
-terminal classification, which is intentionally status-only; stdout metadata
+terminal classification, which is intentionally status-only. Output awaiting
+durable session or resume admission is held in a request-owned anonymous file,
+not cumulative memory, and has no fixed total-byte or event-count ceiling.
+Filesystem exhaustion or any spool create/write/flush/seek/read failure is an
+explicit launch failure; output is never truncated to manufacture success.
+Heartbeats bypass that deferred payload lane so resumed launches remain visibly
+live. After both native drains finish and every deferred event is replayed, the
+provider emits `oulipoly.launch_output_complete/v1` with exact per-channel byte
+counts and SHA-256 digests plus the data-event count immediately before the
+final exit when `params.output_delivery` requested the host-selected
+`oulipoly.launch_output/v1` extension. Legacy requests may omit that optional
+field and receive no completion attestation; supplying it without
+`OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1` is rejected. Any spool, event-writer, or
+native pipe-read failure cannot produce a clean completion attestation. Stdout metadata
 needed for provider session and native-error evidence is parsed on its bounded
 typed path. Native event framing consumes each received byte once and
 retains at most 1 MiB for an incomplete metadata line; an over-bound line is
@@ -392,14 +422,16 @@ never need recovery. The caller's bytes remain an unmodified prefix, but the
 model can observe the appended provider-authored item and the provider does not
 claim that it is semantically neutral. OpenCode records the item inside its
 native `role=user` message; that role names the native transport role and does
-not mean the item was authored by the human caller. `session.read_turns` and
-canonical export deliberately preserve that native history, so transcript
-consumers that need a human-authored-only view must recognize the reserved
-provider item rather than attributing it to the caller. There is no fidelity
-opt-out: omitting the identity would make response-loss recovery unable to
-distinguish identical sibling submissions. Workloads requiring the exact
-caller payload to be the complete model-visible or exported user text are
-therefore outside this provider's launch-fidelity contract.
+not mean the item was authored by the human caller. Canonical export preserves
+that native history. Bounded `session.read_turns` pages preserve the native text
+when it fits the selected inline-body budget and otherwise retain an explicit
+omitted-body state. Transcript consumers that need a human-authored-only view
+must recognize the reserved provider item rather than attributing it to the
+caller. There is no fidelity opt-out: omitting the identity would make
+response-loss recovery unable to distinguish identical sibling submissions.
+Workloads requiring the exact caller payload to be the complete model-visible
+or exported user text are therefore outside this provider's launch-fidelity
+contract.
 
 ### Launch request custody and replay
 
@@ -525,6 +557,47 @@ external boundary. It translates every non-empty carrier into one typed
 candidate set with provenance and rejects the request if any simultaneously
 supplied session identities disagree; priority never erases conflicting launch,
 lifecycle, pinned-target, bare, or live-report evidence.
+
+Live-report capture validates the exact session ID and workspace from the
+OpenCode session metadata row through the bounded database adapter. It never
+exports or parses message history.
+
+## Bounded session-turn paging
+
+`session.read_turns` supports only the selected
+`oulipoly.session_turn_pages/v1` protocol. The provider advertises
+`session_turn_pages_v1=true` only when the describe request supplies
+`OULIPOLY_HOST_SESSION_TURN_PAGES_V1=1`; an unselected invocation is rejected,
+and there is no whole-history compatibility path.
+
+The adapter uses OpenCode's official `opencode --pure db path` and bounded
+`opencode --pure db <query> --format json` surface over the account-scoped
+SQLite message/part store. The supported source shape is the OpenCode `1.18.25`
+session/message/part schema with
+`message_session_time_created_id_idx(session_id,time_created,id)` and
+`part_message_id_id_idx(message_id,id)`. The provider detects those columns and
+indexes before every read and rejects incompatible stores. It captures an
+indexed immutable high-watermark and uses `(time_created,id)` keyset predicates
+for every page. A trailing assistant message without completion evidence
+remains outside the snapshot. Appends beyond the captured high-watermark become
+visible only after the completed snapshot's resume token.
+
+Page and resume tokens are bounded, integrity checked, and bound to the provider
+instance, settings version, session, projection, native runtime identity, and
+database generation. Observation tokens additionally bind the required exact
+64-lowercase-hex delivery nonce. Only that authorized trailing delivery marker
+is removed from normalized observation text; different valid-looking authored
+markers remain content. Active page tokens carry a bounded database/WAL revision
+and monotonic message/part row-frontier witness. Updates, deletes, part changes,
+or backdated inserts inside the frozen prefix invalidate the snapshot, while
+rows appended beyond its high-watermark remain excluded and do not invalidate
+continuation. Database replacement or incompatible schema change also
+invalidates an active snapshot. Turn count, compact response bytes, source
+payload bytes, and per-turn inline body bytes are independently host-selected
+within contract maxima. Oversized bodies are represented as
+`omitted_oversize`; the provider does not increase stdout retention or invoke
+`opencode export` to satisfy paging. `user_observation` tail mode captures an
+empty immutable anchor so foreground confirmation reads only later user turns.
 
 ## Rotation assessment and materialization
 

@@ -4,7 +4,7 @@
 //!     role: intrinsic-surface
 //!     Domain: canonical transcript surface
 //!     Owns:
-//!       - opencode export to provider session responses
+//!       - bounded provider session operations and archival export routing
 //!       - canonical transcript byte serialization
 //!       - session replace unsupported boundary
 //!
@@ -12,7 +12,6 @@
 //!   - component: src/session.rs
 //!     role: adapter
 //!     Translates:
-//!       - opencode export native session JSON to SessionReadTurnsResult
 //!       - opencode launch sessionID evidence to SessionCaptureResult
 //!       - opencode export native session JSON to oulipoly.canonical_transcript/v1
 //!       - opencode absent transcript path to SessionLocateTranscriptResult
@@ -27,20 +26,15 @@ use crate::runtime_selection::{append_resolved_activity_targets, resolve_runtime
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
 
 const CANONICAL_FORMAT: &str = "oulipoly.canonical_transcript/v1";
 const NATIVE_FORMAT_ID: &str = "opencode.export/native-json";
 const SOURCE_KIND: &str = "opencode.export";
-const USER_OBSERVATION_PROJECTION: &str = "user_observation";
-const MAX_OBSERVATION_BODY_TAIL: usize = 16;
 
 #[derive(Deserialize)]
 struct SessionParams {
     settings_id: String,
     session_id: Option<String>,
-    turn_projection: Option<String>,
-    body_tail_limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +104,9 @@ pub(crate) fn handle(
     command: Command,
     request: RequestEnvelope,
 ) -> Result<SessionOutcome, ProviderFailure> {
+    if command == Command::ReadTurns {
+        return crate::session_turn_pages::read_turns(request).map(SessionOutcome::new);
+    }
     let RequestEnvelope {
         host,
         params,
@@ -120,9 +117,7 @@ pub(crate) fn handle(
         Command::LocateTranscript => {
             locate_transcript_params(params, &request_id).map(SessionOutcome::new)
         }
-        Command::ReadTurns => {
-            read_turns_params(&host, params, &request_id).map(SessionOutcome::new)
-        }
+        Command::ReadTurns => unreachable!("session.read_turns is dispatched before destructuring"),
         Command::Capture => capture_params(&host, params, &request_id).map(SessionOutcome::new),
         Command::Enumerate => {
             crate::session_enumeration::enumerate_params(&host, params, &request_id)
@@ -259,24 +254,6 @@ pub fn locate_transcript_params(params: Value, request_id: &str) -> Result<Value
     Ok(locate_transcript_result(params.session_id.as_deref()))
 }
 
-pub fn read_turns_params(
-    host: &crate::envelope::HostContext,
-    params: Value,
-    request_id: &str,
-) -> Result<Value, ProviderFailure> {
-    let params = parse_session_params(params, request_id)?;
-    validate_turn_projection(&params, request_id)?;
-    let session_id = required_session_id(&params, request_id)?;
-    let native = export_native(host, &params.settings_id, &session_id, request_id)?;
-    let turns = match params.turn_projection.as_deref() {
-        Some(USER_OBSERVATION_PROJECTION) => {
-            user_observation_turns(&native, &session_id, params.body_tail_limit.unwrap_or(4))?
-        }
-        _ => native_turns(&native, &session_id)?,
-    };
-    Ok(read_turns_result(turns))
-}
-
 pub fn capture_params(
     host: &crate::envelope::HostContext,
     params: Value,
@@ -327,37 +304,14 @@ fn capture_live_report(
             "live_report.invocation_uuid must match invocation_uuid",
         ));
     }
-    let native = export_native(host, &params.settings_id, &provider_session_id, request_id)?;
-    validate_live_report_working_directory(&native, host.working_directory.as_deref(), request_id)?;
-    Ok(Some(native.info.id))
-}
-
-fn validate_live_report_working_directory(
-    native: &OpencodeExport,
-    working_directory: Option<&str>,
-    request_id: &str,
-) -> Result<(), ProviderFailure> {
-    let expected = non_empty_string(working_directory).ok_or_else(|| {
-        invalid_session_capture_params_failure(
-            request_id,
-            "live reports require host.working_directory",
-        )
-    })?;
-    let actual = non_empty_string(native.info.directory.as_deref()).ok_or_else(|| {
-        invalid_session_capture_params_failure(
-            request_id,
-            "opencode export is missing info.directory for the live report",
-        )
-    })?;
-    if Path::new(&actual) != Path::new(&expected) {
-        return Err(invalid_session_capture_params_failure(
-            request_id,
-            format!(
-                "live report workspace mismatch: opencode exported {actual}, runner requested {expected}"
-            ),
-        ));
-    }
-    Ok(())
+    crate::session_turn_pages::capture_live_session(
+        host,
+        &params.settings_id,
+        &provider_session_id,
+        host.working_directory.as_deref(),
+        request_id,
+    )
+    .map(Some)
 }
 
 pub fn export_params(
@@ -406,31 +360,6 @@ fn required_session_id(
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .ok_or_else(|| missing_session_id_failure(request_id))
-}
-
-fn validate_turn_projection(
-    params: &SessionParams,
-    request_id: &str,
-) -> Result<(), ProviderFailure> {
-    match params.turn_projection.as_deref() {
-        None => Ok(()),
-        Some(USER_OBSERVATION_PROJECTION)
-            if matches!(
-                params.body_tail_limit,
-                None | Some(1..=MAX_OBSERVATION_BODY_TAIL)
-            ) =>
-        {
-            Ok(())
-        }
-        Some(USER_OBSERVATION_PROJECTION) => Err(invalid_session_params_message_failure(
-            request_id,
-            format!("body_tail_limit must be between 1 and {MAX_OBSERVATION_BODY_TAIL}"),
-        )),
-        Some(projection) => Err(invalid_session_params_message_failure(
-            request_id,
-            format!("unsupported turn_projection: {projection}"),
-        )),
-    }
 }
 
 fn export_native(
@@ -516,78 +445,6 @@ fn export_failure(request_id: &str, session_id: &str, err: OpencodeExportError) 
             format!("opencode export timed out for {session_id}"),
         ),
     }
-}
-
-fn native_turns(native: &OpencodeExport, session_id: &str) -> Result<Vec<Value>, ProviderFailure> {
-    native
-        .messages
-        .iter()
-        .map(|message| native_turn(message, session_id))
-        .collect()
-}
-
-fn user_observation_turns(
-    native: &OpencodeExport,
-    session_id: &str,
-    body_tail_limit: usize,
-) -> Result<Vec<Value>, ProviderFailure> {
-    let messages = native
-        .messages
-        .iter()
-        .filter(|message| message.info.role == "user")
-        .collect::<Vec<_>>();
-    let body_start = messages.len().saturating_sub(body_tail_limit);
-    messages
-        .into_iter()
-        .enumerate()
-        .map(|(index, message)| user_observation_turn(message, session_id, index >= body_start))
-        .collect()
-}
-
-fn user_observation_turn(
-    message: &OpencodeMessage,
-    session_id: &str,
-    include_body: bool,
-) -> Result<Value, ProviderFailure> {
-    let mut turn = json!({
-        "session_id": session_id,
-        "turn_id": stable_turn_id(message, session_id),
-        "role": message.info.role,
-        "timestamp": provider_turn_timestamp(message),
-    });
-    if include_body {
-        turn["body"] = Value::Array(text_parts(message));
-    }
-    Ok(turn)
-}
-
-fn native_turn(message: &OpencodeMessage, session_id: &str) -> Result<Value, ProviderFailure> {
-    let model_identity = message.info.model_identity();
-    Ok(json!({
-        "session_id": session_id,
-        "turn_id": stable_turn_id(message, session_id),
-        "role": message.info.role,
-        "timestamp": provider_turn_timestamp(message),
-        "body": text_parts(message),
-        "native": {
-            "message_id": message.info.id,
-            "session_id": message.info.session_id,
-            "created_unix_ms": message.info.time.as_ref().and_then(|time| time.created),
-            "completed_unix_ms": message.info.time.as_ref().and_then(|time| time.completed),
-            "provider_id": model_identity.provider_id(),
-            "model_id": model_identity.model_id(),
-            "variant": model_identity.variant(),
-            "parts": message.parts,
-        },
-    }))
-}
-
-fn provider_turn_timestamp(message: &OpencodeMessage) -> String {
-    message_time_millis(message)
-        .and_then(|milliseconds| i64::try_from(milliseconds).ok())
-        .and_then(DateTime::<Utc>::from_timestamp_millis)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-        .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 pub(crate) fn rotation_boundary_timestamp(native: &OpencodeExport) -> Option<String> {
@@ -815,14 +672,6 @@ fn locate_transcript_result(session_id: Option<&str>) -> Value {
     })
 }
 
-fn read_turns_result(turns: Vec<Value>) -> Value {
-    json!({
-        "turn_count": turns.len(),
-        "turns": turns,
-        "complete": true,
-    })
-}
-
 fn capture_result(provider_session_id: Option<String>, source: &'static str) -> Value {
     let artifacts = capture_artifacts(provider_session_id.as_deref());
     let source_id = source_id(provider_session_id.as_deref());
@@ -992,34 +841,4 @@ fn pinned_target(params: &SessionCaptureParams) -> Option<String> {
 
 fn start_bound_provider_session_id(params: &SessionCaptureParams) -> Option<String> {
     non_empty_string(params.start_bound_provider_session_id.as_deref())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn user_observation_turn_omits_unselected_body() {
-        let message: OpencodeMessage = serde_json::from_value(json!({
-            "info": {
-                "id": "message-1",
-                "role": "user",
-                "sessionID": "session-1",
-                "time": { "created": 1 }
-            },
-            "parts": [{ "type": "text", "text": "body" }]
-        }))
-        .expect("user message");
-
-        let without_body =
-            user_observation_turn(&message, "session-1", false).expect("observation without body");
-        let with_body =
-            user_observation_turn(&message, "session-1", true).expect("observation with body");
-
-        assert!(!without_body
-            .as_object()
-            .expect("observation object")
-            .contains_key("body"));
-        assert_eq!(with_body["body"][0]["text"], "body");
-    }
 }

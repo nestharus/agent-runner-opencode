@@ -35,6 +35,9 @@ fn shell_output(output: Output) -> ShellOutput {
 }
 
 fn resolved_program(program: &str) -> PathBuf {
+    if let Some(configured) = crate::config::program_override(program) {
+        return configured;
+    }
     let path = Path::new(program);
     if program_has_path_component(path) {
         return path.to_path_buf();

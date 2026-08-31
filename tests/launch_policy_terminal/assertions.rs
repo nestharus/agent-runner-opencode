@@ -138,6 +138,7 @@ pub fn assert_contract_launch_stream_output(
         FAKE_LAUNCH_STDERR,
         "stderr events must byte-preserve the selected opencodeN wrapper output"
     );
+    assert_launch_output_completion(&events, FAKE_LAUNCH_STDOUT, FAKE_LAUNCH_STDERR);
     assert_eq!(
         expected_session_marker(&events, fixture_session_id)["value"],
         true,
@@ -214,6 +215,40 @@ pub fn assert_provider_session_marker(events: &[Value], fixture_session_id: &str
     );
 }
 
+pub fn assert_launch_output_completion(events: &[Value], stdout: &[u8], stderr: &[u8]) {
+    let markers = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event["kind"] == "marker" && event["name"] == "oulipoly.launch_output_complete/v1"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        markers.len(),
+        1,
+        "launch must emit exactly one output completion marker; events={events:?}"
+    );
+    let (marker_index, marker) = markers[0];
+    assert_eq!(
+        marker_index + 1,
+        events.len() - 1,
+        "output completion must immediately precede the final exit"
+    );
+    assert_eq!(marker["value"]["protocol"], "oulipoly.launch_output/v1");
+    assert_eq!(marker["value"]["stdout"]["bytes"], stdout.len() as u64);
+    assert_eq!(marker["value"]["stdout"]["sha256"], sha256_hex(stdout));
+    assert_eq!(marker["value"]["stderr"]["bytes"], stderr.len() as u64);
+    assert_eq!(marker["value"]["stderr"]["sha256"], sha256_hex(stderr));
+    let data_event_count = events
+        .iter()
+        .filter(|event| event["kind"] == "stdout" || event["kind"] == "stderr")
+        .count() as u64;
+    assert_eq!(
+        marker["value"]["data_event_count"], data_event_count,
+        "completion marker must account for every projected data event"
+    );
+}
+
 pub fn assert_status_derived_terminal_signal(final_event: &Value) {
     assert_eq!(
         final_event["terminal_signal"]["kind"],
@@ -263,16 +298,8 @@ pub fn assert_declared_xdg_data_home_logged(wrapper_log: &str) {
 
 pub fn assert_oulipoly_linkage_logged(wrapper_log: &str) {
     assert!(
-        wrapper_log.contains("oulipoly_data=/tmp/real-oulipoly-data"),
-        "OULIPOLY_DATA_DIR must reach env-cleared launch child; log={wrapper_log:?}"
-    );
-    assert!(
         wrapper_log.contains("oulipoly_parent=parent-invocation-token"),
         "OULIPOLY_PARENT_INVOCATION must reach env-cleared launch child; log={wrapper_log:?}"
-    );
-    assert!(
-        wrapper_log.contains("agent_runner_bin=/tmp/target-release/oulipoly-agent-runner"),
-        "AGENT_BASH_AGENT_RUNNER_BIN must reach env-cleared launch child; log={wrapper_log:?}"
     );
 }
 

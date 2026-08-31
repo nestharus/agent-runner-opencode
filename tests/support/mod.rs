@@ -173,6 +173,15 @@ pub fn invoke_raw_stdin_with_env(
 }
 
 pub fn request_envelope(subcommand: &str, params: Value, host_overrides: Value) -> Value {
+    let mut host = host_context(host_overrides);
+    if subcommand == "launch"
+        && params.get("output_delivery").is_some()
+        && host
+            .pointer("/env/OULIPOLY_HOST_LAUNCH_OUTPUT_V1")
+            .is_none()
+    {
+        host["env"]["OULIPOLY_HOST_LAUNCH_OUTPUT_V1"] = json!("1");
+    }
     json!({
         "contract": CONTRACT,
         "request_id": format!(
@@ -180,7 +189,7 @@ pub fn request_envelope(subcommand: &str, params: Value, host_overrides: Value) 
             REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ),
         "provider_instance_id": "opencode-primary",
-        "host": host_context(host_overrides),
+        "host": host,
         "params": params
     })
 }

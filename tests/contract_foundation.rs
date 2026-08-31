@@ -6,8 +6,8 @@ use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Value};
 use std::process::Command;
 use support::{
-    assert_valid, host_context, invoke, invoke_raw_stdin, invoke_with_request, json_stdout,
-    CONTRACT,
+    assert_valid, host_context, invoke, invoke_raw_stdin, invoke_with_host, invoke_with_request,
+    json_stdout, CONTRACT,
 };
 
 #[test]
@@ -16,6 +16,41 @@ fn describe_response_conforms_and_sets_opencode_identity() {
     assert_success(&output, "describe");
     let response = json_stdout(&output);
     assert_describe_response(&response);
+}
+
+#[test]
+fn describe_advertises_launch_output_only_when_selected_by_the_host() {
+    let legacy = json_stdout(&invoke("describe", json!({})));
+    assert!(legacy["result"]["capabilities"]
+        .get("launch_output_v1")
+        .is_none());
+
+    let selected = json_stdout(&invoke_with_host(
+        "describe",
+        json!({}),
+        json!({"env": {"OULIPOLY_HOST_LAUNCH_OUTPUT_V1": "1"}}),
+    ));
+    assert_eq!(selected["result"]["capabilities"]["launch_output_v1"], true);
+    assert_describe_response(&selected);
+}
+
+#[test]
+fn describe_advertises_session_turn_pages_only_when_selected_by_the_host() {
+    let unselected = json_stdout(&invoke("describe", json!({})));
+    assert!(unselected["result"]["capabilities"]
+        .get("session_turn_pages_v1")
+        .is_none());
+
+    let selected = json_stdout(&invoke_with_host(
+        "describe",
+        json!({}),
+        json!({"env": {"OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"}}),
+    ));
+    assert_eq!(
+        selected["result"]["capabilities"]["session_turn_pages_v1"],
+        true
+    );
+    assert_describe_response(&selected);
 }
 
 #[test]
