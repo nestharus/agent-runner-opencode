@@ -614,6 +614,39 @@ fn contract_session_read_turns_preserves_a_different_valid_user_authored_deliver
 }
 
 #[test]
+fn contract_session_read_turns_removes_the_provider_quoted_launch_marker() {
+    let session_id = "ses_turn_pages_provider_launch_marker";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.remove_trailing_assistant();
+    let path = prepend_path(fake_opencode.dir());
+    let anchor = read_turns_result(session_turn_page_tail_params(session_id), &path);
+    let prompt = format!(
+        "[OULIPOLY NOTIFICATIONS]\npath: \"/tmp/result\"\n[OULIPOLY-DELIVERY {OBSERVATION_DELIVERY_NONCE}]\n[END OULIPOLY NOTIFICATIONS]"
+    );
+    let persisted = format!(
+        "\"{}\" \"[OULIPOLY-DELIVERY {}]\"",
+        prompt.replace('"', "\\\""),
+        "a".repeat(64)
+    );
+    fake_opencode.append_user("msg_005", 5000, &persisted);
+    let observed = read_turns_result(
+        session_turn_page_beginning_params(
+            session_id,
+            "user_observation",
+            anchor["resume_token"].as_str(),
+        ),
+        &path,
+    );
+
+    assert_eq!(observed["turns"][0]["body"][0]["text"], prompt);
+    assert_eq!(
+        observed["turns"][0]["canonical_text_sha256"],
+        format!("{:x}", sha2::Sha256::digest(prompt.as_bytes()))
+    );
+    fake_opencode.assert_no_export();
+}
+
+#[test]
 fn contract_session_read_turns_rejects_observation_tokens_in_a_different_nonce_context() {
     let session_id = "ses_turn_pages_nonce_replay";
     let fake_opencode = FakeOpencodeDatabase::new(session_id);
