@@ -28,7 +28,10 @@ pub fn launch_params_for_model(
         "mode": "agent",
         "model": model_request_for(alias, provider_model, effort),
         "argv": host_candidate_argv_for_model(command, provider_model, effort),
-        "working_directory": env!("CARGO_MANIFEST_DIR")
+        "working_directory": env!("CARGO_MANIFEST_DIR"),
+        "output_delivery": {
+            "protocol": "oulipoly.launch_output/v1"
+        }
     })
 }
 

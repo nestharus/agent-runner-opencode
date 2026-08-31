@@ -348,6 +348,7 @@ impl NativeRuntimeContext {
     ) -> BTreeMap<String, String> {
         let mut environment = ambient_environment();
         environment.extend(declared_env.clone());
+        crate::config::apply_tool_paths(&mut environment);
         // The persisted values select the admitted executable and account state
         // namespace. Keep them authoritative while forwarding every other
         // inherited or request-declared variable to the child unchanged.
@@ -759,7 +760,9 @@ fn runtime_identity_environment(
 
 fn resolve_program(program: &str, env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let path = Path::new(program);
-    let candidate = if path.is_absolute() || path.components().count() > 1 {
+    let candidate = if let Some(configured) = crate::config::program_override(program) {
+        configured
+    } else if path.is_absolute() || path.components().count() > 1 {
         path.to_path_buf()
     } else {
         env.get("PATH")

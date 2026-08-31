@@ -654,6 +654,9 @@ fn invalid_setup_settings_ids(request_id: &str, message: &str) -> ProviderFailur
 }
 
 fn find_on_path(program: &str) -> Option<PathBuf> {
+    if let Some(configured) = crate::config::program_override(program) {
+        return Some(configured);
+    }
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
             .map(|directory| directory.join(program))

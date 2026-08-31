@@ -4,11 +4,17 @@ mod session_projection;
 #[allow(dead_code)]
 mod support;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 use session_projection::*;
+use sha2::Digest as _;
 use std::fs;
+use std::io::Write as _;
 use std::sync::Mutex;
-use support::{invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env};
+use support::{
+    invoke, invoke_validated, invoke_with_env, invoke_with_host_and_env,
+    invoke_with_request_and_env,
+};
 
 static PATH_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -111,96 +117,793 @@ fn characterization_opencode_session_export_json() {
 }
 
 #[test]
-fn contract_session_read_turns() {
-    let session_id = fixture_session_id();
-    let fake_opencode = FakeOpencodeExport::new(session_id);
+fn contract_session_read_turns_pages_a_bounded_immutable_snapshot_without_export() {
+    let session_id = "ses_turn_pages_fixture";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
     let path = prepend_path(fake_opencode.dir());
-    let params = session_params(session_id);
+    let params = session_turn_page_beginning_params(session_id, "canonical_ingest", None);
 
-    let result = read_turns_result(params.clone(), &path);
-    let first_ids = assert_first_read_turns_result(&result);
+    let first = read_turns_result(params.clone(), &path);
+    let exact_retry = read_turns_result(params.clone(), &path);
+    assert_eq!(exact_retry, first, "the same bounded read must be stable");
+    assert_eq!(first["read_protocol"], "oulipoly.session_turn_pages/v1");
+    assert_eq!(first["provider_instance_id"], "opencode-primary");
+    assert_eq!(first["settings_id"], "opencode1");
+    assert_eq!(first["session_id"], session_id);
+    assert_eq!(first["turn_projection"], "canonical_ingest");
+    assert_eq!(first["page_index"], 0);
+    assert_eq!(first["page_start_sequence"], 0);
 
-    let second = read_turns_result(params, &path);
-    assert_stable_turn_ids(&second, &first_ids);
+    let snapshot_id = first["snapshot_id"]
+        .as_str()
+        .expect("snapshot id")
+        .to_string();
+    let mut pages = vec![first];
+    while !pages
+        .last()
+        .expect("page")
+        .get("snapshot_complete")
+        .and_then(Value::as_bool)
+        .expect("snapshot_complete bool")
+    {
+        let page = continue_turn_page(&params, pages.last().expect("prior page"), &path);
+        assert_eq!(page["snapshot_id"], snapshot_id);
+        pages.push(page);
+    }
 
-    assert_missing_read_turns_error(&path);
-}
-
-#[test]
-fn contract_session_read_turns_uses_regular_file_for_export_stdout() {
-    let session_id = fixture_session_id();
-    let fake_opencode = FakeOpencodeExport::pipe_truncating(session_id);
-    let path = prepend_path(fake_opencode.dir());
-
-    let result = read_turns_result(session_params(session_id), &path);
-
-    assert_first_read_turns_result(&result);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn contract_session_read_turns_does_not_limit_native_side_files() {
-    let session_id = fixture_session_id();
-    let (fake_opencode, side_file) = FakeOpencodeExport::with_large_side_file(session_id);
-    let path = prepend_path(fake_opencode.dir());
-
-    let result = read_turns_result(session_params(session_id), &path);
-
-    assert_first_read_turns_result(&result);
+    assert_eq!(pages.len(), 3);
+    let turns = pages
+        .iter()
+        .flat_map(|page| page["turns"].as_array().expect("turns array"))
+        .collect::<Vec<_>>();
+    assert_eq!(turns.len(), 3, "trailing mutable assistant is excluded");
     assert_eq!(
-        fs::metadata(side_file).expect("side-file metadata").len(),
-        17 * 1024 * 1024
+        turns
+            .iter()
+            .map(|turn| turn["role"].as_str().expect("turn role"))
+            .collect::<Vec<_>>(),
+        vec!["user", "assistant", "user"]
+    );
+    assert_eq!(
+        turns
+            .iter()
+            .map(|turn| turn["snapshot_sequence"].as_u64().expect("sequence"))
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(turns[0]["body_state"], "inline");
+    assert_eq!(turns[0]["body"][0]["text"], "first user");
+    assert_eq!(turns[0]["body_bytes"], 37);
+    assert_eq!(
+        turns[0]["body_sha256"],
+        "1ecf0eba2029e64b01236bd8add7ee02082b97889cdf7ddbe4b578dc136a843d"
+    );
+    assert_eq!(turns[1]["body_state"], "inline");
+    assert_eq!(turns[2]["body_state"], "omitted_oversize");
+    assert!(turns[2]["body"].is_null());
+    assert!(turns[0]["parent_turn_id"].is_null());
+    assert_eq!(turns[1]["parent_turn_id"], turns[0]["turn_id"]);
+    assert_eq!(turns[2]["parent_turn_id"], turns[1]["turn_id"]);
+    assert!(turns.iter().all(|turn| {
+        turn["turn_id"]
+            .as_str()
+            .is_some_and(|turn_id| !turn_id.is_empty())
+    }));
+    for page in &pages {
+        assert_eq!(page["page_turn_count"], 1);
+        assert!(page["source_bytes_examined"].as_u64().unwrap() <= 131072);
+        assert_eq!(page["scan_progress"], false);
+    }
+    let terminal = pages.last().expect("terminal page");
+    assert_eq!(terminal["snapshot_complete"], true);
+    assert!(terminal["next_page_token"].is_null());
+    assert!(terminal["resume_token"].as_str().is_some());
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_stops_before_an_incomplete_interior_assistant() {
+    let session_id = "ses_turn_pages_interior_gap";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.insert_incomplete_assistant(
+        "msg_002_gap",
+        2500,
+        "msg_002",
+        "interior assistant still receiving parts",
+    );
+    let path = prepend_path(fake_opencode.dir());
+    let params = session_turn_page_beginning_params(session_id, "canonical_ingest", None);
+
+    let first = read_turns_result(params.clone(), &path);
+    let terminal = continue_turn_page(&params, &first, &path);
+    let turns = [&first, &terminal]
+        .into_iter()
+        .flat_map(|page| page["turns"].as_array().expect("turns array"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(terminal["snapshot_complete"], true);
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["body"][0]["text"], "first user");
+    assert_eq!(turns[1]["body"][0]["text"], "first assistant");
+    assert!(turns.iter().all(|turn| {
+        turn["body"].as_array().is_some_and(|body| {
+            body.iter().all(|part| {
+                part["text"].as_str() != Some("interior assistant still receiving parts")
+            })
+        })
+    }));
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_splits_before_the_selected_response_budget() {
+    let session_id = "ses_turn_pages_response_budget";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.remove_trailing_assistant();
+    let path = prepend_path(fake_opencode.dir());
+    let mut params = session_turn_page_beginning_params(session_id, "canonical_ingest", None);
+    params["max_turns"] = json!(3);
+    params["max_response_bytes"] = json!(2560);
+
+    let output = invoke_with_host_and_env(
+        "session.read_turns",
+        params,
+        json!({
+            "env": {
+                "TERM": "xterm-256color",
+                "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+            }
+        }),
+        &[("PATH", path.as_str())],
+    );
+    assert!(
+        output.stdout.len() <= 2560,
+        "success envelope exceeded the selected response budget"
+    );
+    let page = success_result(
+        output,
+        "session.schema.json#/$defs/SessionReadTurnsResponse",
+        "session.schema.json#/$defs/SessionReadTurnsResult",
+    );
+
+    let count = page["page_turn_count"].as_u64().expect("page turn count");
+    assert!(
+        count > 0 && count < 3,
+        "the response budget must split the page"
+    );
+    assert_eq!(page["snapshot_complete"], false);
+    assert!(page["next_page_token"].as_str().is_some());
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_preserves_metadata_when_response_budget_omits_inline_body() {
+    let session_id = "ses_turn_pages_response_omission";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.clear_messages();
+    fake_opencode.append_user("msg_large", 1000, &"z".repeat(1500));
+    let path = prepend_path(fake_opencode.dir());
+    let mut inline_params =
+        session_turn_page_beginning_params(session_id, "canonical_ingest", None);
+    inline_params["max_inline_body_bytes"] = json!(2048);
+    let inline = read_turns_result(inline_params.clone(), &path);
+    assert_eq!(inline["turns"][0]["body_state"], "inline");
+
+    let mut omitted_params = inline_params;
+    omitted_params["max_response_bytes"] = json!(2048);
+    let omitted = read_turns_result(omitted_params, &path);
+    assert_eq!(omitted["turns"][0]["body_state"], "omitted_oversize");
+    assert!(omitted["turns"][0]["body"].is_null());
+    for field in ["body_bytes", "body_sha256", "canonical_text_sha256"] {
+        assert_eq!(omitted["turns"][0][field], inline["turns"][0][field]);
+    }
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_uses_the_actual_request_id_for_small_response_budgets() {
+    let session_id = "s";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    let path = prepend_path(fake_opencode.dir());
+    let mut params = session_turn_page_beginning_params(session_id, "canonical_ingest", None);
+    params["max_response_bytes"] = json!(2048);
+
+    let mut request = support::request_envelope(
+        "session.read_turns",
+        params,
+        json!({
+            "env": {
+                "TERM": "xterm-256color",
+                "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+            }
+        }),
+    );
+    request["request_id"] = json!("r".repeat(256));
+    let output =
+        invoke_with_request_and_env("session.read_turns", request, &[("PATH", path.as_str())]);
+    assert!(output.stdout.len() <= 2048);
+    let page = success_result(
+        output,
+        "session.schema.json#/$defs/SessionReadTurnsResponse",
+        "session.schema.json#/$defs/SessionReadTurnsResult",
+    );
+
+    assert_eq!(page["page_turn_count"], 1);
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_adjacent_tool_paths_reach_the_native_opencode_child() {
+    let session_id = "ses_adjacent_tool_paths";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fs::write(
+        fake_opencode.dir().join("opencode1"),
+        format!(
+            "#!/bin/sh\n\
+             printf 'agent_bash_bin=%s\\n' \"${{AGENT_BASH_BIN-}}\" >> '{}'\n\
+             printf 'agent_runner_bin=%s\\n' \"${{AGENT_BASH_AGENT_RUNNER_BIN-}}\" >> '{}'\n\
+             if [ \"$1\" = db ] && [ \"${{2:-}}\" = path ]; then printf '%s\\n' '{}'; exit 0; fi\n\
+             if [ \"$1\" = db ] && [ \"${{3:-}}\" = --format ] && [ \"${{4:-}}\" = json ]; then exec /usr/bin/sqlite3 -json '{}' \"$2\"; fi\n\
+             exit 64\n",
+            fake_opencode.log_path.display(),
+            fake_opencode.log_path.display(),
+            fake_opencode.db_path.display(),
+            fake_opencode.db_path.display(),
+        ),
+    )
+    .expect("write environment-observing OpenCode fixture");
+    make_fake_opencode_export_executable(&fake_opencode.dir().join("opencode1"));
+    let install_dir = fake_opencode.dir().join("provider-install");
+    fs::create_dir_all(&install_dir).expect("create provider install directory");
+    let provider = install_dir.join("agent-runner-opencode");
+    fs::copy(env!("CARGO_BIN_EXE_agent-runner-opencode"), &provider).expect("copy provider binary");
+    let configured_agent_bash = install_dir.join("agent-bash-configured");
+    let configured_agent_runner = install_dir.join("agents-configured");
+    fs::write(
+        install_dir.join("config.toml"),
+        format!(
+            "opencode_bin = {:?}\nagent_bash_bin = {:?}\nagent_runner_bin = {:?}\n",
+            fake_opencode.dir().join("opencode").display().to_string(),
+            configured_agent_bash.display().to_string(),
+            configured_agent_runner.display().to_string(),
+        ),
+    )
+    .expect("write adjacent provider config");
+    let config_root = support::isolated_test_config_root("adjacent-tool-paths");
+    let data_root = config_root.join("data");
+    let request = support::request_envelope(
+        "session.read_turns",
+        session_turn_page_beginning_params(session_id, "canonical_ingest", None),
+        json!({
+            "config_root": config_root,
+            "data_root": data_root,
+            "env": {
+                "TERM": "xterm-256color",
+                "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+            }
+        }),
+    );
+    support::ensure_default_runtime_settings(&request);
+    fs::create_dir_all(install_dir.join("home")).expect("create configured provider home");
+    let mut child = std::process::Command::new(&provider)
+        .arg("session.read_turns")
+        .env_clear()
+        .env("HOME", install_dir.join("home"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn configured provider");
+    child
+        .stdin
+        .take()
+        .expect("provider stdin")
+        .write_all(request.to_string().as_bytes())
+        .expect("write provider request");
+    let output = child.wait_with_output().expect("wait configured provider");
+    let _ = success_result(
+        output,
+        "session.schema.json#/$defs/SessionReadTurnsResponse",
+        "session.schema.json#/$defs/SessionReadTurnsResult",
+    );
+    let log = fs::read_to_string(&fake_opencode.log_path).expect("read fake OpenCode log");
+
+    assert!(
+        log.contains(&format!(
+            "agent_bash_bin={}\n",
+            configured_agent_bash.display()
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "agent_runner_bin={}\n",
+            configured_agent_runner.display()
+        )),
+        "{log}"
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn contract_session_read_turns_reports_oversized_export_stdout() {
-    let session_id = fixture_session_id();
-    let fake_opencode = FakeOpencodeExport::oversized_stdout(session_id);
+fn contract_session_read_turns_completes_an_empty_source_without_export() {
+    let session_id = "ses_turn_pages_empty";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.clear_messages();
     let path = prepend_path(fake_opencode.dir());
 
-    let response = assert_error_envelope(invoke_with_env(
+    let page = read_turns_result(
+        session_turn_page_beginning_params(session_id, "canonical_ingest", None),
+        &path,
+    );
+
+    assert_eq!(page["page_index"], 0);
+    assert_eq!(page["page_turn_count"], 0);
+    assert_eq!(page["turns"], json!([]));
+    assert_eq!(page["snapshot_complete"], true);
+    assert!(page["next_page_token"].is_null());
+    assert!(page["resume_token"].as_str().is_some());
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_freezes_snapshots_and_resumes_after_the_high_watermark() {
+    let session_id = "ses_turn_pages_snapshot";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.remove_trailing_assistant();
+    let path = prepend_path(fake_opencode.dir());
+    let params = session_turn_page_beginning_params(session_id, "canonical_ingest", None);
+
+    let first = read_turns_result(params.clone(), &path);
+    fake_opencode.append_user("msg_005", 5000, "appended after snapshot start");
+    let second = continue_turn_page(&params, &first, &path);
+    let terminal = continue_turn_page(&params, &second, &path);
+    assert_eq!(terminal["snapshot_complete"], true);
+    let frozen_bodies = [&first, &second, &terminal]
+        .into_iter()
+        .flat_map(|page| page["turns"].as_array().expect("frozen turns"))
+        .filter_map(|turn| turn["body"].get(0))
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !frozen_bodies.contains(&"appended after snapshot start"),
+        "a continuation must not widen its captured high-watermark"
+    );
+
+    let resumed = read_turns_result(
+        session_turn_page_beginning_params(
+            session_id,
+            "canonical_ingest",
+            terminal["resume_token"].as_str(),
+        ),
+        &path,
+    );
+    assert_eq!(
+        resumed["turns"][0]["body"][0]["text"],
+        "appended after snapshot start"
+    );
+    assert_eq!(resumed["snapshot_complete"], true);
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_invalidates_an_unread_message_update() {
+    assert_unread_snapshot_mutation_invalidated("message update", |database| {
+        database.update_message("msg_002");
+    });
+}
+
+#[test]
+fn contract_session_read_turns_invalidates_an_unread_message_delete() {
+    assert_unread_snapshot_mutation_invalidated("message delete", |database| {
+        database.delete_message("msg_002");
+    });
+}
+
+#[test]
+fn contract_session_read_turns_invalidates_an_unread_part_mutation() {
+    assert_unread_snapshot_mutation_invalidated("part mutation", |database| {
+        database.update_text_part("msg_002");
+    });
+}
+
+#[test]
+fn contract_session_read_turns_invalidates_a_backdated_incomplete_assistant() {
+    assert_unread_snapshot_mutation_invalidated("backdated incomplete assistant", |database| {
+        database.insert_incomplete_assistant(
+            "msg_001_gap",
+            1500,
+            "msg_001",
+            "inserted inside frozen prefix",
+        );
+    });
+}
+
+fn assert_unread_snapshot_mutation_invalidated(
+    label: &str,
+    mutate: impl FnOnce(&FakeOpencodeDatabase),
+) {
+    let session_id = format!("ses_turn_pages_{}", label.replace(' ', "_"));
+    let fake_opencode = FakeOpencodeDatabase::new(&session_id);
+    let path = prepend_path(fake_opencode.dir());
+    let params = session_turn_page_beginning_params(&session_id, "canonical_ingest", None);
+    let first = read_turns_result(params.clone(), &path);
+    mutate(&fake_opencode);
+
+    let response = assert_error_envelope(invoke_with_host_and_env(
         "session.read_turns",
-        session_params(session_id),
+        session_turn_page_continuation_params(
+            &params,
+            first["snapshot_id"].as_str().expect("snapshot id"),
+            first["next_page_token"].as_str().expect("next page token"),
+        ),
+        json!({
+            "env": {
+                "TERM": "xterm-256color",
+                "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+            }
+        }),
+        &[("PATH", path.as_str())],
+    ));
+
+    assert_eq!(response["error"]["code"], "snapshot_invalidated", "{label}");
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_observation_tail_anchors_before_following_user_turns() {
+    let session_id = "ses_turn_pages_observation";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.remove_trailing_assistant();
+    let path = prepend_path(fake_opencode.dir());
+
+    let anchor = read_turns_result(session_turn_page_tail_params(session_id), &path);
+    assert_eq!(anchor["turn_projection"], "user_observation");
+    assert_eq!(anchor["page_turn_count"], 0);
+    assert_eq!(anchor["snapshot_complete"], true);
+    let resume_token = anchor["resume_token"].as_str().expect("tail resume token");
+
+    let prompt = "new user observation";
+    fake_opencode.append_user(
+        "msg_005",
+        5000,
+        &format!(
+            "{prompt}\n\n[OULIPOLY-DELIVERY 5169694dde0f40d1890c6e28e55bab275169694dde0f40d1890c6e28e55bab27]\n"
+        ),
+    );
+    let mut params =
+        session_turn_page_beginning_params(session_id, "user_observation", Some(resume_token));
+    params["max_inline_body_bytes"] = json!(0);
+    let observed = read_turns_result(params, &path);
+    assert_eq!(observed["page_turn_count"], 1);
+    assert_eq!(observed["turns"][0]["role"], "user");
+    assert_eq!(observed["turns"][0]["body_state"], "omitted_oversize");
+    assert!(observed["turns"][0]["body"].is_null());
+    assert!(observed["turns"][0]["body_bytes"].as_u64().is_some());
+    assert!(observed["turns"][0]["body_sha256"].as_str().is_some());
+    assert_eq!(
+        observed["turns"][0]["canonical_text_sha256"],
+        format!("{:x}", sha2::Sha256::digest(prompt.as_bytes()))
+    );
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_preserves_a_different_valid_user_authored_delivery_marker() {
+    let session_id = "ses_turn_pages_authored_delivery_marker";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.remove_trailing_assistant();
+    let path = prepend_path(fake_opencode.dir());
+    let anchor = read_turns_result(session_turn_page_tail_params(session_id), &path);
+    let authored = "user text\n\n[OULIPOLY-DELIVERY bbbbbbbb99999999bbbbbbbb99999999bbbbbbbb99999999bbbbbbbb99999999]";
+    fake_opencode.append_user("msg_005", 5000, authored);
+    let observed = read_turns_result(
+        session_turn_page_beginning_params(
+            session_id,
+            "user_observation",
+            anchor["resume_token"].as_str(),
+        ),
+        &path,
+    );
+
+    assert_eq!(observed["turns"][0]["body"][0]["text"], authored);
+    assert_eq!(
+        observed["turns"][0]["canonical_text_sha256"],
+        format!("{:x}", sha2::Sha256::digest(authored.as_bytes()))
+    );
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_rejects_observation_tokens_in_a_different_nonce_context() {
+    let session_id = "ses_turn_pages_nonce_replay";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.remove_trailing_assistant();
+    let path = prepend_path(fake_opencode.dir());
+    let anchor_params = session_turn_page_tail_params(session_id);
+    let anchor = read_turns_result(anchor_params, &path);
+    let mut replay = session_turn_page_beginning_params(
+        session_id,
+        "user_observation",
+        anchor["resume_token"].as_str(),
+    );
+    replay["expected_delivery_nonce"] =
+        json!("aaaaaaaa99999999aaaaaaaa99999999aaaaaaaa99999999aaaaaaaa99999999");
+
+    let response = assert_error_envelope(invoke_with_host_and_env(
+        "session.read_turns",
+        replay,
+        json!({
+            "env": {
+                "TERM": "xterm-256color",
+                "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+            }
+        }),
+        &[("PATH", path.as_str())],
+    ));
+
+    assert_eq!(response["error"]["code"], "invalid_session_page_token");
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_enforces_projection_specific_delivery_nonce_shape() {
+    let session_id = "ses_turn_pages_nonce_validation";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    let path = prepend_path(fake_opencode.dir());
+    let selected_host = json!({
+        "env": {
+            "TERM": "xterm-256color",
+            "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+        }
+    });
+    let mut missing = session_turn_page_beginning_params(session_id, "user_observation", None);
+    missing
+        .as_object_mut()
+        .expect("paging params object")
+        .remove("expected_delivery_nonce");
+    let missing_response = assert_error_envelope(invoke_with_host_and_env(
+        "session.read_turns",
+        missing,
+        selected_host.clone(),
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        missing_response["error"]["code"],
+        "invalid_session_read_turns_params"
+    );
+
+    let mut forbidden = session_turn_page_beginning_params(session_id, "canonical_ingest", None);
+    forbidden["expected_delivery_nonce"] = json!(OBSERVATION_DELIVERY_NONCE);
+    let forbidden_response = assert_error_envelope(invoke_with_host_and_env(
+        "session.read_turns",
+        forbidden,
+        selected_host,
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        forbidden_response["error"]["code"],
+        "invalid_session_read_turns_params"
+    );
+}
+
+#[test]
+fn contract_session_read_turns_rejects_tampering_and_source_replacement() {
+    let session_id = "ses_turn_pages_invalid";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    let path = prepend_path(fake_opencode.dir());
+    let selected_host = json!({
+        "env": {
+            "TERM": "xterm-256color",
+            "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+        }
+    });
+
+    let unselected = assert_error_envelope(invoke_with_host_and_env(
+        "session.read_turns",
+        session_turn_page_beginning_params(session_id, "canonical_ingest", None),
+        json!({"env": {"TERM": "xterm-256color"}}),
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        unselected["error"]["code"],
+        "session_turn_pages_not_selected"
+    );
+
+    let params = session_turn_page_beginning_params(session_id, "canonical_ingest", None);
+    let first = read_turns_result(params.clone(), &path);
+    let mut tampered = first["next_page_token"]
+        .as_str()
+        .expect("next page token")
+        .to_string();
+    let last = tampered.pop().expect("token byte");
+    tampered.push(if last == '0' { '1' } else { '0' });
+    let tampered_params = session_turn_page_continuation_params(
+        &params,
+        first["snapshot_id"].as_str().expect("snapshot id"),
+        &tampered,
+    );
+    let tampered_response = assert_error_envelope(invoke_with_host_and_env(
+        "session.read_turns",
+        tampered_params,
+        selected_host.clone(),
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        tampered_response["error"]["code"],
+        "invalid_session_page_token"
+    );
+
+    let token = first["next_page_token"].as_str().expect("next page token");
+    let fields = token.split('.').collect::<Vec<_>>();
+    let mut uppercase_digest = fields[2].to_uppercase();
+    if uppercase_digest == fields[2] {
+        uppercase_digest.replace_range(..1, "A");
+    }
+    let noncanonical_tokens = [
+        format!("{}.{}.{}", fields[0], fields[1], uppercase_digest),
+        format!(
+            "{}.{}\n{}.{}",
+            fields[0],
+            &fields[1][..4],
+            &fields[1][4..],
+            fields[2]
+        ),
+    ];
+    for noncanonical in noncanonical_tokens {
+        let response = assert_error_envelope(invoke_with_host_and_env(
+            "session.read_turns",
+            session_turn_page_continuation_params(
+                &params,
+                first["snapshot_id"].as_str().expect("snapshot id"),
+                &noncanonical,
+            ),
+            selected_host.clone(),
+            &[("PATH", path.as_str())],
+        ));
+        assert_eq!(response["error"]["code"], "invalid_session_page_token");
+    }
+
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(fields[1])
+        .expect("decode public token payload");
+    let mut forged_payload: Value = serde_json::from_slice(&payload).expect("token JSON");
+    forged_payload["p"] = json!(forged_payload["p"].as_u64().expect("page index") + 10);
+    let forged_payload = serde_json::to_vec(&forged_payload).expect("serialize forged payload");
+    let runtime_identity = serde_json::from_slice::<Value>(&payload).expect("original token JSON")
+        ["b"]["r"]
+        .as_str()
+        .expect("public runtime identity")
+        .to_string();
+    let mut old_public_preimage = b"agent-runner-opencode.session-turn-token.v1\0".to_vec();
+    old_public_preimage.extend_from_slice(runtime_identity.as_bytes());
+    old_public_preimage.push(0);
+    old_public_preimage.extend_from_slice(&forged_payload);
+    let old_public_digest = format!("{:x}", sha2::Sha256::digest(&old_public_preimage));
+    let forged = format!(
+        "{}.{}.{}",
+        fields[0],
+        base64::engine::general_purpose::STANDARD.encode(&forged_payload),
+        old_public_digest
+    );
+    let forged_response = assert_error_envelope(invoke_with_host_and_env(
+        "session.read_turns",
+        session_turn_page_continuation_params(
+            &params,
+            first["snapshot_id"].as_str().expect("snapshot id"),
+            &forged,
+        ),
+        selected_host.clone(),
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        forged_response["error"]["code"],
+        "invalid_session_page_token"
+    );
+
+    fake_opencode.replace_source_file();
+    let replacement_response = assert_error_envelope(invoke_with_host_and_env(
+        "session.read_turns",
+        session_turn_page_continuation_params(
+            &params,
+            first["snapshot_id"].as_str().expect("snapshot id"),
+            first["next_page_token"].as_str().expect("next page token"),
+        ),
+        selected_host,
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        replacement_response["error"]["code"],
+        "snapshot_invalidated"
+    );
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_rejects_an_incompatible_source_schema_without_export() {
+    let session_id = "ses_turn_pages_schema_mismatch";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.remove_required_message_index();
+    let path = prepend_path(fake_opencode.dir());
+
+    let response = assert_error_envelope(invoke_with_host_and_env(
+        "session.read_turns",
+        session_turn_page_beginning_params(session_id, "canonical_ingest", None),
+        json!({
+            "env": {
+                "TERM": "xterm-256color",
+                "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+            }
+        }),
         &[("PATH", path.as_str())],
     ));
 
     assert_eq!(
         response["error"]["code"],
-        "opencode_export_capacity_exceeded"
+        "opencode_session_source_schema_unsupported"
     );
-    assert!(response["error"]["message"]
-        .as_str()
-        .expect("error message string")
-        .contains("export stdout"));
+    fake_opencode.assert_no_export();
 }
 
 #[test]
-fn contract_session_read_turns_projects_bounded_user_observation() {
-    let session_id = fixture_session_id();
-    let fake_opencode = FakeOpencodeExport::new(session_id);
+fn contract_session_read_turns_ignores_a_bracketed_native_prefix() {
+    let session_id = "ses_turn_pages_native_prefix";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.emit_bracketed_database_prefix();
     let path = prepend_path(fake_opencode.dir());
-    let result = read_turns_result(
-        json!({
-            "settings_id": "opencode1",
-            "session_id": session_id,
-            "turn_projection": "user_observation",
-            "body_tail_limit": 4
-        }),
-        &path,
+
+    let result = success_result(
+        invoke_with_host_and_env(
+            "session.read_turns",
+            session_turn_page_beginning_params(session_id, "canonical_ingest", None),
+            json!({
+                "env": {
+                    "TERM": "xterm-256color",
+                    "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+                }
+            }),
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionReadTurnsResponse",
+        "session.schema.json#/$defs/SessionReadTurnsResult",
     );
 
-    assert_eq!(result["turn_count"], 1);
-    let turns = result["turns"].as_array().expect("projected turns array");
-    assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0]["role"], "user");
-    assert_eq!(turns[0]["session_id"], session_id);
-    assert!(turns[0].get("native").is_none());
-    assert_eq!(
-        turns[0]["body"][0]["text"],
-        "\"reply with the single word: ok\""
+    assert_eq!(result["read_protocol"], "oulipoly.session_turn_pages/v1");
+    assert_eq!(result["turn_projection"], "canonical_ingest");
+    fake_opencode.assert_no_export();
+}
+
+#[test]
+fn contract_session_read_turns_chunks_native_database_output_below_pipe_capacity() {
+    let session_id = "ses_turn_pages_chunked_native_output";
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
+    fake_opencode.clear_messages();
+    let text = "x".repeat(40 * 1024);
+    fake_opencode.append_user("msg_large_user", 5000, &text);
+    let path = prepend_path(fake_opencode.dir());
+    let mut params = session_turn_page_beginning_params(session_id, "canonical_ingest", None);
+    params["max_inline_body_bytes"] = json!(64 * 1024);
+    params["max_response_bytes"] = json!(128 * 1024);
+
+    let result = success_result(
+        invoke_with_host_and_env(
+            "session.read_turns",
+            params,
+            json!({
+                "env": {
+                    "TERM": "xterm-256color",
+                    "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+                }
+            }),
+            &[("PATH", path.as_str())],
+        ),
+        "session.schema.json#/$defs/SessionReadTurnsResponse",
+        "session.schema.json#/$defs/SessionReadTurnsResult",
     );
+
+    assert_eq!(result["page_turn_count"], 1);
+    assert_eq!(result["turns"][0]["body_state"], "inline");
+    assert_eq!(result["turns"][0]["body"][0]["text"], text);
+    fake_opencode.assert_no_export();
 }
 
 #[test]
@@ -1450,7 +2153,7 @@ fn contract_session_capture_rejects_conflicting_identity_carriers() {
 fn contract_session_capture_validates_exact_live_report() {
     let session_id = fixture_session_id();
     let invocation_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    let fake_opencode = FakeOpencodeExport::new(session_id);
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
     let path = prepend_path(fake_opencode.dir());
     let working_directory = native_export_fixture()["info"]["directory"]
         .as_str()
@@ -1469,13 +2172,14 @@ fn contract_session_capture_validates_exact_live_report() {
     );
 
     assert_live_capture_result(&result, session_id);
+    fake_opencode.assert_no_export();
 }
 
 #[test]
 fn contract_session_capture_rejects_live_report_workspace_mismatch() {
     let session_id = fixture_session_id();
     let invocation_uuid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
-    let fake_opencode = FakeOpencodeExport::new(session_id);
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
     let path = prepend_path(fake_opencode.dir());
 
     let response = assert_error_envelope(invoke_with_host_and_env(
@@ -1486,12 +2190,13 @@ fn contract_session_capture_rejects_live_report_workspace_mismatch() {
     ));
 
     assert_eq!(response["error"]["code"], "invalid_session_capture_params");
+    fake_opencode.assert_no_export();
 }
 
 #[test]
 fn contract_session_capture_rejects_live_report_invocation_mismatch() {
     let session_id = fixture_session_id();
-    let fake_opencode = FakeOpencodeExport::new(session_id);
+    let fake_opencode = FakeOpencodeDatabase::new(session_id);
     let path = prepend_path(fake_opencode.dir());
     let mut params = live_capture_params(session_id, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
     params["live_report"]["invocation_uuid"] =

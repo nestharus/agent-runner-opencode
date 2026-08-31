@@ -19,6 +19,10 @@ pub const INCIDENT_ERROR_EVENT_LINE: &str = "{\"type\":\"error\",\"timestamp\":1
 
 pub const SLOW_WRAPPER_SLEEP_SECONDS: u64 = 2;
 
+pub const LARGE_DEFERRED_EVENT_REPETITIONS: usize = 160;
+
+pub const LARGE_DEFERRED_EVENT_TEXT_BYTES: usize = 8 * 1024;
+
 pub const SUBMITTED_USER_TURN_MARKER_FOR_TEST: &str = "oulipoly.submitted_user_turn";
 
 pub const PRODUCED_ASSISTANT_RESPONSE_MARKER_FOR_TEST: &str =
@@ -421,6 +425,143 @@ pub fn fake_opencode_script_with_output_and_status(
     )
 }
 
+pub fn large_deferred_new_session_script(session_id: &str) -> String {
+    let deferred_line = large_deferred_event_line(None);
+    let session_line = session_start_event_line(session_id, OBSERVED_AT_UNIX_MS + 1);
+    format!(
+        "#!/bin/sh\n\
+i=0\n\
+while [ \"$i\" -lt {LARGE_DEFERRED_EVENT_REPETITIONS} ]; do\n\
+  printf '%s\\n' {deferred_line}\n\
+  i=$((i + 1))\n\
+done\n\
+printf '%s\\n' {session_line}\n\
+exit 0\n",
+        deferred_line = shell_single_quote(&deferred_line),
+        session_line = shell_single_quote(&session_line),
+    )
+}
+
+pub fn large_deferred_new_session_stdout(session_id: &str) -> Vec<u8> {
+    let mut output = format!("{}\n", large_deferred_event_line(None))
+        .repeat(LARGE_DEFERRED_EVENT_REPETITIONS)
+        .into_bytes();
+    output.extend_from_slice(
+        session_start_event_line(session_id, OBSERVED_AT_UNIX_MS + 1).as_bytes(),
+    );
+    output.push(b'\n');
+    output
+}
+
+pub fn large_deferred_resume_script() -> String {
+    let deferred_line = large_deferred_event_line(Some(resume_session_id()));
+    let start_line = session_start_event_line(resume_session_id(), OBSERVED_AT_UNIX_MS + 1);
+    let finish_line = json!({
+        "type": "step_finish",
+        "timestamp": OBSERVED_AT_UNIX_MS + 2,
+        "sessionID": resume_session_id(),
+        "part": {
+            "type": "step-finish",
+            "sessionID": resume_session_id(),
+            "reason": "stop"
+        }
+    })
+    .to_string();
+    format!(
+        "#!/bin/sh\n\
+i=0\n\
+while [ \"$i\" -lt {LARGE_DEFERRED_EVENT_REPETITIONS} ]; do\n\
+  printf '%s\\n' {deferred_line}\n\
+  i=$((i + 1))\n\
+done\n\
+/bin/sleep 1\n\
+printf '%s\\n' {start_line}\n\
+printf '%s\\n' {finish_line}\n\
+exit 0\n",
+        deferred_line = shell_single_quote(&deferred_line),
+        start_line = shell_single_quote(&start_line),
+        finish_line = shell_single_quote(&finish_line),
+    )
+}
+
+pub fn large_deferred_resume_stdout() -> Vec<u8> {
+    let mut output = format!("{}\n", large_deferred_event_line(Some(resume_session_id())))
+        .repeat(LARGE_DEFERRED_EVENT_REPETITIONS)
+        .into_bytes();
+    output.extend_from_slice(
+        session_start_event_line(resume_session_id(), OBSERVED_AT_UNIX_MS + 1).as_bytes(),
+    );
+    output.push(b'\n');
+    output.extend_from_slice(
+        json!({
+            "type": "step_finish",
+            "timestamp": OBSERVED_AT_UNIX_MS + 2,
+            "sessionID": resume_session_id(),
+            "part": {
+                "type": "step-finish",
+                "sessionID": resume_session_id(),
+                "reason": "stop"
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    output.push(b'\n');
+    output
+}
+
+pub fn mixed_binary_launch_script(session_id: &str) -> String {
+    let session_line = session_start_event_line(session_id, OBSERVED_AT_UNIX_MS);
+    format!(
+        "#!/bin/sh\n\
+printf '\\000\\001\\177\\200\\377stdout\\n'\n\
+printf '\\376\\000stderr\\377\\n' >&2\n\
+printf '%s\\n' {session_line}\n\
+exit 0\n",
+        session_line = shell_single_quote(&session_line),
+    )
+}
+
+pub fn mixed_binary_stdout(session_id: &str) -> Vec<u8> {
+    let mut output = b"\0\x01\x7f\x80\xffstdout\n".to_vec();
+    output.extend_from_slice(session_start_event_line(session_id, OBSERVED_AT_UNIX_MS).as_bytes());
+    output.push(b'\n');
+    output
+}
+
+pub fn mixed_binary_stderr() -> Vec<u8> {
+    b"\xfe\0stderr\xff\n".to_vec()
+}
+
+fn large_deferred_event_line(session_id: Option<&str>) -> String {
+    let mut event = json!({
+        "type": "text",
+        "timestamp": OBSERVED_AT_UNIX_MS,
+        "part": {
+            "type": "text",
+            "text": "0".repeat(LARGE_DEFERRED_EVENT_TEXT_BYTES),
+        }
+    });
+    if let Some(session_id) = session_id {
+        event["sessionID"] = json!(session_id);
+        event["part"]["sessionID"] = json!(session_id);
+    }
+    event.to_string()
+}
+
+fn session_start_event_line(session_id: &str, timestamp: u64) -> String {
+    json!({
+        "type": "step_start",
+        "timestamp": timestamp,
+        "sessionID": session_id,
+        "part": {
+            "type": "step-start",
+            "sessionID": session_id,
+        }
+    })
+    .to_string()
+}
+
 pub fn incident_error_event_stdout() -> String {
     format!("{INCIDENT_ERROR_EVENT_LINE}\n")
 }
@@ -457,9 +598,7 @@ pub fn env_probe_opencode_script() -> String {
   printf 'path=%s\\n' \"${PATH-}\"\n\
   printf 'declared=%s\\n' \"${DECLARED_CHILD_ENV-}\"\n\
   printf 'xdg=%s\\n' \"${XDG_DATA_HOME-}\"\n\
-  printf 'oulipoly_data=%s\\n' \"${OULIPOLY_DATA_DIR-<unset>}\"\n\
   printf 'oulipoly_parent=%s\\n' \"${OULIPOLY_PARENT_INVOCATION-<unset>}\"\n\
-  printf 'agent_runner_bin=%s\\n' \"${AGENT_BASH_AGENT_RUNNER_BIN-<unset>}\"\n\
   if [ \"${UNDECLARED_PARENT_ENV+x}\" = x ]; then\n\
     printf 'undeclared=%s\\n' \"$UNDECLARED_PARENT_ENV\"\n\
   else\n\

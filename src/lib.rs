@@ -3,6 +3,7 @@
 pub mod account;
 pub mod activity;
 mod child_custody;
+mod config;
 pub mod discovery;
 pub mod dispatch;
 mod durable_fs;
@@ -30,6 +31,7 @@ pub mod runtime_selection;
 pub mod schema;
 pub mod session;
 mod session_enumeration;
+mod session_turn_pages;
 pub mod settings;
 pub mod settings_definition;
 pub mod setup;
@@ -39,3 +41,7 @@ pub mod terminal;
 pub use dispatch::handle_invocation;
 pub use dispatch::write_invocation;
 pub use native_process::{run_native_effect_gate, NATIVE_EFFECT_GATE_ARG};
+
+pub fn validate_binary_configuration() -> Result<(), String> {
+    config::load().map(|_| ())
+}

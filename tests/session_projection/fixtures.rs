@@ -59,13 +59,6 @@ pub fn fixture_session_id() -> &'static str {
     )
 }
 
-pub fn fixture_message_count() -> usize {
-    native_export_fixture()["messages"]
-        .as_array()
-        .expect("fixture messages array")
-        .len()
-}
-
 pub fn success_result(
     output: std::process::Output,
     response_schema: &str,
@@ -94,22 +87,6 @@ pub fn assert_error_envelope(output: std::process::Output) -> Value {
     assert_valid(&response, "common.schema.json#/$defs/ErrorResponseEnvelope");
     assert_eq!(response["ok"], false);
     response
-}
-
-pub fn turn_ids(result: &Value) -> Vec<String> {
-    turns(result)
-        .iter()
-        .map(|turn| {
-            turn["turn_id"]
-                .as_str()
-                .unwrap_or_else(|| panic!("turn must have stable string id: {turn}"))
-                .to_owned()
-        })
-        .collect()
-}
-
-pub fn turns(result: &Value) -> &[Value] {
-    result["turns"].as_array().expect("turns array")
 }
 
 pub fn canonical_record_count(bytes: &[u8]) -> usize {
@@ -198,6 +175,361 @@ impl Drop for SessionReplaceFixture {
     }
 }
 
+pub struct FakeOpencodeDatabase {
+    pub dir: PathBuf,
+    pub db_path: PathBuf,
+    pub log_path: PathBuf,
+    session_id: String,
+}
+
+impl FakeOpencodeDatabase {
+    pub fn new(session_id: &str) -> Self {
+        let dir = unique_temp_dir("agent-runner-opencode-contract-session-db");
+        let db_path = dir.join("opencode.db");
+        let log_path = dir.join("wrapper.log");
+        let wrapper_path = dir.join("opencode1");
+        fs::create_dir_all(&dir).expect("create fake opencode database dir");
+        let directory = native_export_fixture()["info"]["directory"]
+            .as_str()
+            .expect("native fixture directory")
+            .to_string();
+        run_sqlite(
+            &db_path,
+            &format!(
+                "BEGIN;
+                 CREATE TABLE session (
+                   id TEXT PRIMARY KEY, project_id TEXT, directory TEXT NOT NULL, title TEXT,
+                   version TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                   time_archived INTEGER
+                 );
+                 CREATE TABLE message (
+                   id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                   time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                 );
+                 CREATE TABLE part (
+                   id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                   time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                 );
+                 CREATE INDEX message_session_time_created_id_idx
+                   ON message(session_id,time_created,id);
+                 CREATE INDEX part_message_id_id_idx ON part(message_id,id);
+                 INSERT INTO session(id,project_id,directory,title,version,time_created,time_updated)
+                   VALUES ({},'project-fixture',{},'Paging fixture','1.18.25',1000,4000);
+                 COMMIT;",
+                sqlite_string(session_id),
+                sqlite_string(&directory),
+            ),
+        );
+        let oversized_text = "x".repeat(4096);
+        for (id, created, role, completed, parent, text) in [
+            ("msg_001", 1000, "user", true, None, "first user"),
+            (
+                "msg_002",
+                2000,
+                "assistant",
+                true,
+                Some("msg_001"),
+                "first assistant",
+            ),
+            (
+                "msg_003",
+                3000,
+                "user",
+                true,
+                Some("msg_002"),
+                oversized_text.as_str(),
+            ),
+            (
+                "msg_004",
+                4000,
+                "assistant",
+                false,
+                Some("msg_003"),
+                "mutable trailing assistant",
+            ),
+        ] {
+            insert_database_message(
+                &db_path,
+                session_id,
+                DatabaseMessage {
+                    id,
+                    created,
+                    role,
+                    completed,
+                    parent,
+                    text,
+                },
+            );
+        }
+        fs::write(
+            &wrapper_path,
+            fake_opencode_database_script(&db_path, &log_path, None),
+        )
+        .expect("write fake opencode database wrapper");
+        make_fake_opencode_export_executable(&wrapper_path);
+        crate::support::write_fake_opencode_dispatcher(&dir);
+        Self {
+            dir,
+            db_path,
+            log_path,
+            session_id: session_id.to_string(),
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn append_user(&self, id: &str, created: i64, text: &str) {
+        insert_database_message(
+            &self.db_path,
+            &self.session_id,
+            DatabaseMessage {
+                id,
+                created,
+                role: "user",
+                completed: true,
+                parent: Some("msg_003"),
+                text,
+            },
+        );
+    }
+
+    pub fn insert_incomplete_assistant(&self, id: &str, created: i64, parent: &str, text: &str) {
+        insert_database_message(
+            &self.db_path,
+            &self.session_id,
+            DatabaseMessage {
+                id,
+                created,
+                role: "assistant",
+                completed: false,
+                parent: Some(parent),
+                text,
+            },
+        );
+    }
+
+    pub fn update_message(&self, id: &str) {
+        run_sqlite(
+            &self.db_path,
+            &format!(
+                "UPDATE message SET data=json_set(data,'$.parentID','mutated-parent'), \
+                 time_updated=time_updated+100 WHERE id={};",
+                sqlite_string(id),
+            ),
+        );
+    }
+
+    pub fn delete_message(&self, id: &str) {
+        run_sqlite(
+            &self.db_path,
+            &format!(
+                "DELETE FROM part WHERE message_id={}; DELETE FROM message WHERE id={};",
+                sqlite_string(id),
+                sqlite_string(id),
+            ),
+        );
+    }
+
+    pub fn update_text_part(&self, message_id: &str) {
+        run_sqlite(
+            &self.db_path,
+            &format!(
+                "UPDATE part SET data=json_set(data,'$.text','mutated text'), \
+                 time_updated=time_updated+100 WHERE id={};",
+                sqlite_string(&format!("part_{message_id}_text")),
+            ),
+        );
+    }
+
+    pub fn remove_trailing_assistant(&self) {
+        run_sqlite(
+            &self.db_path,
+            "DELETE FROM part WHERE message_id='msg_004'; DELETE FROM message WHERE id='msg_004';",
+        );
+    }
+
+    pub fn clear_messages(&self) {
+        run_sqlite(&self.db_path, "DELETE FROM part; DELETE FROM message;");
+    }
+
+    pub fn remove_required_message_index(&self) {
+        run_sqlite(
+            &self.db_path,
+            "DROP INDEX message_session_time_created_id_idx;",
+        );
+    }
+
+    pub fn emit_bracketed_database_prefix(&self) {
+        let wrapper_path = self.dir.join("opencode1");
+        fs::write(
+            &wrapper_path,
+            fake_opencode_database_script(
+                &self.db_path,
+                &self.log_path,
+                Some("[native startup notice]"),
+            ),
+        )
+        .expect("replace fake opencode database wrapper");
+        make_fake_opencode_export_executable(&wrapper_path);
+    }
+
+    pub fn replace_source_file(&self) {
+        let replacement = self.dir.join("replacement.db");
+        fs::copy(&self.db_path, &replacement).expect("copy replacement database");
+        fs::rename(&replacement, &self.db_path).expect("replace database inode");
+    }
+
+    pub fn assert_no_export(&self) {
+        let log = fs::read_to_string(&self.log_path).expect("read database wrapper log");
+        assert!(
+            log.contains("arg=db"),
+            "database command was not used: {log}"
+        );
+        assert!(
+            !log.contains("arg=export"),
+            "session paging/capture must never invoke export: {log}"
+        );
+    }
+}
+
+impl Drop for FakeOpencodeDatabase {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+struct DatabaseMessage<'a> {
+    id: &'a str,
+    created: i64,
+    role: &'a str,
+    completed: bool,
+    parent: Option<&'a str>,
+    text: &'a str,
+}
+
+fn insert_database_message(db_path: &Path, session_id: &str, message_fixture: DatabaseMessage<'_>) {
+    let DatabaseMessage {
+        id,
+        created,
+        role,
+        completed,
+        parent,
+        text,
+    } = message_fixture;
+    let mut message = json!({
+        "id": id,
+        "sessionID": session_id,
+        "role": role,
+        "time": { "created": created },
+    });
+    if completed {
+        message["time"]["completed"] = json!(created + 1);
+    }
+    if let Some(parent) = parent {
+        message["parentID"] = json!(parent);
+    }
+    let text_part = format!(
+        "{{\"type\":\"text\",\"id\":{},\"messageID\":{},\"sessionID\":{},\"text\":{}}}",
+        serde_json::to_string(&format!("part_{id}_text")).expect("serialize part id"),
+        serde_json::to_string(id).expect("serialize message id"),
+        serde_json::to_string(session_id).expect("serialize session id"),
+        serde_json::to_string(text).expect("serialize part text"),
+    );
+    let mut sql = format!(
+        "BEGIN;
+         INSERT INTO message(id,session_id,time_created,time_updated,data)
+           VALUES ({},{},{},{},{});
+         INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
+           VALUES ({},{},{},{},{},{});",
+        sqlite_string(id),
+        sqlite_string(session_id),
+        created,
+        created + 1,
+        sqlite_string(&message.to_string()),
+        sqlite_string(&format!("part_{id}_text")),
+        sqlite_string(id),
+        sqlite_string(session_id),
+        created,
+        created + 1,
+        sqlite_string(&text_part),
+    );
+    if role == "assistant" {
+        for (suffix, part_type) in [("start", "step-start"), ("finish", "step-finish")] {
+            let part = json!({
+                "id": format!("part_{id}_{suffix}"),
+                "messageID": id,
+                "sessionID": session_id,
+                "type": part_type,
+            });
+            sql.push_str(&format!(
+                "INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
+                   VALUES ({},{},{},{},{},{});",
+                sqlite_string(&format!("part_{id}_{suffix}")),
+                sqlite_string(id),
+                sqlite_string(session_id),
+                created,
+                created + 1,
+                sqlite_string(&part.to_string()),
+            ));
+        }
+    }
+    sql.push_str("COMMIT;");
+    run_sqlite(db_path, &sql);
+}
+
+fn run_sqlite(db_path: &Path, sql: &str) {
+    let output = Command::new("/usr/bin/sqlite3")
+        .arg(db_path)
+        .arg(sql)
+        .output()
+        .expect("run sqlite3 fixture command");
+    assert!(
+        output.status.success(),
+        "sqlite fixture command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn sqlite_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn fake_opencode_database_script(
+    db_path: &Path,
+    log_path: &Path,
+    database_prefix: Option<&str>,
+) -> String {
+    let database_prefix = database_prefix
+        .map(|prefix| format!("printf '%s\\n' {}\n", shell_single_quote(prefix)))
+        .unwrap_or_default();
+    format!(
+        "#!/bin/sh\n\
+{{\n\
+  printf 'invocation\\n'\n\
+  for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
+}} >> {}\n\
+if [ \"$1\" = \"db\" ] && [ \"${{2:-}}\" = \"path\" ]; then\n\
+  printf '%s\\n' {}\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"db\" ] && [ \"${{3:-}}\" = \"--format\" ] && [ \"${{4:-}}\" = \"json\" ]; then\n\
+  {}  exec /usr/bin/sqlite3 -json {} \"$2\"\n\
+fi\n\
+if [ \"$1\" = \"export\" ]; then\n\
+  printf 'export is forbidden for this fixture\\n' >&2\n\
+  exit 97\n\
+fi\n\
+printf 'unsupported fake opencode database invocation\\n' >&2\n\
+exit 64\n",
+        shell_single_quote(&path_string(log_path)),
+        shell_single_quote(&path_string(db_path)),
+        database_prefix,
+        shell_single_quote(&path_string(db_path)),
+    )
+}
+
 pub struct FakeOpencodeExport {
     pub dir: PathBuf,
 }
@@ -216,46 +548,6 @@ impl FakeOpencodeExport {
 
     pub fn dir(&self) -> &Path {
         &self.dir
-    }
-
-    pub fn pipe_truncating(session_id: &str) -> Self {
-        let dir = unique_temp_dir("agent-runner-opencode-contract-session-export");
-        let wrapper_path = dir.join("opencode1");
-        fs::create_dir_all(&dir).expect("create pipe-sensitive fake opencode dir");
-        fs::write(
-            &wrapper_path,
-            pipe_truncating_opencode_export_script(session_id),
-        )
-        .expect("write pipe-sensitive fake opencode1 export wrapper");
-        make_fake_opencode_export_executable(&wrapper_path);
-        crate::support::write_fake_opencode_dispatcher(&dir);
-        Self { dir }
-    }
-
-    pub fn with_large_side_file(session_id: &str) -> (Self, PathBuf) {
-        let dir = unique_temp_dir("agent-runner-opencode-contract-session-export");
-        let wrapper_path = dir.join("opencode1");
-        let side_file = dir.join("opencode.db-wal");
-        fs::create_dir_all(&dir).expect("create side-file fake opencode dir");
-        fs::write(
-            &wrapper_path,
-            large_side_file_opencode_export_script(session_id, &side_file),
-        )
-        .expect("write side-file fake opencode1 export wrapper");
-        make_fake_opencode_export_executable(&wrapper_path);
-        crate::support::write_fake_opencode_dispatcher(&dir);
-        (Self { dir }, side_file)
-    }
-
-    pub fn oversized_stdout(session_id: &str) -> Self {
-        let dir = unique_temp_dir("agent-runner-opencode-contract-session-export");
-        let wrapper_path = dir.join("opencode1");
-        fs::create_dir_all(&dir).expect("create oversized fake opencode dir");
-        fs::write(&wrapper_path, oversized_opencode_export_script(session_id))
-            .expect("write oversized fake opencode1 export wrapper");
-        make_fake_opencode_export_executable(&wrapper_path);
-        crate::support::write_fake_opencode_dispatcher(&dir);
-        Self { dir }
     }
 }
 
@@ -426,52 +718,6 @@ printf 'unsupported fake opencode invocation\\n' >&2\n\
 exit 64\n",
         shell_single_quote(session_id),
         shell_single_quote(OPENCODE_EXPORT_RAW)
-    )
-}
-
-pub fn pipe_truncating_opencode_export_script(session_id: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-if [ \"$1\" = \"export\" ] && [ \"${{2:-}}\" = {} ]; then\n\
-  if [ -p /dev/stdout ]; then\n\
-    printf '%s' '{{\"info\":{{\"id\":\"truncated\"}}'\n\
-    exit 0\n\
-  fi\n\
-  printf '%s' {}\n\
-  exit 0\n\
-fi\n\
-printf 'unsupported fake opencode invocation\n' >&2\n\
-exit 64\n",
-        shell_single_quote(session_id),
-        shell_single_quote(OPENCODE_EXPORT_RAW)
-    )
-}
-
-pub fn large_side_file_opencode_export_script(session_id: &str, side_file: &Path) -> String {
-    format!(
-        "#!/bin/sh\n\
-if [ \"$1\" = \"export\" ] && [ \"${{2:-}}\" = {} ]; then\n\
-  /bin/dd if=/dev/zero of={} bs=1048576 count=17 2>/dev/null || exit 73\n\
-  printf '%s' {}\n\
-  exit 0\n\
-fi\n\
-printf 'unsupported fake opencode invocation\n' >&2\n\
-exit 64\n",
-        shell_single_quote(session_id),
-        shell_single_quote(&side_file.to_string_lossy()),
-        shell_single_quote(OPENCODE_EXPORT_RAW)
-    )
-}
-
-pub fn oversized_opencode_export_script(session_id: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-if [ \"$1\" = \"export\" ] && [ \"${{2:-}}\" = {} ]; then\n\
-  exec /bin/dd if=/dev/zero bs=1048576 count=17 2>/dev/null\n\
-fi\n\
-printf 'unsupported fake opencode invocation\n' >&2\n\
-exit 64\n",
-        shell_single_quote(session_id)
     )
 }
 

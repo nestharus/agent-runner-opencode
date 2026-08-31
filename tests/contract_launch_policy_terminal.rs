@@ -34,8 +34,11 @@ fn native_program_stamp(path: &std::path::Path) -> Value {
     })
 }
 
+#[derive(Default)]
 struct FailAfterFirstLaunchEvent {
     completed_events: usize,
+    pending_event: Vec<u8>,
+    failed: bool,
 }
 
 struct RejectLaunchWrites;
@@ -145,14 +148,32 @@ impl std::io::Write for RejectLaunchWrites {
 
 impl std::io::Write for FailAfterFirstLaunchEvent {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        if self.completed_events >= 1 {
+        if self.failed {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "simulated launch event handoff failure",
             ));
         }
-        self.completed_events += buffer.iter().filter(|byte| **byte == b'\n').count();
-        Ok(buffer.len())
+        self.pending_event.extend_from_slice(buffer);
+        if !buffer.contains(&b'\n') {
+            return Ok(buffer.len());
+        }
+        let event: Value = serde_json::from_slice(
+            self.pending_event
+                .strip_suffix(b"\n")
+                .expect("completed launch event newline"),
+        )
+        .expect("completed launch event JSON");
+        if self.completed_events == 0 || event["kind"] == "heartbeat" {
+            self.completed_events += 1;
+            self.pending_event.clear();
+            return Ok(buffer.len());
+        }
+        self.failed = true;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "simulated launch event handoff failure",
+        ))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -235,6 +256,164 @@ fn contract_launch_stream() {
 }
 
 #[test]
+fn contract_launch_preserves_an_unselected_legacy_request_without_completion_attestation() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_opencode_script_with_output_and_status(
+            fake_launch_stdout_text(),
+            fake_launch_stderr_text(),
+            0,
+        ));
+    let path = prepend_path(fake_wrapper.dir());
+    let mut params = launch_params_with_env(
+        "low",
+        &[
+            ("PATH", path.as_str()),
+            (
+                "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                fake_wrapper.log_path_str(),
+            ),
+        ],
+    );
+    params
+        .as_object_mut()
+        .expect("launch params object")
+        .remove("output_delivery");
+    let request = support::validated_request_envelope(
+        "launch",
+        params,
+        json!({"env": {"TERM": "xterm-256color"}}),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    let output =
+        support::invoke_with_request_and_env("launch", request, &[("PATH", path.as_str())]);
+
+    assert_output_success(&output, "legacy unselected launch");
+    let events = launch_events_from_output(&output, "legacy unselected launch stdout");
+    assert!(events
+        .iter()
+        .all(|event| { event["name"] != "oulipoly.launch_output_complete/v1" }));
+    assert_eq!(final_launch_event(&events)["kind"], "exit");
+}
+
+#[test]
+fn contract_launch_rejects_output_delivery_when_capability_was_not_selected() {
+    let params = launch_params("low");
+    let output = invoke_with_host_and_env(
+        "launch",
+        params,
+        json!({
+            "env": {
+                "TERM": "xterm-256color",
+                "OULIPOLY_HOST_LAUNCH_OUTPUT_V1": "0"
+            }
+        }),
+        &[],
+    );
+    let response = json_stdout(&output);
+
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "launch_output_not_selected");
+}
+
+#[test]
+fn contract_launch_spools_more_than_one_mib_before_projection_admission() {
+    let provider_session_id = "ses_large_deferred_new_session";
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(large_deferred_new_session_script(provider_session_id));
+    let path = prepend_path(fake_wrapper.dir());
+    let output = invoke_with_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                (
+                    "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                    fake_wrapper.log_path_str(),
+                ),
+            ],
+        ),
+        &[("PATH", path.as_str())],
+    );
+
+    assert_output_success(&output, "large deferred new-session launch");
+    let events = launch_events_from_output(&output, "large deferred launch stdout");
+    let expected_stdout = large_deferred_new_session_stdout(provider_session_id);
+    assert!(
+        expected_stdout.len() > 1024 * 1024,
+        "fixture must exceed the removed cumulative deferral limit"
+    );
+    assert_eq!(collect_stream_bytes(&events, "stdout"), expected_stdout);
+    assert_eq!(collect_stream_bytes(&events, "stderr"), b"");
+    assert_launch_output_completion(&events, &expected_stdout, b"");
+    assert_provider_session_marker(&events, provider_session_id);
+    assert_eq!(final_launch_event(&events)["kind"], "exit");
+}
+
+#[test]
+fn contract_launch_resume_spools_large_output_while_heartbeats_remain_live() {
+    let fake_wrapper = FakeOpencodeWrapper::with_script(large_deferred_resume_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let output = invoke_with_env(
+        "launch",
+        resume_launch_params_with_arg_payload_env(path.as_str(), fake_wrapper.log_path_str()),
+        &[("PATH", path.as_str())],
+    );
+
+    assert_output_success(&output, "large deferred resumed-session launch");
+    let events = launch_events_from_output(&output, "large deferred resume stdout");
+    let expected_stdout = large_deferred_resume_stdout();
+    assert!(expected_stdout.len() > 1024 * 1024);
+    assert_eq!(collect_stream_bytes(&events, "stdout"), expected_stdout);
+    assert_launch_output_completion(&events, &expected_stdout, b"");
+    let heartbeat_index = events
+        .iter()
+        .position(|event| event["kind"] == "heartbeat")
+        .expect("resumed launch must emit a heartbeat during deferred projection");
+    let first_payload_index = events
+        .iter()
+        .position(|event| event["kind"] == "stdout" || event["kind"] == "stderr")
+        .expect("resumed launch must project deferred payload");
+    assert!(
+        heartbeat_index < first_payload_index,
+        "heartbeat must bypass deferred payload custody and reach the runner live"
+    );
+    assert_monotonic_launch_events(&events);
+    assert_eq!(final_launch_event(&events)["kind"], "exit");
+}
+
+#[test]
+fn contract_launch_completion_manifest_preserves_mixed_binary_channels() {
+    let provider_session_id = "ses_mixed_binary_launch";
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(mixed_binary_launch_script(provider_session_id));
+    let path = prepend_path(fake_wrapper.dir());
+    let output = invoke_with_env(
+        "launch",
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                (
+                    "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                    fake_wrapper.log_path_str(),
+                ),
+            ],
+        ),
+        &[("PATH", path.as_str())],
+    );
+
+    let events = launch_events_from_output(&output, "mixed binary launch stdout");
+    let expected_stdout = mixed_binary_stdout(provider_session_id);
+    let expected_stderr = mixed_binary_stderr();
+    assert_eq!(collect_stream_bytes(&events, "stdout"), expected_stdout);
+    assert_eq!(collect_stream_bytes(&events, "stderr"), expected_stderr);
+    assert_launch_output_completion(&events, &expected_stdout, &expected_stderr);
+    assert_provider_session_marker(&events, provider_session_id);
+    assert_eq!(final_launch_event(&events)["kind"], "exit");
+}
+
+#[test]
 fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss() {
     let runtime = IsolatedLaunchSettings::new();
     let provider_session_id = "ses_durable_launch_response_loss";
@@ -262,9 +441,7 @@ fn contract_launch_replay_reconciles_durable_generated_session_after_output_loss
     support::ensure_default_runtime_settings(&request);
 
     let args = vec!["agent-runner-opencode".to_string(), "launch".to_string()];
-    let mut writer = FailAfterFirstLaunchEvent {
-        completed_events: 0,
-    };
+    let mut writer = FailAfterFirstLaunchEvent::default();
     assert_eq!(
         agent_runner_opencode::write_invocation(
             &args,
@@ -350,9 +527,7 @@ fn contract_launch_resume_replay_does_not_resubmit_after_output_loss() {
     support::ensure_default_runtime_settings(&request);
 
     let args = vec!["agent-runner-opencode".to_string(), "launch".to_string()];
-    let mut writer = FailAfterFirstLaunchEvent {
-        completed_events: 0,
-    };
+    let mut writer = FailAfterFirstLaunchEvent::default();
     assert_eq!(
         agent_runner_opencode::write_invocation(
             &args,
@@ -404,9 +579,7 @@ fn contract_launch_resume_reconciliation_observes_late_completion_without_resubm
     support::ensure_default_runtime_settings(&request);
 
     let args = vec!["agent-runner-opencode".to_string(), "launch".to_string()];
-    let mut writer = FailAfterFirstLaunchEvent {
-        completed_events: 0,
-    };
+    let mut writer = FailAfterFirstLaunchEvent::default();
     assert_eq!(
         agent_runner_opencode::write_invocation(
             &args,
@@ -473,9 +646,7 @@ fn contract_launch_resume_replay_preserves_multi_part_positional_identity() {
     support::ensure_default_runtime_settings(&request);
 
     let args = vec!["agent-runner-opencode".to_string(), "launch".to_string()];
-    let mut writer = FailAfterFirstLaunchEvent {
-        completed_events: 0,
-    };
+    let mut writer = FailAfterFirstLaunchEvent::default();
     assert_eq!(
         agent_runner_opencode::write_invocation(
             &args,
@@ -1985,12 +2156,7 @@ fn contract_launch_env_preserves_declared_and_inherited_environment() {
         ),
         &[
             ("PATH", path.as_str()),
-            ("OULIPOLY_DATA_DIR", "/tmp/real-oulipoly-data"),
             ("OULIPOLY_PARENT_INVOCATION", "parent-invocation-token"),
-            (
-                "AGENT_BASH_AGENT_RUNNER_BIN",
-                "/tmp/target-release/oulipoly-agent-runner",
-            ),
             ("UNDECLARED_PARENT_ENV", "ambient-secret-do-not-leak"),
             ("OPENAI_API_KEY", "ambient-openai-secret-do-not-leak"),
         ],

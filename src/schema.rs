@@ -1,6 +1,6 @@
 //! Declared roles: formatter, parser, validator, accessor, mapper, predicate
 
-use crate::envelope::{ProviderFailure, CONTRACT};
+use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 use crate::settings_definition;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 pub const SETTINGS_SCHEMA_ID: &str = "opencode.settings/v1";
 pub const NATIVE_IDENTITY_REBIND_SCHEMA_ID: &str = "opencode.native-identity-rebind/v1";
 pub const ROTATION_DECISION_SCHEMA_ID: &str = "opencode.rotation-decision/v1";
+pub const HOST_LAUNCH_OUTPUT_V1_ENV: &str = "OULIPOLY_HOST_LAUNCH_OUTPUT_V1";
+pub const LAUNCH_OUTPUT_V1: &str = "oulipoly.launch_output/v1";
+pub const HOST_SESSION_TURN_PAGES_V1_ENV: &str = "OULIPOLY_HOST_SESSION_TURN_PAGES_V1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,26 +31,45 @@ pub fn validate_schema_id(request_id: &str, schema_id: &str) -> Result<(), Provi
     Err(unknown_schema_failure(request_id, schema_id))
 }
 
-pub fn describe_result() -> Value {
+pub fn describe_result(host: &HostContext) -> Value {
+    let mut capabilities = json!({
+        "launch": true,
+        "policy": true,
+        "quota": true,
+        "session": true,
+        "session_enumerate": true,
+        "terminal": true,
+        "rotation": true,
+        "discovery": true,
+        "settings": true,
+        "setup_brain": false,
+        "setup": true,
+        "migration": true,
+    });
+    if host
+        .env
+        .as_ref()
+        .and_then(|env| env.get(HOST_LAUNCH_OUTPUT_V1_ENV))
+        .map(String::as_str)
+        == Some("1")
+    {
+        capabilities["launch_output_v1"] = json!(true);
+    }
+    if host
+        .env
+        .as_ref()
+        .and_then(|env| env.get(HOST_SESSION_TURN_PAGES_V1_ENV))
+        .map(String::as_str)
+        == Some("1")
+    {
+        capabilities["session_turn_pages_v1"] = json!(true);
+    }
     json!({
         "provider_id": "opencode",
         "display_name": "OpenCode",
         "contract_versions": [CONTRACT],
         "preferred_contract": CONTRACT,
-        "capabilities": {
-            "launch": true,
-            "policy": true,
-            "quota": true,
-            "session": true,
-            "session_enumerate": true,
-            "terminal": true,
-            "rotation": true,
-            "discovery": true,
-            "settings": true,
-            "setup_brain": false,
-            "setup": true,
-            "migration": true,
-        },
+        "capabilities": capabilities,
         "settings_schema_id": SETTINGS_SCHEMA_ID,
         "concurrency": {
             "safe_for_parallel_invocation": true,
