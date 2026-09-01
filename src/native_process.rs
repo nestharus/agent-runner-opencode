@@ -6,6 +6,8 @@ use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus};
@@ -201,11 +203,8 @@ pub(crate) fn actor_is_terminal_or_recycled(actor: &ProcessGroupActor) -> io::Re
 }
 
 /// Discharge custody for a durably recorded process-group incarnation after
-/// its in-process owner has been lost. A changed leader incarnation proves the
-/// numeric process-group identity was recycled and must not be signalled. A
-/// missing leader while the group remains live is the original orphaned group:
-/// a new group with that number cannot exist without a leader whose PID equals
-/// the PGID.
+/// its in-process owner has been lost. Linux signals only pidfd-pinned members;
+/// a numeric PGID is never a signal target after its incarnation can drain.
 #[cfg(unix)]
 pub(crate) fn terminate_process_group_actor(actor: &ProcessGroupActor) -> io::Result<()> {
     terminate_process_group_actor_inner(actor, None).map(|_| ())
@@ -222,99 +221,157 @@ pub(crate) fn terminate_process_group_actor_with_child(
 #[cfg(unix)]
 fn terminate_process_group_actor_inner(
     actor: &ProcessGroupActor,
-    mut child: Option<&mut Child>,
+    child: Option<&mut Child>,
+) -> io::Result<Option<ExitStatus>> {
+    #[cfg(target_os = "linux")]
+    {
+        terminate_linux_process_group_actor(actor, child)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        terminate_pinned_process_group_actor(actor, child)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_process_group_actor(
+    actor: &ProcessGroupActor,
+    child: Option<&mut Child>,
 ) -> io::Result<Option<ExitStatus>> {
     let started = Instant::now();
     let deadline = started + ACTOR_SETTLEMENT_TIMEOUT;
-    let mut child_status = reap_direct_child(child.as_deref_mut())?;
-    if actor_is_effect_terminal(actor, child.as_deref_mut(), &mut child_status)? {
-        return Ok(child_status);
+    let child_id = child.as_ref().map(|child| child.id());
+    let child_pins_identity =
+        child_id == Some(actor.process_group_id) && linux_actor_leader_matches(actor)?;
+    if child.is_some() && !child_pins_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "direct actor leader was reaped before process-group settlement could pin its incarnation",
+        ));
     }
-    let pgid = i32::try_from(actor.process_group_id).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "native process-group identity exceeds the platform PID range",
-        )
-    })?;
-    send_process_group_signal_checked(-pgid, SIGTERM)?;
-    if wait_for_actor_effect_terminal(
-        actor,
-        child.as_deref_mut(),
-        &mut child_status,
-        (started + TERMINATION_GRACE).min(deadline),
-    )? {
-        return Ok(child_status);
+
+    let initial = linux_process_group_snapshot(actor.process_group_id)?;
+    if linux_snapshot_is_recycled(actor, &initial)? {
+        return reap_settled_direct_child(child);
     }
-    if !process_group_actor_requires_signal(actor)? {
-        return Ok(child_status);
+    if !initial.iter().any(LinuxProcess::is_effect_capable) {
+        if child_pins_identity {
+            reap_adopted_process_group_descendants(actor, child_id)?;
+        }
+        return reap_settled_direct_child(child);
     }
-    send_process_group_signal_checked(-pgid, SIGKILL)?;
-    if wait_for_actor_effect_terminal(actor, child, &mut child_status, deadline)? {
-        return Ok(child_status);
+
+    let mut members = Vec::new();
+    pin_and_stop_snapshot_members(&initial, &mut members)?;
+    if !child_pins_identity && !members_have_effect(&members)? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "native process group lost its stable member anchor before settlement",
+        ));
     }
-    if process_group_actor_requires_signal(actor)? {
+
+    freeze_actor_members(actor, &mut members, child_pins_identity, deadline)?;
+    signal_actor_members(&members, SIGTERM, None)?;
+    let retained_anchor = if child_pins_identity {
+        None
+    } else {
+        first_effect_capable_identity(&members)?
+    };
+    signal_actor_members(&members, SIGCONT, retained_anchor)?;
+    wait_for_pinned_members(&members, (started + TERMINATION_GRACE).min(deadline))?;
+
+    freeze_actor_members(actor, &mut members, child_pins_identity, deadline)?;
+    signal_actor_members(&members, SIGKILL, None)?;
+    if !wait_for_pinned_members(&members, deadline)? {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "native process group retains effect-capable members after bounded termination",
         ));
     }
-    Ok(child_status)
+    reap_pinned_descendants(&members, child_id)?;
+    if child_pins_identity {
+        reap_adopted_process_group_descendants(actor, child_id)?;
+    }
+    reap_settled_direct_child(child)
 }
 
-#[cfg(unix)]
-fn wait_for_actor_effect_terminal(
+#[cfg(all(unix, not(target_os = "linux")))]
+fn terminate_pinned_process_group_actor(
     actor: &ProcessGroupActor,
     mut child: Option<&mut Child>,
-    child_status: &mut Option<ExitStatus>,
-    deadline: Instant,
-) -> io::Result<bool> {
-    let mut backoff = INITIAL_SETTLEMENT_BACKOFF;
-    loop {
-        if actor_is_effect_terminal(actor, child.as_deref_mut(), child_status)? {
-            return Ok(true);
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        std::thread::sleep(remaining.min(backoff));
-        backoff = (backoff * 2).min(MAX_SETTLEMENT_BACKOFF);
+) -> io::Result<Option<ExitStatus>> {
+    if !process_group_actor_requires_signal(actor)? {
+        return reap_settled_direct_child(child);
     }
+    let Some(child) = child.as_deref_mut() else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "durable process-group recovery has no waitable leader to pin the numeric group identity",
+        ));
+    };
+    if child.id() != actor.process_group_id
+        || process_group_incarnation(child.id())? != actor.incarnation
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "direct actor leader no longer pins the recorded process-group incarnation",
+        ));
+    }
+    let process_group_id = i32::try_from(actor.process_group_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "native process-group identity exceeds the platform PID range",
+        )
+    })?;
+    send_process_group_signal_checked(-process_group_id, SIGTERM)?;
+    std::thread::sleep(TERMINATION_GRACE);
+    send_process_group_signal_checked(-process_group_id, SIGKILL)?;
+    reap_settled_direct_child(Some(child))
 }
 
 #[cfg(unix)]
-fn actor_is_effect_terminal(
-    actor: &ProcessGroupActor,
-    mut child: Option<&mut Child>,
-    child_status: &mut Option<ExitStatus>,
-) -> io::Result<bool> {
-    let direct_child_id = child.as_ref().map(|child| child.id());
-    if child_status.is_none() {
-        *child_status = reap_direct_child(child.as_deref_mut())?;
-    }
-    reap_adopted_process_group_descendants(actor, direct_child_id)?;
-    if process_group_actor_requires_signal(actor)? {
-        return Ok(false);
-    }
-    // A second observation closes short /proc enumeration races while an
-    // exiting member reparents its descendants to this subreaper.
-    std::thread::sleep(INITIAL_SETTLEMENT_BACKOFF);
-    if child_status.is_none() {
-        *child_status = reap_direct_child(child)?;
-    }
-    reap_adopted_process_group_descendants(actor, direct_child_id)?;
-    Ok(!process_group_actor_requires_signal(actor)?)
+fn reap_settled_direct_child(child: Option<&mut Child>) -> io::Result<Option<ExitStatus>> {
+    child.map(Child::wait).transpose()
 }
 
 #[cfg(unix)]
-fn reap_direct_child(child: Option<&mut Child>) -> io::Result<Option<ExitStatus>> {
-    match child {
-        Some(child) => child.try_wait(),
-        None => Ok(None),
+pub(crate) fn child_exit_status_unreaped(child: &Child) -> io::Result<Option<ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let status = unsafe { info.si_status() };
+    match info.si_code {
+        libc::CLD_EXITED => Ok(Some(ExitStatus::from_raw(status << 8))),
+        libc::CLD_KILLED => Ok(Some(ExitStatus::from_raw(status))),
+        libc::CLD_DUMPED => Ok(Some(ExitStatus::from_raw(status | 0x80))),
+        code => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("waitid returned unexpected child exit code {code}"),
+        )),
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(unix))]
+pub(crate) fn child_exit_status_unreaped(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    child.try_wait()
+}
+
+#[cfg(all(target_os = "linux", test))]
 fn process_group_actor_requires_signal(actor: &ProcessGroupActor) -> io::Result<bool> {
     linux_process_group_actor_requires_signal(actor)
 }
@@ -332,7 +389,7 @@ fn process_group_actor_requires_signal(actor: &ProcessGroupActor) -> io::Result<
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn linux_process_group_actor_requires_signal(actor: &ProcessGroupActor) -> io::Result<bool> {
     let snapshot = linux_process_group_snapshot(actor.process_group_id)?;
     if snapshot.is_empty() {
@@ -411,6 +468,377 @@ impl LinuxProcess {
     fn is_effect_capable(&self) -> bool {
         !self.is_dead()
     }
+
+    fn is_stopped(&self) -> bool {
+        matches!(self.state, b'T' | b't')
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxProcessPin {
+    process: LinuxProcess,
+    pidfd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+trait StableMemberSignal {
+    fn send(&self, signal: i32) -> io::Result<()>;
+}
+
+#[cfg(target_os = "linux")]
+impl StableMemberSignal for LinuxProcessPin {
+    fn send(&self, signal: i32) -> io::Result<()> {
+        send_pidfd_signal(&self.pidfd, signal)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_stable_member_signal(target: &impl StableMemberSignal, signal: i32) -> io::Result<()> {
+    target.send(signal)
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxProcessPin {
+    fn identity(&self) -> (u32, u64) {
+        (self.process.process_id, self.process.start_ticks)
+    }
+
+    fn is_effect_capable(&self) -> io::Result<bool> {
+        if pidfd_has_exited(&self.pidfd)? {
+            return Ok(false);
+        }
+        let Some(current) = read_linux_process(self.process.process_id)? else {
+            return Ok(false);
+        };
+        Ok(current.start_ticks == self.process.start_ticks && current.is_effect_capable())
+    }
+
+    fn is_stopped_or_terminal(&self) -> io::Result<bool> {
+        if pidfd_has_exited(&self.pidfd)? {
+            return Ok(true);
+        }
+        let Some(current) = read_linux_process(self.process.process_id)? else {
+            return Ok(true);
+        };
+        Ok(current.start_ticks != self.process.start_ticks
+            || current.is_dead()
+            || current.is_stopped())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_actor_leader_matches(actor: &ProcessGroupActor) -> io::Result<bool> {
+    let Some(leader) = read_linux_process(actor.process_group_id)? else {
+        return Ok(false);
+    };
+    Ok(leader.process_group_id == actor.process_group_id
+        && linux_incarnation(leader.start_ticks)? == actor.incarnation)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_snapshot_is_recycled(
+    actor: &ProcessGroupActor,
+    snapshot: &[LinuxProcess],
+) -> io::Result<bool> {
+    snapshot
+        .iter()
+        .find(|process| process.process_id == actor.process_group_id)
+        .map(|leader| Ok(linux_incarnation(leader.start_ticks)? != actor.incarnation))
+        .unwrap_or(Ok(false))
+}
+
+#[cfg(target_os = "linux")]
+fn pin_and_stop_snapshot_members(
+    snapshot: &[LinuxProcess],
+    members: &mut Vec<LinuxProcessPin>,
+) -> io::Result<usize> {
+    let mut pinned = 0;
+    for process in snapshot
+        .iter()
+        .filter(|process| process.is_effect_capable())
+    {
+        if members
+            .iter()
+            .any(|member| member.identity() == (process.process_id, process.start_ticks))
+        {
+            continue;
+        }
+        let Some(member) = pin_linux_process(process)? else {
+            continue;
+        };
+        send_stable_member_signal(&member, SIGSTOP)?;
+        members.push(member);
+        pinned += 1;
+    }
+    Ok(pinned)
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_actor_members(
+    actor: &ProcessGroupActor,
+    members: &mut Vec<LinuxProcessPin>,
+    child_pins_identity: bool,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut backoff = INITIAL_SETTLEMENT_BACKOFF;
+    loop {
+        if !child_pins_identity && !members_have_effect(members)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native process group lost its stable member anchor during settlement",
+            ));
+        }
+        let snapshot = linux_process_group_snapshot(actor.process_group_id)?;
+        if linux_snapshot_is_recycled(actor, &snapshot)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native process-group incarnation changed while stable members were being pinned",
+            ));
+        }
+        let added = pin_and_stop_snapshot_members(&snapshot, members)?;
+        for member in members.iter() {
+            if member.is_effect_capable()? {
+                send_stable_member_signal(member, SIGSTOP)?;
+            }
+        }
+        if wait_for_members_stopped(members, deadline)? {
+            let verification = linux_process_group_snapshot(actor.process_group_id)?;
+            if linux_snapshot_is_recycled(actor, &verification)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "native process-group incarnation changed during stable-member verification",
+                ));
+            }
+            let has_unpinned_member = verification.iter().any(|process| {
+                process.is_effect_capable()
+                    && !members.iter().any(|member| {
+                        member.identity() == (process.process_id, process.start_ticks)
+                    })
+            });
+            if added == 0 && !has_unpinned_member {
+                return Ok(());
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native process group could not be frozen within the bounded settlement interval",
+            ));
+        }
+        std::thread::sleep(remaining.min(backoff));
+        backoff = (backoff * 2).min(MAX_SETTLEMENT_BACKOFF);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_members_stopped(members: &[LinuxProcessPin], deadline: Instant) -> io::Result<bool> {
+    let mut backoff = INITIAL_SETTLEMENT_BACKOFF;
+    loop {
+        if members_all_stopped_or_terminal(members)? {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(backoff));
+        backoff = (backoff * 2).min(MAX_SETTLEMENT_BACKOFF);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_actor_members(
+    members: &[LinuxProcessPin],
+    signal: i32,
+    retained_anchor: Option<(u32, u64)>,
+) -> io::Result<()> {
+    for member in members {
+        if retained_anchor == Some(member.identity()) || !member.is_effect_capable()? {
+            continue;
+        }
+        send_stable_member_signal(member, signal)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_pinned_members(members: &[LinuxProcessPin], deadline: Instant) -> io::Result<bool> {
+    if retain_effect_capable_test_member() {
+        return Ok(!members_have_effect(members)?);
+    }
+    let mut backoff = INITIAL_SETTLEMENT_BACKOFF;
+    loop {
+        if !members_have_effect(members)? {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(backoff));
+        backoff = (backoff * 2).min(MAX_SETTLEMENT_BACKOFF);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn members_have_effect(members: &[LinuxProcessPin]) -> io::Result<bool> {
+    for member in members {
+        if member.is_effect_capable()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn first_effect_capable_identity(members: &[LinuxProcessPin]) -> io::Result<Option<(u32, u64)>> {
+    for member in members {
+        if member.is_effect_capable()? {
+            return Ok(Some(member.identity()));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn members_all_stopped_or_terminal(members: &[LinuxProcessPin]) -> io::Result<bool> {
+    for member in members {
+        if !member.is_stopped_or_terminal()? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn pin_linux_process(process: &LinuxProcess) -> io::Result<Option<LinuxProcessPin>> {
+    let process_id = i32::try_from(process.process_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "native process identity exceeds the platform PID range",
+        )
+    })?;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0_u32) };
+    if fd == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let Some(current) = read_linux_process(process.process_id)? else {
+        return Ok(None);
+    };
+    if current.process_group_id != process.process_group_id
+        || current.start_ticks != process.start_ticks
+        || pidfd_has_exited(&pidfd)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(LinuxProcessPin {
+        process: current,
+        pidfd,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn send_pidfd_signal(pidfd: &OwnedFd, signal: i32) -> io::Result<()> {
+    if retain_effect_capable_test_member() && matches!(signal, SIGTERM | SIGKILL) {
+        return Ok(());
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0_u32,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_has_exited(pidfd: &OwnedFd) -> io::Result<bool> {
+    let mut pollfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if result >= 0 {
+            return Ok(result == 1);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_process(process_id: u32) -> io::Result<Option<LinuxProcess>> {
+    let stat = match fs::read_to_string(format!("/proc/{process_id}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if linux_process_disappeared(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    parse_linux_process_stat(process_id, &stat).map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_disappeared(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "linux")]
+fn reap_pinned_descendants(
+    members: &[LinuxProcessPin],
+    direct_child_id: Option<u32>,
+) -> io::Result<()> {
+    for member in members
+        .iter()
+        .filter(|member| Some(member.process.process_id) != direct_child_id)
+    {
+        let process_id = i32::try_from(member.process.process_id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native process identity exceeds the platform PID range",
+            )
+        })?;
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(process_id, &mut status, libc::WNOHANG) };
+        if waited == process_id || waited == 0 {
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::ECHILD) | Some(libc::ESRCH)) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn retain_effect_capable_test_member() -> bool {
+    #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
+    {
+        std::env::var_os("AGENT_RUNNER_OPENCODE_TEST_RETAIN_EFFECT_CAPABLE_ACTOR").is_some()
+    }
+    #[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]
+    {
+        false
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -427,7 +855,7 @@ fn linux_process_group_snapshot(process_group_id: u32) -> io::Result<Vec<LinuxPr
         };
         let stat = match fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if linux_process_disappeared(&error) => continue,
             Err(error) => return Err(error),
         };
         let process = parse_linux_process_stat(process_id, &stat)?;
@@ -530,12 +958,11 @@ fn process_group_leader_is_missing(error: &io::Error) -> bool {
 #[cfg(unix)]
 pub(crate) fn terminate_process_group_child(child: &mut Child) -> Option<ExitStatus> {
     let actor = actor_for_child(child).ok();
-    let observed_status = child.try_wait().ok()?;
     match actor {
         Some(actor) => terminate_process_group_actor_with_child(&actor, child)
             .ok()
             .flatten(),
-        None => match observed_status {
+        None => match child.try_wait().ok()? {
             Some(status) => Some(status),
             None => {
                 let _ = child.kill();
@@ -717,7 +1144,7 @@ pub(crate) fn process_group_is_live(_process_group_id: u32) -> bool {
     true
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn send_process_group_signal_checked(pgid: i32, signal: i32) -> io::Result<()> {
     if unsafe { kill(pgid, signal) } == 0 {
         return Ok(());
@@ -733,6 +1160,10 @@ fn send_process_group_signal_checked(pgid: i32, signal: i32) -> io::Result<()> {
 const SIGTERM: i32 = 15;
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
+#[cfg(target_os = "linux")]
+const SIGCONT: i32 = 18;
+#[cfg(target_os = "linux")]
+const SIGSTOP: i32 = 19;
 #[cfg(target_os = "linux")]
 const PR_SET_PDEATHSIG: i32 = 1;
 #[cfg(target_os = "linux")]
@@ -754,6 +1185,52 @@ unsafe extern "C" {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct InjectedStableSignal {
+        pinned_generation: u64,
+        signalled_generations: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl StableMemberSignal for InjectedStableSignal {
+        fn send(&self, _signal: i32) -> io::Result<()> {
+            self.signalled_generations
+                .lock()
+                .expect("stable signal evidence lock")
+                .push(self.pinned_generation);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stable_member_signal_cannot_follow_numeric_identity_reuse() {
+        let signalled_generations = Arc::new(Mutex::new(Vec::new()));
+        let original = InjectedStableSignal {
+            pinned_generation: 1,
+            signalled_generations: Arc::clone(&signalled_generations),
+        };
+        let numeric_identity_generation = Arc::new(Mutex::new(1_u64));
+
+        *numeric_identity_generation
+            .lock()
+            .expect("numeric identity generation lock") = 2;
+        send_stable_member_signal(&original, SIGKILL).expect("signal pinned original member");
+
+        assert_eq!(
+            *numeric_identity_generation
+                .lock()
+                .expect("numeric identity generation lock"),
+            2,
+            "the same numeric identity now names foreign work"
+        );
+        assert_eq!(
+            *signalled_generations
+                .lock()
+                .expect("stable signal evidence lock"),
+            vec![1],
+            "signalling must remain bound to the pinned original incarnation"
+        );
+    }
 
     #[test]
     fn durable_actor_recovery_terminates_a_group_after_its_leader_exits() {

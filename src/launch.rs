@@ -27,7 +27,7 @@ use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 #[cfg(unix)]
 use crate::native_process::GatedCommand;
 use crate::native_process::{
-    process_group_incarnation as launch_process_incarnation,
+    child_exit_status_unreaped, process_group_incarnation as launch_process_incarnation,
     process_group_is_live as launch_process_group_is_live, terminate_process_group_actor,
     terminate_process_group_actor_with_child, terminate_process_group_child as terminate_child,
     ExecGate as LaunchExecGate, ProcessGroupActor,
@@ -1357,10 +1357,9 @@ fn capture_child_exit(child: &mut Child, state: &mut LaunchState) -> Result<(), 
     if state.final_status.is_some() {
         return Ok(());
     }
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|err| spawn_failure(&state.request_id, "try_wait", err))?
-    {
+    if let Some(status) = child_exit_status_unreaped(child).map_err(|err| {
+        spawn_failure(&state.request_id, "observe child exit without reaping", err)
+    })? {
         state.record_child_exit(process_status_from_exit(status));
     }
     Ok(())
@@ -2221,7 +2220,7 @@ fn require_prior_actor_terminal(
 }
 
 /// Settle a recorded native actor only while the caller owns the exact launch
-/// request lock (or has just dropped its in-process `ChildCustody`). That
+/// request lock (or still owns its in-process `ChildCustody`). That
 /// ownership distinction makes it safe to terminate a still-live incarnation:
 /// another provider cannot still be its responsible supervisor.
 struct LaunchActorSettlementContext<'a> {
@@ -2241,22 +2240,11 @@ fn settle_recorded_launch_actor(
     if actor_terminal_at_unix_ms.is_some() {
         return Ok(false);
     }
-    let inject_settlement_failure = child.is_some();
     let Some(process_group_id) = process_group_id else {
         *actor_terminal_at_unix_ms = Some(now_unix_ms());
         return Ok(true);
     };
     if !launch_process_group_is_live(process_group_id) {
-        injected_launch_actor_settlement_failure(inject_settlement_failure).map_err(|error| {
-            launch_actor_cleanup_failed(
-                context.request_id,
-                context.request_identity_sha256,
-                context.binding_sha256,
-                process_group_id,
-                context.provider_session_id,
-                error,
-            )
-        })?;
         *actor_terminal_at_unix_ms = Some(now_unix_ms());
         return Ok(true);
     }
@@ -2275,8 +2263,7 @@ fn settle_recorded_launch_actor(
     let settlement = match child {
         Some(child) => terminate_process_group_actor_with_child(&actor, child).map(|_| ()),
         None => terminate_process_group_actor(&actor),
-    }
-    .and_then(|_| injected_launch_actor_settlement_failure(inject_settlement_failure));
+    };
     settlement.map_err(|error| {
         launch_actor_cleanup_failed(
             context.request_id,
@@ -3166,7 +3153,7 @@ fn launch_actor_cleanup_failed(
     provider_session_id: Option<&str>,
     error: impl std::fmt::Display,
 ) -> ProviderFailure {
-    ProviderFailure::conflict(
+    ProviderFailure::retryable_conflict(
         request_id,
         "launch_actor_cleanup_failed",
         format!(
@@ -3183,19 +3170,6 @@ fn launch_actor_cleanup_failed(
             "required_action": "retry only this exact durable request to continue actor cleanup and provider-session reconciliation",
         }),
     )
-}
-
-fn injected_launch_actor_settlement_failure(enabled: bool) -> std::io::Result<()> {
-    #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
-    if enabled && std::env::var_os("AGENT_RUNNER_OPENCODE_TEST_FAIL_ACTOR_SETTLEMENT").is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "contract fixture retained an effect-capable actor after bounded termination",
-        ));
-    }
-    #[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]
-    let _ = enabled;
-    Ok(())
 }
 
 fn resume_launch_request_reuse_conflict(

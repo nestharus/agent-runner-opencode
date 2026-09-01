@@ -190,10 +190,12 @@ fn lifecycle_descendant_fixture() {
     let Ok(mode) = std::env::var("OULIPOLY_LIFECYCLE_DESCENDANT_MODE") else {
         return;
     };
-    let evidence_path = CString::new(
-        std::env::var("OULIPOLY_LIFECYCLE_EVIDENCE").expect("lifecycle fixture evidence path"),
-    )
-    .expect("lifecycle fixture evidence path has no NUL");
+    let evidence_path =
+        std::env::var("OULIPOLY_LIFECYCLE_EVIDENCE").expect("lifecycle fixture evidence path");
+    let descendant_pid_path = CString::new(format!("{evidence_path}.pid"))
+        .expect("lifecycle fixture descendant PID path has no NUL");
+    let evidence_path =
+        CString::new(evidence_path).expect("lifecycle fixture evidence path has no NUL");
     let mut readiness = [0_i32; 2];
     assert_eq!(unsafe { libc::pipe(readiness.as_mut_ptr()) }, 0);
     let child = unsafe { libc::fork() };
@@ -227,6 +229,22 @@ fn lifecycle_descendant_fixture() {
                 "stubborn descendant must install SIGTERM ignore"
             );
         }
+        let descendant_pid = child.to_string();
+        let pid_fd = libc::open(
+            descendant_pid_path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(pid_fd >= 0, "open lifecycle descendant PID evidence");
+        assert_eq!(
+            libc::write(
+                pid_fd,
+                descendant_pid.as_bytes().as_ptr().cast(),
+                descendant_pid.len(),
+            ),
+            descendant_pid.len() as isize
+        );
+        libc::close(pid_fd);
         let evidence = if mode == "zombie" {
             b"zombie-only\n".as_slice()
         } else {
@@ -428,7 +446,10 @@ fn assert_cleanup_failure_is_the_only_terminal_outcome(resumed: bool) {
         request.clone(),
         &[
             ("PATH", path.as_str()),
-            ("AGENT_RUNNER_OPENCODE_TEST_FAIL_ACTOR_SETTLEMENT", "1"),
+            (
+                "AGENT_RUNNER_OPENCODE_TEST_RETAIN_EFFECT_CAPABLE_ACTOR",
+                "1",
+            ),
         ],
     );
     assert_eq!(failed.status.code(), Some(2));
@@ -450,6 +471,10 @@ fn assert_cleanup_failure_is_the_only_terminal_outcome(resumed: bool) {
     assert_eq!(failure["error"]["category"], "conflict");
     assert_eq!(failure["error"]["code"], "launch_actor_cleanup_failed");
     assert_eq!(
+        failure["error"]["retryable"], true,
+        "exact durable-request cleanup retry must be admitted by the envelope"
+    );
+    assert_eq!(
         failure["error"]["details"]["durable_request_id"],
         request["request_id"]
     );
@@ -467,6 +492,51 @@ fn assert_cleanup_failure_is_the_only_terminal_outcome(resumed: bool) {
             .expect("durable request identity")
             .len(),
         64
+    );
+
+    let descendant_pid_path = std::path::PathBuf::from(format!(
+        "{}.descendant-state.pid",
+        fake_wrapper.log_path().to_string_lossy()
+    ));
+    let descendant_pid = fs::read_to_string(descendant_pid_path)
+        .expect("read retained descendant PID")
+        .parse::<i32>()
+        .expect("parse retained descendant PID");
+    let descendant_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, descendant_pid, 0_u32) };
+    assert!(
+        descendant_pidfd >= 0,
+        "pin retained descendant for test cleanup"
+    );
+    struct RetainedDescendant(i32);
+    impl Drop for RetainedDescendant {
+        fn drop(&mut self) {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0_u32,
+                );
+                libc::close(self.0);
+            }
+        }
+    }
+    let _retained_descendant = RetainedDescendant(descendant_pidfd as i32);
+    assert_eq!(
+        unsafe { kill(descendant_pid, 0) },
+        0,
+        "the failure boundary must observe a genuinely effect-capable member"
+    );
+    let descendant_stat = fs::read_to_string(format!("/proc/{descendant_pid}/stat"))
+        .expect("read retained descendant process state");
+    let descendant_state = descendant_stat
+        .rfind(')')
+        .and_then(|end| descendant_stat[end + 1..].split_whitespace().next())
+        .expect("parse retained descendant process state");
+    assert!(
+        !matches!(descendant_state, "Z" | "X" | "x"),
+        "the retained descendant must still be effect-capable, state={descendant_state}"
     );
 
     let replay =
