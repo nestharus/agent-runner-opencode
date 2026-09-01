@@ -61,6 +61,18 @@ fn spawn_orphaned_rotation_actor() -> (u32, String) {
 }
 
 #[cfg(target_os = "linux")]
+struct RetainedRotationProcessGroup(u32);
+
+#[cfg(target_os = "linux")]
+impl Drop for RetainedRotationProcessGroup {
+    fn drop(&mut self) {
+        unsafe {
+            kill(-(self.0 as i32), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn rotation_process_group_is_live(process_group_id: u32) -> bool {
     (unsafe { kill(-(process_group_id as i32), 0) }) == 0
 }
@@ -3476,7 +3488,7 @@ fn contract_rotation_reconciles_settings_changed_after_import_without_reimport()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn contract_rotation_settles_recorded_actor_before_changed_settings() {
+fn contract_rotation_fails_closed_for_leaderless_actor_before_changed_settings() {
     let host = HostRoots::new("agent-runner-opencode-rotation-actor-before-settings");
     let opencode = RotationOpencodeFixture::with_post_import_finalization_fault();
     let (settings_id, version) = create_rotation_settings(&host, "opencode2");
@@ -3506,6 +3518,7 @@ fn contract_rotation_settles_recorded_actor_before_changed_settings() {
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
         .expect("prepared rotation operation");
     let (process_group_id, incarnation) = spawn_orphaned_rotation_actor();
+    let _actor_cleanup = RetainedRotationProcessGroup(process_group_id);
     let mut operation: Value = serde_json::from_slice(
         &fs::read(&operation_path).expect("read prepared rotation operation"),
     )
@@ -3529,17 +3542,20 @@ fn contract_rotation_settles_recorded_actor_before_changed_settings() {
     ));
     assert_eq!(
         response["error"]["code"],
-        "rotation_settings_reconciliation_required"
+        "rotation_import_actor_cleanup_failed"
     );
+    assert!(response["error"]["details"]["failure"]
+        .as_str()
+        .is_some_and(|failure| failure.contains("ownership is unresolved")));
     assert!(
-        !rotation_process_group_is_live(process_group_id),
-        "settings reconciliation must not precede recorded-actor cleanup"
+        rotation_process_group_is_live(process_group_id),
+        "unprovable ownership must leave the leaderless process group unsignalled"
     );
-    let settled: Value = serde_json::from_slice(
-        &fs::read(&operation_path).expect("read actor-settled rotation operation"),
+    let unresolved: Value = serde_json::from_slice(
+        &fs::read(&operation_path).expect("read unresolved actor-bound rotation operation"),
     )
-    .expect("actor-settled rotation operation JSON");
-    assert!(settled["import_actor_terminal_at_unix_ms"].is_number());
+    .expect("unresolved actor-bound rotation operation JSON");
+    assert!(unresolved["import_actor_terminal_at_unix_ms"].is_null());
     assert_eq!(
         opencode.import_count(),
         1,

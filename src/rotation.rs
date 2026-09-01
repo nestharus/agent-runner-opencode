@@ -5,7 +5,9 @@ use crate::activity::ActivityTargets;
 use crate::durable_fs;
 use crate::encoding::sha256_hex;
 use crate::envelope::{HostContext, ProviderFailure};
-use crate::native_process::{terminate_process_group_actor, ProcessGroupActor};
+use crate::native_process::{
+    terminate_process_group_actor, terminate_process_group_actor_with_child, ProcessGroupActor,
+};
 use crate::native_runtime;
 use crate::opencode::{self, OpencodeExportError};
 use crate::operation_bounds;
@@ -1496,7 +1498,7 @@ fn settle_existing_rotation_actor(
     {
         return Ok(());
     }
-    if !settle_rotation_import_actor(operation, request_id)? {
+    if !settle_rotation_import_actor(operation, request_id, None)? {
         return Ok(());
     }
     write_rotation_actor_terminal(host, binding, operation, request_id)
@@ -1529,11 +1531,25 @@ fn admit_and_observe_import(
         )
     })?;
     publish_rotation_import_actor(host, binding, operation, prepared.actor(), request_id)?;
-    let observed = prepared.observe(import_timeout);
-    if let Ok(target_session_id) = observed.as_deref() {
-        preserve_import_candidate(host, binding, operation, target_session_id, request_id)?;
-    }
-    settle_rotation_import_actor(operation, request_id)?;
+    let (mut pending, observed) = match prepared.observe(import_timeout) {
+        Ok(pending) => {
+            let observed = pending.result();
+            (Some(pending), observed)
+        }
+        Err(error) => (None, Err(error)),
+    };
+    let candidate_preservation = match observed.as_deref() {
+        Ok(target_session_id) => {
+            preserve_import_candidate(host, binding, operation, target_session_id, request_id)
+        }
+        Err(_) => Ok(()),
+    };
+    settle_rotation_import_actor(
+        operation,
+        request_id,
+        pending.as_mut().map(|pending| pending.child_mut()),
+    )?;
+    candidate_preservation?;
     write_rotation_actor_terminal(host, binding, operation, request_id)?;
     let target_session_id = match observed {
         Ok(target_session_id) => target_session_id,
@@ -1596,6 +1612,7 @@ fn publish_rotation_import_actor(
 fn settle_rotation_import_actor(
     operation: &mut RotationOperation,
     request_id: &str,
+    child: Option<&mut std::process::Child>,
 ) -> Result<bool, ProviderFailure> {
     if operation.import_actor_terminal_at_unix_ms.is_some() {
         return Ok(false);
@@ -1613,7 +1630,11 @@ fn settle_rotation_import_actor(
         process_group_id,
         incarnation: incarnation.clone(),
     };
-    terminate_process_group_actor(&actor)
+    let settlement = match child {
+        Some(child) => terminate_process_group_actor_with_child(&actor, child).map(|_| ()),
+        None => terminate_process_group_actor(&actor),
+    };
+    settlement
         .map_err(|error| rotation_import_actor_cleanup_failed(request_id, operation, error))?;
     operation.import_actor_terminal_at_unix_ms = Some(now_unix_ms());
     Ok(true)
@@ -2483,6 +2504,18 @@ mod tests {
     use crate::native_process::{actor_for_child, configure_process_group};
     use std::process::{Command, Stdio};
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct TestProcessGroup(u32);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for TestProcessGroup {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.0 as i32), libc::SIGKILL);
+            }
+        }
+    }
+
     #[test]
     fn rotation_rejects_message_without_source_session_identity() {
         let native = crate::opencode::parse_export_stdout(
@@ -2533,18 +2566,20 @@ mod tests {
 
         child.kill().expect("terminate rotation import actor");
         child.wait().expect("reap rotation import actor");
-        assert!(settle_rotation_import_actor(&mut operation, "request-test")
-            .expect("terminal import actor permits rotation recovery"));
+        assert!(
+            settle_rotation_import_actor(&mut operation, "request-test", None)
+                .expect("terminal import actor permits rotation recovery")
+        );
         assert!(operation.import_actor_terminal_at_unix_ms.is_some());
         assert!(
-            !settle_rotation_import_actor(&mut operation, "request-test")
+            !settle_rotation_import_actor(&mut operation, "request-test", None)
                 .expect("terminal settlement is idempotent")
         );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn rotation_retry_terminates_a_recorded_group_after_its_leader_exits() {
+    fn rotation_retry_fails_closed_after_the_recorded_group_leader_exits() {
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & exit 0"])
@@ -2555,6 +2590,7 @@ mod tests {
         let actor = actor_for_child(&child).expect("identify rotation process group");
         let recorded_actor = actor.clone();
         assert!(child.wait().expect("observe direct leader exit").success());
+        let _cleanup = TestProcessGroup(actor.process_group_id);
         let mut operation = RotationOperation {
             schema_version: ROTATION_OPERATION_SCHEMA_VERSION,
             binding_sha256: "binding".to_string(),
@@ -2575,12 +2611,18 @@ mod tests {
             imported_at_unix_ms: None,
         };
 
-        assert!(settle_rotation_import_actor(&mut operation, "request-test")
-            .expect("exact retry terminates the orphaned import process group"));
-        assert!(operation.import_actor_terminal_at_unix_ms.is_some());
+        let failure = settle_rotation_import_actor(&mut operation, "request-test", None)
+            .expect_err("leaderless durable recovery must fail closed");
+        assert_eq!(failure.code, "rotation_import_actor_cleanup_failed");
+        assert!(failure
+            .details
+            .get("failure")
+            .and_then(Value::as_str)
+            .is_some_and(|failure| failure.contains("ownership is unresolved")));
+        assert!(operation.import_actor_terminal_at_unix_ms.is_none());
         assert!(
-            crate::native_process::actor_is_terminal_or_recycled(&recorded_actor)
-                .expect("verify rotation actor terminality")
+            !crate::native_process::actor_is_terminal_or_recycled(&recorded_actor)
+                .expect("preserve unresolved rotation actor custody")
         );
     }
 }

@@ -27,7 +27,8 @@ use crate::envelope::{HostContext, ProviderFailure, CONTRACT};
 #[cfg(unix)]
 use crate::native_process::GatedCommand;
 use crate::native_process::{
-    child_exit_status_unreaped, process_group_incarnation as launch_process_incarnation,
+    actor_cleanup_ownership_is_unresolved, child_exit_status_unreaped,
+    process_group_incarnation as launch_process_incarnation,
     process_group_is_live as launch_process_group_is_live, terminate_process_group_actor,
     terminate_process_group_actor_with_child, terminate_process_group_child as terminate_child,
     ExecGate as LaunchExecGate, ProcessGroupActor,
@@ -3319,13 +3320,19 @@ fn launch_actor_cleanup_failed(
     binding_sha256: &str,
     process_group_id: u32,
     provider_session_id: Option<&str>,
-    error: impl std::fmt::Display,
+    error: std::io::Error,
 ) -> ProviderFailure {
+    let actor_ownership = if actor_cleanup_ownership_is_unresolved(&error) {
+        "unresolved"
+    } else {
+        "established_or_not_required"
+    };
+    let cleanup_diagnostic = error.to_string();
     ProviderFailure::retryable_conflict(
         request_id,
         "launch_actor_cleanup_failed",
         format!(
-            "native process-group {process_group_id} custody for binding {binding_sha256} could not be discharged: {error}; the durable launch request remains active and retrying this exact request will retry cleanup without submitting independent work"
+            "native process-group {process_group_id} custody for binding {binding_sha256} could not be discharged: {cleanup_diagnostic}; the durable launch request remains active and retrying this exact request will retry cleanup without submitting independent work"
         ),
         json!({
             "durable_request_id": request_id,
@@ -3333,7 +3340,9 @@ fn launch_actor_cleanup_failed(
             "binding_sha256": binding_sha256,
             "process_group_id": process_group_id,
             "provider_session_id": provider_session_id,
-            "actor_terminality": "effect_capable_after_bounded_termination",
+            "actor_ownership": actor_ownership,
+            "actor_terminality": "unresolved",
+            "cleanup_diagnostic": cleanup_diagnostic,
             "duplicate_model_submission_allowed": false,
             "required_action": "retry only this exact durable request to continue actor cleanup and provider-session reconciliation",
         }),
@@ -4505,6 +4514,31 @@ mod streaming_tests {
         assert!(state.child_exit_at.is_some());
         assert_eq!(state.wait_duration(), HEARTBEAT_INTERVAL);
         assert!(!state.wait_duration().is_zero());
+    }
+
+    #[test]
+    fn unresolved_actor_ownership_preserves_retryable_nonterminal_request_identity() {
+        let failure = launch_actor_cleanup_failed(
+            "request-leaderless-recovery",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            900,
+            Some("session-leaderless-recovery"),
+            crate::native_process::unresolved_actor_ownership_for_test(),
+        );
+
+        assert_eq!(failure.code, "launch_actor_cleanup_failed");
+        assert!(failure.retryable);
+        assert_eq!(
+            failure.details["durable_request_id"],
+            "request-leaderless-recovery"
+        );
+        assert_eq!(failure.details["actor_ownership"], "unresolved");
+        assert_eq!(failure.details["actor_terminality"], "unresolved");
+        assert!(failure.details["cleanup_diagnostic"]
+            .as_str()
+            .is_some_and(|diagnostic| diagnostic.contains("leaderless actor")));
+        assert_eq!(failure.details["duplicate_model_submission_allowed"], false);
     }
 
     #[cfg(target_os = "linux")]

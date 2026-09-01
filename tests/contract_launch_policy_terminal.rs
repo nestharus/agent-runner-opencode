@@ -201,13 +201,6 @@ impl std::io::Write for FailAfterFirstLaunchEvent {
 struct RetainedLaunchActor(Option<i32>);
 
 #[cfg(target_os = "linux")]
-impl RetainedLaunchActor {
-    fn disarm(mut self) {
-        self.0 = None;
-    }
-}
-
-#[cfg(target_os = "linux")]
 impl Drop for RetainedLaunchActor {
     fn drop(&mut self) {
         let Some(process_group_id) = self.0 else {
@@ -290,6 +283,13 @@ fn cleanup_failure_stream(output: &std::process::Output, request_id: &str) -> (V
         failure["error"]["details"]["duplicate_model_submission_allowed"],
         false
     );
+    assert_eq!(
+        failure["error"]["details"]["actor_terminality"],
+        "unresolved"
+    );
+    assert!(failure["error"]["details"]["cleanup_diagnostic"]
+        .as_str()
+        .is_some_and(|diagnostic| !diagnostic.is_empty()));
     assert_eq!(
         failure["error"]["details"]["request_identity_sha256"]
             .as_str()
@@ -667,13 +667,12 @@ fn assert_cleanup_failure_is_the_only_terminal_outcome(resumed: bool) {
     let replay =
         support::invoke_with_request_and_env("launch", request, &[("PATH", path.as_str())]);
     let replay = json_stdout(&replay);
+    assert_eq!(replay["error"]["code"], "launch_actor_cleanup_failed");
+    assert_eq!(replay["error"]["retryable"], true);
+    assert_eq!(replay["error"]["details"]["actor_ownership"], "unresolved");
     assert_eq!(
-        replay["error"]["code"],
-        if resumed {
-            "launch_resume_reconciliation_required"
-        } else {
-            "launch_session_reconciliation_required"
-        }
+        replay["error"]["details"]["actor_terminality"],
+        "unresolved"
     );
     assert_eq!(
         replay["error"]["details"]["provider_session_id"],
@@ -682,7 +681,7 @@ fn assert_cleanup_failure_is_the_only_terminal_outcome(resumed: bool) {
     assert_eq!(
         fs::read_to_string(fake_wrapper.log_path()).expect("read lifecycle launch count"),
         "1\n",
-        "cleanup reconciliation must not submit duplicate model work"
+        "unresolved cleanup retry must not submit duplicate model work"
     );
 }
 
@@ -2657,9 +2656,12 @@ fn contract_completed_resume_settlement_failure_is_bounded_retryable_and_exact_r
         request,
         &[("PATH", path.as_str())],
     ));
+    assert_eq!(replay["error"]["code"], "launch_actor_cleanup_failed");
+    assert_eq!(replay["error"]["retryable"], true);
+    assert_eq!(replay["error"]["details"]["actor_ownership"], "unresolved");
     assert_eq!(
-        replay["error"]["code"],
-        "launch_resume_reconciliation_required"
+        replay["error"]["details"]["actor_terminality"],
+        "unresolved"
     );
     assert_eq!(
         replay["error"]["details"]["provider_session_id"],
@@ -2670,7 +2672,16 @@ fn contract_completed_resume_settlement_failure_is_bounded_retryable_and_exact_r
         submitted_argv,
         "exact-request cleanup retry must not resubmit the model turn"
     );
-    actor.disarm();
+    let process_group_id = failure["error"]["details"]["process_group_id"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+        .expect("cleanup process-group identity");
+    assert_eq!(
+        unsafe { kill(-process_group_id, 0) },
+        0,
+        "leaderless retry must leave the unresolved actor unsignalled"
+    );
+    drop(actor);
 }
 
 #[test]

@@ -27,7 +27,7 @@ use std::io::{Read, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 pub const MAX_EXPORT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -331,29 +331,47 @@ pub(crate) struct PreparedOpencodeImport {
     actor: ProcessGroupActor,
 }
 
+pub(crate) struct PendingOpencodeImport {
+    child: Child,
+    output: Output,
+}
+
 impl PreparedOpencodeImport {
     pub(crate) fn actor(&self) -> &ProcessGroupActor {
         &self.actor
     }
 
-    pub(crate) fn observe(self, timeout: Duration) -> Result<String, OpencodeImportError> {
+    pub(crate) fn observe(
+        self,
+        timeout: Duration,
+    ) -> Result<PendingOpencodeImport, OpencodeImportError> {
         let Self {
             custody,
             gate,
             actor: _,
         } = self;
         gate.release().map_err(import_spawn_error)?;
-        let output = custody
-            .wait_with_bounded_output_timeout(
+        let (child, output) = custody
+            .wait_with_bounded_output_timeout_unreaped(
                 timeout,
                 MAX_NATIVE_COMMAND_OUTPUT_BYTES,
                 MAX_NATIVE_COMMAND_OUTPUT_BYTES,
             )
             .map_err(import_spawn_error)?
             .ok_or(OpencodeImportError::TimedOut)?;
-        validate_bounded_import_output(&output)?;
-        validate_import_status(&output)?;
-        parse_import_stdout(&output.stdout)
+        Ok(PendingOpencodeImport { child, output })
+    }
+}
+
+impl PendingOpencodeImport {
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    pub(crate) fn result(&self) -> Result<String, OpencodeImportError> {
+        validate_bounded_import_output(&self.output)?;
+        validate_import_status(&self.output)?;
+        parse_import_stdout(&self.output.stdout)
     }
 }
 
@@ -368,6 +386,7 @@ pub(crate) struct PreparedOpencodeAuthObservation {
 pub(crate) struct PendingOpencodeAuthObservation {
     before: Option<Vec<u8>>,
     auth_path: PathBuf,
+    child: Option<Child>,
     output: ShellOutput,
     output_exceeded_bound: bool,
 }
@@ -390,8 +409,8 @@ impl PreparedOpencodeAuthObservation {
         } = self;
         gate.release()
             .map_err(OpencodeAuthFailure::EffectUnsettled)?;
-        let output = custody
-            .wait_with_bounded_output_timeout(
+        let (child, output) = custody
+            .wait_with_bounded_output_timeout_unreaped(
                 timeout,
                 MAX_NATIVE_COMMAND_OUTPUT_BYTES,
                 MAX_NATIVE_COMMAND_OUTPUT_BYTES,
@@ -408,6 +427,7 @@ impl PreparedOpencodeAuthObservation {
         Ok(PendingOpencodeAuthObservation {
             before,
             auth_path,
+            child: Some(child),
             output: ShellOutput {
                 stdout: output.stdout,
                 stderr: output.stderr,
@@ -419,6 +439,10 @@ impl PreparedOpencodeAuthObservation {
 }
 
 impl PendingOpencodeAuthObservation {
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("pending auth child is active")
+    }
+
     pub(crate) fn observe_terminal_credentials(
         self,
     ) -> Result<OpencodeAuthObservation, OpencodeAuthFailure> {
@@ -1448,6 +1472,7 @@ mod tests {
         let pending = PendingOpencodeAuthObservation {
             before,
             auth_path: auth_path.clone(),
+            child: None,
             output: ShellOutput {
                 stdout: Vec::new(),
                 stderr: Vec::new(),

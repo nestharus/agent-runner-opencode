@@ -36,6 +36,35 @@ pub(crate) struct ProcessGroupActor {
     pub(crate) incarnation: String,
 }
 
+#[derive(Debug)]
+struct UnresolvedActorOwnership(&'static str);
+
+impl std::fmt::Display for UnresolvedActorOwnership {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for UnresolvedActorOwnership {}
+
+fn unresolved_actor_ownership(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, UnresolvedActorOwnership(message))
+}
+
+pub(crate) fn actor_cleanup_ownership_is_unresolved(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<UnresolvedActorOwnership>())
+        .is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn unresolved_actor_ownership_for_test() -> io::Error {
+    unresolved_actor_ownership(
+        "durable recovery ownership is unresolved: injected leaderless actor",
+    )
+}
+
 pub(crate) struct ExecGate {
     #[cfg(unix)]
     writer: UnixStream,
@@ -205,8 +234,8 @@ pub(crate) fn actor_is_terminal_or_recycled(actor: &ProcessGroupActor) -> io::Re
 }
 
 /// Discharge custody for a durably recorded process-group incarnation after
-/// its in-process owner has been lost. Linux signals only pidfd-pinned members;
-/// a numeric PGID is never a signal target after its incarnation can drain.
+/// its in-process owner has been lost. Linux requires the recorded leader to be
+/// present and stably pinned before it signals any current group member.
 #[cfg(unix)]
 pub(crate) fn terminate_process_group_actor(actor: &ProcessGroupActor) -> io::Result<()> {
     terminate_process_group_actor_inner(actor, None).map(|_| ())
@@ -274,8 +303,25 @@ fn terminate_linux_process_group_actor(
     }
 
     let initial = linux_process_group_snapshot_before(actor.process_group_id, deadline)?;
-    if linux_snapshot_is_recycled(actor, &initial)? {
-        return reap_settled_direct_child(child);
+    let mut members = Vec::new();
+    if child_pins_identity {
+        if linux_snapshot_is_recycled(actor, &initial)? {
+            return reap_settled_direct_child(child);
+        }
+    } else {
+        match linux_durable_recovery_provenance(actor, &initial)? {
+            LinuxDurableRecoveryProvenance::Vacant | LinuxDurableRecoveryProvenance::Recycled => {
+                return reap_settled_direct_child(child);
+            }
+            LinuxDurableRecoveryProvenance::RecordedLeader(leader) => {
+                let Some(leader) = pin_linux_process(leader)? else {
+                    return Err(unresolved_actor_ownership(
+                        "durable recovery ownership is unresolved: the recorded process-group leader incarnation disappeared before a stable kernel pin could be acquired",
+                    ));
+                };
+                members.push(leader);
+            }
+        }
     }
     if !initial.iter().any(LinuxProcess::is_effect_capable) {
         if child_pins_identity {
@@ -284,7 +330,6 @@ fn terminate_linux_process_group_actor(
         return reap_settled_direct_child(child);
     }
 
-    let mut members = Vec::new();
     pin_and_stop_snapshot_members(&initial, &mut members)?;
     if !child_pins_identity && !members_have_effect(&members)? {
         return Err(io::Error::new(
@@ -327,9 +372,8 @@ fn terminate_pinned_process_group_actor(
         return reap_settled_direct_child(child);
     }
     let Some(child) = child.as_deref_mut() else {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "durable process-group recovery has no waitable leader to pin the numeric group identity",
+        return Err(unresolved_actor_ownership(
+            "durable recovery ownership is unresolved: no waitable leader or restart-surviving kernel containment identity pins the numeric process group",
         ));
     };
     if child.id() != actor.process_group_id
@@ -807,6 +851,36 @@ fn linux_snapshot_is_recycled(
         .find(|process| process.process_id == actor.process_group_id)
         .map(|leader| Ok(linux_incarnation(leader.start_ticks)? != actor.incarnation))
         .unwrap_or(Ok(false))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum LinuxDurableRecoveryProvenance<'a> {
+    Vacant,
+    Recycled,
+    RecordedLeader(&'a LinuxProcess),
+}
+
+#[cfg(target_os = "linux")]
+fn linux_durable_recovery_provenance<'a>(
+    actor: &ProcessGroupActor,
+    snapshot: &'a [LinuxProcess],
+) -> io::Result<LinuxDurableRecoveryProvenance<'a>> {
+    if snapshot.is_empty() {
+        return Ok(LinuxDurableRecoveryProvenance::Vacant);
+    }
+    let Some(leader) = snapshot
+        .iter()
+        .find(|process| process.process_id == actor.process_group_id)
+    else {
+        return Err(unresolved_actor_ownership(
+            "durable recovery ownership is unresolved: the recorded process-group leader incarnation is absent and no restart-surviving kernel containment identity is available",
+        ));
+    };
+    if linux_incarnation(leader.start_ticks)? != actor.incarnation {
+        return Ok(LinuxDurableRecoveryProvenance::Recycled);
+    }
+    Ok(LinuxDurableRecoveryProvenance::RecordedLeader(leader))
 }
 
 #[cfg(target_os = "linux")]
@@ -1876,22 +1950,64 @@ mod tests {
     }
 
     #[test]
-    fn durable_actor_recovery_terminates_a_group_after_its_leader_exits() {
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg("sleep 30 </dev/null >/dev/null 2>&1 & exit 0");
-        configure_process_group(&mut command);
-        let mut child = command.spawn().expect("spawn orphanable process group");
-        let actor = actor_for_child(&child).expect("capture durable actor identity");
-        child.wait().expect("process-group leader exits");
-        assert!(
-            process_group_is_live(actor.process_group_id),
-            "background descendant retains the original process group"
-        );
+    fn durable_recovery_rejects_a_leaderless_recycled_group_before_signalling() {
+        let process_group_id = 900;
+        let actor = ProcessGroupActor {
+            process_group_id,
+            incarnation: linux_incarnation(100).expect("record original leader incarnation"),
+        };
+        let original_group = vec![
+            LinuxProcess {
+                process_id: process_group_id,
+                process_group_id,
+                state: b'S',
+                start_ticks: 100,
+            },
+            LinuxProcess {
+                process_id: 901,
+                process_group_id,
+                state: b'S',
+                start_ticks: 101,
+            },
+        ];
+        assert!(matches!(
+            linux_durable_recovery_provenance(&actor, &original_group)
+                .expect("classify original group"),
+            LinuxDurableRecoveryProvenance::RecordedLeader(_)
+        ));
 
-        terminate_process_group_actor(&actor).expect("terminate orphaned process group");
-        assert!(!process_group_is_live(actor.process_group_id));
+        let replacement_group = vec![
+            LinuxProcess {
+                process_id: process_group_id,
+                process_group_id,
+                state: b'S',
+                start_ticks: 200,
+            },
+            LinuxProcess {
+                process_id: 902,
+                process_group_id,
+                state: b'S',
+                start_ticks: 201,
+            },
+        ];
+        assert!(matches!(
+            linux_durable_recovery_provenance(&actor, &replacement_group)
+                .expect("classify replacement group while its leader is live"),
+            LinuxDurableRecoveryProvenance::Recycled
+        ));
+
+        let leaderless_replacement = vec![LinuxProcess {
+            process_id: 902,
+            process_group_id,
+            state: b'S',
+            start_ticks: 201,
+        }];
+        let error = linux_durable_recovery_provenance(&actor, &leaderless_replacement)
+            .expect_err("leaderless replacement ownership must remain unresolved");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(actor_cleanup_ownership_is_unresolved(&error));
+        assert!(error.to_string().contains("leader incarnation is absent"));
     }
 
     #[test]

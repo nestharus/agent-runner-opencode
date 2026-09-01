@@ -112,6 +112,60 @@ impl ChildCustody {
         }))
     }
 
+    pub(crate) fn wait_with_bounded_output_timeout_unreaped(
+        mut self,
+        timeout: Duration,
+        maximum_stdout_bytes: usize,
+        maximum_stderr_bytes: usize,
+    ) -> io::Result<Option<(Child, Output)>> {
+        let started = Instant::now();
+        self.child_mut().stdin.take();
+        let stdout = self
+            .child_mut()
+            .stdout
+            .take()
+            .map(|reader| spawn_bounded_drain(reader, maximum_stdout_bytes));
+        let stderr = self
+            .child_mut()
+            .stderr
+            .take()
+            .map(|reader| spawn_bounded_drain(reader, maximum_stderr_bytes));
+        let status = loop {
+            #[cfg(unix)]
+            let status = crate::native_process::child_exit_status_unreaped(
+                self.child.as_ref().expect("child custody is active"),
+            )?;
+            #[cfg(not(unix))]
+            let status = self.child_mut().try_wait()?;
+            if let Some(status) = status {
+                break status;
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                self.cleanup_now();
+                return Ok(None);
+            }
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        };
+        let Some(stdout) = join_drain_before(stdout, started, timeout)? else {
+            self.cleanup_now();
+            return Ok(None);
+        };
+        let Some(stderr) = join_drain_before(stderr, started, timeout)? else {
+            self.cleanup_now();
+            return Ok(None);
+        };
+        let child = self.child.take().expect("child custody is active");
+        Ok(Some((
+            child,
+            Output {
+                status,
+                stdout,
+                stderr,
+            },
+        )))
+    }
+
     fn cleanup_now(&mut self) {
         if let Some(child) = self.child.as_mut() {
             (self.cleanup)(child);

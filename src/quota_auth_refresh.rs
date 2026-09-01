@@ -12,7 +12,9 @@ use crate::account::{profile_for_wrapper_reference, AccountProfile};
 use crate::durable_fs;
 use crate::encoding::{bounded_text_bytes, now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure};
-use crate::native_process::{terminate_process_group_actor, ProcessGroupActor};
+use crate::native_process::{
+    terminate_process_group_actor, terminate_process_group_actor_with_child, ProcessGroupActor,
+};
 use crate::native_runtime::{self, NativeRuntimeContext};
 use crate::opencode::{
     OpencodeAuthEffect, OpencodeAuthFailure, OpencodeAuthObservation,
@@ -143,7 +145,7 @@ pub fn refresh_auth_params(
                     }
                     QuotaRefreshOperationPhase::NativeEffectAdmitted => {
                         let mut unresolved = operation;
-                        settle_quota_refresh_actor(&mut unresolved, request_id)?;
+                        settle_quota_refresh_actor(&mut unresolved, request_id, None)?;
                         require_quota_refresh_reconciliation(
                             &mut unresolved,
                             "provider_interrupted_after_effect_admission",
@@ -157,7 +159,7 @@ pub fn refresh_auth_params(
                         ));
                     }
                     QuotaRefreshOperationPhase::ReconciliationRequired => {
-                        if settle_quota_refresh_actor(&mut operation, request_id)? {
+                        if settle_quota_refresh_actor(&mut operation, request_id, None)? {
                             write_quota_refresh_operation(host, &operation, request_id)?;
                         }
                         if let Some(reconciliation) = parsed.reconciliation() {
@@ -229,12 +231,16 @@ pub fn refresh_auth_params(
         Ok(prepared) => {
             publish_quota_refresh_actor(host, &mut operation, prepared.actor(), request_id)?;
             match prepared.observe_leader(native_timeout) {
-                Ok(pending) => {
-                    settle_quota_refresh_actor(&mut operation, request_id)?;
+                Ok(mut pending) => {
+                    settle_quota_refresh_actor(
+                        &mut operation,
+                        request_id,
+                        Some(pending.child_mut()),
+                    )?;
                     pending.observe_terminal_credentials()
                 }
                 Err(error) => {
-                    settle_quota_refresh_actor(&mut operation, request_id)?;
+                    settle_quota_refresh_actor(&mut operation, request_id, None)?;
                     Err(error)
                 }
             }
@@ -1201,6 +1207,7 @@ fn publish_quota_refresh_actor(
 fn settle_quota_refresh_actor(
     operation: &mut QuotaRefreshOperation,
     request_id: &str,
+    child: Option<&mut std::process::Child>,
 ) -> Result<bool, ProviderFailure> {
     if operation.actor_terminal_at_unix_ms.is_some() {
         return Ok(false);
@@ -1218,8 +1225,11 @@ fn settle_quota_refresh_actor(
         process_group_id,
         incarnation: incarnation.clone(),
     };
-    terminate_process_group_actor(&actor)
-        .map_err(|error| quota_refresh_actor_cleanup_failed(request_id, operation, error))?;
+    let settlement = match child {
+        Some(child) => terminate_process_group_actor_with_child(&actor, child).map(|_| ()),
+        None => terminate_process_group_actor(&actor),
+    };
+    settlement.map_err(|error| quota_refresh_actor_cleanup_failed(request_id, operation, error))?;
     operation.actor_terminal_at_unix_ms = Some(now_unix_ms());
     Ok(true)
 }
@@ -1360,6 +1370,18 @@ mod custody_tests {
     use std::process::{Command as ProcessCommand, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct TestProcessGroup(u32);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for TestProcessGroup {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.0 as i32), libc::SIGKILL);
+            }
+        }
+    }
+
     #[test]
     fn exact_refresh_retry_resumes_pre_lock_reservation_at_active_capacity() {
         let directory = tempfile::tempdir().expect("quota custody directory");
@@ -1445,16 +1467,20 @@ mod custody_tests {
 
         actor_child.kill().expect("terminate quota actor");
         actor_child.wait().expect("reap quota actor");
-        assert!(settle_quota_refresh_actor(&mut operation, "request-1")
-            .expect("terminal actor permits credential reconciliation"));
+        assert!(
+            settle_quota_refresh_actor(&mut operation, "request-1", None)
+                .expect("terminal actor permits credential reconciliation")
+        );
         assert!(operation.actor_terminal_at_unix_ms.is_some());
-        assert!(!settle_quota_refresh_actor(&mut operation, "request-1")
-            .expect("terminal settlement is idempotent"));
+        assert!(
+            !settle_quota_refresh_actor(&mut operation, "request-1", None)
+                .expect("terminal settlement is idempotent")
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn quota_retry_terminates_a_recorded_group_after_its_leader_exits() {
+    fn quota_retry_fails_closed_after_the_recorded_group_leader_exits() {
         let mut command = ProcessCommand::new("/bin/sh");
         command
             .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & exit 0"])
@@ -1465,18 +1491,25 @@ mod custody_tests {
         let actor = actor_for_child(&child).expect("identify quota process group");
         let recorded_actor = actor.clone();
         assert!(child.wait().expect("observe direct leader exit").success());
+        let _cleanup = TestProcessGroup(actor.process_group_id);
         let mut operation =
             quota_custody_operation(1, QuotaRefreshOperationPhase::NativeEffectAdmitted);
         operation.actor_process_group_id = Some(actor.process_group_id);
         operation.actor_process_group_incarnation = Some(actor.incarnation);
         operation.actor_terminal_at_unix_ms = None;
 
-        assert!(settle_quota_refresh_actor(&mut operation, "request-1")
-            .expect("exact retry terminates the orphaned process group"));
-        assert!(operation.actor_terminal_at_unix_ms.is_some());
+        let failure = settle_quota_refresh_actor(&mut operation, "request-1", None)
+            .expect_err("leaderless durable recovery must fail closed");
+        assert_eq!(failure.code, "quota_refresh_actor_cleanup_failed");
+        assert!(failure
+            .details
+            .get("failure")
+            .and_then(Value::as_str)
+            .is_some_and(|failure| failure.contains("ownership is unresolved")));
+        assert!(operation.actor_terminal_at_unix_ms.is_none());
         assert!(
-            crate::native_process::actor_is_terminal_or_recycled(&recorded_actor)
-                .expect("verify quota actor terminality")
+            !crate::native_process::actor_is_terminal_or_recycled(&recorded_actor)
+                .expect("preserve unresolved quota actor custody")
         );
     }
 
