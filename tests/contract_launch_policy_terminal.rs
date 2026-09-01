@@ -119,6 +119,17 @@ impl IsolatedLaunchSettings {
         )
     }
 
+    #[cfg(target_os = "linux")]
+    fn launch_request_state(&self, request_id: &str) -> Value {
+        let request_stem = agent_runner_opencode::encoding::sha256_hex(request_id.as_bytes());
+        let state_path = self
+            .data_root()
+            .join("provider-state/opencode/launch/requests")
+            .join(format!("{request_stem}.json"));
+        serde_json::from_slice(&fs::read(state_path).expect("read durable launch request state"))
+            .expect("parse durable launch request state")
+    }
+
     fn delete_settings_record(&self) {
         let output = support::invoke_validated_with_host(
             "settings.delete",
@@ -184,6 +195,116 @@ impl std::io::Write for FailAfterFirstLaunchEvent {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+struct RetainedLaunchActor(Option<i32>);
+
+#[cfg(target_os = "linux")]
+impl RetainedLaunchActor {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RetainedLaunchActor {
+    fn drop(&mut self) {
+        let Some(process_group_id) = self.0 else {
+            return;
+        };
+        unsafe {
+            kill(-process_group_id, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn actor_retaining_launch_pipes(failure: &Value) -> RetainedLaunchActor {
+    let process_group_id = failure["error"]["details"]["process_group_id"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+        .expect("cleanup failure process-group identity");
+    assert_eq!(
+        unsafe { kill(-process_group_id, 0) },
+        0,
+        "failed settlement must leave the unresolved effect-capable actor observable"
+    );
+    let pipe_holder = fs::read_dir("/proc")
+        .expect("read procfs for retained launch actor")
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .find(|process_id| {
+            let Ok(stat) = fs::read_to_string(format!("/proc/{process_id}/stat")) else {
+                return false;
+            };
+            let Some(command_end) = stat.rfind(')') else {
+                return false;
+            };
+            let fields = stat[command_end + 1..]
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            !matches!(fields.first().copied(), Some("Z" | "X" | "x"))
+                && fields.get(2).and_then(|value| value.parse::<i32>().ok())
+                    == Some(process_group_id)
+        })
+        .expect("effect-capable process-group member retaining launch pipes");
+    for descriptor in [1, 2] {
+        let target = fs::read_link(format!("/proc/{pipe_holder}/fd/{descriptor}"))
+            .expect("read retained launch pipe descriptor");
+        assert!(
+            target.to_string_lossy().starts_with("pipe:["),
+            "unresolved actor descriptor {descriptor} must retain its launch pipe: {target:?}"
+        );
+    }
+    RetainedLaunchActor(Some(process_group_id))
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_failure_stream(output: &std::process::Output, request_id: &str) -> (Vec<Value>, Value) {
+    assert_eq!(output.status.code(), Some(2));
+    support::assert_stderr_diagnostics_only(output);
+    let mut records = std::str::from_utf8(&output.stdout)
+        .expect("cleanup failure output is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("cleanup failure output JSON"))
+        .collect::<Vec<_>>();
+    let failure = records.pop().expect("cleanup failure envelope");
+    support::assert_valid(&failure, "common.schema.json#/$defs/ErrorResponseEnvelope");
+    for (index, event) in records.iter().enumerate() {
+        assert_valid_launch_event(index + 1, event);
+    }
+    assert!(
+        records.iter().all(|event| event["kind"] != "exit"),
+        "cleanup failure must be the only authoritative terminal outcome: {records:?}"
+    );
+    assert_eq!(failure["request_id"], request_id);
+    assert_eq!(failure["error"]["category"], "conflict");
+    assert_eq!(failure["error"]["code"], "launch_actor_cleanup_failed");
+    assert_eq!(failure["error"]["retryable"], true);
+    assert_eq!(
+        failure["error"]["details"]["durable_request_id"],
+        request_id
+    );
+    assert_eq!(
+        failure["error"]["details"]["duplicate_model_submission_allowed"],
+        false
+    );
+    assert_eq!(
+        failure["error"]["details"]["request_identity_sha256"]
+            .as_str()
+            .expect("durable request identity")
+            .len(),
+        64
+    );
+    assert_eq!(
+        failure["error"]["details"]["binding_sha256"]
+            .as_str()
+            .expect("durable launch binding")
+            .len(),
+        64
+    );
+    (records, failure)
 }
 
 #[test]
@@ -2467,6 +2588,92 @@ fn contract_launch_completed_resume_does_not_wait_for_lingering_native_process()
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn contract_completed_resume_settlement_failure_is_bounded_retryable_and_exact_request_only() {
+    let runtime = IsolatedLaunchSettings::new();
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_completed_resume_then_hang_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params =
+        resume_launch_params_with_prompt_acceptance_env(path.as_str(), fake_wrapper.log_path_str());
+    let request_id = "req-completed-resume-settlement-failure";
+    let mut request = support::validated_request_envelope(
+        "launch",
+        params,
+        runtime.host_overrides(),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    request["request_id"] = json!(request_id);
+    let attempts_path = runtime
+        .data_root()
+        .join("completed-resume-settlement-attempts");
+    let attempts_path_text = attempts_path.to_string_lossy().into_owned();
+
+    let started = std::time::Instant::now();
+    let output = support::invoke_with_request_and_env(
+        "launch",
+        request.clone(),
+        &[
+            ("PATH", path.as_str()),
+            (
+                "AGENT_RUNNER_OPENCODE_TEST_ACTOR_SETTLEMENT_FAILURE_FILE",
+                attempts_path_text.as_str(),
+            ),
+        ],
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "completed-resume cleanup failure must terminate before the five-second actor; elapsed={elapsed:?}"
+    );
+    let (events, failure) = cleanup_failure_stream(&output, request_id);
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "heartbeat")
+            .count()
+            <= 8,
+        "completed-resume failure supervision must remain bounded: {events:?}"
+    );
+    assert_eq!(
+        failure["error"]["details"]["provider_session_id"],
+        resume_session_id()
+    );
+    assert_eq!(
+        fs::read_to_string(&attempts_path).expect("read settlement attempt log"),
+        "attempt\n",
+        "persistent settlement failure must cross the terminal boundary after one attempt"
+    );
+    let actor = actor_retaining_launch_pipes(&failure);
+    let durable_state = runtime.launch_request_state(request_id);
+    assert!(durable_state["actor_terminal_at_unix_ms"].is_null());
+    assert!(durable_state["terminal_status"].is_null());
+    assert_eq!(durable_state["phase"], "prepared");
+    let submitted_argv = fs::read(fake_wrapper.log_path()).expect("read submitted resume argv");
+
+    let replay = json_stdout(&support::invoke_with_request_and_env(
+        "launch",
+        request,
+        &[("PATH", path.as_str())],
+    ));
+    assert_eq!(
+        replay["error"]["code"],
+        "launch_resume_reconciliation_required"
+    );
+    assert_eq!(
+        replay["error"]["details"]["provider_session_id"],
+        resume_session_id()
+    );
+    assert_eq!(
+        fs::read(fake_wrapper.log_path()).expect("read replay resume argv"),
+        submitted_argv,
+        "exact-request cleanup retry must not resubmit the model turn"
+    );
+    actor.disarm();
+}
+
+#[test]
 fn contract_launch_rejects_prompt_acceptance_for_a_different_effective_prompt() {
     let fake_wrapper =
         FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());
@@ -2630,6 +2837,73 @@ fn contract_launch_stream_heartbeat_policy() {
         &[("PATH", deadline_path.as_str())],
     );
     assert_deadline_launch_output(&deadline_output);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn contract_deadline_settlement_failure_has_no_terminal_claim_or_zero_wait_spin() {
+    let runtime = IsolatedLaunchSettings::new();
+    let fake_wrapper = FakeOpencodeWrapper::with_script(hanging_opencode_script());
+    let path = prepend_path(fake_wrapper.dir());
+    let params =
+        resume_launch_params_with_arg_payload_env(path.as_str(), fake_wrapper.log_path_str());
+    let request_id = "req-deadline-settlement-failure";
+    let mut request = support::validated_request_envelope(
+        "launch",
+        params,
+        runtime.host_overrides(),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    request["request_id"] = json!(request_id);
+    let attempts_path = runtime.data_root().join("deadline-settlement-attempts");
+    let attempts_path_text = attempts_path.to_string_lossy().into_owned();
+
+    let (output, elapsed) = support::invoke_with_request_and_env_fresh_deadline(
+        "launch",
+        request,
+        &[
+            ("PATH", path.as_str()),
+            (
+                "AGENT_RUNNER_OPENCODE_TEST_ACTOR_SETTLEMENT_FAILURE_FILE",
+                attempts_path_text.as_str(),
+            ),
+        ],
+        std::time::Duration::from_millis(500),
+    );
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "deadline cleanup failure must not spin until the five-second pipe holder exits; elapsed={elapsed:?}"
+    );
+    let (events, failure) = cleanup_failure_stream(&output, request_id);
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "heartbeat")
+            .count()
+            <= 8,
+        "expired deadline supervision must not emit an unbounded heartbeat stream: {events:?}"
+    );
+    assert_eq!(
+        failure["error"]["details"]["provider_session_id"],
+        resume_session_id()
+    );
+    assert_eq!(
+        fs::read_to_string(&attempts_path).expect("read deadline settlement attempts"),
+        "attempt\n",
+        "deadline settlement failure must not be retried inside the supervision loop"
+    );
+    let _actor = actor_retaining_launch_pipes(&failure);
+    let durable_state = runtime.launch_request_state(request_id);
+    assert!(
+        durable_state["actor_terminal_at_unix_ms"].is_null(),
+        "failed deadline settlement must preserve unresolved actor custody"
+    );
+    assert!(
+        durable_state["terminal_status"].is_null(),
+        "failed deadline settlement must not durably claim a terminal child status"
+    );
+    assert_eq!(durable_state["phase"], "prepared");
 }
 
 #[test]

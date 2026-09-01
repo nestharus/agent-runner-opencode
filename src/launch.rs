@@ -666,7 +666,11 @@ fn finalize_launch_actor_and_replay<W: Write>(
     preparation: Result<(), ProviderFailure>,
 ) -> Result<i32, ProviderFailure> {
     let mut child = custody.into_child();
-    let actor_settlement = state.settle_actor_custody(Some(&mut child));
+    let actor_settlement = if state.actor_settlement_failure_observed {
+        Ok(())
+    } else {
+        state.settle_actor_custody(Some(&mut child)).map(|_| ())
+    };
     drop(child);
     actor_settlement?;
     let replayable_request = state.replayable_request_state();
@@ -1452,7 +1456,7 @@ fn run_supervision_loop<W: Write>(
     while !state.is_complete() {
         capture_child_exit(child, state)?;
         enforce_deadline(child, state)?;
-        complete_terminal_resume(child, state);
+        complete_terminal_resume(child, state)?;
         close_lingering_process_group(child, state)?;
         match receiver.recv_timeout(state.wait_duration()) {
             Ok(message) => state.handle_drain_message(message, writer)?,
@@ -1463,13 +1467,17 @@ fn run_supervision_loop<W: Write>(
     Ok(())
 }
 
-fn complete_terminal_resume(child: &mut Child, state: &mut LaunchState) {
+fn complete_terminal_resume(
+    child: &mut Child,
+    state: &mut LaunchState,
+) -> Result<(), ProviderFailure> {
     if state.final_status.is_some() || !state.completed_resume_grace_elapsed() {
-        return;
+        return Ok(());
     }
-    if let Some(status) = terminate_child(child) {
+    if let Some(status) = state.settle_actor_custody(Some(child))? {
         state.record_forced_exit(process_status_from_exit(status));
     }
+    Ok(())
 }
 
 fn close_lingering_process_group(
@@ -1479,15 +1487,24 @@ fn close_lingering_process_group(
     if state.drains_done() || !state.child_exit_grace_elapsed() {
         return Ok(());
     }
-    state.settle_actor_custody(Some(child))
+    state.settle_actor_custody(Some(child)).map(|_| ())
 }
 
 fn enforce_deadline(child: &mut Child, state: &mut LaunchState) -> Result<(), ProviderFailure> {
     if state.final_status.is_some() || !state.deadline_reached() {
         return Ok(());
     }
-    let _ = terminate_child(child);
-    state.final_status = Some(deadline_status());
+    let settlement = state.settle_actor_custody(Some(child)).map(|_| ());
+    complete_deadline_settlement(state, settlement)?;
+    Ok(())
+}
+
+fn complete_deadline_settlement(
+    state: &mut LaunchState,
+    settlement: Result<(), ProviderFailure>,
+) -> Result<(), ProviderFailure> {
+    settlement?;
+    state.record_child_exit(deadline_status());
     Ok(())
 }
 
@@ -1637,7 +1654,9 @@ fn interpret_existing_new_session_retry(
             provider_session_id: state.provider_session_id.as_deref(),
         },
         None,
-    )? {
+    )?
+    .0
+    {
         write_launch_request_state(state_path, &state, request_id)?;
     }
     match state.phase {
@@ -1710,7 +1729,9 @@ fn interpret_existing_resume_retry(
             provider_session_id: Some(&state.observation.session_id),
         },
         None,
-    )? {
+    )?
+    .0
+    {
         write_launch_request_state(state_path, &state, request_id)?;
     }
     match state.phase {
@@ -1892,8 +1913,11 @@ impl LaunchRequestGuard {
         Ok(())
     }
 
-    fn settle_actor_custody(&mut self, child: Option<&mut Child>) -> Result<(), ProviderFailure> {
-        if settle_recorded_launch_actor(
+    fn settle_actor_custody(
+        &mut self,
+        child: Option<&mut Child>,
+    ) -> Result<Option<ExitStatus>, ProviderFailure> {
+        let (changed, child_status) = settle_recorded_launch_actor(
             self.state.actor_process_group_id,
             self.state.actor_process_group_incarnation.as_deref(),
             &mut self.state.actor_terminal_at_unix_ms,
@@ -1904,10 +1928,11 @@ impl LaunchRequestGuard {
                 provider_session_id: self.state.provider_session_id.as_deref(),
             },
             child,
-        )? {
+        )?;
+        if changed {
             write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)?;
         }
-        Ok(())
+        Ok(child_status)
     }
 
     fn observe_terminal_without_session(
@@ -2030,8 +2055,11 @@ impl ResumeLaunchRequestGuard {
         Ok(())
     }
 
-    fn settle_actor_custody(&mut self, child: Option<&mut Child>) -> Result<(), ProviderFailure> {
-        if settle_recorded_launch_actor(
+    fn settle_actor_custody(
+        &mut self,
+        child: Option<&mut Child>,
+    ) -> Result<Option<ExitStatus>, ProviderFailure> {
+        let (changed, child_status) = settle_recorded_launch_actor(
             self.state.actor_process_group_id,
             self.state.actor_process_group_incarnation.as_deref(),
             &mut self.state.actor_terminal_at_unix_ms,
@@ -2042,10 +2070,11 @@ impl ResumeLaunchRequestGuard {
                 provider_session_id: Some(&self.state.observation.session_id),
             },
             child,
-        )? {
+        )?;
+        if changed {
             write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)?;
         }
-        Ok(())
+        Ok(child_status)
     }
 
     fn settle(
@@ -2375,17 +2404,17 @@ fn settle_recorded_launch_actor(
     actor_terminal_at_unix_ms: &mut Option<u64>,
     context: &LaunchActorSettlementContext<'_>,
     child: Option<&mut Child>,
-) -> Result<bool, ProviderFailure> {
+) -> Result<(bool, Option<ExitStatus>), ProviderFailure> {
     if actor_terminal_at_unix_ms.is_some() {
-        return Ok(false);
+        return Ok((false, None));
     }
     let Some(process_group_id) = process_group_id else {
         *actor_terminal_at_unix_ms = Some(now_unix_ms());
-        return Ok(true);
+        return Ok((true, None));
     };
     if !launch_process_group_is_live(process_group_id) {
         *actor_terminal_at_unix_ms = Some(now_unix_ms());
-        return Ok(true);
+        return Ok((true, None));
     }
     let Some(incarnation) = process_group_incarnation else {
         return Err(launch_actor_reconciliation_required(
@@ -2399,11 +2428,11 @@ fn settle_recorded_launch_actor(
         process_group_id,
         incarnation: incarnation.to_string(),
     };
-    let settlement = match child {
-        Some(child) => terminate_process_group_actor_with_child(&actor, child).map(|_| ()),
-        None => terminate_process_group_actor(&actor),
+    let child_status = match child {
+        Some(child) => terminate_process_group_actor_with_child(&actor, child),
+        None => terminate_process_group_actor(&actor).map(|()| None),
     };
-    settlement.map_err(|error| {
+    let child_status = child_status.map_err(|error| {
         launch_actor_cleanup_failed(
             context.request_id,
             context.request_identity_sha256,
@@ -2414,7 +2443,7 @@ fn settle_recorded_launch_actor(
         )
     })?;
     *actor_terminal_at_unix_ms = Some(now_unix_ms());
-    Ok(true)
+    Ok((true, child_status))
 }
 
 fn recover_prepared_launch(
@@ -3388,6 +3417,7 @@ struct LaunchState {
     route_evidence: Value,
     launch_request: Option<LaunchRequestGuard>,
     resume_launch_request: Option<ResumeLaunchRequestGuard>,
+    actor_settlement_failure_observed: bool,
     projection_admitted: bool,
     deferred_spool: DeferredLaunchSpool,
     output_summary: LaunchOutputSummary,
@@ -3427,6 +3457,7 @@ impl LaunchState {
             deadline_unix_ms,
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
             route_evidence,
+            actor_settlement_failure_observed: false,
             projection_admitted: launch_request.is_none(),
             launch_request,
             resume_launch_request: None,
@@ -3445,14 +3476,21 @@ impl LaunchState {
         self.projection_admitted = false;
     }
 
-    fn settle_actor_custody(&mut self, child: Option<&mut Child>) -> Result<(), ProviderFailure> {
-        if let Some(launch_request) = self.launch_request.as_mut() {
-            return launch_request.settle_actor_custody(child);
+    fn settle_actor_custody(
+        &mut self,
+        child: Option<&mut Child>,
+    ) -> Result<Option<ExitStatus>, ProviderFailure> {
+        let settlement = if let Some(launch_request) = self.launch_request.as_mut() {
+            launch_request.settle_actor_custody(child)
+        } else if let Some(resume_launch_request) = self.resume_launch_request.as_mut() {
+            resume_launch_request.settle_actor_custody(child)
+        } else {
+            Ok(None)
+        };
+        if settlement.is_err() {
+            self.actor_settlement_failure_observed = true;
         }
-        if let Some(resume_launch_request) = self.resume_launch_request.as_mut() {
-            return resume_launch_request.settle_actor_custody(child);
-        }
-        Ok(())
+        settlement
     }
 
     fn replayable_request_state(&self) -> Option<(PathBuf, String)> {
@@ -4025,6 +4063,9 @@ impl LaunchState {
     }
 
     fn wait_duration(&self) -> Duration {
+        if self.final_status.is_some() {
+            return HEARTBEAT_INTERVAL;
+        }
         self.deadline_wait_duration()
             .min(self.heartbeat_wait_duration())
     }
@@ -4427,6 +4468,43 @@ mod streaming_tests {
             buffer[..partial.len()].copy_from_slice(partial);
             Ok(partial.len())
         }
+    }
+
+    #[test]
+    fn deadline_status_and_child_exit_time_require_successful_actor_settlement() {
+        let mut state = LaunchState::new(
+            "request-deadline-settlement",
+            Some(0),
+            true,
+            None,
+            None,
+            json!({}),
+            None,
+        )
+        .expect("create deadline launch state");
+        let failure = ProviderFailure::retryable_conflict(
+            "request-deadline-settlement",
+            "launch_actor_cleanup_failed",
+            "injected settlement failure",
+            json!({}),
+        );
+
+        let observed = complete_deadline_settlement(&mut state, Err(failure))
+            .expect_err("failed settlement must remain terminal");
+
+        assert_eq!(observed.code, "launch_actor_cleanup_failed");
+        assert!(state.final_status.is_none());
+        assert!(state.child_exit_at.is_none());
+
+        complete_deadline_settlement(&mut state, Ok(()))
+            .expect("proven settlement may record deadline terminality");
+        assert!(matches!(
+            state.final_status,
+            Some(ProcessStatus::ProlongedSilence { .. })
+        ));
+        assert!(state.child_exit_at.is_some());
+        assert_eq!(state.wait_duration(), HEARTBEAT_INTERVAL);
+        assert!(!state.wait_duration().is_zero());
     }
 
     #[cfg(target_os = "linux")]

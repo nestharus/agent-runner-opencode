@@ -585,6 +585,11 @@ pub fn slow_opencode_script(exit_code: i32) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
+pub fn hanging_opencode_script() -> String {
+    format!("{}\n/bin/sleep 5\nexit 9\n", fake_wrapper_log_script())
+}
+
 pub fn env_probe_opencode_script() -> String {
     "#!/bin/sh\n\
 {\n\

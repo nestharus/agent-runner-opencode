@@ -225,6 +225,7 @@ fn terminate_process_group_actor_inner(
     actor: &ProcessGroupActor,
     child: Option<&mut Child>,
 ) -> io::Result<Option<ExitStatus>> {
+    inject_actor_settlement_failure()?;
     #[cfg(target_os = "linux")]
     {
         terminate_linux_process_group_actor(actor, child)
@@ -233,6 +234,26 @@ fn terminate_process_group_actor_inner(
     {
         terminate_pinned_process_group_actor(actor, child)
     }
+}
+
+#[cfg(unix)]
+fn inject_actor_settlement_failure() -> io::Result<()> {
+    #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
+    if let Some(attempt_path) =
+        std::env::var_os("AGENT_RUNNER_OPENCODE_TEST_ACTOR_SETTLEMENT_FAILURE_FILE")
+    {
+        let mut attempts = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(attempt_path)?;
+        attempts.write_all(b"attempt\n")?;
+        attempts.flush()?;
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "injected persistent actor-settlement failure",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1313,44 +1334,17 @@ fn process_group_leader_is_missing(error: &io::Error) -> bool {
 }
 
 #[cfg(unix)]
-pub(crate) fn terminate_process_group_child(child: &mut Child) -> Option<ExitStatus> {
-    let actor = actor_for_child(child).ok();
-    match actor {
-        Some(actor) => terminate_process_group_actor_with_child(&actor, child)
-            .ok()
-            .flatten(),
-        None => terminate_direct_child_bounded(child).ok().flatten(),
-    }
-}
-
-#[cfg(unix)]
-fn terminate_direct_child_bounded(child: &mut Child) -> io::Result<Option<ExitStatus>> {
-    if let Some(status) = child.try_wait()? {
-        return Ok(Some(status));
-    }
-    child.kill()?;
-    let deadline = Instant::now() + ACTOR_SETTLEMENT_TIMEOUT;
-    let mut backoff = INITIAL_SETTLEMENT_BACKOFF;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "direct child remained effect-capable after bounded termination",
-            ));
-        }
-        std::thread::sleep(remaining.min(backoff));
-        backoff = (backoff * 2).min(MAX_SETTLEMENT_BACKOFF);
-    }
+pub(crate) fn terminate_process_group_child(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    let actor = actor_for_child(child)?;
+    terminate_process_group_actor_with_child(&actor, child)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn terminate_process_group_child(child: &mut Child) -> Option<ExitStatus> {
-    let _ = child.kill();
-    child.wait().ok()
+pub(crate) fn terminate_process_group_child(_child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process-group child settlement requires Unix process custody",
+    ))
 }
 
 #[cfg(unix)]
