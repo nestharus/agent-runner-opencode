@@ -27,6 +27,8 @@ const ACTOR_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIAL_SETTLEMENT_BACKOFF: Duration = Duration::from_millis(2);
 #[cfg(unix)]
 const MAX_SETTLEMENT_BACKOFF: Duration = Duration::from_millis(50);
+#[cfg(target_os = "linux")]
+const LINUX_SNAPSHOT_MAX_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProcessGroupActor {
@@ -250,13 +252,13 @@ fn terminate_linux_process_group_actor(
         ));
     }
 
-    let initial = linux_process_group_snapshot(actor.process_group_id)?;
+    let initial = linux_process_group_snapshot_before(actor.process_group_id, deadline)?;
     if linux_snapshot_is_recycled(actor, &initial)? {
         return reap_settled_direct_child(child);
     }
     if !initial.iter().any(LinuxProcess::is_effect_capable) {
         if child_pins_identity {
-            reap_adopted_process_group_descendants(actor, child_id)?;
+            reap_adopted_process_group_descendants(actor, child_id, deadline)?;
         }
         return reap_settled_direct_child(child);
     }
@@ -290,7 +292,7 @@ fn terminate_linux_process_group_actor(
     }
     reap_pinned_descendants(&members, child_id)?;
     if child_pins_identity {
-        reap_adopted_process_group_descendants(actor, child_id)?;
+        reap_adopted_process_group_descendants(actor, child_id, deadline)?;
     }
     reap_settled_direct_child(child)
 }
@@ -323,15 +325,128 @@ fn terminate_pinned_process_group_actor(
             "native process-group identity exceeds the platform PID range",
         )
     })?;
-    send_process_group_signal_checked(-process_group_id, SIGTERM)?;
-    std::thread::sleep(TERMINATION_GRACE);
-    send_process_group_signal_checked(-process_group_id, SIGKILL)?;
+    let mut settlement = PinnedProcessGroupSettlement::new(process_group_id);
+    settle_effect_capable_process_group(&mut settlement)?;
     reap_settled_direct_child(Some(child))
 }
 
 #[cfg(unix)]
 fn reap_settled_direct_child(child: Option<&mut Child>) -> io::Result<Option<ExitStatus>> {
-    child.map(Child::wait).transpose()
+    let Some(child) = child else {
+        return Ok(None);
+    };
+    child.try_wait()?.map(Some).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "direct actor leader was not waitable after process-group settlement",
+        )
+    })
+}
+
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectCapableGroupObservation {
+    Gone,
+    Present,
+}
+
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+trait ProcessGroupSettlementDriver {
+    fn observe(&mut self) -> io::Result<EffectCapableGroupObservation>;
+    fn signal(&mut self, signal: i32) -> io::Result<()>;
+    fn elapsed(&self) -> Duration;
+    fn wait(&mut self, duration: Duration);
+}
+
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+enum BoundedGroupObservation {
+    Gone,
+    Present,
+    Uncertain(String),
+}
+
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn settle_effect_capable_process_group(
+    driver: &mut impl ProcessGroupSettlementDriver,
+) -> io::Result<()> {
+    driver.signal(SIGTERM)?;
+    if matches!(
+        observe_effect_capable_group_until(driver, TERMINATION_GRACE),
+        BoundedGroupObservation::Gone
+    ) {
+        return Ok(());
+    }
+
+    driver.signal(SIGKILL)?;
+    match observe_effect_capable_group_until(driver, ACTOR_SETTLEMENT_TIMEOUT) {
+        BoundedGroupObservation::Gone => Ok(()),
+        BoundedGroupObservation::Present => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "native process group retains effect-capable members after bounded termination",
+        )),
+        BoundedGroupObservation::Uncertain(error) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "native process-group membership remained uncertain after bounded termination: {error}"
+            ),
+        )),
+    }
+}
+
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn observe_effect_capable_group_until(
+    driver: &mut impl ProcessGroupSettlementDriver,
+    deadline: Duration,
+) -> BoundedGroupObservation {
+    let mut backoff = INITIAL_SETTLEMENT_BACKOFF;
+    loop {
+        let last = match driver.observe() {
+            Ok(EffectCapableGroupObservation::Gone) => return BoundedGroupObservation::Gone,
+            Ok(EffectCapableGroupObservation::Present) => BoundedGroupObservation::Present,
+            Err(error) => BoundedGroupObservation::Uncertain(error.to_string()),
+        };
+        let remaining = deadline.saturating_sub(driver.elapsed());
+        if remaining.is_zero() {
+            return last;
+        }
+        driver.wait(remaining.min(backoff));
+        backoff = (backoff * 2).min(MAX_SETTLEMENT_BACKOFF);
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+struct PinnedProcessGroupSettlement {
+    process_group_id: i32,
+    started: Instant,
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl PinnedProcessGroupSettlement {
+    fn new(process_group_id: i32) -> Self {
+        Self {
+            process_group_id,
+            started: Instant::now(),
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl ProcessGroupSettlementDriver for PinnedProcessGroupSettlement {
+    fn observe(&mut self) -> io::Result<EffectCapableGroupObservation> {
+        non_linux_process_group_observation(self.process_group_id)
+    }
+
+    fn signal(&mut self, signal: i32) -> io::Result<()> {
+        send_process_group_signal_checked(-self.process_group_id, signal)
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn wait(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 #[cfg(unix)]
@@ -389,6 +504,139 @@ fn process_group_actor_requires_signal(actor: &ProcessGroupActor) -> io::Result<
     }
 }
 
+#[cfg(target_os = "macos")]
+fn non_linux_process_group_observation(
+    process_group_id: i32,
+) -> io::Result<EffectCapableGroupObservation> {
+    const MEMBER_SLACK: usize = 16;
+    const MEMBER_LIMIT: usize = 4_096;
+
+    let required = unsafe { libc::proc_listpgrppids(process_group_id, std::ptr::null_mut(), 0) };
+    if required < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if required == 0 {
+        return if process_group_is_live(process_group_id as u32) {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "macOS returned no membership records for a live process group",
+            ))
+        } else {
+            Ok(EffectCapableGroupObservation::Gone)
+        };
+    }
+    let required = usize::try_from(required).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS returned a negative process-group member count",
+        )
+    })?;
+    let capacity = required.checked_add(MEMBER_SLACK).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS process-group member count overflowed",
+        )
+    })?;
+    if capacity > MEMBER_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "macOS process group requires more than the bounded {MEMBER_LIMIT}-member observation capacity"
+            ),
+        ));
+    }
+    let byte_capacity = capacity
+        .checked_mul(std::mem::size_of::<libc::pid_t>())
+        .and_then(|bytes| i32::try_from(bytes).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "macOS process-group observation buffer exceeds the platform range",
+            )
+        })?;
+    let mut process_ids = vec![0_i32; capacity];
+    let observed = unsafe {
+        libc::proc_listpgrppids(
+            process_group_id,
+            process_ids.as_mut_ptr().cast(),
+            byte_capacity,
+        )
+    };
+    if observed < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let observed = usize::try_from(observed).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS returned a negative process-group observation count",
+        )
+    })?;
+    if observed >= capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "macOS process-group membership changed beyond the bounded observation buffer",
+        ));
+    }
+
+    for process_id in process_ids
+        .into_iter()
+        .take(observed)
+        .filter(|pid| *pid > 0)
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let info_size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process identity structure exceeds the platform query range",
+            )
+        })?;
+        let read_size = unsafe {
+            libc::proc_pidinfo(
+                process_id,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                info_size,
+            )
+        };
+        if read_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "macOS process-group member {process_id} disappeared or became unreadable during observation"
+                ),
+            ));
+        }
+        if read_size != info_size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("macOS process-group member {process_id} returned a partial record"),
+            ));
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pid != process_id as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "macOS process-group observation returned a mismatched process identity",
+            ));
+        }
+        if info.pbi_pgid == process_group_id as u32 && info.pbi_status != libc::SZOMB {
+            return Ok(EffectCapableGroupObservation::Present);
+        }
+    }
+    Ok(EffectCapableGroupObservation::Gone)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn non_linux_process_group_observation(
+    _process_group_id: i32,
+) -> io::Result<EffectCapableGroupObservation> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "effect-capable process-group observation is unsupported on this Unix platform",
+    ))
+}
+
 #[cfg(all(target_os = "linux", test))]
 fn linux_process_group_actor_requires_signal(actor: &ProcessGroupActor) -> io::Result<bool> {
     let snapshot = linux_process_group_snapshot(actor.process_group_id)?;
@@ -410,8 +658,9 @@ fn linux_process_group_actor_requires_signal(actor: &ProcessGroupActor) -> io::R
 fn reap_adopted_process_group_descendants(
     actor: &ProcessGroupActor,
     direct_child_id: Option<u32>,
+    deadline: Instant,
 ) -> io::Result<()> {
-    let snapshot = linux_process_group_snapshot(actor.process_group_id)?;
+    let snapshot = linux_process_group_snapshot_before(actor.process_group_id, deadline)?;
     if snapshot
         .iter()
         .find(|process| process.process_id == actor.process_group_id)
@@ -439,14 +688,6 @@ fn reap_adopted_process_group_descendants(
             return Err(error);
         }
     }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn reap_adopted_process_group_descendants(
-    _actor: &ProcessGroupActor,
-    _direct_child_id: Option<u32>,
-) -> io::Result<()> {
     Ok(())
 }
 
@@ -588,7 +829,7 @@ fn freeze_actor_members(
                 "native process group lost its stable member anchor during settlement",
             ));
         }
-        let snapshot = linux_process_group_snapshot(actor.process_group_id)?;
+        let snapshot = linux_process_group_snapshot_before(actor.process_group_id, deadline)?;
         if linux_snapshot_is_recycled(actor, &snapshot)? {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -602,7 +843,8 @@ fn freeze_actor_members(
             }
         }
         if wait_for_members_stopped(members, deadline)? {
-            let verification = linux_process_group_snapshot(actor.process_group_id)?;
+            let verification =
+                linux_process_group_snapshot_before(actor.process_group_id, deadline)?;
             if linux_snapshot_is_recycled(actor, &verification)? {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -788,7 +1030,7 @@ fn pidfd_has_exited(pidfd: &OwnedFd) -> io::Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn read_linux_process(process_id: u32) -> io::Result<Option<LinuxProcess>> {
-    let stat = match fs::read_to_string(format!("/proc/{process_id}/stat")) {
+    let stat = match fs::read(format!("/proc/{process_id}/stat")) {
         Ok(stat) => stat,
         Err(error) if linux_process_disappeared(&error) => return Ok(None),
         Err(error) => return Err(error),
@@ -842,48 +1084,158 @@ fn retain_effect_capable_test_member() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+trait LinuxProcessTable {
+    fn process_ids(&mut self) -> io::Result<Vec<u32>>;
+    fn read_stat(&mut self, process_id: u32) -> io::Result<Option<Vec<u8>>>;
+}
+
+#[cfg(target_os = "linux")]
+struct ProcLinuxProcessTable;
+
+#[cfg(target_os = "linux")]
+impl LinuxProcessTable for ProcLinuxProcessTable {
+    fn process_ids(&mut self) -> io::Result<Vec<u32>> {
+        let mut process_ids = Vec::new();
+        for entry in fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(process_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            process_ids.push(process_id);
+        }
+        Ok(process_ids)
+    }
+
+    fn read_stat(&mut self, process_id: u32) -> io::Result<Option<Vec<u8>>> {
+        match fs::read(format!("/proc/{process_id}/stat")) {
+            Ok(stat) => Ok(Some(stat)),
+            Err(error) if linux_process_disappeared(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", test))]
 fn linux_process_group_snapshot(process_group_id: u32) -> io::Result<Vec<LinuxProcess>> {
+    linux_process_group_snapshot_before(process_group_id, Instant::now() + ACTOR_SETTLEMENT_TIMEOUT)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_snapshot_before(
+    process_group_id: u32,
+    deadline: Instant,
+) -> io::Result<Vec<LinuxProcess>> {
+    linux_process_group_snapshot_from(&mut ProcLinuxProcessTable, process_group_id, deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_snapshot_from(
+    process_table: &mut impl LinuxProcessTable,
+    process_group_id: u32,
+    deadline: Instant,
+) -> io::Result<Vec<LinuxProcess>> {
+    let mut backoff = INITIAL_SETTLEMENT_BACKOFF;
+    let mut last_error = None;
+    for attempt in 0..LINUX_SNAPSHOT_MAX_ATTEMPTS {
+        match linux_process_group_snapshot_once(process_table, process_group_id) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => last_error = Some(error),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || attempt + 1 == LINUX_SNAPSHOT_MAX_ATTEMPTS {
+            break;
+        }
+        std::thread::sleep(remaining.min(backoff));
+        backoff = (backoff * 2).min(MAX_SETTLEMENT_BACKOFF);
+    }
+    let error = last_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "no complete process-table observation".to_string());
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+            "Linux target-group membership remained uncertain after bounded process-table observations: {error}"
+        ),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_snapshot_once(
+    process_table: &mut impl LinuxProcessTable,
+    process_group_id: u32,
+) -> io::Result<Vec<LinuxProcess>> {
     let mut snapshot = Vec::new();
-    for entry in fs::read_dir("/proc")? {
-        let entry = entry?;
-        let Some(process_id) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
+    for process_id in process_table.process_ids()? {
+        let Some(stat) = process_table.read_stat(process_id)? else {
             continue;
         };
-        let stat = match fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if linux_process_disappeared(&error) => continue,
-            Err(error) => return Err(error),
-        };
-        let process = parse_linux_process_stat(process_id, &stat)?;
-        if process.process_group_id == process_group_id {
-            snapshot.push(process);
+        let fields = parse_linux_process_stat_fields(process_id, &stat)?;
+        if parse_linux_stat_field::<u32>(&fields, 2, "process group")? != process_group_id {
+            continue;
         }
+        snapshot.push(parse_linux_process_stat_from_fields(process_id, &fields)?);
     }
     Ok(snapshot)
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_process_stat(process_id: u32, stat: &str) -> io::Result<LinuxProcess> {
-    let command_end = stat.rfind(')').ok_or_else(|| {
+fn parse_linux_process_stat(process_id: u32, stat: &[u8]) -> io::Result<LinuxProcess> {
+    let fields = parse_linux_process_stat_fields(process_id, stat)?;
+    parse_linux_process_stat_from_fields(process_id, &fields)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_stat_fields(process_id: u32, stat: &[u8]) -> io::Result<Vec<&[u8]>> {
+    let process_id = process_id.to_string();
+    let command_start = process_id.len() + 2;
+    if !stat.starts_with(process_id.as_bytes())
+        || stat.get(process_id.len()..command_start) != Some(b" (")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process stat identity does not match its procfs path",
+        ));
+    }
+    let command_end = stat.iter().rposition(|byte| *byte == b')').ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "process stat has no command terminator",
         )
     })?;
-    let fields = stat[command_end + 1..]
-        .split_whitespace()
-        .collect::<Vec<_>>();
+    if command_end < command_start {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process stat command terminates before it begins",
+        ));
+    }
+    if stat.get(command_end + 1) != Some(&b' ') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process stat command terminator is not followed by a field separator",
+        ));
+    }
+    Ok(stat[command_end + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_stat_from_fields(
+    process_id: u32,
+    fields: &[&[u8]],
+) -> io::Result<LinuxProcess> {
     let state = fields
         .first()
-        .and_then(|state| state.as_bytes().first())
-        .copied()
+        .filter(|state| state.len() == 1)
+        .map(|state| state[0])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process stat has no state"))?;
-    let process_group_id = parse_linux_stat_field::<u32>(&fields, 2, "process group")?;
-    let start_ticks = parse_linux_stat_field::<u64>(&fields, 19, "start time")?;
+    let process_group_id = parse_linux_stat_field::<u32>(fields, 2, "process group")?;
+    let start_ticks = parse_linux_stat_field::<u64>(fields, 19, "start time")?;
     Ok(LinuxProcess {
         process_id,
         process_group_id,
@@ -893,21 +1245,26 @@ fn parse_linux_process_stat(process_id: u32, stat: &str) -> io::Result<LinuxProc
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_stat_field<T>(fields: &[&str], index: usize, name: &str) -> io::Result<T>
+fn parse_linux_stat_field<T>(fields: &[&[u8]], index: usize, name: &str) -> io::Result<T>
 where
     T: std::str::FromStr,
-    T::Err: Into<Box<dyn std::error::Error + Send + Sync>>,
+    T::Err: std::fmt::Display,
 {
-    fields
-        .get(index)
-        .ok_or_else(|| {
+    let field = fields.get(index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("process stat has no {name} field"),
+        )
+    })?;
+    std::str::from_utf8(field)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        .parse::<T>()
+        .map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("process stat has no {name} field"),
+                format!("process stat has invalid {name} field: {error}"),
             )
-        })?
-        .parse::<T>()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -962,13 +1319,31 @@ pub(crate) fn terminate_process_group_child(child: &mut Child) -> Option<ExitSta
         Some(actor) => terminate_process_group_actor_with_child(&actor, child)
             .ok()
             .flatten(),
-        None => match child.try_wait().ok()? {
-            Some(status) => Some(status),
-            None => {
-                let _ = child.kill();
-                child.wait().ok()
-            }
-        },
+        None => terminate_direct_child_bounded(child).ok().flatten(),
+    }
+}
+
+#[cfg(unix)]
+fn terminate_direct_child_bounded(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+    child.kill()?;
+    let deadline = Instant::now() + ACTOR_SETTLEMENT_TIMEOUT;
+    let mut backoff = INITIAL_SETTLEMENT_BACKOFF;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "direct child remained effect-capable after bounded termination",
+            ));
+        }
+        std::thread::sleep(remaining.min(backoff));
+        backoff = (backoff * 2).min(MAX_SETTLEMENT_BACKOFF);
     }
 }
 
@@ -1045,25 +1420,13 @@ fn set_current_process_group() -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn process_group_incarnation(process_id: u32) -> io::Result<String> {
-    let stat = fs::read_to_string(format!("/proc/{process_id}/stat"))?;
-    let command_end = stat.rfind(')').ok_or_else(|| {
+    let process = read_linux_process(process_id)?.ok_or_else(|| {
         io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process stat has no command terminator",
+            io::ErrorKind::NotFound,
+            "process disappeared before its incarnation could be observed",
         )
     })?;
-    let start_ticks = stat[command_end + 1..]
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "process stat has no start-time field",
-            )
-        })?
-        .parse::<u64>()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    linux_incarnation(start_ticks)
+    linux_incarnation(process.start_ticks)
 }
 
 #[cfg(target_os = "macos")]
@@ -1185,7 +1548,124 @@ unsafe extern "C" {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    enum InjectedStatRead {
+        Stat(Vec<u8>),
+        Missing,
+        Error(io::ErrorKind),
+    }
+
+    struct InjectedLinuxProcessTable {
+        process_ids: Vec<u32>,
+        stat_reads: BTreeMap<u32, VecDeque<InjectedStatRead>>,
+        read_counts: BTreeMap<u32, usize>,
+    }
+
+    impl LinuxProcessTable for InjectedLinuxProcessTable {
+        fn process_ids(&mut self) -> io::Result<Vec<u32>> {
+            Ok(self.process_ids.clone())
+        }
+
+        fn read_stat(&mut self, process_id: u32) -> io::Result<Option<Vec<u8>>> {
+            *self.read_counts.entry(process_id).or_default() += 1;
+            let reads = self
+                .stat_reads
+                .get_mut(&process_id)
+                .expect("injected process stat sequence");
+            let read = if reads.len() > 1 {
+                reads.pop_front().expect("injected process stat read")
+            } else {
+                reads.front().expect("retained process stat read").clone()
+            };
+            match read {
+                InjectedStatRead::Stat(stat) => Ok(Some(stat)),
+                InjectedStatRead::Missing => Ok(None),
+                InjectedStatRead::Error(kind) => {
+                    Err(io::Error::new(kind, "injected transient stat read failure"))
+                }
+            }
+        }
+    }
+
+    fn injected_linux_stat(
+        process_id: u32,
+        command: &[u8],
+        state: u8,
+        process_group_id: u32,
+        start_ticks: u64,
+    ) -> Vec<u8> {
+        let mut fields = vec![b"0".to_vec(); 20];
+        fields[0] = vec![state];
+        fields[1] = b"1".to_vec();
+        fields[2] = process_group_id.to_string().into_bytes();
+        fields[19] = start_ticks.to_string().into_bytes();
+        let mut stat = format!("{process_id} (").into_bytes();
+        stat.extend_from_slice(command);
+        stat.extend_from_slice(b") ");
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                stat.push(b' ');
+            }
+            stat.extend_from_slice(field);
+        }
+        stat.push(b'\n');
+        stat
+    }
+
+    #[derive(Clone)]
+    enum InjectedGroupObservation {
+        Gone,
+        Present,
+        Error(&'static str),
+    }
+
+    struct InjectedSettlementDriver {
+        after_term: VecDeque<InjectedGroupObservation>,
+        after_kill: VecDeque<InjectedGroupObservation>,
+        signals: Vec<i32>,
+        elapsed: Duration,
+    }
+
+    impl InjectedSettlementDriver {
+        fn observation(queue: &mut VecDeque<InjectedGroupObservation>) -> InjectedGroupObservation {
+            if queue.len() > 1 {
+                queue.pop_front().expect("injected group observation")
+            } else {
+                queue.front().expect("retained group observation").clone()
+            }
+        }
+    }
+
+    impl ProcessGroupSettlementDriver for InjectedSettlementDriver {
+        fn observe(&mut self) -> io::Result<EffectCapableGroupObservation> {
+            let observation = if self.signals.last() == Some(&SIGKILL) {
+                Self::observation(&mut self.after_kill)
+            } else {
+                Self::observation(&mut self.after_term)
+            };
+            match observation {
+                InjectedGroupObservation::Gone => Ok(EffectCapableGroupObservation::Gone),
+                InjectedGroupObservation::Present => Ok(EffectCapableGroupObservation::Present),
+                InjectedGroupObservation::Error(message) => Err(io::Error::other(message)),
+            }
+        }
+
+        fn signal(&mut self, signal: i32) -> io::Result<()> {
+            self.signals.push(signal);
+            Ok(())
+        }
+
+        fn elapsed(&self) -> Duration {
+            self.elapsed
+        }
+
+        fn wait(&mut self, duration: Duration) {
+            self.elapsed += duration;
+        }
+    }
 
     struct InjectedStableSignal {
         pinned_generation: u64,
@@ -1200,6 +1680,175 @@ mod tests {
                 .push(self.pinned_generation);
             Ok(())
         }
+    }
+
+    #[test]
+    fn linux_stat_parser_accepts_arbitrary_command_bytes_and_delimiters() {
+        let stat = injected_linux_stat(
+            700,
+            b"name with spaces ) parens\n and invalid utf8 \xff(",
+            b'S',
+            701,
+            9_876_543,
+        );
+        let process = parse_linux_process_stat(700, &stat).expect("parse valid unusual stat");
+
+        assert_eq!(process.process_id, 700);
+        assert_eq!(process.process_group_id, 701);
+        assert_eq!(process.state, b'S');
+        assert_eq!(process.start_ticks, 9_876_543);
+    }
+
+    #[test]
+    fn linux_snapshot_retries_transient_unrelated_records_without_partial_proof() {
+        let target_process = 800;
+        let unrelated_process = 801;
+        let disappeared_process = 802;
+        let mut process_table = InjectedLinuxProcessTable {
+            process_ids: vec![unrelated_process, disappeared_process, target_process],
+            stat_reads: BTreeMap::from([
+                (
+                    unrelated_process,
+                    VecDeque::from([
+                        InjectedStatRead::Error(io::ErrorKind::PermissionDenied),
+                        InjectedStatRead::Stat(injected_linux_stat(
+                            unrelated_process,
+                            b"unrelated ) name\n\xff",
+                            b'R',
+                            900,
+                            11,
+                        )),
+                    ]),
+                ),
+                (
+                    disappeared_process,
+                    VecDeque::from([InjectedStatRead::Missing]),
+                ),
+                (
+                    target_process,
+                    VecDeque::from([InjectedStatRead::Stat(injected_linux_stat(
+                        target_process,
+                        b"target (worker)",
+                        b'S',
+                        target_process,
+                        22,
+                    ))]),
+                ),
+            ]),
+            read_counts: BTreeMap::new(),
+        };
+
+        let snapshot = linux_process_group_snapshot_from(
+            &mut process_table,
+            target_process,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("retry complete target-group snapshot");
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].process_id, target_process);
+        assert_eq!(process_table.read_counts[&unrelated_process], 2);
+        assert_eq!(process_table.read_counts[&disappeared_process], 1);
+        assert_eq!(process_table.read_counts[&target_process], 1);
+    }
+
+    #[test]
+    fn linux_snapshot_fails_closed_after_bounded_persistent_uncertainty() {
+        let uncertain_process = 810;
+        let mut process_table = InjectedLinuxProcessTable {
+            process_ids: vec![uncertain_process],
+            stat_reads: BTreeMap::from([(
+                uncertain_process,
+                VecDeque::from([InjectedStatRead::Error(io::ErrorKind::PermissionDenied)]),
+            )]),
+            read_counts: BTreeMap::new(),
+        };
+
+        let error = linux_process_group_snapshot_from(
+            &mut process_table,
+            811,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("persistent uncertainty must not return partial membership proof");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("membership remained uncertain"));
+        assert_eq!(
+            process_table.read_counts[&uncertain_process],
+            LINUX_SNAPSHOT_MAX_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn bounded_group_settlement_requires_post_kill_terminality_proof() {
+        let mut driver = InjectedSettlementDriver {
+            after_term: VecDeque::from([InjectedGroupObservation::Present]),
+            after_kill: VecDeque::from([
+                InjectedGroupObservation::Present,
+                InjectedGroupObservation::Gone,
+            ]),
+            signals: Vec::new(),
+            elapsed: Duration::ZERO,
+        };
+
+        settle_effect_capable_process_group(&mut driver)
+            .expect("post-kill observation proves terminality");
+
+        assert_eq!(driver.signals, vec![SIGTERM, SIGKILL]);
+        assert!(driver.elapsed >= TERMINATION_GRACE);
+        assert!(driver.elapsed < ACTOR_SETTLEMENT_TIMEOUT);
+    }
+
+    #[test]
+    fn bounded_group_settlement_fails_closed_for_surviving_members() {
+        let mut driver = InjectedSettlementDriver {
+            after_term: VecDeque::from([InjectedGroupObservation::Present]),
+            after_kill: VecDeque::from([InjectedGroupObservation::Present]),
+            signals: Vec::new(),
+            elapsed: Duration::ZERO,
+        };
+
+        let error = settle_effect_capable_process_group(&mut driver)
+            .expect_err("surviving member prevents settlement");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("retains effect-capable members"));
+        assert_eq!(driver.signals, vec![SIGTERM, SIGKILL]);
+        assert_eq!(driver.elapsed, ACTOR_SETTLEMENT_TIMEOUT);
+    }
+
+    #[test]
+    fn bounded_group_settlement_fails_closed_for_observation_uncertainty() {
+        let mut driver = InjectedSettlementDriver {
+            after_term: VecDeque::from([InjectedGroupObservation::Error("term uncertainty")]),
+            after_kill: VecDeque::from([InjectedGroupObservation::Error("kill uncertainty")]),
+            signals: Vec::new(),
+            elapsed: Duration::ZERO,
+        };
+
+        let error = settle_effect_capable_process_group(&mut driver)
+            .expect_err("uncertainty prevents terminality proof");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("kill uncertainty"));
+        assert_eq!(driver.signals, vec![SIGTERM, SIGKILL]);
+        assert_eq!(driver.elapsed, ACTOR_SETTLEMENT_TIMEOUT);
+    }
+
+    #[test]
+    fn bounded_group_settlement_avoids_kill_after_terminality_is_proven() {
+        let mut driver = InjectedSettlementDriver {
+            after_term: VecDeque::from([InjectedGroupObservation::Gone]),
+            after_kill: VecDeque::from([InjectedGroupObservation::Present]),
+            signals: Vec::new(),
+            elapsed: Duration::ZERO,
+        };
+
+        settle_effect_capable_process_group(&mut driver)
+            .expect("term observation proves terminality");
+
+        assert_eq!(driver.signals, vec![SIGTERM]);
+        assert_eq!(driver.elapsed, Duration::ZERO);
     }
 
     #[test]

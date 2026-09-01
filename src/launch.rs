@@ -4263,8 +4263,10 @@ mod streaming_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
     #[cfg(unix)]
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::fd::{FromRawFd, IntoRawFd};
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
 

@@ -17,6 +17,10 @@ use support::{invoke_validated, invoke_with_env, invoke_with_host_and_env, json_
 #[cfg(unix)]
 extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
 }
 
