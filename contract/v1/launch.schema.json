@@ -99,6 +99,9 @@
         { "type": "object", "properties": { "params": { "$ref": "#/$defs/LaunchParams" } } }
       ]
     },
+    "LaunchErrorResponse": {
+      "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope"
+    },
     "LaunchStdoutEvent": {
       "type": "object",
       "properties": {

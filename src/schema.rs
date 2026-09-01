@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 pub const SETTINGS_SCHEMA_ID: &str = "opencode.settings/v1";
 pub const NATIVE_IDENTITY_REBIND_SCHEMA_ID: &str = "opencode.native-identity-rebind/v1";
 pub const ROTATION_DECISION_SCHEMA_ID: &str = "opencode.rotation-decision/v1";
+pub const HOST_PROMPT_ACCEPTANCE_V1_ENV: &str = "OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1";
+pub const PROMPT_ACCEPTANCE_V1: &str = "oulipoly.prompt_acceptance/v1";
+pub const PROMPT_ACCEPTED_MARKER_V1: &str = "oulipoly.prompt_accepted/v1";
 pub const HOST_LAUNCH_OUTPUT_V1_ENV: &str = "OULIPOLY_HOST_LAUNCH_OUTPUT_V1";
 pub const LAUNCH_OUTPUT_V1: &str = "oulipoly.launch_output/v1";
 pub const HOST_SESSION_TURN_PAGES_V1_ENV: &str = "OULIPOLY_HOST_SESSION_TURN_PAGES_V1";
@@ -46,6 +49,15 @@ pub fn describe_result(host: &HostContext) -> Value {
         "setup": true,
         "migration": true,
     });
+    if host
+        .env
+        .as_ref()
+        .and_then(|env| env.get(HOST_PROMPT_ACCEPTANCE_V1_ENV))
+        .map(String::as_str)
+        == Some("1")
+    {
+        capabilities["prompt_acceptance_v1"] = json!(true);
+    }
     if host
         .env
         .as_ref()

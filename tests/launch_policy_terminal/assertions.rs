@@ -495,6 +495,27 @@ pub fn assert_resume_stdin_payload_wrapper_log(wrapper_log_path: &Path) {
     assert_wrapper_log_stdin_value(&wrapper_log, resume_payload());
 }
 
+pub fn assert_negotiated_resume_prompt_exact(wrapper_log_path: &Path) {
+    let argv = wrapper_nul_log_args(wrapper_log_path);
+    let session = argv_arg_index_owned(&argv, OPENCODE_SESSION_FLAG_FOR_TEST);
+    assert_eq!(
+        argv.get(session + 1).map(String::as_str),
+        Some(resume_session_id())
+    );
+    assert_eq!(
+        argv.last().map(String::as_str),
+        Some(resume_payload()),
+        "negotiated native prompt must equal the runner-hashed prompt"
+    );
+    assert_eq!(
+        argv.iter()
+            .filter(|arg| arg.contains("[OULIPOLY-DELIVERY "))
+            .count(),
+        1,
+        "negotiated launch must not append a competing delivery marker: {argv:?}"
+    );
+}
+
 pub fn assert_wrapper_log_arg_value(wrapper_log: &str, value: &str) {
     let expected = wrapper_arg_log_line(value);
     assert!(wrapper_log.contains(&expected), "{wrapper_log}");
@@ -578,13 +599,16 @@ pub fn assert_oversized_resume_prompt(
     );
     assert_oversized_prompt_segments(wrapper_log_path, prompt);
     let events = launch_events_from_output(output, "launch oversized resume prompt stdout");
-    let marker = expected_submitted_user_turn_marker(&events);
+    let marker = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "marker" && event["name"] == "oulipoly.resume_completion_unresolved"
+        })
+        .expect("oversized accepted prompt should retain unresolved reconciliation evidence");
     assert_eq!(
         marker["value"]["prompt_sha256"],
         sha256_hex(prompt.as_bytes())
     );
-    assert!(marker["value"]["event_timestamp_unix_ms"].is_u64());
-    assert_eq!(marker["value"]["source"], "opencode.run.format_json");
     assert_unresolved_resume_completion(output, &events);
 }
 
@@ -636,9 +660,82 @@ pub fn assert_argv_session_before_notification_payload(argv: &[&str]) {
     );
 }
 
-pub fn assert_submitted_user_turn_marker(events: &[Value]) {
-    let marker = expected_submitted_user_turn_marker(events);
-    assert_submitted_user_turn_marker_value(marker);
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerPromptAcceptedMarkerValueV1 {
+    protocol: String,
+    provider_session_id: String,
+    prompt_sha256: String,
+    delivery_nonce: Option<String>,
+    source: Option<String>,
+    message_id: Option<String>,
+}
+
+pub fn assert_runner_prompt_accepted_marker(
+    events: &[Value],
+    expected_prompt_sha256: &str,
+    expected_delivery_nonce: &str,
+) {
+    let markers = events
+        .iter()
+        .filter(|event| is_prompt_accepted_marker(event))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        markers.len(),
+        1,
+        "accepted native turn must emit exactly one prompt attestation; events={events:?}"
+    );
+    let marker = markers[0];
+    assert_valid(marker, "launch.schema.json#/$defs/LaunchMarkerEvent");
+    assert_valid(
+        &marker["value"],
+        "launch.schema.json#/$defs/PromptAcceptedMarkerValueV1",
+    );
+    let value: RunnerPromptAcceptedMarkerValueV1 = serde_json::from_value(marker["value"].clone())
+        .expect("runner PromptAcceptedMarkerValueV1 shape");
+    assert_eq!(value.protocol, "oulipoly.prompt_acceptance/v1");
+    assert_eq!(value.provider_session_id, resume_session_id());
+    assert_eq!(value.prompt_sha256, expected_prompt_sha256);
+    assert_eq!(
+        value.delivery_nonce.as_deref(),
+        Some(expected_delivery_nonce)
+    );
+    assert_eq!(value.source.as_deref(), Some("opencode.run.format_json"));
+    assert_eq!(
+        value.message_id.as_deref(),
+        Some("msg-resume-prompt-accepted")
+    );
+    let request_id = events
+        .first()
+        .and_then(|event| event["request_id"].as_str())
+        .expect("launch event request identity");
+    assert_eq!(marker["request_id"], request_id);
+    assert!(events.iter().any(|event| {
+        event["kind"] == "stdout"
+            && event["seq"].as_u64().is_some_and(|seq| {
+                marker["seq"]
+                    .as_u64()
+                    .is_some_and(|marker_seq| seq < marker_seq)
+            })
+    }));
+    assert_no_legacy_submitted_user_turn_marker(events);
+}
+
+pub fn assert_no_prompt_accepted_marker(events: &[Value]) {
+    assert!(
+        events.iter().all(|event| !is_prompt_accepted_marker(event)),
+        "unnegotiated or unaccepted launch must not emit prompt acceptance; events={events:?}"
+    );
+}
+
+pub fn assert_no_legacy_submitted_user_turn_marker(events: &[Value]) {
+    assert!(
+        events.iter().all(|event| {
+            event["kind"] != "marker"
+                || event["name"] != LEGACY_SUBMITTED_USER_TURN_MARKER_FOR_TEST
+        }),
+        "legacy submitted-turn authority must not compete with prompt acceptance; events={events:?}"
+    );
 }
 
 pub fn assert_produced_assistant_response_marker(events: &[Value]) {
@@ -701,49 +798,6 @@ pub fn assert_unresolved_resume_completion(output: &std::process::Output, events
     assert!(final_event["terminal_signal"]["evidence"]
         .as_str()
         .is_some_and(|evidence| evidence.contains("completion remains unconfirmed")));
-}
-
-pub fn assert_submitted_user_turn_marker_value(marker: &Value) {
-    assert_submitted_user_turn_provider_session(marker);
-    assert_submitted_user_turn_prompt_hash(marker);
-    assert_submitted_user_turn_source(marker);
-    assert_submitted_user_turn_message_id(marker);
-    assert_submitted_user_turn_delivery_nonce(marker);
-}
-
-pub fn assert_submitted_user_turn_provider_session(marker: &Value) {
-    assert_eq!(
-        marker["value"]["provider_session_id"].as_str(),
-        Some(resume_session_id())
-    );
-}
-
-pub fn assert_submitted_user_turn_prompt_hash(marker: &Value) {
-    let expected = resume_payload_sha256();
-    assert_eq!(
-        marker["value"]["prompt_sha256"].as_str(),
-        Some(expected.as_str())
-    );
-}
-
-pub fn assert_submitted_user_turn_source(marker: &Value) {
-    assert_eq!(
-        marker["value"]["source"].as_str(),
-        Some("opencode.run.format_json")
-    );
-}
-
-pub fn assert_submitted_user_turn_message_id(marker: &Value) {
-    assert!(marker["value"]["event_timestamp_unix_ms"].is_u64());
-}
-
-pub fn assert_submitted_user_turn_delivery_nonce(marker: &Value) {
-    let nonce = marker["value"]["delivery_nonce"]
-        .as_str()
-        .expect("provider-authored delivery nonce");
-    assert_eq!(nonce.len(), 64);
-    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert_ne!(nonce, "5169694d-de0f-40d1-890c-6e28e55bab27");
 }
 
 pub fn assert_empty_resume_payload_rejected(

@@ -2,15 +2,15 @@
 
 These JSON schemas are an exact snapshot of the `contract/v1` product contract
 at `nestharus/agent-runner` commit
-`686970d63043a65510081fdfcb79e66d790936bc`.
+`d5fac086c8efec1397ee2c9a79417c47470899f5`.
 
 SHA-256 identities:
 
 ```text
 9c7a82abf0f4de531802e539ac767cedd95c73b4a7213f21b4507d7b0678b1b0  common.schema.json
-6104625cae57a8ee235eafa2a04ab1fb14defebf4327bbbc85d77377d3c845a0  describe.schema.json
+31cdb3bd1cbd89a243ba5874607f07e513600c7399a039854383fd9cbc6d0825  describe.schema.json
 c39d0c97e3f74b102e08bff14bb28baefdfa23f2fef7fa7fb67c308af05b049b  discovery.schema.json
-b04462a3bd7020d2c3886f554f67cbf0941a638c6a6ce135be3edbb06a9a5840  launch.schema.json
+b4aef2974a52e84a485095e596873041e484f67d353c46358ac4d54bb11473ae  launch.schema.json
 25144a109c8dd4d56c6268d0e89f562b8dca1b3bb8cc5ce1e0f9ef09ac80433d  migration.schema.json
 6bfd306db0d06c2837513a975046a7b2f908e426c2b50f26a5692883d33cc875  policy.schema.json
 e33411bf286d74c64118b597d7fffc7e7c68d456f25fd48c27a4738224d6ddd4  quota.schema.json

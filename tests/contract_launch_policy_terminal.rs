@@ -2421,7 +2421,8 @@ fn contract_launch_resume_returns_non_clean_when_submitted_turn_has_no_completed
 
     let events = launch_events_from_output(&output, "launch resume confirmed payload stdout");
     assert_monotonic_launch_events(&events);
-    assert_submitted_user_turn_marker(&events);
+    assert_no_prompt_accepted_marker(&events);
+    assert_no_legacy_submitted_user_turn_marker(&events);
     assert_no_produced_assistant_response_marker(&events);
     assert_unresolved_resume_completion(&output, &events);
 }
@@ -2438,7 +2439,8 @@ fn contract_launch_resume_uses_run_event_instead_of_export_payload_for_submissio
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
 
     let events = launch_events_from_output(&output, "launch resume unconfirmed payload stdout");
-    assert_submitted_user_turn_marker(&events);
+    assert_no_prompt_accepted_marker(&events);
+    assert_no_legacy_submitted_user_turn_marker(&events);
     assert_unresolved_resume_completion(&output, &events);
 }
 
@@ -2448,13 +2450,45 @@ fn contract_launch_completed_resume_does_not_wait_for_lingering_native_process()
         FakeOpencodeWrapper::with_script(fake_wrapper_completed_resume_then_hang_script());
     let path = prepend_path(fake_wrapper.dir());
     let log_path = fake_wrapper.log_path_str();
-    let params = resume_launch_params_with_arg_payload_env(path.as_str(), log_path);
+    let params = resume_launch_params_with_prompt_acceptance_env(path.as_str(), log_path);
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+    assert_negotiated_resume_prompt_exact(fake_wrapper.log_path());
     let events = launch_events_from_output(&output, "completed lingering resume stdout");
+    let expected_prompt_sha256 = resume_payload_sha256();
+    assert_runner_prompt_accepted_marker(
+        &events,
+        &expected_prompt_sha256,
+        RUNNER_DELIVERY_NONCE_FOR_TEST,
+    );
     assert_produced_assistant_response_marker(&events);
     let final_event = final_launch_event(&events);
     assert_eq!(final_event["status"]["kind"], "signal_terminated");
     assert_live_provider_exit_code(&output, final_event, "completed lingering resume");
+}
+
+#[test]
+fn contract_launch_rejects_prompt_acceptance_for_a_different_effective_prompt() {
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(fake_wrapper_log_stdin_script().to_string());
+    let path = prepend_path(fake_wrapper.dir());
+    let log_path = fake_wrapper.log_path_str();
+    let mut params = resume_launch_params_with_prompt_acceptance_env(path.as_str(), log_path);
+    params["prompt_acceptance"]["prompt_sha256"] = json!(
+        agent_runner_opencode::encoding::sha256_hex(b"different prompt")
+    );
+
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let response = json_stdout(&output);
+    assert_eq!(
+        response["error"]["code"],
+        "prompt_acceptance_prompt_mismatch"
+    );
+    assert!(
+        !fake_wrapper.log_path().exists(),
+        "mismatched prompt attestation must fail before native acceptance"
+    );
 }
 
 #[test]

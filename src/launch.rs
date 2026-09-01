@@ -71,7 +71,6 @@ const OPENCODE_RUN_ARG: &str = "run";
 const POLICY_MANAGED_FLAGS_WITH_VALUE: &[&str] = &["--format", "-m", "--variant"];
 const POLICY_MANAGED_FLAGS_WITHOUT_VALUE: &[&str] = &["--dangerously-skip-permissions"];
 const PRODUCED_ASSISTANT_RESPONSE_MARKER: &str = "oulipoly.produced_assistant_response";
-const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
 const RESUME_COMPLETION_UNRESOLVED_MARKER: &str = "oulipoly.resume_completion_unresolved";
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 const LAUNCH_OUTPUT_COMPLETE_MARKER: &str = "oulipoly.launch_output_complete/v1";
@@ -97,7 +96,16 @@ struct LaunchParams {
     env: Option<BTreeMap<String, String>>,
     stdin: Option<BytePayload>,
     session: Option<LaunchSession>,
+    prompt_acceptance: Option<PromptAcceptanceRequest>,
     output_delivery: Option<LaunchOutputRequest>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptAcceptanceRequest {
+    protocol: String,
+    prompt_sha256: String,
+    delivery_nonce: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -484,6 +492,7 @@ pub(crate) fn stream<W: Write>(
 ) -> Result<LaunchOutcome, ProviderFailure> {
     let raw_params = params.clone();
     let params = parse_launch_params(params, request_id)?;
+    validate_prompt_acceptance_request(params.prompt_acceptance.as_ref(), request_id)?;
     let launch_output_requested =
         validate_launch_output_request(params.output_delivery.as_ref(), host, request_id)?;
     validate_launch_authority(&params, request_id)?;
@@ -509,6 +518,12 @@ pub(crate) fn stream<W: Write>(
     };
     let binding_sha256 =
         launch_request_binding_sha256(host, &raw_params, &effective.route_evidence);
+    let prompt_acceptance = prompt_acceptance_expectation(
+        params.prompt_acceptance.as_ref(),
+        effective.submitted_prompt.as_deref(),
+        known_provider_session_id(&params),
+        request_id,
+    )?;
     let prompt_sha256 = effective
         .prompt
         .as_deref()
@@ -522,6 +537,7 @@ pub(crate) fn stream<W: Write>(
         request_id,
         host.deadline_unix_ms,
         launch_output_requested,
+        prompt_acceptance,
         effective.resume_observation_request,
         effective.route_evidence.clone(),
         None,
@@ -729,11 +745,128 @@ fn validate_launch_output_request(
     ))
 }
 
+fn validate_prompt_acceptance_request(
+    request: Option<&PromptAcceptanceRequest>,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let Some(request) = request else {
+        return Ok(());
+    };
+    if request.protocol != crate::schema::PROMPT_ACCEPTANCE_V1 {
+        return Err(ProviderFailure::unsupported(
+            request_id,
+            "unsupported_prompt_acceptance_protocol",
+            format!(
+                "unsupported prompt acceptance protocol {}",
+                request.protocol
+            ),
+        ));
+    }
+    if !is_lowercase_sha256(&request.prompt_sha256) {
+        return Err(ProviderFailure::invalid_request(
+            request_id,
+            "invalid_prompt_acceptance_hash",
+            "params.prompt_acceptance.prompt_sha256 must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    if request.delivery_nonce.as_deref().is_some_and(str::is_empty) {
+        return Err(ProviderFailure::invalid_request(
+            request_id,
+            "invalid_prompt_acceptance_delivery_nonce",
+            "params.prompt_acceptance.delivery_nonce must be non-empty when present",
+        ));
+    }
+    Ok(())
+}
+
+fn prompt_acceptance_expectation(
+    request: Option<&PromptAcceptanceRequest>,
+    submitted_prompt: Option<&str>,
+    known_provider_session_id: Option<&str>,
+    request_id: &str,
+) -> Result<Option<PromptAcceptanceExpectation>, ProviderFailure> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let submitted_prompt = submitted_prompt.ok_or_else(|| {
+        ProviderFailure::invalid_request(
+            request_id,
+            "prompt_acceptance_prompt_unavailable",
+            "params.prompt_acceptance requires one authoritative non-empty prompt submitted through argv or stdin",
+        )
+    })?;
+    if request.prompt_sha256 != sha256_hex(submitted_prompt.as_bytes()) {
+        return Err(ProviderFailure::invalid_request(
+            request_id,
+            "prompt_acceptance_prompt_mismatch",
+            "params.prompt_acceptance.prompt_sha256 does not identify the policy-effective prompt submitted to OpenCode",
+        ));
+    }
+    Ok(Some(PromptAcceptanceExpectation {
+        prompt_sha256: request.prompt_sha256.clone(),
+        delivery_nonce: request.delivery_nonce.clone(),
+        known_provider_session_id: known_provider_session_id.map(str::to_string),
+    }))
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Clone)]
+struct PromptAcceptanceExpectation {
+    prompt_sha256: String,
+    delivery_nonce: Option<String>,
+    known_provider_session_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct PromptAcceptanceObservation {
+    provider_session_id: String,
+    source: &'static str,
+    message_id: Option<String>,
+}
+
+fn observe_prompt_acceptance(
+    expected: &PromptAcceptanceExpectation,
+    event: &OpencodeEventMetadata,
+) -> Option<PromptAcceptanceObservation> {
+    if event.event_type != "step_start" && !opencode::is_successful_terminal_event(event) {
+        return None;
+    }
+    let provider_session_id = event
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.trim().is_empty())?;
+    if expected
+        .known_provider_session_id
+        .as_deref()
+        .is_some_and(|known| known != provider_session_id)
+    {
+        return None;
+    }
+    let message_id = event
+        .part
+        .get("messageID")
+        .and_then(Value::as_str)
+        .filter(|message_id| !message_id.trim().is_empty())
+        .map(str::to_string);
+    Some(PromptAcceptanceObservation {
+        provider_session_id: provider_session_id.to_string(),
+        source: "opencode.run.format_json",
+        message_id,
+    })
+}
+
 struct EffectiveLaunch {
     argv: Vec<String>,
     execution_env: BTreeMap<String, String>,
     stdin: Option<Vec<u8>>,
     prompt: Option<String>,
+    submitted_prompt: Option<String>,
     delivery_nonce: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
     route_evidence: Value,
@@ -816,20 +949,24 @@ fn effective_launch(
         request_id,
     )?;
     let submitted_payload = submitted_launch_payload(&argv, stdin.as_deref().map(str::as_bytes));
-    let delivery_nonce = Some(launch_delivery_nonce(
-        host,
-        request_id,
-        request_identity_sha256,
-    ));
-    let (argv, stdin) = attach_launch_delivery_marker(
-        argv,
-        stdin,
-        delivery_nonce
-            .as_deref()
-            .expect("provider-authored launch delivery nonce"),
+    let delivery_nonce = params
+        .prompt_acceptance
+        .as_ref()
+        .and_then(|request| request.delivery_nonce.clone())
+        .unwrap_or_else(|| launch_delivery_nonce(host, request_id, request_identity_sha256));
+    let (argv, stdin) = if params.prompt_acceptance.is_some() {
+        // The negotiated hash names the exact policy-effective prompt. Its host
+        // nonce already provides durable correlation, so do not mutate the bytes.
+        (argv, stdin)
+    } else {
+        attach_launch_delivery_marker(argv, stdin, &delivery_nonce)
+    };
+    let resume_observation_request = resume_observation_request(
+        params,
+        submitted_payload.clone(),
+        Some(&delivery_nonce),
+        &route,
     );
-    let resume_observation_request =
-        resume_observation_request(params, submitted_payload, delivery_nonce.as_deref(), &route);
     let mut activity_targets = ActivityTargets::default();
     policy::append_route_activity_targets(&mut activity_targets, &route);
     let argv = split_oversized_prompt_argv(argv, request_id)?;
@@ -838,7 +975,8 @@ fn effective_launch(
         execution_env,
         stdin: stdin.map(String::into_bytes),
         prompt,
-        delivery_nonce,
+        submitted_prompt: submitted_payload,
+        delivery_nonce: Some(delivery_nonce),
         resume_observation_request,
         route_evidence: json!(markers),
         activity_targets,
@@ -1375,6 +1513,7 @@ fn stream_policy_rejection<W: Write>(
         request_id,
         None,
         launch_output_requested,
+        None,
         None,
         json!([]),
         None,
@@ -3237,6 +3376,8 @@ struct LaunchState {
     integrity_failures_omitted: u64,
     parser: EventParser,
     last_opencode_event: Option<OpencodeEventMetadata>,
+    prompt_acceptance: Option<PromptAcceptanceExpectation>,
+    prompt_acceptance_observation: Option<PromptAcceptanceObservation>,
     completed_resume_at: Option<Instant>,
     stream_resume_observation: Option<ResumeObservation>,
     unresolved_resume_completion: Option<Value>,
@@ -3257,6 +3398,7 @@ impl LaunchState {
         request_id: &str,
         deadline_unix_ms: Option<u64>,
         launch_output_requested: bool,
+        prompt_acceptance: Option<PromptAcceptanceExpectation>,
         resume_observation_request: Option<ResumeObservationRequest>,
         route_evidence: Value,
         launch_request: Option<LaunchRequestGuard>,
@@ -3275,6 +3417,8 @@ impl LaunchState {
             integrity_failures_omitted: 0,
             parser: EventParser::default(),
             last_opencode_event: None,
+            prompt_acceptance,
+            prompt_acceptance_observation: None,
             completed_resume_at: None,
             stream_resume_observation: None,
             unresolved_resume_completion: None,
@@ -3537,6 +3681,14 @@ impl LaunchState {
     }
 
     fn record_opencode_events(&mut self, events: &[OpencodeEventMetadata]) {
+        if self.prompt_acceptance_observation.is_none() {
+            self.prompt_acceptance_observation =
+                self.prompt_acceptance.as_ref().and_then(|expected| {
+                    events
+                        .iter()
+                        .find_map(|event| observe_prompt_acceptance(expected, event))
+                });
+        }
         if let Some(request) = self.resume_observation_request.as_ref() {
             for event in events {
                 if let Some(observation) = resume_observation::observe_stream_event(request, event)
@@ -3646,10 +3798,7 @@ impl LaunchState {
         let completion_observed = final_resume_observation
             .as_ref()
             .is_some_and(|observation| observation.completion_observed());
-        let submitted_user_turn = final_resume_observation
-            .as_ref()
-            .and_then(|observation| observation.submitted_user_turn.as_ref());
-        self.confirm_submitted_user_turn(submitted_user_turn, writer)?;
+        self.confirm_prompt_acceptance(writer)?;
         self.confirm_produced_assistant_response(completion_observed, writer)?;
         self.retain_unresolved_resume_completion(
             final_resume_observation.as_ref(),
@@ -3691,17 +3840,34 @@ impl LaunchState {
         self.admit_projection(writer)
     }
 
-    fn confirm_submitted_user_turn<W: Write>(
+    fn confirm_prompt_acceptance<W: Write>(
         &mut self,
-        marker_value: Option<&Value>,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
-        let Some(marker_value) = marker_value else {
+        let (Some(expected), Some(observed)) = (
+            self.prompt_acceptance.as_ref(),
+            self.prompt_acceptance_observation.as_ref(),
+        ) else {
             return Ok(());
         };
+        if self.session_id.as_deref() != Some(observed.provider_session_id.as_str()) {
+            return Ok(());
+        }
+        let mut marker_value = json!({
+            "protocol": crate::schema::PROMPT_ACCEPTANCE_V1,
+            "provider_session_id": observed.provider_session_id,
+            "prompt_sha256": expected.prompt_sha256,
+            "source": observed.source,
+        });
+        if let Some(delivery_nonce) = expected.delivery_nonce.as_deref() {
+            marker_value["delivery_nonce"] = json!(delivery_nonce);
+        }
+        if let Some(message_id) = observed.message_id.as_deref() {
+            marker_value["message_id"] = json!(message_id);
+        }
         self.marker_with_value(
-            SUBMITTED_USER_TURN_MARKER.to_string(),
-            marker_value.clone(),
+            crate::schema::PROMPT_ACCEPTED_MARKER_V1.to_string(),
+            marker_value,
             writer,
         )
     }
@@ -4272,8 +4438,9 @@ mod streaming_tests {
 
     #[test]
     fn launch_integrity_evidence_has_lifetime_count_detail_and_encoding_bounds() {
-        let mut state = LaunchState::new("request-integrity", None, true, None, json!({}), None)
-            .expect("create launch state");
+        let mut state =
+            LaunchState::new("request-integrity", None, true, None, None, json!({}), None)
+                .expect("create launch state");
         for index in 0..MAX_LAUNCH_INTEGRITY_FAILURES + 17 {
             state.record_integrity_failure(format!("{index}:{}", "é".repeat(1024)));
         }
@@ -4310,6 +4477,7 @@ mod streaming_tests {
             None,
             true,
             None,
+            None,
             json!({}),
             None,
         )
@@ -4332,8 +4500,16 @@ mod streaming_tests {
     fn native_pipe_read_failure_cannot_attest_output_completion_or_clean_success() {
         let (sender, receiver) = mpsc::sync_channel(DRAIN_CHANNEL_CAPACITY);
         drain_reader(ReadPartialThenFail { emitted: false }, sender, true);
-        let mut state = LaunchState::new("request-read-failure", None, true, None, json!({}), None)
-            .expect("create launch state");
+        let mut state = LaunchState::new(
+            "request-read-failure",
+            None,
+            true,
+            None,
+            None,
+            json!({}),
+            None,
+        )
+        .expect("create launch state");
         let mut output = Vec::new();
         for message in receiver {
             state

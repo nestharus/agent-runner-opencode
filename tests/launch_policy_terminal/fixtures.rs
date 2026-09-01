@@ -23,7 +23,11 @@ pub const LARGE_DEFERRED_EVENT_REPETITIONS: usize = 160;
 
 pub const LARGE_DEFERRED_EVENT_TEXT_BYTES: usize = 8 * 1024;
 
-pub const SUBMITTED_USER_TURN_MARKER_FOR_TEST: &str = "oulipoly.submitted_user_turn";
+pub const PROMPT_ACCEPTED_MARKER_FOR_TEST: &str = "oulipoly.prompt_accepted/v1";
+
+pub const LEGACY_SUBMITTED_USER_TURN_MARKER_FOR_TEST: &str = "oulipoly.submitted_user_turn";
+
+pub const RUNNER_DELIVERY_NONCE_FOR_TEST: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 
 pub const PRODUCED_ASSISTANT_RESPONSE_MARKER_FOR_TEST: &str =
     "oulipoly.produced_assistant_response";
@@ -169,19 +173,8 @@ pub fn has_heartbeat_event(events: &[Value]) -> bool {
     events.iter().any(|event| event["kind"] == "heartbeat")
 }
 
-pub fn expected_submitted_user_turn_marker(events: &[Value]) -> &Value {
-    submitted_user_turn_marker(events)
-        .unwrap_or_else(|| panic!("missing submitted user turn marker; events={events:?}"))
-}
-
-pub fn submitted_user_turn_marker(events: &[Value]) -> Option<&Value> {
-    events
-        .iter()
-        .find(|event| is_submitted_user_turn_marker(event))
-}
-
-pub fn is_submitted_user_turn_marker(event: &Value) -> bool {
-    event["kind"] == "marker" && event["name"] == SUBMITTED_USER_TURN_MARKER_FOR_TEST
+pub fn is_prompt_accepted_marker(event: &Value) -> bool {
+    event["kind"] == "marker" && event["name"] == PROMPT_ACCEPTED_MARKER_FOR_TEST
 }
 
 pub fn policy_result(response: &Value) -> &Value {
@@ -978,9 +971,10 @@ if [ \"$1\" = \"export\" ]; then\n\
 	  printf '%s\\n' '{\"info\":{\"id\":\"ses_resume_contract\",\"title\":\"resume contract\"},\"messages\":[{\"info\":{\"id\":\"msg-user\",\"role\":\"user\",\"sessionID\":\"ses_resume_contract\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\"},\"time\":{\"created\":4102444800000}},\"parts\":[{\"type\":\"text\",\"text\":\"Notifications delivered:\\n- agent_bash_complete h-s11-external\\n\\n[OULIPOLY-DELIVERY 5169694d-de0f-40d1-890c-6e28e55bab27]\\n\"}]},{\"info\":{\"id\":\"msg-assistant\",\"role\":\"assistant\",\"sessionID\":\"ses_resume_contract\",\"providerID\":\"openai\",\"modelID\":\"gpt-5.6-sol\",\"variant\":\"low\",\"time\":{\"created\":4102444800001,\"completed\":4102444800002}},\"parts\":[{\"type\":\"text\",\"text\":\"done\"}]}]}'\n\
   exit 0\n\
 fi\n\
-printf '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000001,\"part\":{\"type\":\"step-start\",\"sessionID\":\"ses_resume_contract\"}}\\n'\n\
+printf '{\"type\":\"step_start\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000001,\"part\":{\"type\":\"step-start\",\"sessionID\":\"ses_resume_contract\",\"messageID\":\"msg-resume-prompt-accepted\"}}\\n'\n\
 printf '{\"type\":\"text\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000002,\"part\":{\"type\":\"text\",\"sessionID\":\"ses_resume_contract\",\"text\":\"done\"}}\\n'\n\
 printf '{\"type\":\"step_finish\",\"sessionID\":\"ses_resume_contract\",\"timestamp\":1780000000003,\"part\":{\"type\":\"step-finish\",\"sessionID\":\"ses_resume_contract\",\"reason\":\"stop\"}}\\n'\n\
+printf '%s\\0' \"$@\" > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
 /bin/sleep 5\n\
 exit 9\n"
         .to_string()

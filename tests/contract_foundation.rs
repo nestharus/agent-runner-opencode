@@ -19,6 +19,34 @@ fn describe_response_conforms_and_sets_opencode_identity() {
 }
 
 #[test]
+fn describe_advertises_prompt_acceptance_only_when_selected_by_the_host() {
+    let unselected = json_stdout(&invoke("describe", json!({})));
+    assert!(unselected["result"]["capabilities"]
+        .get("prompt_acceptance_v1")
+        .is_none());
+
+    let declined = json_stdout(&invoke_with_host(
+        "describe",
+        json!({}),
+        json!({"env": {"OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1": "0"}}),
+    ));
+    assert!(declined["result"]["capabilities"]
+        .get("prompt_acceptance_v1")
+        .is_none());
+
+    let selected = json_stdout(&invoke_with_host(
+        "describe",
+        json!({}),
+        json!({"env": {"OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1": "1"}}),
+    ));
+    assert_eq!(
+        selected["result"]["capabilities"]["prompt_acceptance_v1"],
+        true
+    );
+    assert_describe_response(&selected);
+}
+
+#[test]
 fn describe_advertises_launch_output_only_when_selected_by_the_host() {
     let legacy = json_stdout(&invoke("describe", json!({})));
     assert!(legacy["result"]["capabilities"]

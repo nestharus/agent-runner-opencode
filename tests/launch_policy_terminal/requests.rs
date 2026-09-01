@@ -91,6 +91,16 @@ pub fn resume_launch_params_with_arg_payload_env(path: &str, log_path: &str) -> 
     launch_params_with_wrapper_env(resume_launch_params_with_arg_payload(), path, log_path)
 }
 
+pub fn resume_launch_params_with_prompt_acceptance_env(path: &str, log_path: &str) -> Value {
+    let mut params = resume_launch_params_with_arg_payload_env(path, log_path);
+    params["prompt_acceptance"] = json!({
+        "protocol": "oulipoly.prompt_acceptance/v1",
+        "prompt_sha256": resume_payload_sha256(),
+        "delivery_nonce": RUNNER_DELIVERY_NONCE_FOR_TEST,
+    });
+    params
+}
+
 pub fn resume_launch_params_with_prompt_env(prompt: &str, path: &str, log_path: &str) -> Value {
     let mut params = launch_params_with_prompt(prompt);
     params["session"] = json!({
