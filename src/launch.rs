@@ -29,8 +29,8 @@ use crate::native_process::GatedCommand;
 use crate::native_process::{
     process_group_incarnation as launch_process_incarnation,
     process_group_is_live as launch_process_group_is_live, terminate_process_group_actor,
-    terminate_process_group_child as terminate_child, ExecGate as LaunchExecGate,
-    ProcessGroupActor,
+    terminate_process_group_actor_with_child, terminate_process_group_child as terminate_child,
+    ExecGate as LaunchExecGate, ProcessGroupActor,
 };
 use crate::native_runtime;
 use crate::opencode::{self, first_session_id, EventParser, OpencodeEventMetadata};
@@ -631,8 +631,8 @@ pub(crate) fn stream<W: Write>(
         })?;
     }
     let result = stream_child(custody.child_mut(), &mut state, writer);
-    finalize_launch_actor_and_replay(custody, state)?;
-    result.map(|exit_code| LaunchOutcome {
+    let exit_code = finalize_launch_actor_and_replay(custody, state, writer, result)?;
+    Ok(LaunchOutcome {
         exit_code,
         activity_targets: effective.activity_targets,
     })
@@ -643,18 +643,22 @@ pub(crate) fn stream<W: Write>(
 /// then persisted while request custody remains active, and only that settled
 /// request may become replay-only. A stop anywhere before the last step leaves
 /// enough durable identity for the exact retry to resume cleanup.
-fn finalize_launch_actor_and_replay(
+fn finalize_launch_actor_and_replay<W: Write>(
     custody: ChildCustody,
     mut state: LaunchState,
-) -> Result<(), ProviderFailure> {
-    drop(custody);
-    state.settle_actor_custody()?;
+    writer: &mut W,
+    preparation: Result<(), ProviderFailure>,
+) -> Result<i32, ProviderFailure> {
+    let mut child = custody.into_child();
+    let actor_settlement = state.settle_actor_custody(Some(&mut child));
+    drop(child);
+    actor_settlement?;
     let replayable_request = state.replayable_request_state();
-    drop(state);
     if let Some((state_path, replay_request_id)) = replayable_request {
-        let _ = retire_completed_launch_request(&state_path, &replay_request_id);
+        retire_completed_launch_request(&state_path, &replay_request_id)?;
     }
-    Ok(())
+    preparation?;
+    state.emit_terminal(writer)
 }
 
 pub(crate) fn attempted_activity_targets(params: &Value) -> ActivityTargets {
@@ -1243,10 +1247,10 @@ fn stream_child<W: Write>(
     child: &mut Child,
     state: &mut LaunchState,
     writer: &mut W,
-) -> Result<i32, ProviderFailure> {
+) -> Result<(), ProviderFailure> {
     let receiver = start_drains(child);
     run_supervision_loop(child, &receiver, state, writer)?;
-    state.finish(writer)
+    state.prepare_terminal(writer)
 }
 
 fn start_drains(child: &mut Child) -> Receiver<DrainMessage> {
@@ -1311,7 +1315,7 @@ fn run_supervision_loop<W: Write>(
         capture_child_exit(child, state)?;
         enforce_deadline(child, state)?;
         complete_terminal_resume(child, state);
-        close_lingering_process_group(child, state);
+        close_lingering_process_group(child, state)?;
         match receiver.recv_timeout(state.wait_duration()) {
             Ok(message) => state.handle_drain_message(message, writer)?,
             Err(mpsc::RecvTimeoutError::Timeout) => state.heartbeat(writer)?,
@@ -1330,11 +1334,14 @@ fn complete_terminal_resume(child: &mut Child, state: &mut LaunchState) {
     }
 }
 
-fn close_lingering_process_group(child: &mut Child, state: &mut LaunchState) {
+fn close_lingering_process_group(
+    child: &mut Child,
+    state: &mut LaunchState,
+) -> Result<(), ProviderFailure> {
     if state.drains_done() || !state.child_exit_grace_elapsed() {
-        return;
+        return Ok(());
     }
-    let _ = terminate_child(child);
+    state.settle_actor_custody(Some(child))
 }
 
 fn enforce_deadline(child: &mut Child, state: &mut LaunchState) -> Result<(), ProviderFailure> {
@@ -1485,8 +1492,13 @@ fn interpret_existing_new_session_retry(
         state.actor_process_group_id,
         state.actor_process_group_incarnation.as_deref(),
         &mut state.actor_terminal_at_unix_ms,
-        request_id,
-        &state.binding_sha256,
+        &LaunchActorSettlementContext {
+            request_id,
+            request_identity_sha256: &state.request_identity_sha256,
+            binding_sha256: &state.binding_sha256,
+            provider_session_id: state.provider_session_id.as_deref(),
+        },
+        None,
     )? {
         write_launch_request_state(state_path, &state, request_id)?;
     }
@@ -1553,8 +1565,13 @@ fn interpret_existing_resume_retry(
         state.actor_process_group_id,
         state.actor_process_group_incarnation.as_deref(),
         &mut state.actor_terminal_at_unix_ms,
-        request_id,
-        &state.binding_sha256,
+        &LaunchActorSettlementContext {
+            request_id,
+            request_identity_sha256: &state.request_identity_sha256,
+            binding_sha256: &state.binding_sha256,
+            provider_session_id: Some(&state.observation.session_id),
+        },
+        None,
     )? {
         write_launch_request_state(state_path, &state, request_id)?;
     }
@@ -1737,13 +1754,18 @@ impl LaunchRequestGuard {
         Ok(())
     }
 
-    fn settle_actor_custody(&mut self) -> Result<(), ProviderFailure> {
+    fn settle_actor_custody(&mut self, child: Option<&mut Child>) -> Result<(), ProviderFailure> {
         if settle_recorded_launch_actor(
             self.state.actor_process_group_id,
             self.state.actor_process_group_incarnation.as_deref(),
             &mut self.state.actor_terminal_at_unix_ms,
-            &self.state.request_id,
-            &self.state.binding_sha256,
+            &LaunchActorSettlementContext {
+                request_id: &self.state.request_id,
+                request_identity_sha256: &self.state.request_identity_sha256,
+                binding_sha256: &self.state.binding_sha256,
+                provider_session_id: self.state.provider_session_id.as_deref(),
+            },
+            child,
         )? {
             write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)?;
         }
@@ -1870,13 +1892,18 @@ impl ResumeLaunchRequestGuard {
         Ok(())
     }
 
-    fn settle_actor_custody(&mut self) -> Result<(), ProviderFailure> {
+    fn settle_actor_custody(&mut self, child: Option<&mut Child>) -> Result<(), ProviderFailure> {
         if settle_recorded_launch_actor(
             self.state.actor_process_group_id,
             self.state.actor_process_group_incarnation.as_deref(),
             &mut self.state.actor_terminal_at_unix_ms,
-            &self.state.request_id,
-            &self.state.binding_sha256,
+            &LaunchActorSettlementContext {
+                request_id: &self.state.request_id,
+                request_identity_sha256: &self.state.request_identity_sha256,
+                binding_sha256: &self.state.binding_sha256,
+                provider_session_id: Some(&self.state.observation.session_id),
+            },
+            child,
         )? {
             write_launch_request_state(&self.state_path, &self.state, &self.state.request_id)?;
         }
@@ -2197,38 +2224,68 @@ fn require_prior_actor_terminal(
 /// request lock (or has just dropped its in-process `ChildCustody`). That
 /// ownership distinction makes it safe to terminate a still-live incarnation:
 /// another provider cannot still be its responsible supervisor.
+struct LaunchActorSettlementContext<'a> {
+    request_id: &'a str,
+    request_identity_sha256: &'a str,
+    binding_sha256: &'a str,
+    provider_session_id: Option<&'a str>,
+}
+
 fn settle_recorded_launch_actor(
     process_group_id: Option<u32>,
     process_group_incarnation: Option<&str>,
     actor_terminal_at_unix_ms: &mut Option<u64>,
-    request_id: &str,
-    binding_sha256: &str,
+    context: &LaunchActorSettlementContext<'_>,
+    child: Option<&mut Child>,
 ) -> Result<bool, ProviderFailure> {
     if actor_terminal_at_unix_ms.is_some() {
         return Ok(false);
     }
+    let inject_settlement_failure = child.is_some();
     let Some(process_group_id) = process_group_id else {
         *actor_terminal_at_unix_ms = Some(now_unix_ms());
         return Ok(true);
     };
     if !launch_process_group_is_live(process_group_id) {
+        injected_launch_actor_settlement_failure(inject_settlement_failure).map_err(|error| {
+            launch_actor_cleanup_failed(
+                context.request_id,
+                context.request_identity_sha256,
+                context.binding_sha256,
+                process_group_id,
+                context.provider_session_id,
+                error,
+            )
+        })?;
         *actor_terminal_at_unix_ms = Some(now_unix_ms());
         return Ok(true);
     }
     let Some(incarnation) = process_group_incarnation else {
         return Err(launch_actor_reconciliation_required(
-            request_id,
-            binding_sha256,
+            context.request_id,
+            context.binding_sha256,
             Some(process_group_id),
             "a live predecessor process group has no durable incarnation and cannot be terminated safely",
         ));
     };
-    terminate_process_group_actor(&ProcessGroupActor {
+    let actor = ProcessGroupActor {
         process_group_id,
         incarnation: incarnation.to_string(),
-    })
-    .map_err(|error| {
-        launch_actor_cleanup_failed(request_id, binding_sha256, process_group_id, error)
+    };
+    let settlement = match child {
+        Some(child) => terminate_process_group_actor_with_child(&actor, child).map(|_| ()),
+        None => terminate_process_group_actor(&actor),
+    }
+    .and_then(|_| injected_launch_actor_settlement_failure(inject_settlement_failure));
+    settlement.map_err(|error| {
+        launch_actor_cleanup_failed(
+            context.request_id,
+            context.request_identity_sha256,
+            context.binding_sha256,
+            process_group_id,
+            context.provider_session_id,
+            error,
+        )
     })?;
     *actor_terminal_at_unix_ms = Some(now_unix_ms());
     Ok(true)
@@ -3103,17 +3160,42 @@ fn launch_actor_reconciliation_required(
 
 fn launch_actor_cleanup_failed(
     request_id: &str,
+    request_identity_sha256: &str,
     binding_sha256: &str,
     process_group_id: u32,
+    provider_session_id: Option<&str>,
     error: impl std::fmt::Display,
 ) -> ProviderFailure {
-    ProviderFailure::internal(
+    ProviderFailure::conflict(
         request_id,
         "launch_actor_cleanup_failed",
         format!(
             "native process-group {process_group_id} custody for binding {binding_sha256} could not be discharged: {error}; the durable launch request remains active and retrying this exact request will retry cleanup without submitting independent work"
         ),
+        json!({
+            "durable_request_id": request_id,
+            "request_identity_sha256": request_identity_sha256,
+            "binding_sha256": binding_sha256,
+            "process_group_id": process_group_id,
+            "provider_session_id": provider_session_id,
+            "actor_terminality": "effect_capable_after_bounded_termination",
+            "duplicate_model_submission_allowed": false,
+            "required_action": "retry only this exact durable request to continue actor cleanup and provider-session reconciliation",
+        }),
     )
+}
+
+fn injected_launch_actor_settlement_failure(enabled: bool) -> std::io::Result<()> {
+    #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
+    if enabled && std::env::var_os("AGENT_RUNNER_OPENCODE_TEST_FAIL_ACTOR_SETTLEMENT").is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "contract fixture retained an effect-capable actor after bounded termination",
+        ));
+    }
+    #[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]
+    let _ = enabled;
+    Ok(())
 }
 
 fn resume_launch_request_reuse_conflict(
@@ -3245,12 +3327,12 @@ impl LaunchState {
         self.projection_admitted = false;
     }
 
-    fn settle_actor_custody(&mut self) -> Result<(), ProviderFailure> {
+    fn settle_actor_custody(&mut self, child: Option<&mut Child>) -> Result<(), ProviderFailure> {
         if let Some(launch_request) = self.launch_request.as_mut() {
-            return launch_request.settle_actor_custody();
+            return launch_request.settle_actor_custody(child);
         }
         if let Some(resume_launch_request) = self.resume_launch_request.as_mut() {
-            return resume_launch_request.settle_actor_custody();
+            return resume_launch_request.settle_actor_custody(child);
         }
         Ok(())
     }
@@ -3575,6 +3657,11 @@ impl LaunchState {
     }
 
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
+        self.prepare_terminal(writer)?;
+        self.emit_terminal(writer)
+    }
+
+    fn prepare_terminal<W: Write>(&mut self, writer: &mut W) -> Result<(), ProviderFailure> {
         self.capture_session_from_parser_tail(writer)?;
         self.admit_terminal_without_session(writer)?;
         let final_resume_observation = self.stream_resume_observation.clone().or_else(|| {
@@ -3600,6 +3687,10 @@ impl LaunchState {
             completion_observed,
             writer,
         )?;
+        Ok(())
+    }
+
+    fn emit_terminal<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
         self.emit_integrity_evidence(writer)?;
         self.emit_output_completion(writer)?;
         let status = self.finished_status();

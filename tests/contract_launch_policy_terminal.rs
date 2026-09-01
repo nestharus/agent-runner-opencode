@@ -17,6 +17,7 @@ use support::{invoke_validated, invoke_with_env, invoke_with_host_and_env, json_
 #[cfg(unix)]
 extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
+    fn kill(pid: i32, signal: i32) -> i32;
 }
 
 #[cfg(unix)]
@@ -179,6 +180,327 @@ impl std::io::Write for FailAfterFirstLaunchEvent {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn lifecycle_descendant_fixture() {
+    use std::ffi::CString;
+
+    let Ok(mode) = std::env::var("OULIPOLY_LIFECYCLE_DESCENDANT_MODE") else {
+        return;
+    };
+    let evidence_path = CString::new(
+        std::env::var("OULIPOLY_LIFECYCLE_EVIDENCE").expect("lifecycle fixture evidence path"),
+    )
+    .expect("lifecycle fixture evidence path has no NUL");
+    let mut readiness = [0_i32; 2];
+    assert_eq!(unsafe { libc::pipe(readiness.as_mut_ptr()) }, 0);
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork lifecycle descendant");
+    if child == 0 {
+        unsafe {
+            libc::close(readiness[0]);
+            if mode == "zombie" {
+                libc::close(readiness[1]);
+                libc::_exit(0);
+            }
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            let ready = [1_u8];
+            libc::write(readiness[1], ready.as_ptr().cast(), ready.len());
+            libc::close(readiness[1]);
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    unsafe {
+        libc::close(readiness[1]);
+        let mut ready = [0_u8; 1];
+        let observed = libc::read(readiness[0], ready.as_mut_ptr().cast(), ready.len());
+        libc::close(readiness[0]);
+        if mode == "zombie" {
+            assert_eq!(observed, 0, "zombie descendant must exit before its parent");
+        } else {
+            assert_eq!(
+                observed, 1,
+                "stubborn descendant must install SIGTERM ignore"
+            );
+        }
+        let evidence = if mode == "zombie" {
+            b"zombie-only\n".as_slice()
+        } else {
+            b"live-ignores-sigterm\n".as_slice()
+        };
+        let fd = libc::open(
+            evidence_path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o600,
+        );
+        assert!(fd >= 0, "open lifecycle fixture evidence");
+        assert_eq!(
+            libc::write(fd, evidence.as_ptr().cast(), evidence.len()),
+            evidence.len() as isize
+        );
+        libc::close(fd);
+        libc::_exit(0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lifecycle_descendant_script(mode: &str, resumed: bool, session_id: &str) -> String {
+    let helper = std::env::current_exe().expect("current lifecycle contract test executable");
+    let start = json!({
+        "type": "step_start",
+        "timestamp": 1_780_565_973_556_u64,
+        "sessionID": session_id,
+        "part": {
+            "type": "step-start",
+            "sessionID": session_id,
+        }
+    })
+    .to_string();
+    let finish = resumed.then(|| {
+        json!({
+            "type": "step_finish",
+            "timestamp": 1_780_565_973_557_u64,
+            "sessionID": session_id,
+            "part": {
+                "type": "step-finish",
+                "sessionID": session_id,
+                "reason": "stop",
+            }
+        })
+        .to_string()
+    });
+    format!(
+        "#!/bin/sh\n\
+printf '%s\\n' \"$$\" > \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG.actor-pgid\"\n\
+printf '1\\n' >> \"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG\"\n\
+OULIPOLY_LIFECYCLE_DESCENDANT_MODE={mode} \\\n+OULIPOLY_LIFECYCLE_EVIDENCE=\"$AGENT_RUNNER_OPENCODE_WRAPPER_LOG.descendant-state\" \\\n+{helper} --exact lifecycle_descendant_fixture --nocapture >/dev/null 2>&1\n\
+printf '%s\\n' {start}\n\
+{finish}\
+exit 0\n",
+        mode = shell_single_quote(mode),
+        helper = shell_single_quote(&helper.to_string_lossy()),
+        start = shell_single_quote(&start),
+        finish = finish
+            .as_deref()
+            .map(|event| format!("printf '%s\\n' {}\n", shell_single_quote(event)))
+            .unwrap_or_default(),
+    )
+    .replace("\n+", "\n")
+}
+
+#[cfg(target_os = "linux")]
+fn assert_launch_descendant_settlement(mode: &str, resumed: bool) {
+    let session_id = if resumed {
+        resume_session_id()
+    } else {
+        "ses_lifecycle_fresh_launch"
+    };
+    let fake_wrapper =
+        FakeOpencodeWrapper::with_script(lifecycle_descendant_script(mode, resumed, session_id));
+    let path = prepend_path(fake_wrapper.dir());
+    let params = if resumed {
+        resume_launch_params_with_arg_payload_env(path.as_str(), fake_wrapper.log_path_str())
+    } else {
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                (
+                    "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                    fake_wrapper.log_path_str(),
+                ),
+            ],
+        )
+    };
+    let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
+    assert_output_success(&output, "descendant lifecycle launch");
+    let events = launch_events_from_output(&output, "descendant lifecycle launch stdout");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "exit")
+            .count(),
+        1,
+        "launch stream must have one authoritative terminal outcome; events={events:?}"
+    );
+    assert_eq!(
+        events.last().expect("terminal launch event")["kind"],
+        "exit"
+    );
+    let actor_path = std::path::PathBuf::from(format!(
+        "{}.actor-pgid",
+        fake_wrapper.log_path().to_string_lossy()
+    ));
+    let actor_process_group_id = fs::read_to_string(actor_path)
+        .expect("read lifecycle actor process group")
+        .trim()
+        .parse::<i32>()
+        .expect("parse lifecycle actor process group");
+    assert_eq!(
+        unsafe { kill(-actor_process_group_id, 0) },
+        -1,
+        "settled lifecycle process group must no longer be kernel-visible"
+    );
+    let evidence_path = std::path::PathBuf::from(format!(
+        "{}.descendant-state",
+        fake_wrapper.log_path().to_string_lossy()
+    ));
+    let expected_evidence = if mode == "zombie" {
+        "zombie-only\n"
+    } else {
+        "live-ignores-sigterm\n"
+    };
+    assert_eq!(
+        fs::read_to_string(evidence_path).expect("read lifecycle descendant evidence"),
+        expected_evidence
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn contract_fresh_launch_reaps_zombie_only_descendants_before_terminal_outcome() {
+    assert_launch_descendant_settlement("zombie", false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn contract_resumed_launch_reaps_zombie_only_descendants_before_terminal_outcome() {
+    assert_launch_descendant_settlement("zombie", true);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn contract_fresh_launch_kills_stubborn_live_descendants_before_terminal_outcome() {
+    assert_launch_descendant_settlement("stubborn", false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn contract_resumed_launch_kills_stubborn_live_descendants_before_terminal_outcome() {
+    assert_launch_descendant_settlement("stubborn", true);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_cleanup_failure_is_the_only_terminal_outcome(resumed: bool) {
+    let runtime = IsolatedLaunchSettings::new();
+    let session_id = if resumed {
+        resume_session_id()
+    } else {
+        "ses_lifecycle_cleanup_failure"
+    };
+    let fake_wrapper = FakeOpencodeWrapper::with_script(lifecycle_descendant_script(
+        "stubborn", resumed, session_id,
+    ));
+    let path = prepend_path(fake_wrapper.dir());
+    let params = if resumed {
+        resume_launch_params_with_arg_payload_env(path.as_str(), fake_wrapper.log_path_str())
+    } else {
+        launch_params_with_env(
+            "low",
+            &[
+                ("PATH", path.as_str()),
+                (
+                    "AGENT_RUNNER_OPENCODE_WRAPPER_LOG",
+                    fake_wrapper.log_path_str(),
+                ),
+            ],
+        )
+    };
+    let mut request = support::validated_request_envelope(
+        "launch",
+        params,
+        runtime.host_overrides(),
+        "launch.schema.json#/$defs/LaunchRequest",
+    );
+    request["request_id"] = json!(if resumed {
+        "req-resumed-launch-cleanup-failure"
+    } else {
+        "req-fresh-launch-cleanup-failure"
+    });
+    support::assert_valid_request_envelope(&request, "launch.schema.json#/$defs/LaunchRequest");
+
+    let failed = support::invoke_with_request_and_env(
+        "launch",
+        request.clone(),
+        &[
+            ("PATH", path.as_str()),
+            ("AGENT_RUNNER_OPENCODE_TEST_FAIL_ACTOR_SETTLEMENT", "1"),
+        ],
+    );
+    assert_eq!(failed.status.code(), Some(2));
+    support::assert_stderr_diagnostics_only(&failed);
+    let mut records = std::str::from_utf8(&failed.stdout)
+        .expect("cleanup failure output is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("cleanup failure output JSON"))
+        .collect::<Vec<_>>();
+    let failure = records.pop().expect("cleanup failure envelope");
+    support::assert_valid(&failure, "common.schema.json#/$defs/ErrorResponseEnvelope");
+    for (index, event) in records.iter().enumerate() {
+        assert_valid_launch_event(index + 1, event);
+    }
+    assert!(
+        records.iter().all(|event| event["kind"] != "exit"),
+        "cleanup failure must not follow a successful terminal exit: {records:?}"
+    );
+    assert_eq!(failure["error"]["category"], "conflict");
+    assert_eq!(failure["error"]["code"], "launch_actor_cleanup_failed");
+    assert_eq!(
+        failure["error"]["details"]["durable_request_id"],
+        request["request_id"]
+    );
+    assert_eq!(
+        failure["error"]["details"]["provider_session_id"],
+        session_id
+    );
+    assert_eq!(
+        failure["error"]["details"]["duplicate_model_submission_allowed"],
+        false
+    );
+    assert_eq!(
+        failure["error"]["details"]["request_identity_sha256"]
+            .as_str()
+            .expect("durable request identity")
+            .len(),
+        64
+    );
+
+    let replay =
+        support::invoke_with_request_and_env("launch", request, &[("PATH", path.as_str())]);
+    let replay = json_stdout(&replay);
+    assert_eq!(
+        replay["error"]["code"],
+        if resumed {
+            "launch_resume_reconciliation_required"
+        } else {
+            "launch_session_reconciliation_required"
+        }
+    );
+    assert_eq!(
+        replay["error"]["details"]["provider_session_id"],
+        session_id
+    );
+    assert_eq!(
+        fs::read_to_string(fake_wrapper.log_path()).expect("read lifecycle launch count"),
+        "1\n",
+        "cleanup reconciliation must not submit duplicate model work"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn contract_fresh_cleanup_failure_precedes_terminal_exit_and_preserves_reconciliation() {
+    assert_cleanup_failure_is_the_only_terminal_outcome(false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn contract_resumed_cleanup_failure_precedes_terminal_exit_and_preserves_reconciliation() {
+    assert_cleanup_failure_is_the_only_terminal_outcome(true);
 }
 
 #[test]

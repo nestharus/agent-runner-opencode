@@ -31,6 +31,10 @@ impl ChildCustody {
         self.child.as_ref()
     }
 
+    pub(crate) fn into_child(mut self) -> Child {
+        self.child.take().expect("child custody is active")
+    }
+
     pub(crate) fn wait_with_output_timeout(
         mut self,
         timeout: Duration,
