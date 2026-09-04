@@ -2053,12 +2053,28 @@ fn contract_launch_completed_resume_does_not_wait_for_lingering_native_process()
     let path = prepend_path(fake_wrapper.dir());
     let log_path = fake_wrapper.log_path_str();
     let params = resume_launch_params_with_arg_payload_env(path.as_str(), log_path);
+    let started = std::time::Instant::now();
     let output = invoke_with_env("launch", params, &[("PATH", path.as_str())]);
     let events = launch_events_from_output(&output, "completed lingering resume stdout");
+
+    assert_output_success(&output, "launch completed lingering resume");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(4_500),
+        "provider should stop a completed resume before the fake five-second hang"
+    );
     assert_produced_assistant_response_marker(&events);
     let final_event = final_launch_event(&events);
-    assert_eq!(final_event["status"]["kind"], "signal_terminated");
-    assert_live_provider_exit_code(&output, final_event, "completed lingering resume");
+    assert_eq!(
+        final_event["status"],
+        serde_json::json!({"kind": "exited", "code": 0})
+    );
+    let cleanup = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "marker" && event["name"] == "oulipoly.response_cleanup_process_status"
+        })
+        .expect("completed lingering resume must retain native cleanup status");
+    assert_ne!(cleanup["value"], final_event["status"]);
 }
 
 #[test]
