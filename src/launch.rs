@@ -1326,7 +1326,7 @@ fn complete_terminal_resume(child: &mut Child, state: &mut LaunchState) {
         return;
     }
     if let Some(status) = terminate_child(child) {
-        state.record_forced_exit(process_status_from_exit(status));
+        state.record_completed_resume_cleanup(process_status_from_exit(status));
     }
 }
 
@@ -3828,9 +3828,9 @@ impl LaunchState {
         self.child_exit_at.get_or_insert_with(Instant::now);
     }
 
-    fn record_forced_exit(&mut self, status: ProcessStatus) {
-        self.forced_exit_status = Some(status.clone());
-        self.record_child_exit(status);
+    fn record_completed_resume_cleanup(&mut self, status: ProcessStatus) {
+        self.forced_exit_status = Some(status);
+        self.record_child_exit(ProcessStatus::Exited { code: 0 });
     }
 
     fn child_exit_grace_elapsed(&self) -> bool {
