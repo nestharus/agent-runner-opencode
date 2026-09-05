@@ -135,7 +135,7 @@ impl<'a> Route<'a> {
                         &request.request_id,
                         "invalid_describe_params",
                     )?;
-                    Ok(EnvelopedOutcome::new(describe_result()))
+                    Ok(EnvelopedOutcome::new(describe_result(&request.host)))
                 },
             ),
             Operation::Schema => write_enveloped_operation(

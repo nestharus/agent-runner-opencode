@@ -59,42 +59,6 @@ pub fn assert_native_export_fixture(export: &Value) {
     );
 }
 
-pub fn assert_first_read_turns_result(result: &Value) -> Vec<String> {
-    let expected_count = fixture_message_count();
-    assert_eq!(
-        result["turn_count"].as_u64(),
-        Some(expected_count as u64),
-        "turn_count should match the native opencode export message count"
-    );
-    assert!(result["complete"].is_boolean(), "complete should be a bool");
-    let turns = turns(result);
-    assert_eq!(
-        turns.len(),
-        expected_count,
-        "turns length should match turn_count and native message count"
-    );
-    for turn in turns {
-        assert_eq!(turn["session_id"].as_str(), Some(fixture_session_id()));
-        assert!(turn["turn_id"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty()));
-        assert!(turn["role"].as_str().is_some_and(|value| !value.is_empty()));
-        let timestamp = turn["timestamp"]
-            .as_str()
-            .expect("turn timestamp should be a string");
-        chrono::DateTime::parse_from_rfc3339(timestamp)
-            .unwrap_or_else(|err| panic!("turn timestamp must be RFC3339: {err}"));
-        assert!(turn["body"].is_array(), "turn body should be an array");
-    }
-    let ids = turn_ids(result);
-    assert_eq!(ids.len(), expected_count);
-    ids
-}
-
-pub fn assert_missing_read_turns_error(path: &str) {
-    assert_error_envelope(missing_read_turns_output(path));
-}
-
 pub fn assert_not_located_result(result: &Value) {
     assert_eq!(result["located"], false);
     assert!(
@@ -116,14 +80,6 @@ pub fn assert_not_located_result(result: &Value) {
             "{message}"
         );
     }
-}
-
-pub fn assert_stable_turn_ids(second: &Value, first_ids: &[String]) {
-    assert_eq!(
-        turn_ids(second),
-        first_ids,
-        "turn ids must be stable across repeated reads of the same opencode export"
-    );
 }
 
 pub fn assert_canonical_export_result(result: &Value, sha_message: &str) {

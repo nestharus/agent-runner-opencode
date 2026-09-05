@@ -48,6 +48,7 @@ use crate::resume_observation::{
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -60,7 +61,6 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const COMPLETED_RESUME_GRACE: Duration = Duration::from_millis(500);
 const DRAIN_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 const DRAIN_CHANNEL_CAPACITY: usize = 32;
-const DEFERRED_EVENT_LIMIT: usize = 1024 * 1024;
 const MAX_LAUNCH_INTEGRITY_FAILURES: usize = 32;
 const MAX_LAUNCH_INTEGRITY_FAILURE_DETAIL_BYTES: usize = 512;
 const MAX_LAUNCH_INTEGRITY_EVIDENCE_BYTES: usize = 32 * 1024;
@@ -74,6 +74,8 @@ const PRODUCED_ASSISTANT_RESPONSE_MARKER: &str = "oulipoly.produced_assistant_re
 const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
 const RESUME_COMPLETION_UNRESOLVED_MARKER: &str = "oulipoly.resume_completion_unresolved";
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
+const LAUNCH_OUTPUT_COMPLETE_MARKER: &str = "oulipoly.launch_output_complete/v1";
+const LAUNCH_OUTPUT_PROTOCOL: &str = "oulipoly.launch_output/v1";
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
 const LAUNCH_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -95,6 +97,13 @@ struct LaunchParams {
     env: Option<BTreeMap<String, String>>,
     stdin: Option<BytePayload>,
     session: Option<LaunchSession>,
+    output_delivery: Option<LaunchOutputRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchOutputRequest {
+    protocol: String,
 }
 
 #[derive(Deserialize)]
@@ -117,6 +126,221 @@ enum DrainMessage {
     StdoutDone,
     StderrDone,
     ReadError { stdout: bool, message: String },
+}
+
+struct DeferredLaunchSpool {
+    file: fs::File,
+    record_count: u64,
+    replayed_records: u64,
+    largest_record_bytes: u64,
+}
+
+impl DeferredLaunchSpool {
+    fn create(request_id: &str) -> Result<Self, ProviderFailure> {
+        let file = tempfile::tempfile().map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_create_failed",
+                "create private deferred launch spool",
+                error,
+            )
+        })?;
+        Ok(Self {
+            file,
+            record_count: 0,
+            replayed_records: 0,
+            largest_record_bytes: 0,
+        })
+    }
+
+    fn append(&mut self, request_id: &str, event: &Value) -> Result<(), ProviderFailure> {
+        let encoded = serde_json::to_vec(event).map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_serialization_failed",
+                "serialize deferred launch event",
+                error,
+            )
+        })?;
+        let encoded_len = u64::try_from(encoded.len()).map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_serialization_failed",
+                "represent deferred launch event length",
+                error,
+            )
+        })?;
+        let next_record_count = self.record_count.checked_add(1).ok_or_else(|| {
+            launch_output_accounting_failure(request_id, "deferred launch event count overflowed")
+        })?;
+        self.file
+            .write_all(&encoded_len.to_le_bytes())
+            .and_then(|()| self.file.write_all(&encoded))
+            .map_err(|error| {
+                deferred_spool_failure(
+                    request_id,
+                    "launch_deferred_spool_write_failed",
+                    "append deferred launch event",
+                    error,
+                )
+            })?;
+        self.record_count = next_record_count;
+        self.largest_record_bytes = self.largest_record_bytes.max(encoded_len);
+        Ok(())
+    }
+
+    fn begin_replay(&mut self, request_id: &str) -> Result<(), ProviderFailure> {
+        self.file.flush().map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_flush_failed",
+                "flush deferred launch spool",
+                error,
+            )
+        })?;
+        self.file.seek(SeekFrom::Start(0)).map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_rewind_failed",
+                "rewind deferred launch spool",
+                error,
+            )
+        })?;
+        self.replayed_records = 0;
+        Ok(())
+    }
+
+    fn read_event(&mut self, request_id: &str) -> Result<Option<Value>, ProviderFailure> {
+        if self.replayed_records == self.record_count {
+            return Ok(None);
+        }
+        let mut encoded_len = [0_u8; std::mem::size_of::<u64>()];
+        self.file.read_exact(&mut encoded_len).map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_read_failed",
+                "read deferred launch event length",
+                error,
+            )
+        })?;
+        let encoded_len = u64::from_le_bytes(encoded_len);
+        if encoded_len > self.largest_record_bytes {
+            return Err(deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_read_failed",
+                "validate deferred launch event length",
+                format!(
+                    "record length {encoded_len} exceeds appended maximum {}",
+                    self.largest_record_bytes
+                ),
+            ));
+        }
+        let encoded_len = usize::try_from(encoded_len).map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_read_failed",
+                "represent deferred launch event length",
+                error,
+            )
+        })?;
+        let mut encoded = Vec::new();
+        encoded.try_reserve_exact(encoded_len).map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_read_failed",
+                "allocate deferred launch replay frame",
+                error,
+            )
+        })?;
+        encoded.resize(encoded_len, 0);
+        self.file.read_exact(&mut encoded).map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_read_failed",
+                "read deferred launch event",
+                error,
+            )
+        })?;
+        let event = serde_json::from_slice(&encoded).map_err(|error| {
+            deferred_spool_failure(
+                request_id,
+                "launch_deferred_spool_serialization_failed",
+                "deserialize deferred launch event",
+                error,
+            )
+        })?;
+        self.replayed_records += 1;
+        Ok(Some(event))
+    }
+}
+
+#[derive(Clone, Default)]
+struct LaunchOutputChannelSummary {
+    bytes: u64,
+    digest: Sha256,
+}
+
+impl LaunchOutputChannelSummary {
+    fn accept(&mut self, request_id: &str, bytes: &[u8]) -> Result<(), ProviderFailure> {
+        let accepted_bytes = u64::try_from(bytes.len()).map_err(|error| {
+            launch_output_accounting_failure(
+                request_id,
+                format!("could not represent accepted launch output length: {error}"),
+            )
+        })?;
+        let total_bytes = self.bytes.checked_add(accepted_bytes).ok_or_else(|| {
+            launch_output_accounting_failure(request_id, "launch output byte count overflowed")
+        })?;
+        self.digest.update(bytes);
+        self.bytes = total_bytes;
+        Ok(())
+    }
+
+    fn sha256(&self) -> String {
+        format!("{:x}", self.digest.clone().finalize())
+    }
+}
+
+#[derive(Default)]
+struct LaunchOutputSummary {
+    stdout: LaunchOutputChannelSummary,
+    stderr: LaunchOutputChannelSummary,
+    data_event_count: u64,
+}
+
+impl LaunchOutputSummary {
+    fn accept(
+        &mut self,
+        request_id: &str,
+        stdout: bool,
+        bytes: &[u8],
+    ) -> Result<(), ProviderFailure> {
+        let data_event_count = self.data_event_count.checked_add(1).ok_or_else(|| {
+            launch_output_accounting_failure(request_id, "launch data event count overflowed")
+        })?;
+        if stdout {
+            self.stdout.accept(request_id, bytes)?;
+        } else {
+            self.stderr.accept(request_id, bytes)?;
+        }
+        self.data_event_count = data_event_count;
+        Ok(())
+    }
+
+    fn marker_value(&self) -> Value {
+        json!({
+            "protocol": LAUNCH_OUTPUT_PROTOCOL,
+            "stdout": {
+                "bytes": self.stdout.bytes,
+                "sha256": self.stdout.sha256(),
+            },
+            "stderr": {
+                "bytes": self.stderr.bytes,
+                "sha256": self.stderr.sha256(),
+            },
+            "data_event_count": self.data_event_count,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -260,6 +484,8 @@ pub(crate) fn stream<W: Write>(
 ) -> Result<LaunchOutcome, ProviderFailure> {
     let raw_params = params.clone();
     let params = parse_launch_params(params, request_id)?;
+    let launch_output_requested =
+        validate_launch_output_request(params.output_delivery.as_ref(), host, request_id)?;
     validate_launch_authority(&params, request_id)?;
     let new_session = known_provider_session_id(&params).is_none();
     let request_identity_sha256 = launch_request_identity_sha256(host, &raw_params);
@@ -274,12 +500,11 @@ pub(crate) fn stream<W: Write>(
     let effective = match launch_argv(&params, host, request_id, &request_identity_sha256)? {
         PolicyLaunch::Accepted(effective) => *effective,
         PolicyLaunch::Rejected(reason) => {
-            return stream_policy_rejection(request_id, writer, reason).map(|exit_code| {
-                LaunchOutcome {
+            return stream_policy_rejection(request_id, writer, reason, launch_output_requested)
+                .map(|exit_code| LaunchOutcome {
                     exit_code,
                     activity_targets: ActivityTargets::default(),
-                }
-            })
+                })
         }
     };
     let binding_sha256 =
@@ -296,10 +521,11 @@ pub(crate) fn stream<W: Write>(
     let mut state = LaunchState::new(
         request_id,
         host.deadline_unix_ms,
+        launch_output_requested,
         effective.resume_observation_request,
         effective.route_evidence.clone(),
         None,
-    );
+    )?;
     let child_stdin = match prepared_child_stdin(effective.stdin.as_deref()) {
         Ok(stdin) => stdin,
         Err(error) => {
@@ -466,6 +692,37 @@ pub(crate) fn attempted_activity_targets(params: &Value) -> ActivityTargets {
 
 fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, ProviderFailure> {
     serde_json::from_value(params).map_err(|err| invalid_launch_params_failure(request_id, err))
+}
+
+fn validate_launch_output_request(
+    request: Option<&LaunchOutputRequest>,
+    host: &HostContext,
+    request_id: &str,
+) -> Result<bool, ProviderFailure> {
+    let Some(request) = request else {
+        return Ok(false);
+    };
+    if host
+        .env
+        .as_ref()
+        .and_then(|env| env.get(crate::schema::HOST_LAUNCH_OUTPUT_V1_ENV))
+        .map(String::as_str)
+        != Some("1")
+    {
+        return Err(ProviderFailure::unsupported(
+            request_id,
+            "launch_output_not_selected",
+            "params.output_delivery is accepted only when host.env.OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1 selected the capability",
+        ));
+    }
+    if request.protocol == crate::schema::LAUNCH_OUTPUT_V1 {
+        return Ok(true);
+    }
+    Err(ProviderFailure::unsupported(
+        request_id,
+        "unsupported_launch_output_protocol",
+        format!("unsupported launch output protocol {}", request.protocol),
+    ))
 }
 
 struct EffectiveLaunch {
@@ -1069,7 +1326,7 @@ fn complete_terminal_resume(child: &mut Child, state: &mut LaunchState) {
         return;
     }
     if let Some(status) = terminate_child(child) {
-        state.record_forced_exit(process_status_from_exit(status));
+        state.record_completed_resume_cleanup(process_status_from_exit(status));
     }
 }
 
@@ -1106,8 +1363,16 @@ fn stream_policy_rejection<W: Write>(
     request_id: &str,
     writer: &mut W,
     reason: String,
+    launch_output_requested: bool,
 ) -> Result<i32, ProviderFailure> {
-    let mut state = LaunchState::new(request_id, None, None, json!([]), None);
+    let mut state = LaunchState::new(
+        request_id,
+        None,
+        launch_output_requested,
+        None,
+        json!([]),
+        None,
+    )?;
     state.final_status = Some(policy_rejection_status(reason));
     state.mark_drains_done();
     state.finish(writer)
@@ -2910,6 +3175,8 @@ struct LaunchState {
     final_status: Option<ProcessStatus>,
     child_exit_at: Option<Instant>,
     forced_exit_status: Option<ProcessStatus>,
+    launch_output_requested: bool,
+    pipe_read_failed: bool,
     integrity_failures: Vec<String>,
     integrity_failures_omitted: u64,
     parser: EventParser,
@@ -2925,19 +3192,20 @@ struct LaunchState {
     launch_request: Option<LaunchRequestGuard>,
     resume_launch_request: Option<ResumeLaunchRequestGuard>,
     projection_admitted: bool,
-    deferred_events: Vec<Value>,
-    deferred_event_bytes: usize,
+    deferred_spool: DeferredLaunchSpool,
+    output_summary: LaunchOutputSummary,
 }
 
 impl LaunchState {
     fn new(
         request_id: &str,
         deadline_unix_ms: Option<u64>,
+        launch_output_requested: bool,
         resume_observation_request: Option<ResumeObservationRequest>,
         route_evidence: Value,
         launch_request: Option<LaunchRequestGuard>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ProviderFailure> {
+        Ok(Self {
             request_id: request_id.to_string(),
             seq: 1,
             stdout_done: false,
@@ -2945,6 +3213,8 @@ impl LaunchState {
             final_status: None,
             child_exit_at: None,
             forced_exit_status: None,
+            launch_output_requested,
+            pipe_read_failed: false,
             integrity_failures: Vec::new(),
             integrity_failures_omitted: 0,
             parser: EventParser::default(),
@@ -2960,9 +3230,9 @@ impl LaunchState {
             projection_admitted: launch_request.is_none(),
             launch_request,
             resume_launch_request: None,
-            deferred_events: Vec::new(),
-            deferred_event_bytes: 0,
-        }
+            deferred_spool: DeferredLaunchSpool::create(request_id)?,
+            output_summary: LaunchOutputSummary::default(),
+        })
     }
 
     fn attach_launch_request(&mut self, launch_request: LaunchRequestGuard) {
@@ -3024,8 +3294,15 @@ impl LaunchState {
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
         match message {
-            DrainMessage::Stdout(bytes) => self.stdout_bytes(&bytes, writer),
-            DrainMessage::Stderr(bytes) => self.stderr_bytes(&bytes, writer),
+            DrainMessage::Stdout(bytes) => {
+                self.output_summary.accept(&self.request_id, true, &bytes)?;
+                self.stdout_bytes(&bytes, writer)
+            }
+            DrainMessage::Stderr(bytes) => {
+                self.output_summary
+                    .accept(&self.request_id, false, &bytes)?;
+                self.stderr_bytes(&bytes, writer)
+            }
             DrainMessage::StdoutDone => {
                 self.stdout_done = true;
                 Ok(())
@@ -3044,6 +3321,7 @@ impl LaunchState {
                     "{} pipe read failed: {message}",
                     if stdout { "stdout" } else { "stderr" }
                 ));
+                self.pipe_read_failed = true;
                 Ok(())
             }
         }
@@ -3148,9 +3426,9 @@ impl LaunchState {
         if self.projection_admitted {
             return Ok(());
         }
+        self.deferred_spool.begin_replay(&self.request_id)?;
         self.projection_admitted = true;
-        self.deferred_event_bytes = 0;
-        for event in std::mem::take(&mut self.deferred_events) {
+        while let Some(event) = self.deferred_spool.read_event(&self.request_id)? {
             self.write_event(event, writer)?;
         }
         Ok(())
@@ -3293,7 +3571,7 @@ impl LaunchState {
             return Ok(());
         }
         self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-        self.write_event(heartbeat_event(&self.request_id, self.seq), writer)
+        self.write_live_event(heartbeat_event(&self.request_id, self.seq), writer)
     }
 
     fn finish<W: Write>(&mut self, writer: &mut W) -> Result<i32, ProviderFailure> {
@@ -3323,6 +3601,7 @@ impl LaunchState {
             writer,
         )?;
         self.emit_integrity_evidence(writer)?;
+        self.emit_output_completion(writer)?;
         let status = self.finished_status();
         let signal = self.terminal_signal_for(&status);
         let event = self.exit_event(&status, signal);
@@ -3490,25 +3769,20 @@ impl LaunchState {
 
     fn write_event<W: Write>(
         &mut self,
-        mut event: Value,
+        event: Value,
         writer: &mut W,
     ) -> Result<(), ProviderFailure> {
         if !self.projection_admitted {
-            let event_bytes = event.to_string().len();
-            if self.deferred_event_bytes.saturating_add(event_bytes) <= DEFERRED_EVENT_LIMIT {
-                self.deferred_event_bytes += event_bytes;
-                self.deferred_events.push(event);
-            } else if !self
-                .integrity_failures
-                .iter()
-                .any(|failure| failure == "pre-session event projection buffer exhausted")
-            {
-                self.record_integrity_failure(
-                    "pre-session event projection buffer exhausted".to_string(),
-                );
-            }
-            return Ok(());
+            return self.deferred_spool.append(&self.request_id, &event);
         }
+        self.write_live_event(event, writer)
+    }
+
+    fn write_live_event<W: Write>(
+        &mut self,
+        mut event: Value,
+        writer: &mut W,
+    ) -> Result<(), ProviderFailure> {
         assign_event_seq(&mut event, self.seq);
         write_ndjson_event(&self.request_id, writer, &event)?;
         self.advance_seq();
@@ -3554,9 +3828,9 @@ impl LaunchState {
         self.child_exit_at.get_or_insert_with(Instant::now);
     }
 
-    fn record_forced_exit(&mut self, status: ProcessStatus) {
-        self.forced_exit_status = Some(status.clone());
-        self.record_child_exit(status);
+    fn record_completed_resume_cleanup(&mut self, status: ProcessStatus) {
+        self.forced_exit_status = Some(status);
+        self.record_child_exit(ProcessStatus::Exited { code: 0 });
     }
 
     fn child_exit_grace_elapsed(&self) -> bool {
@@ -3588,6 +3862,24 @@ impl LaunchState {
             )?;
         }
         Ok(())
+    }
+
+    fn emit_output_completion<W: Write>(&mut self, writer: &mut W) -> Result<(), ProviderFailure> {
+        if !self.launch_output_requested || self.pipe_read_failed {
+            return Ok(());
+        }
+        if !self.projection_admitted {
+            return Err(ProviderFailure::internal(
+                &self.request_id,
+                "launch_deferred_projection_incomplete",
+                "deferred launch output was not projected before completion",
+            ));
+        }
+        self.marker_with_value(
+            LAUNCH_OUTPUT_COMPLETE_MARKER.to_string(),
+            self.output_summary.marker_value(),
+            writer,
+        )
     }
 
     fn mark_drains_done(&mut self) {
@@ -3866,13 +4158,55 @@ fn json_write_failure(request_id: &str, err: serde_json::Error) -> ProviderFailu
     )
 }
 
+fn deferred_spool_failure(
+    request_id: &str,
+    code: &'static str,
+    action: &str,
+    error: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::internal(request_id, code, format!("failed to {action}: {error}"))
+}
+
+fn launch_output_accounting_failure(
+    request_id: &str,
+    error: impl std::fmt::Display,
+) -> ProviderFailure {
+    ProviderFailure::internal(
+        request_id,
+        "launch_output_accounting_failed",
+        format!("failed to account for accepted native launch output: {error}"),
+    )
+}
+
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
 
+    struct ReadPartialThenFail {
+        emitted: bool,
+    }
+
+    impl Read for ReadPartialThenFail {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.emitted {
+                return Err(std::io::Error::other("injected native pipe read failure"));
+            }
+            self.emitted = true;
+            let partial = b"truncated native stream";
+            buffer[..partial.len()].copy_from_slice(partial);
+            Ok(partial.len())
+        }
+    }
+
+    #[cfg(unix)]
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+
     #[test]
     fn launch_integrity_evidence_has_lifetime_count_detail_and_encoding_bounds() {
-        let mut state = LaunchState::new("request-integrity", None, None, json!({}), None);
+        let mut state = LaunchState::new("request-integrity", None, true, None, json!({}), None)
+            .expect("create launch state");
         for index in 0..MAX_LAUNCH_INTEGRITY_FAILURES + 17 {
             state.record_integrity_failure(format!("{index}:{}", "é".repeat(1024)));
         }
@@ -3904,7 +4238,15 @@ mod streaming_tests {
 
     #[test]
     fn launch_integrity_evidence_preserves_parser_failure_multiplicity() {
-        let mut state = LaunchState::new("request-parser-integrity", None, None, json!({}), None);
+        let mut state = LaunchState::new(
+            "request-parser-integrity",
+            None,
+            true,
+            None,
+            json!({}),
+            None,
+        )
+        .expect("create launch state");
 
         assert!(state
             .session_from_stdout(&b"not-json\n".repeat(9))
@@ -3917,6 +4259,184 @@ mod streaming_tests {
             .expect("parser integrity evidence");
         assert_eq!(evidence["retained_failure_count"], 4);
         assert_eq!(evidence["omitted_failure_count"], 5);
+    }
+
+    #[test]
+    fn native_pipe_read_failure_cannot_attest_output_completion_or_clean_success() {
+        let (sender, receiver) = mpsc::sync_channel(DRAIN_CHANNEL_CAPACITY);
+        drain_reader(ReadPartialThenFail { emitted: false }, sender, true);
+        let mut state = LaunchState::new("request-read-failure", None, true, None, json!({}), None)
+            .expect("create launch state");
+        let mut output = Vec::new();
+        for message in receiver {
+            state
+                .handle_drain_message(message, &mut output)
+                .expect("retain bounded read-failure diagnostics");
+        }
+        state.stderr_done = true;
+        state.final_status = Some(ProcessStatus::Exited { code: 0 });
+
+        let exit_code = state.finish(&mut output).expect("finish failed pipe read");
+        let events = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).expect("launch event JSON"))
+            .collect::<Vec<_>>();
+
+        assert_ne!(exit_code, 0);
+        assert!(events.iter().any(|event| {
+            event["name"] == "oulipoly.launch_evidence_loss"
+                && event["value"]["failures"]
+                    .as_array()
+                    .is_some_and(|failures| {
+                        failures.iter().any(|failure| {
+                            failure
+                                .as_str()
+                                .is_some_and(|failure| failure.contains("stdout pipe read failed"))
+                        })
+                    })
+        }));
+        assert!(events
+            .iter()
+            .all(|event| { event["name"] != LAUNCH_OUTPUT_COMPLETE_MARKER }));
+        let exit = events.last().expect("terminal launch event");
+        assert_eq!(exit["kind"], "exit");
+        assert_eq!(exit["status"]["kind"], "unknown");
+    }
+
+    #[test]
+    fn deferred_launch_spool_round_trips_records_in_order() {
+        let mut spool = DeferredLaunchSpool::create("request-spool-order")
+            .expect("create deferred launch spool");
+        let first = json!({"kind": "stdout", "data_base64": "AAE="});
+        let second = json!({"kind": "marker", "name": "second", "value": true});
+        spool
+            .append("request-spool-order", &first)
+            .expect("append first deferred event");
+        spool
+            .append("request-spool-order", &second)
+            .expect("append second deferred event");
+
+        spool
+            .begin_replay("request-spool-order")
+            .expect("rewind deferred spool");
+        assert_eq!(
+            spool
+                .read_event("request-spool-order")
+                .expect("read first event"),
+            Some(first)
+        );
+        assert_eq!(
+            spool
+                .read_event("request-spool-order")
+                .expect("read second event"),
+            Some(second)
+        );
+        assert_eq!(
+            spool
+                .read_event("request-spool-order")
+                .expect("reach spool end"),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deferred_launch_spool_write_failure_is_explicit() {
+        let mut spool = DeferredLaunchSpool::create("request-spool-write-failure")
+            .expect("create deferred launch spool");
+        spool.file = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open deterministic full device");
+
+        let failure = spool
+            .append("request-spool-write-failure", &json!({"event": true}))
+            .expect_err("full spool device must reject append");
+
+        assert_eq!(failure.code, "launch_deferred_spool_write_failed");
+    }
+
+    #[test]
+    fn deferred_launch_spool_read_failure_is_explicit() {
+        let mut spool = DeferredLaunchSpool::create("request-spool-read-failure")
+            .expect("create deferred launch spool");
+        spool
+            .append("request-spool-read-failure", &json!({"event": true}))
+            .expect("append deferred event");
+        spool.file.set_len(4).expect("truncate deferred record");
+        spool
+            .begin_replay("request-spool-read-failure")
+            .expect("rewind truncated spool");
+
+        let failure = spool
+            .read_event("request-spool-read-failure")
+            .expect_err("truncated spool must reject replay");
+
+        assert_eq!(failure.code, "launch_deferred_spool_read_failed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deferred_launch_spool_rewind_failure_is_explicit() {
+        let mut spool = DeferredLaunchSpool::create("request-spool-rewind-failure")
+            .expect("create deferred launch spool");
+        let (non_seekable, _peer) = UnixStream::pair().expect("create non-seekable spool file");
+        spool.file = unsafe { fs::File::from_raw_fd(non_seekable.into_raw_fd()) };
+
+        let failure = spool
+            .begin_replay("request-spool-rewind-failure")
+            .expect_err("non-seekable spool must reject replay");
+
+        assert_eq!(failure.code, "launch_deferred_spool_rewind_failed");
+    }
+
+    #[test]
+    fn deferred_launch_spool_deserialization_failure_is_explicit() {
+        let mut spool = DeferredLaunchSpool::create("request-spool-decode-failure")
+            .expect("create deferred launch spool");
+        spool
+            .append("request-spool-decode-failure", &json!({"event": true}))
+            .expect("append deferred event");
+        let encoded_len = usize::try_from(spool.largest_record_bytes)
+            .expect("represent appended deferred event length");
+        spool
+            .file
+            .seek(SeekFrom::Start(std::mem::size_of::<u64>() as u64))
+            .expect("seek to deferred event body");
+        spool
+            .file
+            .write_all(&vec![b'x'; encoded_len])
+            .expect("corrupt deferred event body");
+        spool
+            .begin_replay("request-spool-decode-failure")
+            .expect("rewind corrupt spool");
+
+        let failure = spool
+            .read_event("request-spool-decode-failure")
+            .expect_err("corrupt spool must reject replay");
+
+        assert_eq!(failure.code, "launch_deferred_spool_serialization_failed");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn deferred_launch_spool_file_closes_with_its_owner() {
+        let fd_path = {
+            let spool = DeferredLaunchSpool::create("request-spool-cleanup")
+                .expect("create deferred launch spool");
+            let fd_path = PathBuf::from(format!("/proc/self/fd/{}", spool.file.as_raw_fd()));
+            assert!(
+                fd_path.exists(),
+                "spool descriptor must be live while owned"
+            );
+            fd_path
+        };
+
+        assert!(
+            !fd_path.exists(),
+            "dropping deferred spool ownership must close its anonymous file"
+        );
     }
 }
 

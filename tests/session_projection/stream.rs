@@ -7,7 +7,17 @@ pub const CANONICAL_FORMAT: &str = "oulipoly.canonical_transcript/v1";
 
 pub fn read_turns_result(params: Value, path: &str) -> Value {
     success_result(
-        invoke_with_env("session.read_turns", params, &[("PATH", path)]),
+        invoke_with_host_and_env(
+            "session.read_turns",
+            params,
+            json!({
+                "env": {
+                    "TERM": "xterm-256color",
+                    "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1"
+                }
+            }),
+            &[("PATH", path)],
+        ),
         "session.schema.json#/$defs/SessionReadTurnsResponse",
         "session.schema.json#/$defs/SessionReadTurnsResult",
     )
@@ -21,10 +31,17 @@ pub fn enumerate_result(params: Value, path: &str) -> Value {
     )
 }
 
-pub fn missing_read_turns_output(path: &str) -> std::process::Output {
-    invoke_with_env(
-        "session.read_turns",
-        session_params("ses_missing_contract_session_projection"),
-        &[("PATH", path)],
+pub fn continue_turn_page(prior_params: &Value, prior_result: &Value, path: &str) -> Value {
+    read_turns_result(
+        session_turn_page_continuation_params(
+            prior_params,
+            prior_result["snapshot_id"]
+                .as_str()
+                .expect("snapshot id string"),
+            prior_result["next_page_token"]
+                .as_str()
+                .expect("next page token string"),
+        ),
+        path,
     )
 }

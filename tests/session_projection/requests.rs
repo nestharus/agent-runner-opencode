@@ -3,6 +3,9 @@
 
 use super::*;
 
+pub const OBSERVATION_DELIVERY_NONCE: &str =
+    "5169694dde0f40d1890c6e28e55bab275169694dde0f40d1890c6e28e55bab27";
+
 pub fn session_params(session_id: &str) -> Value {
     json!({
         "settings_id": "opencode1",
@@ -15,6 +18,50 @@ pub fn session_params_for_settings(settings_id: &str, session_id: &str) -> Value
         "settings_id": settings_id,
         "session_id": session_id
     })
+}
+
+pub fn session_turn_page_beginning_params(
+    session_id: &str,
+    projection: &str,
+    after_token: Option<&str>,
+) -> Value {
+    let mut params = json!({
+        "settings_id": "opencode1",
+        "session_id": session_id,
+        "read_protocol": "oulipoly.session_turn_pages/v1",
+        "turn_projection": projection,
+        "start_mode": "beginning",
+        "after_token": after_token,
+        "snapshot_id": null,
+        "page_token": null,
+        "max_turns": 1,
+        "max_response_bytes": 8192,
+        "max_source_bytes": 131072,
+        "max_inline_body_bytes": 512
+    });
+    if projection == "user_observation" {
+        params["expected_delivery_nonce"] = json!(OBSERVATION_DELIVERY_NONCE);
+    }
+    params
+}
+
+pub fn session_turn_page_tail_params(session_id: &str) -> Value {
+    let mut params = session_turn_page_beginning_params(session_id, "user_observation", None);
+    params["start_mode"] = json!("tail");
+    params
+}
+
+pub fn session_turn_page_continuation_params(
+    prior: &Value,
+    snapshot_id: &str,
+    page_token: &str,
+) -> Value {
+    let mut params = prior.clone();
+    params["start_mode"] = json!("continuation");
+    params["after_token"] = Value::Null;
+    params["snapshot_id"] = json!(snapshot_id);
+    params["page_token"] = json!(page_token);
+    params
 }
 
 pub fn session_enumerate_params() -> Value {

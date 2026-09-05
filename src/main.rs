@@ -3,6 +3,10 @@
 use std::io::Read;
 
 fn main() {
+    if let Err(error) = agent_runner_opencode::validate_binary_configuration() {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
     let args = std::env::args().collect::<Vec<_>>();
     if args.get(1).map(String::as_str) == Some(agent_runner_opencode::NATIVE_EFFECT_GATE_ARG) {
         std::process::exit(agent_runner_opencode::run_native_effect_gate(&args));
