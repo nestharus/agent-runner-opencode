@@ -1,0 +1,743 @@
+import { tool } from "@opencode-ai/plugin"
+import { createConnection } from "node:net"
+
+/**
+ * opencode `bash` tool override. Workloads survive shell timeouts under agent-bash, but remain
+ * leased to this opencode process so aborting the tool or closing the session cancels the tree.
+ * Exact `agent-bash list [--all] [--json]` observations and standalone sleeps run attached without
+ * creating a workload. Session ownership metadata lets resumed processes rediscover their handles.
+ */
+
+const AGENT_BASH = process.env.AGENT_BASH_BIN || `${process.env.HOME}/.local/bin/agent-bash`
+const AGENTS = process.env.AGENT_BASH_AGENT_RUNNER_BIN || `${process.env.HOME}/.local/bin/agents`
+const POLL_MS = Number(process.env.AGENT_BASH_TOOL_POLL_MS || 500)
+const CONSUMER_GRACE_MS = Number(process.env.AGENT_BASH_CONSUMER_GRACE_MS || Math.max(POLL_MS * 3, 1500))
+const MAX_FOREGROUND_SLEEP_MS = Number(process.env.AGENT_BASH_TOOL_MAX_FOREGROUND_SLEEP_MS || 300000)
+const PROCESS_TIMEOUT_MS = Number(process.env.AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS || 30000)
+const LIVE_SESSION_BIND_TIMEOUT_MS = 5000
+const MAX_LIVE_SESSION_RESPONSE_BYTES = 16 * 1024
+
+type DeliveryMode = "sync" | "async"
+type CompletionScope = "root" | "tree"
+
+type RunDispatch = {
+  handle: string
+  dispatchState: "running" | "registration-outcome-unknown"
+}
+
+type StatusReadPolicy = {
+  detail: "header" | "full"
+  progression: "observe-only" | "request-progress"
+}
+
+type ConsumptionAttempt = "consumed" | "ineligible"
+
+type ShellCommandWithoutAdapterControls = {
+  prefix: string
+  body: string
+}
+
+type CommandPolicy = {
+  agentDispatch: boolean
+  delivery: DeliveryMode
+  ownerLease: boolean
+  completionScope: CompletionScope
+}
+
+type CommandAdmission = CommandPolicy &
+  (
+    | { kind: "ordinary"; command: string }
+    | { kind: "unsupported" }
+    | { kind: "direct"; argv: string[] }
+  )
+
+const RESERVED_SPOOLER_ASSIGNMENTS = new Set([
+  "AGENT_BASH_AGENT_RUNNER_BIN",
+  "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+])
+
+function isReservedSpoolerAssignment(name: string): boolean {
+  return RESERVED_SPOOLER_ASSIGNMENTS.has(name)
+}
+
+type ProcessResult = {
+  exitCode: number
+  stdout: string
+  stderr: string
+}
+
+type LiveSessionResponse = {
+  ok?: boolean
+  session_id?: string
+  error?: string
+}
+
+class LiveSessionBindingTransportError extends Error {
+  constructor(message: string, readonly code?: string) {
+    super(message)
+  }
+}
+
+let liveSessionBinding: Promise<void> | undefined
+
+function clearLiveSessionBindingEnvironment() {
+  delete process.env.OULIPOLY_LIVE_SESSION_BIND_SOCKET
+  delete process.env.OULIPOLY_LIVE_SESSION_BIND_TOKEN
+}
+
+function liveSessionBindingTransportIsGone(error: unknown): boolean {
+  return (
+    error instanceof LiveSessionBindingTransportError &&
+    (error.code === "ENOENT" || error.code === "ECONNREFUSED")
+  )
+}
+
+function ownerInvocationUuid(): string | undefined {
+  const raw = process.env.OULIPOLY_PARENT_INVOCATION
+  if (!raw) return undefined
+  try {
+    const parsed = JSON.parse(raw)
+    return typeof parsed.id === "string" && parsed.id.length > 0 ? parsed.id : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function reportLiveSession(
+  socketPath: string,
+  token: string,
+  invocationUuid: string,
+  providerSessionId: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ path: socketPath })
+    let responseBytes = ""
+    let settled = false
+    const timeout = setTimeout(
+      () => finish(new Error(`live session binding timed out after ${LIVE_SESSION_BIND_TIMEOUT_MS}ms`)),
+      LIVE_SESSION_BIND_TIMEOUT_MS,
+    )
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      socket.destroy()
+      if (error) reject(error)
+      else resolve()
+    }
+
+    socket.setEncoding("utf8")
+    socket.on("connect", () => {
+      socket.write(
+        `${JSON.stringify({
+          schema_version: 1,
+          token,
+          invocation_uuid: invocationUuid,
+          provider_session_id: providerSessionId,
+        })}\n`,
+      )
+    })
+    socket.on("data", (chunk: string) => {
+      responseBytes += chunk
+      if (Buffer.byteLength(responseBytes) > MAX_LIVE_SESSION_RESPONSE_BYTES) {
+        finish(new Error("live session binding response exceeded the size limit"))
+        return
+      }
+      const newline = responseBytes.indexOf("\n")
+      if (newline < 0) return
+      try {
+        const response = JSON.parse(responseBytes.slice(0, newline)) as LiveSessionResponse
+        if (response.ok !== true) {
+          finish(new Error(`live session binding was rejected: ${response.error || "unknown error"}`))
+        } else if (response.session_id !== providerSessionId) {
+          finish(new Error("live session binding acknowledged a different provider session"))
+        } else {
+          finish()
+        }
+      } catch (error) {
+        finish(new Error(`live session binding returned invalid JSON: ${String(error)}`))
+      }
+    })
+    socket.on("error", (error) => {
+      const code = (error as Error & { code?: string }).code
+      finish(new LiveSessionBindingTransportError(`live session binding failed: ${error.message}`, code))
+    })
+    socket.on("end", () => finish(new Error("live session binding closed without an acknowledgement")))
+  })
+}
+
+function ensureLiveSessionBinding(providerSessionId: string): Promise<void> | undefined {
+  const socketPath = process.env.OULIPOLY_LIVE_SESSION_BIND_SOCKET
+  const token = process.env.OULIPOLY_LIVE_SESSION_BIND_TOKEN
+  if (!socketPath && !token) return undefined
+  const invocationUuid = ownerInvocationUuid()
+  if (!socketPath || !token || !invocationUuid) {
+    throw new Error("live session binding environment is incomplete")
+  }
+  if (!liveSessionBinding) {
+    liveSessionBinding = reportLiveSession(socketPath, token, invocationUuid, providerSessionId).catch((error) => {
+      if (liveSessionBindingTransportIsGone(error)) {
+        clearLiveSessionBindingEnvironment()
+        return
+      }
+      liveSessionBinding = undefined
+      throw error
+    })
+  }
+  return liveSessionBinding
+}
+
+function runEnv(ownerSessionId?: string) {
+  const invocationUuid = ownerInvocationUuid()
+  const env = { ...process.env }
+  // The handshake capability is scoped to this adapter and is never a workload credential.
+  delete env.OULIPOLY_LIVE_SESSION_BIND_SOCKET
+  delete env.OULIPOLY_LIVE_SESSION_BIND_TOKEN
+  return {
+    ...env,
+    AGENT_BASH_AGENT_RUNNER_BIN: AGENTS,
+    AGENT_BASH_CONSUMER_GRACE_MS: String(CONSUMER_GRACE_MS),
+    ...(ownerSessionId ? { AGENT_BASH_OWNER_SESSION_ID: ownerSessionId } : {}),
+    ...(invocationUuid ? { AGENT_BASH_OWNER_INVOCATION_UUID: invocationUuid } : {}),
+  }
+}
+
+async function runProcess(
+  argv: string[],
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+  operation = "subprocess",
+  environment: Record<string, string> = {},
+  workdir?: string,
+): Promise<ProcessResult> {
+  const child = Bun.spawn(argv, {
+    env: { ...runEnv(ownerSessionId), ...environment },
+    cwd: workdir,
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const stopped = new Promise<never>((_, reject) => {
+    const stop = (message: string) => {
+      child.kill()
+      reject(new Error(message))
+    }
+    timeout = setTimeout(() => stop(`${operation} timed out after ${PROCESS_TIMEOUT_MS}ms`), PROCESS_TIMEOUT_MS)
+    if (abort) {
+      if (abort.aborted) stop("subprocess aborted")
+      else abort.addEventListener("abort", () => stop("subprocess aborted"), { once: true })
+    }
+  })
+  try {
+    const completed = Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]).then(([exitCode, stdout, stderr]) => ({ exitCode, stdout, stderr }))
+    return await Promise.race([completed, stopped])
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
+}
+
+function processFailure(operation: string, result: ProcessResult): Error {
+  const detail = result.stderr.trim() || result.stdout.trim()
+  return new Error(`${operation} failed with exit code ${result.exitCode}${detail ? `: ${detail}` : ""}`)
+}
+
+async function checkedProcessText(
+  argv: string[],
+  operation: string,
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+  environment?: Record<string, string>,
+  workdir?: string,
+): Promise<string> {
+  const result = await runProcess(argv, ownerSessionId, abort, operation, environment, workdir)
+  if (result.exitCode !== 0) throw processFailure(operation, result)
+  return result.stdout.trim()
+}
+
+async function statusText(
+  handle: string,
+  policy: StatusReadPolicy,
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<string> {
+  const args = [AGENT_BASH, "status"]
+  if (policy.detail === "header") args.push("--tail-bytes", "0")
+  if (policy.progression === "observe-only") args.push("--observe-only")
+  args.push(handle)
+  const status = await checkedProcessText(args, "agent-bash status", ownerSessionId, abort)
+  const header = status.split("\n", 1)[0]
+  if (!/^(RUNNING|DONE rc=-?\d+|ERROR rc=-?\d+) handle=/.test(header) || !header.includes(`handle=${handle}`)) {
+    throw new Error(`agent-bash status returned invalid output: ${header || "<empty>"}`)
+  }
+  return status
+}
+
+function observeVisibleHandle(
+  handle: string,
+  runningDetail: "full",
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<string>
+function observeVisibleHandle(
+  handle: string,
+  runningDetail: "omit",
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<string | undefined>
+async function observeVisibleHandle(
+  handle: string,
+  runningDetail: "omit" | "full",
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<string | undefined> {
+  const header = await statusText(
+    handle,
+    { detail: "header", progression: "observe-only" },
+    ownerSessionId,
+    abort,
+  )
+  if (isTerminalStatus(header)) {
+    await attemptTerminalConsumption(handle, ownerSessionId, abort)
+    return statusText(handle, { detail: "full", progression: "request-progress" }, ownerSessionId, abort)
+  }
+  if (runningDetail === "omit") return undefined
+
+  const status = await statusText(
+    handle,
+    { detail: "full", progression: "observe-only" },
+    ownerSessionId,
+    abort,
+  )
+  if (!isTerminalStatus(status)) return status
+  await attemptTerminalConsumption(handle, ownerSessionId, abort)
+  return statusText(handle, { detail: "full", progression: "request-progress" }, ownerSessionId, abort)
+}
+
+async function attemptTerminalConsumption(
+  handle: string,
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<ConsumptionAttempt> {
+  const consume = await runProcess([AGENT_BASH, "consume", handle], ownerSessionId, abort, "agent-bash consume")
+  if (consume.exitCode === 0) return "consumed"
+  if (consume.exitCode === 77) return "ineligible"
+  throw processFailure("agent-bash consume", consume)
+}
+
+async function modeText(handle: string, ownerSessionId: string, abort?: AbortSignal): Promise<DeliveryMode> {
+  const mode = await checkedProcessText([AGENT_BASH, "mode", handle], "agent-bash mode", ownerSessionId, abort)
+  if (!validDeliveryMode(mode)) throw new Error(`agent-bash mode returned invalid output: ${mode || "<empty>"}`)
+  return mode
+}
+
+function isTerminalStatus(status: string): boolean {
+  return status.startsWith("DONE") || status.startsWith("ERROR")
+}
+
+function commandProvided(command: string | undefined): command is string {
+  return Boolean(command)
+}
+
+export function standaloneSleepMilliseconds(command: string): number | undefined {
+  const match = /^\s*sleep\s+((?:\d+(?:\.\d*)?|\.\d+))\s*$/.exec(command)
+  if (!match) return undefined
+
+  const milliseconds = Math.ceil(Number(match[1]) * 1000)
+  if (!Number.isFinite(milliseconds) || milliseconds < 0 || milliseconds > MAX_FOREGROUND_SLEEP_MS) {
+    return undefined
+  }
+  return milliseconds
+}
+
+async function runStandaloneSleep(milliseconds: number): Promise<string> {
+  await Bun.sleep(milliseconds)
+  return "DONE rc=0\n--- output ---"
+}
+
+function validDeliveryMode(value: string | undefined): value is DeliveryMode {
+  return value === "sync" || value === "async"
+}
+
+function missingCommandResponse(): string {
+  return "error: provide `command` (to run) or `handle` (to poll an existing background command)"
+}
+
+function invalidDeliveryResponse(value: string): string {
+  return `error: delivery must be \"sync\" or \"async\", got ${JSON.stringify(value)}`
+}
+
+type ListControl = {
+  all: boolean
+  json: boolean
+}
+
+type AgentBashControl =
+  | { kind: "list"; options: ListControl }
+  | { kind: "cancel"; handle: string }
+
+function classifyAgentBashControl(command: string): AgentBashControl | undefined {
+  const trimmed = command.trim()
+  if (!trimmed) return undefined
+  const tokens = trimmed.split(/\s+/)
+  if (tokens[0] !== AGENT_BASH && tokens[0] !== "agent-bash") return undefined
+
+  if (tokens[1] === "cancel" && tokens.length === 3 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(tokens[2])) {
+    return { kind: "cancel", handle: tokens[2] }
+  }
+  if (tokens.length < 2 || tokens.length > 4) return undefined
+  if (tokens[1] !== "list") return undefined
+
+  let all = false
+  let json = false
+  for (const token of tokens.slice(2)) {
+    if (token === "--all" && !all) {
+      all = true
+    } else if (token === "--json" && !json) {
+      json = true
+    } else {
+      return undefined
+    }
+  }
+  return { kind: "list", options: { all, json } }
+}
+
+async function executeAgentBashControl(
+  control: AgentBashControl,
+  ownerSessionId: string,
+  abort?: AbortSignal,
+): Promise<string> {
+  if (control.kind === "cancel") {
+    return checkedProcessText([AGENT_BASH, "cancel", control.handle], "agent-bash cancel", ownerSessionId)
+  }
+
+  const argv = [AGENT_BASH, "list"]
+  if (control.options.all) argv.push("--all")
+  if (control.options.json) argv.push("--json")
+
+  const result = await runProcess(argv, ownerSessionId, abort, "agent-bash list")
+  if (result.exitCode !== 0) throw processFailure("agent-bash list", result)
+  return result.stdout
+}
+
+function parseRunDispatch(runOut: string): RunDispatch | undefined {
+  try {
+    const parsed = JSON.parse(runOut)
+    return typeof parsed.handle === "string" &&
+      (parsed.dispatch_state === "running" || parsed.dispatch_state === "registration-outcome-unknown")
+      ? { handle: parsed.handle, dispatchState: parsed.dispatch_state }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function dispatchErrorResponse(runOut: string): string {
+  return `agent-bash spooler error (could not dispatch): ${runOut}`
+}
+
+function registrationOutcomeUnknownResponse(handle: string): string {
+  return (
+    `Dispatch unresolved (handle=${handle}): completion registration was admitted but its outcome is unknown. ` +
+    "The retained handle is terminal, the workload was not started, and registration will not be replayed."
+  )
+}
+
+function startsWithToken(command: string, token: string): boolean {
+  return command === token || command.startsWith(`${token} `)
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+// Reserved spooler assignments are neutralized for classification and shell
+// rewriting. Ordinary assignments and shell semantics remain; direct execution
+// still requires parseStructuredExplicitRun admission.
+function stripReservedSpoolerAssignmentsForShellRouting(command: string): ShellCommandWithoutAdapterControls {
+  const leadingWhitespace = command.match(/^\s*/)?.[0] || ""
+  let body = command.slice(leadingWhitespace.length)
+  let environmentPrefix = ""
+  const assignment = /^[A-Za-z_][A-Za-z0-9_]*=(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s]*)\s+/
+  while (true) {
+    const matched = body.match(assignment)?.[0]
+    if (!matched) break
+    const name = matched.slice(0, matched.indexOf("="))
+    if (!isReservedSpoolerAssignment(name)) environmentPrefix += matched
+    body = body.slice(matched.length)
+  }
+  return { prefix: leadingWhitespace + environmentPrefix, body }
+}
+
+// This intentionally broad recognizer routes potentially privileged input to structured
+// admission. The resulting admission record owns every semantic fact consumed by callers.
+function conservativelyRecognizesExplicitRun(command: string): boolean {
+  const { body } = stripReservedSpoolerAssignmentsForShellRouting(command)
+  return [`${AGENT_BASH} run`, "agent-bash run"].some((prefix) => startsWithToken(body, prefix))
+}
+
+function recognizesAgentDispatchForAdmission(command: string): boolean {
+  const { body } = stripReservedSpoolerAssignmentsForShellRouting(command)
+  if (
+    startsWithToken(body, "agents") ||
+    startsWithToken(body, AGENTS) ||
+    startsWithToken(body, "oulipoly-agent-runner")
+  ) {
+    return true
+  }
+  return (
+    conservativelyRecognizesExplicitRun(body) &&
+    /\s--\s+(?:[^\s]+\/)?(?:agents|oulipoly-agent-runner)(?:\s|$)/.test(body)
+  )
+}
+
+function pinAgentRunnerBinary(command: string): string {
+  const shellCommand = stripReservedSpoolerAssignmentsForShellRouting(command)
+  let body = shellCommand.body
+  for (const token of ["agents", "oulipoly-agent-runner"]) {
+    if (startsWithToken(body, token)) {
+      return `${shellCommand.prefix}${shellQuote(AGENTS)}${body.slice(token.length)}`
+    }
+  }
+  body = body.replace(/(\s--\s+)(?:agents|oulipoly-agent-runner)(?=\s|$)/, `$1${shellQuote(AGENTS)}`)
+  return `${shellCommand.prefix}${body}`
+}
+
+function isHeadlessCaller(): boolean {
+  return process.stdin.isTTY !== true
+}
+
+function selectedDelivery(agentDispatch: boolean, requested: string | undefined): DeliveryMode {
+  if (agentDispatch && isHeadlessCaller()) return "async"
+  if (validDeliveryMode(requested)) return requested
+  return agentDispatch ? "async" : "sync"
+}
+
+function leaseToCaller(delivery: DeliveryMode): boolean {
+  return delivery === "sync" || !isHeadlessCaller()
+}
+
+function structuredShellWords(command: string): string[] | undefined {
+  const words: string[] = []
+  let word = ""
+  let started = false
+  let quote: "single" | "double" | undefined
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]
+    if (quote === "single") {
+      if (character === "'") quote = undefined
+      else word += character
+      continue
+    }
+    if (quote === "double") {
+      if (character === '"') {
+        quote = undefined
+      } else if (character === "\\") {
+        index += 1
+        if (index >= command.length) return undefined
+        word += command[index]
+      } else if (character === "$" || character === "`") {
+        return undefined
+      } else {
+        word += character
+      }
+      continue
+    }
+    if (character === "\n" || character === "\r") return undefined
+    if (/\s/.test(character)) {
+      if (started) {
+        words.push(word)
+        word = ""
+        started = false
+      }
+    } else if (character === "'") {
+      quote = "single"
+      started = true
+    } else if (character === '"') {
+      quote = "double"
+      started = true
+    } else if (character === "\\") {
+      index += 1
+      if (index >= command.length) return undefined
+      word += command[index]
+      started = true
+    } else if ("$`;|&<>()".includes(character)) {
+      return undefined
+    } else {
+      word += character
+      started = true
+    }
+  }
+  if (quote) return undefined
+  if (started) words.push(word)
+  return words
+}
+
+function parseStructuredExplicitRun(
+  command: string,
+  delivery: DeliveryMode,
+  ownerLease: boolean,
+): string[] | undefined {
+  const words = structuredShellWords(command)
+  if (!words) return undefined
+  while (words[0]?.match(/^[A-Za-z_][A-Za-z0-9_]*=/)) {
+    const assignment = words.shift()!
+    const separator = assignment.indexOf("=")
+    const name = assignment.slice(0, separator)
+    if (!isReservedSpoolerAssignment(name)) return undefined
+  }
+  if ((words[0] !== AGENT_BASH && words[0] !== "agent-bash") || words[1] !== "run") return undefined
+  words[0] = AGENT_BASH
+  const separator = words.indexOf("--")
+  const optionsEnd = separator < 0 ? words.length : separator
+  for (let index = 2; index < optionsEnd; index += 1) {
+    if (words[index] === "--delivery") {
+      words.splice(index, 2)
+      break
+    }
+  }
+  const controls = ["--delivery", delivery]
+  if (ownerLease) controls.unshift("--cancel-on-owner-exit", "--owner-pid", String(process.pid))
+  words.splice(2, 0, ...controls)
+  const workload = words.indexOf("--") + 1
+  if (workload > 0 && ["agents", "oulipoly-agent-runner"].includes(words[workload])) words[workload] = AGENTS
+  return words
+}
+
+function admitCommand(command: string, requestedDelivery: string | undefined): CommandAdmission {
+  const agentDispatch = recognizesAgentDispatchForAdmission(command)
+  const delivery = selectedDelivery(agentDispatch, requestedDelivery)
+  const ownerLease = leaseToCaller(delivery)
+  const completionScope = agentDispatch ? "tree" : "root"
+  const policy = { agentDispatch, delivery, ownerLease, completionScope } as const
+  if (!conservativelyRecognizesExplicitRun(command)) return { ...policy, kind: "ordinary", command }
+  const argv = parseStructuredExplicitRun(command, delivery, ownerLease)
+  return argv ? { ...policy, kind: "direct", argv } : { ...policy, kind: "unsupported" }
+}
+
+async function dispatchCommand(
+  admission: CommandAdmission,
+  ownerSessionId: string,
+  workdir?: string,
+): Promise<string> {
+  if (admission.kind === "unsupported") {
+    throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
+  }
+  if (admission.kind === "direct") {
+    return checkedProcessText(admission.argv, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir)
+  }
+  const command = pinAgentRunnerBinary(admission.command)
+  const args = [AGENT_BASH, "run"]
+  if (!admission.ownerLease) {
+    args.push("--completion-scope", admission.completionScope, "--delivery", admission.delivery)
+  } else {
+    args.push(
+      "--cancel-on-owner-exit",
+      "--owner-pid",
+      String(process.pid),
+      "--completion-scope",
+      admission.completionScope,
+      "--delivery",
+      admission.delivery,
+    )
+  }
+  args.push("--", "bash", "-lc", command)
+  return checkedProcessText(args, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir)
+}
+
+async function cancelResult(handle: string, ownerSessionId: string): Promise<string> {
+  const result = await checkedProcessText(
+    [AGENT_BASH, "cancel", handle],
+    "agent-bash cancel",
+    ownerSessionId,
+  )
+  return `Cancellation requested (handle=${handle}). ${result}`
+}
+
+async function waitForSyncResult(
+  handle: string,
+  abort: AbortSignal,
+  ownerSessionId: string,
+): Promise<string> {
+  const aborted = new Promise<void>((resolve) => {
+    if (abort.aborted) resolve()
+    else abort.addEventListener("abort", () => resolve(), { once: true })
+  })
+  while (true) {
+    if (abort.aborted) return cancelResult(handle, ownerSessionId)
+    try {
+      const status = await observeVisibleHandle(handle, "omit", ownerSessionId, abort)
+      if (status !== undefined) return status
+      if ((await modeText(handle, ownerSessionId, abort)) === "async") return asyncDispatchResponse(handle)
+    } catch (error) {
+      if (abort.aborted) return cancelResult(handle, ownerSessionId)
+      throw error
+    }
+    await Promise.race([Bun.sleep(POLL_MS), aborted])
+  }
+}
+
+function asyncDispatchResponse(handle: string, endHeadlessTurn = false): string {
+  const response =
+    `Running asynchronously (handle=${handle}). You will be woken with the result when it completes, ` +
+    `or call bash with { handle: "${handle}" } to poll.`
+  return endHeadlessTurn ? `${response} End this headless turn now so the notification can resume it.` : response
+}
+
+export default tool({
+  description:
+    "Run a shell command under a detached supervisor. Ordinary commands default to synchronous in-band completion; " +
+    "ordinary commands complete with their root process, while child-agent dispatches retain full-tree completion. " +
+    "Child-agent dispatches default to asynchronous mailbox delivery and return a handle immediately. Set `delivery` " +
+    "to override either default. Headless child-agent dispatches remain asynchronous so their caller can end its turn. " +
+    "A synchronous call can be detached externally without terminating its workload. Exact " +
+    "`agent-bash list [--all] [--json]` observations and bounded standalone sleeps run attached without creating a " +
+    `workload handle. Leading agent-runner commands are pinned to ${AGENTS}. An optional workdir sets the supervised ` +
+    "process working directory.",
+  args: {
+    command: tool.schema.string().describe("the shell command to run").optional(),
+    handle: tool.schema.string().describe("poll an existing asynchronous command by its handle").optional(),
+    delivery: tool.schema.string().describe('completion delivery: "sync" or "async"').optional(),
+    workdir: tool.schema.string().describe("working directory for the supervised process").optional(),
+  },
+  async execute(args, context) {
+    if (args.handle) {
+      return observeVisibleHandle(args.handle, "full", context.sessionID, context.abort)
+    }
+    if (!commandProvided(args.command)) return missingCommandResponse()
+    if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {
+      return invalidDeliveryResponse(args.delivery)
+    }
+    const agentBashControl = classifyAgentBashControl(args.command)
+    if (agentBashControl) {
+      if (agentBashControl.kind === "cancel") {
+        const binding = ensureLiveSessionBinding(context.sessionID)
+        if (binding) await binding
+      }
+      return executeAgentBashControl(agentBashControl, context.sessionID, context.abort)
+    }
+
+    if (context.abort.aborted) return "Cancellation requested before dispatch."
+    const admission = admitCommand(args.command, args.delivery)
+    const sleepMilliseconds = standaloneSleepMilliseconds(args.command)
+    if (admission.delivery === "sync" && sleepMilliseconds !== undefined) {
+      return runStandaloneSleep(sleepMilliseconds)
+    }
+    const binding = ensureLiveSessionBinding(context.sessionID)
+    if (binding) await binding
+    const runOut = await dispatchCommand(admission, context.sessionID, args.workdir)
+    const dispatch = parseRunDispatch(runOut)
+    if (!dispatch) return dispatchErrorResponse(runOut)
+    if (dispatch.dispatchState === "registration-outcome-unknown") {
+      return registrationOutcomeUnknownResponse(dispatch.handle)
+    }
+    if (context.abort.aborted) return cancelResult(dispatch.handle, context.sessionID)
+    if (admission.delivery === "async") {
+      return asyncDispatchResponse(dispatch.handle, admission.agentDispatch && isHeadlessCaller())
+    }
+    return waitForSyncResult(dispatch.handle, context.abort, context.sessionID)
+  },
+})

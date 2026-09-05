@@ -1,0 +1,9 @@
+{
+  "source_repository": "agent-bash-tool",
+  "source_branch": "fix/opencode-bash-workdir-types",
+  "source_commit": "daedaeb604f1e26efd6ae71c9fee02a3916f610d",
+  "source_path": "integrations/opencode/tools/bash.ts",
+  "sha256": "23dbb0dfd555e3ac720659e5b22a1fe0119c5ebe13102b09231ab47e4fd42c2d",
+  "verified_installed_opencode_copy": true,
+  "verified_date": "2026-09-04"
+}
