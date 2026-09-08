@@ -329,8 +329,12 @@ pub fn decode_request(stdin: &[u8]) -> Result<RequestEnvelope, ProviderFailure> 
     let raw = parse_raw_request(stdin).map_err(invalid_json_failure)?;
     let request_id = fallback_request_id(request_id_from_raw(&raw));
     validate_params_present(&raw, &request_id)?;
-    let request = parse_request_envelope(raw, &request_id)?;
-    validate_request_envelope(request)
+    let request = parse_request_envelope(raw.clone(), &request_id)?;
+    let request = validate_request_envelope(request)?;
+    agent_provider_contract::SchemaRegistry::new()
+        .validate_request_envelope(&raw)
+        .map_err(|err| invalid_envelope_failure(&request_id, err))?;
+    Ok(request)
 }
 
 fn write_enveloped_operation<W: Write, P, H>(
@@ -418,7 +422,55 @@ fn write_invocation_result<W: Write>(
 }
 
 fn parse_raw_request(stdin: &[u8]) -> Result<Value, serde_json::Error> {
-    serde_json::from_slice(stdin)
+    let raw = serde_json::from_slice::<&serde_json::value::RawValue>(stdin)?;
+    parse_json_value(raw, 128)
+}
+
+// Arbitrary-precision Serde uses private map transports for numbers/raw values.
+// Select containers by their actual JSON token so an ordinary caller object
+// cannot be mistaken for either transport. Retain serde_json's default nesting
+// limit and last-key-wins object mapping; no numeric magnitude limit is added.
+fn parse_json_value(
+    raw: &serde_json::value::RawValue,
+    remaining_depth: usize,
+) -> Result<Value, serde_json::Error> {
+    match raw.get().as_bytes()[0] {
+        b'{' => parse_json_object(raw, next_json_depth(remaining_depth)?),
+        b'[' => parse_json_array(raw, next_json_depth(remaining_depth)?),
+        _ => serde_json::from_str(raw.get()),
+    }
+}
+
+fn next_json_depth(remaining_depth: usize) -> Result<usize, serde_json::Error> {
+    remaining_depth
+        .checked_sub(1)
+        .filter(|depth| *depth > 0)
+        .ok_or_else(|| <serde_json::Error as serde::de::Error>::custom("recursion limit exceeded"))
+}
+
+fn parse_json_object(
+    raw: &serde_json::value::RawValue,
+    remaining_depth: usize,
+) -> Result<Value, serde_json::Error> {
+    let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(raw.get())?;
+    fields
+        .into_iter()
+        .map(|(key, value)| parse_json_value(value, remaining_depth).map(|value| (key, value)))
+        .collect::<Result<serde_json::Map<_, _>, _>>()
+        .map(Value::Object)
+}
+
+fn parse_json_array(
+    raw: &serde_json::value::RawValue,
+    remaining_depth: usize,
+) -> Result<Value, serde_json::Error> {
+    let items: Vec<&serde_json::value::RawValue> = serde_json::from_str(raw.get())?;
+    items
+        .into_iter()
+        .map(|value| parse_json_value(value, remaining_depth))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
 }
 
 fn invalid_json_failure(err: serde_json::Error) -> ProviderFailure {
@@ -461,7 +513,18 @@ fn parse_request_envelope(
     raw: Value,
     request_id: &str,
 ) -> Result<RequestEnvelope, ProviderFailure> {
-    serde_json::from_value(raw).map_err(|err| invalid_envelope_failure(request_id, err))
+    let mut fields = raw;
+    // Params are already parsed, and common admission permits every JSON value.
+    // Move them unchanged around the typed Serde transport rather than decoding
+    // Value a second time (which could reinterpret private-looking object keys).
+    let params = fields
+        .as_object_mut()
+        .and_then(|fields| fields.remove("params"));
+    fields["params"] = Value::Null;
+    let mut request: RequestEnvelope =
+        serde_json::from_value(fields).map_err(|err| invalid_envelope_failure(request_id, err))?;
+    request.params = params.expect("params presence was checked before typed mapping");
+    Ok(request)
 }
 
 fn validate_request_envelope(request: RequestEnvelope) -> Result<RequestEnvelope, ProviderFailure> {
@@ -581,7 +644,7 @@ fn empty_params_failure(request_id: &str, code: &'static str) -> ProviderFailure
     )
 }
 
-fn invalid_envelope_failure(request_id: &str, err: serde_json::Error) -> ProviderFailure {
+fn invalid_envelope_failure(request_id: &str, err: impl std::fmt::Display) -> ProviderFailure {
     ProviderFailure::invalid_request(
         request_id,
         "invalid_envelope",
@@ -652,5 +715,430 @@ mod tests {
         .expect("serialize request fixture");
         let failure = decode_request(&bytes).expect_err("oversized host env must fail");
         assert_eq!(failure.code, "invalid_host");
+    }
+    fn wire_request() -> Value {
+        json!({"contract": CONTRACT, "request_id": "req-wire", "host": {"app": "fixture"}, "params": {}})
+    }
+
+    fn decode_value(value: &Value) -> Result<RequestEnvelope, ProviderFailure> {
+        decode_request(&serde_json::to_vec(value).unwrap())
+    }
+
+    fn assert_failure(value: &Value, code: &str, id: &str) {
+        let failure = decode_value(value).unwrap_err();
+        println!(
+            "failure code={} id={} category={} exit={}",
+            failure.code, failure.request_id, failure.category, failure.exit_code
+        );
+        assert_eq!(
+            (
+                failure.code,
+                failure.request_id.as_str(),
+                failure.category,
+                failure.exit_code
+            ),
+            (code, id, "invalid_request", 2)
+        );
+    }
+
+    #[test]
+    fn common_envelope_presence_and_numeric_admission() {
+        for token in [
+            "80",
+            "80.0",
+            "8e1",
+            "800e-1",
+            "0",
+            "-0",
+            "-0.0",
+            "-0e-999999999999999999999",
+            "18446744073709551616",
+            "18446744073709551617",
+            "1e1000001",
+            "1e999999999999999999999",
+        ] {
+            let mut value = wire_request();
+            value["host"]["deadline_unix_ms"] = serde_json::from_str(token).unwrap();
+            let actual = decode_value(&value).unwrap();
+            let number = actual.host.deadline_unix_ms.unwrap();
+            println!(
+                "deadline input={token} decoded={} serialized={}",
+                number.as_number(),
+                serde_json::to_string(&number).unwrap()
+            );
+            assert_eq!(
+                number.as_number(),
+                value["host"]["deadline_unix_ms"].as_number().unwrap()
+            );
+        }
+        for token in [
+            "-1",
+            "-1e-1000001",
+            "80.5",
+            "80.00000000000000001",
+            "1e-1000001",
+            "null",
+            "true",
+            "\"80\"",
+            "[]",
+            "{}",
+        ] {
+            let mut value = wire_request();
+            value["host"]["deadline_unix_ms"] = serde_json::from_str(token).unwrap();
+            println!("reject deadline token={token}");
+            assert_failure(&value, "invalid_envelope", "req-wire");
+        }
+        for field in [
+            "app_version",
+            "platform",
+            "working_directory",
+            "config_root",
+            "data_root",
+        ] {
+            assert_optional_host_field(field);
+        }
+        for value in [
+            json!(""),
+            Value::Null,
+            json!(1),
+            json!(true),
+            json!({}),
+            json!([]),
+        ] {
+            let mut request = wire_request();
+            request["provider_instance_id"] = value;
+            assert_failure(&request, "invalid_envelope", "req-wire");
+        }
+        for value in [" ", "account-a", "account-b"] {
+            let mut request = wire_request();
+            request["provider_instance_id"] = json!(value);
+            assert_eq!(
+                decode_value(&request)
+                    .unwrap()
+                    .provider_instance_id
+                    .as_deref(),
+                Some(value)
+            );
+        }
+        assert!(decode_value(&wire_request())
+            .unwrap()
+            .provider_instance_id
+            .is_none());
+        assert!(decode_value(&wire_request()).unwrap().host.env.is_none());
+        for env in [json!({}), json!({"SENTINEL": "not-a-secret"})] {
+            let mut request = wire_request();
+            request["host"]["env"] = env.clone();
+            let decoded = decode_value(&request).unwrap();
+            println!("env input={env} decoded={:?}", decoded.host.env);
+            assert_eq!(
+                serde_json::to_value(decoded.host.env.as_ref().unwrap()).unwrap(),
+                env
+            );
+        }
+        for env in [Value::Null, json!(false), json!([]), json!({"SENTINEL": 1})] {
+            let mut request = wire_request();
+            request["host"]["env"] = env;
+            assert_failure(&request, "invalid_envelope", "req-wire");
+        }
+        for params in [
+            Value::Null,
+            json!(true),
+            json!([]),
+            serde_json::from_str(
+                r#"{"nested":[18446744073709551617,80.00000000000000001,1e999999999999999999999]}"#,
+            )
+            .unwrap(),
+        ] {
+            let mut request = wire_request();
+            request["params"] = params.clone();
+            assert_eq!(decode_value(&request).unwrap().params, params);
+        }
+    }
+
+    fn assert_optional_host_field(field: &str) {
+        for value in [None, Some(""), Some("sentinel/second-context")] {
+            let mut request = wire_request();
+            if let Some(value) = value {
+                request["host"][field] = json!(value);
+            }
+            let host = decode_value(&request).unwrap().host;
+            let actual = match field {
+                "app_version" => host.app_version,
+                "platform" => host.platform,
+                "working_directory" => host.working_directory,
+                "config_root" => host.config_root,
+                "data_root" => host.data_root,
+                _ => unreachable!(),
+            };
+            println!("host field={field} decoded={actual:?}");
+            assert_eq!(actual.as_deref(), value);
+        }
+        for invalid in [Value::Null, json!(1), json!(true), json!([]), json!({})] {
+            let mut request = wire_request();
+            request["host"][field] = invalid;
+            assert_failure(&request, "invalid_envelope", "req-wire");
+        }
+    }
+
+    #[test]
+    fn common_envelope_failure_precedence() {
+        let mut missing = wire_request();
+        missing.as_object_mut().unwrap().remove("params");
+        missing["contract"] = json!("wrong");
+        missing.as_object_mut().unwrap().remove("host");
+        assert_failure(&missing, "missing_params", "req-wire");
+        let mut wrong = wire_request();
+        wrong["contract"] = json!("wrong");
+        assert_failure(&wrong, "unsupported_contract", "req-wire");
+        for token in ["80.0", "18446744073709551617", "null"] {
+            let mut request = wrong.clone();
+            request["host"]["deadline_unix_ms"] = serde_json::from_str(token).unwrap();
+            assert_failure(&request, "unsupported_contract", "req-wire");
+        }
+        for token in ["-1", "80.00000000000000001", "true"] {
+            let mut request = wrong.clone();
+            request["host"]["deadline_unix_ms"] = serde_json::from_str(token).unwrap();
+            assert_failure(&request, "invalid_envelope", "req-wire");
+        }
+        wrong["host"]["unexpected"] = json!(true);
+        assert_failure(&wrong, "invalid_envelope", "req-wire");
+        for (field, value, code, id) in [
+            ("request_id", json!(""), "invalid_request_id", "unknown"),
+            ("request_id", json!("  "), "invalid_request_id", "unknown"),
+            ("request_id", json!(1), "invalid_envelope", "unknown"),
+            ("contract", json!(1), "invalid_envelope", "req-wire"),
+        ] {
+            let mut request = wire_request();
+            request[field] = value;
+            assert_failure(&request, code, id);
+        }
+        for field in ["request_id", "contract", "host"] {
+            let mut request = wire_request();
+            request.as_object_mut().unwrap().remove(field);
+            assert_failure(
+                &request,
+                "invalid_envelope",
+                if field == "request_id" {
+                    "unknown"
+                } else {
+                    "req-wire"
+                },
+            );
+        }
+        for app in [json!(""), json!(" ")] {
+            let mut request = wire_request();
+            request["host"]["app"] = app;
+            request["provider_instance_id"] = Value::Null;
+            assert_failure(&request, "invalid_host", "req-wire");
+        }
+        let mut request = wire_request();
+        request["host"].as_object_mut().unwrap().remove("app");
+        assert_failure(&request, "invalid_envelope", "req-wire");
+        request["host"]["app"] = json!(1);
+        assert_failure(&request, "invalid_envelope", "req-wire");
+        let args = vec!["provider".into(), "describe".into(), "bad-argv".into()];
+        assert_wire_error(
+            &args,
+            &vec![b'!'; MAX_REQUEST_ENVELOPE_BYTES + 1],
+            "request_envelope_capacity_exceeded",
+            "unknown",
+        );
+        for bytes in [b"{bad".as_slice(), b"{} {}".as_slice()] {
+            assert_wire_error(&args, bytes, "invalid_json", "unknown");
+        }
+        assert_wire_error(
+            &args,
+            &serde_json::to_vec(&wire_request()).unwrap(),
+            "invalid_argv",
+            "req-wire",
+        );
+    }
+
+    fn assert_wire_error(args: &[String], bytes: &[u8], code: &str, id: &str) {
+        let (stdout, exit) = handle_invocation(args, bytes);
+        println!("output={} exit={exit}", String::from_utf8_lossy(&stdout));
+        let actual: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(exit, 2);
+        assert_eq!(actual["error"]["code"], code);
+        assert_eq!(actual["error"]["category"], "invalid_request");
+        assert_eq!(actual["request_id"], id);
+    }
+
+    #[test]
+    fn common_envelope_authored_byte_boundaries() {
+        for (pointer, bound, code, id) in [
+            (
+                "/request_id",
+                MAX_REQUEST_ID_BYTES,
+                "request_envelope_capacity_exceeded",
+                "unknown",
+            ),
+            (
+                "/provider_instance_id",
+                MAX_PROVIDER_INSTANCE_ID_BYTES,
+                "request_envelope_capacity_exceeded",
+                "unknown",
+            ),
+            (
+                "/host/app",
+                MAX_HOST_LABEL_BYTES,
+                "invalid_host",
+                "req-wire",
+            ),
+            (
+                "/host/app_version",
+                MAX_HOST_LABEL_BYTES,
+                "invalid_host",
+                "req-wire",
+            ),
+            (
+                "/host/platform",
+                MAX_HOST_LABEL_BYTES,
+                "invalid_host",
+                "req-wire",
+            ),
+            (
+                "/host/working_directory",
+                MAX_HOST_PATH_BYTES,
+                "invalid_host",
+                "req-wire",
+            ),
+            (
+                "/host/config_root",
+                MAX_HOST_PATH_BYTES,
+                "invalid_host",
+                "req-wire",
+            ),
+            (
+                "/host/data_root",
+                MAX_HOST_PATH_BYTES,
+                "invalid_host",
+                "req-wire",
+            ),
+        ] {
+            assert_string_boundary(pointer, bound, code, id);
+        }
+        for count in [MAX_HOST_ENV_ENTRIES, MAX_HOST_ENV_ENTRIES + 1] {
+            let env = (0..count)
+                .map(|i| (i.to_string(), json!("v")))
+                .collect::<serde_json::Map<_, _>>();
+            assert_env_boundary(json!(env), count == MAX_HOST_ENV_ENTRIES);
+        }
+        assert_env_boundary(json!({"é".repeat(MAX_HOST_ENV_KEY_BYTES/2): "v"}), true);
+        assert_env_boundary(
+            json!({format!("{}x", "é".repeat(MAX_HOST_ENV_KEY_BYTES/2)): "v"}),
+            false,
+        );
+        assert_env_boundary(json!({"k": "é".repeat(MAX_HOST_ENV_VALUE_BYTES/2)}), true);
+        assert_env_boundary(
+            json!({"k": format!("{}x", "é".repeat(MAX_HOST_ENV_VALUE_BYTES/2))}),
+            false,
+        );
+        let mut env = (0..4)
+            .map(|i| {
+                (
+                    i.to_string(),
+                    json!("x".repeat(MAX_HOST_ENV_VALUE_BYTES - 1)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        assert_env_boundary(json!(env), true);
+        env.insert("0".into(), json!("x".repeat(MAX_HOST_ENV_VALUE_BYTES)));
+        assert_env_boundary(json!(env), false);
+        let mut request = wire_request();
+        request["params"] = json!("");
+        let base = serde_json::to_vec(&request).unwrap().len();
+        request["params"] = json!("x".repeat(MAX_REQUEST_ENVELOPE_BYTES - base));
+        let mut bytes = serde_json::to_vec(&request).unwrap();
+        assert_eq!(bytes.len(), MAX_REQUEST_ENVELOPE_BYTES);
+        assert!(decode_request(&bytes).is_ok());
+        println!("wire bytes={} admitted=true", bytes.len());
+        bytes.push(b' ');
+        let failure = decode_request(&bytes).unwrap_err();
+        println!("wire bytes={} error={}", bytes.len(), failure.code);
+        assert_eq!(
+            (failure.code, failure.request_id.as_str()),
+            ("request_envelope_capacity_exceeded", "unknown")
+        );
+    }
+
+    fn assert_string_boundary(pointer: &str, bound: usize, code: &str, id: &str) {
+        let mut request = wire_request();
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        let object = if parent.is_empty() {
+            request.as_object_mut().unwrap()
+        } else {
+            request
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+        };
+        object.insert(key.into(), json!("é".repeat(bound / 2)));
+        assert!(decode_value(&request).is_ok(), "{pointer} at {bound}");
+        *request.pointer_mut(pointer).unwrap() = json!(format!("{}x", "é".repeat(bound / 2)));
+        println!(
+            "byte boundary pointer={pointer} admitted={bound} rejected={}",
+            bound + 1
+        );
+        assert_failure(&request, code, id);
+    }
+
+    fn assert_env_boundary(env: Value, admitted: bool) {
+        let mut request = wire_request();
+        request["host"]["env"] = env;
+        println!(
+            "env entries={} bytes={} admitted={admitted}",
+            request["host"]["env"].as_object().unwrap().len(),
+            request["host"]["env"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| k.len() + v.as_str().unwrap().len())
+                .sum::<usize>()
+        );
+        if admitted {
+            assert!(decode_value(&request).is_ok());
+            return;
+        }
+        assert_failure(&request, "invalid_host", "req-wire");
+    }
+
+    #[test]
+    fn common_envelope_retains_json_token_shapes() {
+        for key in [
+            "$serde_json::private::Number",
+            "$serde_json::private::RawValue",
+        ] {
+            let mut request = wire_request();
+            request["host"]["deadline_unix_ms"] = json!({key: "80"});
+            assert_failure(&request, "invalid_envelope", "req-wire");
+            request["host"]
+                .as_object_mut()
+                .unwrap()
+                .remove("deadline_unix_ms");
+            request["params"] = json!({"nested": [{key: "80"}]});
+            let decoded = decode_value(&request).unwrap();
+            println!(
+                "literal-object params input={} actual={}",
+                request["params"], decoded.params
+            );
+            assert_eq!(decoded.params, request["params"]);
+        }
+        let mut request = wire_request();
+        request["params"] = json!(0);
+        let input = serde_json::to_string(&request)
+            .unwrap()
+            .replace("\"params\":0", "\"params\":1,\"params\":2");
+        assert_eq!(decode_request(input.as_bytes()).unwrap().params, json!(2));
+        for depth in [127_usize, 128] {
+            let raw = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            let expected = serde_json::from_str::<Value>(&raw).is_ok();
+            assert_eq!(
+                parse_raw_request(raw.as_bytes()).is_ok(),
+                expected,
+                "container depth={depth}"
+            );
+        }
     }
 }

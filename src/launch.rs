@@ -295,7 +295,7 @@ pub(crate) fn stream<W: Write>(
         .map(ResumeObservationRequest::durable_identity);
     let mut state = LaunchState::new(
         request_id,
-        host.deadline_unix_ms,
+        host.deadline_unix_ms.clone(),
         effective.resume_observation_request,
         effective.route_evidence.clone(),
         None,
@@ -2040,7 +2040,7 @@ fn launch_recovery_remaining(
     request_id: &str,
 ) -> Result<Duration, ProviderFailure> {
     let remaining = LAUNCH_RECOVERY_TIMEOUT.saturating_sub(started.elapsed());
-    operation_bounds::remaining_timeout(host.deadline_unix_ms, remaining)
+    operation_bounds::remaining_timeout(host.deadline_unix_ms.as_ref(), remaining)
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| launch_recovery_unavailable(request_id, "recovery deadline was reached"))
 }
@@ -2163,17 +2163,18 @@ fn acquire_launch_request_lock(
         .map_err(|error| launch_custody_failure(request_id, error))?;
     let lock = open_launch_state_lock(&lock_path)
         .map_err(|error| launch_state_failure(request_id, error))?;
-    let acquired =
-        match operation_bounds::remaining_timeout(host.deadline_unix_ms, LAUNCH_STATE_LOCK_TIMEOUT)
-        {
-            Some(timeout) => operation_bounds::lock_exclusive_for(&lock, timeout)
-                .map_err(|error| launch_state_failure(request_id, error))?,
-            None => match fs2::FileExt::try_lock_exclusive(&lock) {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
-                Err(error) => return Err(launch_state_failure(request_id, error)),
-            },
-        };
+    let acquired = match operation_bounds::remaining_timeout(
+        host.deadline_unix_ms.as_ref(),
+        LAUNCH_STATE_LOCK_TIMEOUT,
+    ) {
+        Some(timeout) => operation_bounds::lock_exclusive_for(&lock, timeout)
+            .map_err(|error| launch_state_failure(request_id, error))?,
+        None => match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => return Err(launch_state_failure(request_id, error)),
+        },
+    };
     if !acquired {
         return Err(launch_request_lock_timeout(request_id));
     }
@@ -2280,7 +2281,7 @@ fn acquire_launch_registration_lock(
     let lock =
         open_launch_state_lock(&path).map_err(|error| launch_state_failure(request_id, error))?;
     let timeout = operation_bounds::remaining_timeout(
-        host.deadline_unix_ms,
+        host.deadline_unix_ms.as_ref(),
         LAUNCH_REGISTRATION_LOCK_TIMEOUT,
     )
     .unwrap_or(Duration::ZERO);
@@ -2919,7 +2920,7 @@ struct LaunchState {
     unresolved_resume_completion: Option<Value>,
     session_id: Option<String>,
     resume_observation_request: Option<ResumeObservationRequest>,
-    deadline_unix_ms: Option<u64>,
+    deadline_unix_ms: Option<agent_provider_contract::UnixMilliseconds>,
     next_heartbeat: Instant,
     route_evidence: Value,
     launch_request: Option<LaunchRequestGuard>,
@@ -2932,7 +2933,7 @@ struct LaunchState {
 impl LaunchState {
     fn new(
         request_id: &str,
-        deadline_unix_ms: Option<u64>,
+        deadline_unix_ms: Option<agent_provider_contract::UnixMilliseconds>,
         resume_observation_request: Option<ResumeObservationRequest>,
         route_evidence: Value,
         launch_request: Option<LaunchRequestGuard>,
@@ -3530,15 +3531,21 @@ impl LaunchState {
     }
 
     fn deadline_wait_duration(&self) -> Duration {
-        let Some(deadline) = self.deadline_unix_ms else {
-            return HEARTBEAT_INTERVAL;
-        };
-        Duration::from_millis(deadline.saturating_sub(now_unix_ms()))
+        self.deadline_wait_duration_at(now_unix_ms())
+    }
+
+    fn deadline_wait_duration_at(&self, now: u64) -> Duration {
+        operation_bounds::remaining_at(self.deadline_unix_ms.as_ref(), now, HEARTBEAT_INTERVAL)
+            .unwrap_or(Duration::ZERO)
     }
 
     fn deadline_reached(&self) -> bool {
-        self.deadline_unix_ms
-            .is_some_and(|deadline| now_unix_ms() >= deadline)
+        self.deadline_reached_at(now_unix_ms())
+    }
+
+    fn deadline_reached_at(&self, now: u64) -> bool {
+        operation_bounds::remaining_at(self.deadline_unix_ms.as_ref(), now, Duration::ZERO)
+            .is_none()
     }
 
     fn is_complete(&self) -> bool {
@@ -3869,6 +3876,39 @@ fn json_write_failure(request_id: &str, err: serde_json::Error) -> ProviderFailu
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    #[test]
+    fn exact_deadline_wait_and_expiry() {
+        for token in ["80", "80.0", "8e1", "800e-1"] {
+            let deadline = agent_provider_contract::UnixMilliseconds::new(
+                serde_json::from_str(token).unwrap(),
+            )
+            .unwrap();
+            let state = LaunchState::new("req-clock", Some(deadline), None, json!({}), None);
+            for (now, wait, expired) in [
+                (79, Duration::from_millis(1), false),
+                (80, Duration::ZERO, true),
+                (100, Duration::ZERO, true),
+            ] {
+                println!(
+                    "launch deadline={token} now={now} wait={:?} expired={}",
+                    state.deadline_wait_duration_at(now),
+                    state.deadline_reached_at(now)
+                );
+                assert_eq!(state.deadline_wait_duration_at(now), wait);
+                assert_eq!(state.deadline_reached_at(now), expired);
+            }
+        }
+        let deadline = agent_provider_contract::UnixMilliseconds::new(
+            serde_json::from_str("1e999999999999999999999").unwrap(),
+        )
+        .unwrap();
+        for deadline in [None, Some(deadline)] {
+            let state = LaunchState::new("req-clock", deadline, None, json!({}), None);
+            assert_eq!(state.deadline_wait_duration_at(100), HEARTBEAT_INTERVAL);
+            assert!(!state.deadline_reached_at(100));
+        }
+    }
 
     #[test]
     fn launch_integrity_evidence_has_lifetime_count_detail_and_encoding_bounds() {

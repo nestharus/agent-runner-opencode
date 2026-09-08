@@ -424,7 +424,7 @@ fn acquire_migration_capacity_lock(
         .open(path)
         .map_err(|error| migration_artifact_create_failure(request_id, error))?;
     let timeout =
-        operation_bounds::remaining_timeout(host.deadline_unix_ms, MIGRATION_LOCK_TIMEOUT)
+        operation_bounds::remaining_timeout(host.deadline_unix_ms.as_ref(), MIGRATION_LOCK_TIMEOUT)
             .ok_or_else(|| migration_artifact_lock_timeout(request_id))?;
     if !operation_bounds::lock_exclusive_for(&lock, timeout)
         .map_err(|error| migration_artifact_create_failure(request_id, error))?

@@ -126,9 +126,11 @@ fn enumerate_native(
     request_id: &str,
 ) -> Result<Vec<OpencodeSessionListRow>, ProviderFailure> {
     let runtime = session_runtime(host, settings_id, request_id)?;
-    let timeout =
-        operation_bounds::remaining_timeout(host.deadline_unix_ms, Duration::from_secs(20))
-            .ok_or_else(|| session_list_timeout_failure(request_id))?;
+    let timeout = operation_bounds::remaining_timeout(
+        host.deadline_unix_ms.as_ref(),
+        Duration::from_secs(20),
+    )
+    .ok_or_else(|| session_list_timeout_failure(request_id))?;
     let sessions = opencode::session_list_with_timeout(
         Some(MAX_ENUMERATED_SESSIONS.saturating_add(1)),
         &runtime,
@@ -796,7 +798,7 @@ fn acquire_enumeration_snapshot_lock(
         .open(lock_path)
         .map_err(|error| session_snapshot_failure(request_id, error))?;
     let timeout = operation_bounds::remaining_timeout(
-        host.deadline_unix_ms,
+        host.deadline_unix_ms.as_ref(),
         SESSION_ENUMERATION_LOCK_TIMEOUT,
     )
     .ok_or_else(|| session_snapshot_lock_timeout_failure(request_id))?;

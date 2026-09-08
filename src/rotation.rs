@@ -71,14 +71,14 @@ impl Drop for RotationReservationGuard {
 
 struct RotationBudget {
     started: Instant,
-    host_deadline_unix_ms: Option<u64>,
+    host_deadline_unix_ms: Option<agent_provider_contract::UnixMilliseconds>,
 }
 
 impl RotationBudget {
     fn new(host: &HostContext) -> Self {
         Self {
             started: Instant::now(),
-            host_deadline_unix_ms: host.deadline_unix_ms,
+            host_deadline_unix_ms: host.deadline_unix_ms.clone(),
         }
     }
 
@@ -87,7 +87,7 @@ impl RotationBudget {
         if provider_remaining.is_zero() {
             return Err(rotation_deadline_exceeded(request_id));
         }
-        operation_bounds::remaining_timeout(self.host_deadline_unix_ms, provider_remaining)
+        operation_bounds::remaining_timeout(self.host_deadline_unix_ms.as_ref(), provider_remaining)
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| rotation_deadline_exceeded(request_id))
     }

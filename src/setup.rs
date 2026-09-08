@@ -51,8 +51,8 @@ pub fn detect_params(
     let required_settings_ids = required_settings_ids(&params, request_id)?;
     let settings_store = settings::transition_readiness(host, request_id, &required_settings_ids);
     let required_profiles = settings_store.required_account_wrappers();
-    let opencode = executable_evidence("opencode", host.deadline_unix_ms);
-    let curl = quota_transport_evidence(host.deadline_unix_ms);
+    let opencode = executable_evidence("opencode", host.deadline_unix_ms.as_ref());
+    let curl = quota_transport_evidence(host.deadline_unix_ms.as_ref());
     let profiles = profile_evidence(
         host,
         data_root,
@@ -81,12 +81,16 @@ pub fn detect_params(
 }
 
 #[cfg(all(feature = "contract-test-fixtures", debug_assertions))]
-fn quota_transport_evidence(deadline_unix_ms: Option<u64>) -> Value {
+fn quota_transport_evidence(
+    deadline_unix_ms: Option<&agent_provider_contract::UnixMilliseconds>,
+) -> Value {
     executable_evidence("curl", deadline_unix_ms)
 }
 
 #[cfg(not(all(feature = "contract-test-fixtures", debug_assertions)))]
-fn quota_transport_evidence(_deadline_unix_ms: Option<u64>) -> Value {
+fn quota_transport_evidence(
+    _deadline_unix_ms: Option<&agent_provider_contract::UnixMilliseconds>,
+) -> Value {
     quota_observer::setup_transport_evidence()
 }
 
@@ -129,7 +133,10 @@ pub fn brain_unsupported(request_id: String) -> ProviderFailure {
     )
 }
 
-fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
+fn executable_evidence(
+    program: &str,
+    deadline_unix_ms: Option<&agent_provider_contract::UnixMilliseconds>,
+) -> Value {
     let path = find_on_path(program);
     executable_evidence_at(program, path, deadline_unix_ms)
 }
@@ -137,7 +144,7 @@ fn executable_evidence(program: &str, deadline_unix_ms: Option<u64>) -> Value {
 fn executable_evidence_at(
     program: &str,
     path: Option<PathBuf>,
-    deadline_unix_ms: Option<u64>,
+    deadline_unix_ms: Option<&agent_provider_contract::UnixMilliseconds>,
 ) -> Value {
     let timeout = operation_bounds::remaining_timeout(deadline_unix_ms, SETUP_PROBE_TIMEOUT);
     let implementation = match (&path, timeout) {

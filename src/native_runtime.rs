@@ -258,9 +258,11 @@ pub fn resolve_for_launch(
         runtime_identity_environment(&launch_environment),
         request_id,
     )?;
-    let timeout =
-        operation_bounds::remaining_timeout(host.deadline_unix_ms, NATIVE_RUNTIME_LOCK_TIMEOUT)
-            .unwrap_or(Duration::ZERO);
+    let timeout = operation_bounds::remaining_timeout(
+        host.deadline_unix_ms.as_ref(),
+        NATIVE_RUNTIME_LOCK_TIMEOUT,
+    )
+    .unwrap_or(Duration::ZERO);
     let _lock = acquire_runtime_lock(host, account, timeout, request_id)?;
     if let Some(record) = read_runtime_record(host, account, request_id)? {
         let context = activate_runtime_record(host, account, record, request_id)?;
@@ -1500,7 +1502,7 @@ fn acquire_runtime_lock(
 }
 
 fn runtime_lock_timeout(host: &HostContext, request_id: &str) -> Result<Duration, ProviderFailure> {
-    operation_bounds::remaining_timeout(host.deadline_unix_ms, NATIVE_RUNTIME_LOCK_TIMEOUT)
+    operation_bounds::remaining_timeout(host.deadline_unix_ms.as_ref(), NATIVE_RUNTIME_LOCK_TIMEOUT)
         .ok_or_else(|| native_runtime_lock_timeout(request_id))
 }
 

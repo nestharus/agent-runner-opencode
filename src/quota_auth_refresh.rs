@@ -781,8 +781,11 @@ fn quota_refresh_operation_timeout(
     host: &HostContext,
     request_id: &str,
 ) -> Result<Duration, ProviderFailure> {
-    operation_bounds::remaining_timeout(host.deadline_unix_ms, QUOTA_REFRESH_OPERATION_TIMEOUT)
-        .ok_or_else(|| quota_refresh_deadline_exceeded(request_id))
+    operation_bounds::remaining_timeout(
+        host.deadline_unix_ms.as_ref(),
+        QUOTA_REFRESH_OPERATION_TIMEOUT,
+    )
+    .ok_or_else(|| quota_refresh_deadline_exceeded(request_id))
 }
 
 fn quota_refresh_operation_path(

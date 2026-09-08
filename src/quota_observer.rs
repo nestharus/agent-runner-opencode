@@ -110,9 +110,11 @@ pub fn resolve(
     account: &AccountProfile,
     request_id: &str,
 ) -> Result<QuotaObserverContext, ProviderFailure> {
-    let timeout =
-        operation_bounds::remaining_timeout(host.deadline_unix_ms, QUOTA_OBSERVER_LOCK_TIMEOUT)
-            .ok_or_else(|| quota_observer_lock_timeout(request_id))?;
+    let timeout = operation_bounds::remaining_timeout(
+        host.deadline_unix_ms.as_ref(),
+        QUOTA_OBSERVER_LOCK_TIMEOUT,
+    )
+    .ok_or_else(|| quota_observer_lock_timeout(request_id))?;
     let _lock = acquire_observer_lock(host, account, timeout, request_id)?;
     if let Some(record) = read_observer_record(host, account, request_id)? {
         return activate_observer_record(host, account, record, request_id);

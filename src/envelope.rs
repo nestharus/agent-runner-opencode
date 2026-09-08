@@ -1,5 +1,6 @@
 //! Declared roles: formatter, validator, mapper
 
+use agent_provider_contract::UnixMilliseconds;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -41,7 +42,7 @@ pub struct HostContext {
     pub config_root: Option<String>,
     pub data_root: Option<String>,
     pub env: Option<BTreeMap<String, String>>,
-    pub deadline_unix_ms: Option<u64>,
+    pub deadline_unix_ms: Option<UnixMilliseconds>,
 }
 
 #[derive(Debug)]

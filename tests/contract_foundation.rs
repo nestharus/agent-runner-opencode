@@ -627,3 +627,234 @@ fn assert_account_mapping(
     assert_eq!(quota_source["account_tag"], tag);
     assert_eq!(quota_source["account_hash"], hash);
 }
+
+fn pinned_wire_fixtures() -> Value {
+    serde_json::from_str(include_str!("fixtures/sdk-contract.json")).unwrap()
+}
+
+#[test]
+fn pinned_request_context_is_preserved() {
+    let fixtures = pinned_wire_fixtures();
+    let ordinary = fixtures["non_launch"].as_object().unwrap();
+    assert_eq!(ordinary.len(), 30);
+    for (operation, fixture) in ordinary {
+        assert_complete_context(operation, &fixture["request"]);
+    }
+    assert_complete_context("launch", &fixtures["launch"]["request"]);
+    assert_eq!(
+        fixtures["non_launch"]["describe"]["request"]["provider_instance_id"],
+        "acct-primary"
+    );
+    assert_eq!(
+        fixtures["non_launch"]["describe"]["request"]["host"]["working_directory"],
+        "/home/user/project"
+    );
+}
+
+fn assert_complete_context(operation: &str, request: &Value) {
+    let decoded =
+        agent_runner_opencode::dispatch::decode_request(&serde_json::to_vec(request).unwrap())
+            .unwrap();
+    println!("context operation={operation} actual={decoded:?}");
+    assert_eq!(decoded.contract, request["contract"]);
+    assert_eq!(decoded.request_id, request["request_id"]);
+    assert_eq!(
+        decoded.provider_instance_id.as_deref(),
+        request.get("provider_instance_id").and_then(Value::as_str)
+    );
+    assert_eq!(decoded.params, request["params"]);
+    let host = &request["host"];
+    assert_eq!(decoded.host.app, host["app"]);
+    for (field, actual) in [
+        ("app_version", decoded.host.app_version.as_deref()),
+        ("platform", decoded.host.platform.as_deref()),
+        (
+            "working_directory",
+            decoded.host.working_directory.as_deref(),
+        ),
+        ("config_root", decoded.host.config_root.as_deref()),
+        ("data_root", decoded.host.data_root.as_deref()),
+    ] {
+        assert_eq!(
+            actual,
+            host.get(field).and_then(Value::as_str),
+            "{operation}/{field}"
+        );
+    }
+    let expected_env = host.get("env").map(|v| {
+        serde_json::from_value::<std::collections::BTreeMap<String, String>>(v.clone()).unwrap()
+    });
+    assert_eq!(decoded.host.env.as_ref(), expected_env.as_ref());
+    assert_eq!(
+        decoded
+            .host
+            .deadline_unix_ms
+            .as_ref()
+            .map(|d| d.as_number()),
+        host.get("deadline_unix_ms").and_then(Value::as_number)
+    );
+}
+
+fn stateless_request(operation: &str) -> Value {
+    let request = pinned_wire_fixtures()["non_launch"][operation]["request"].clone();
+    assert!(request["host"].get("data_root").is_none());
+    request
+}
+
+fn actual_stateless_output(operation: &str, request: &Value, exit: i32) -> Value {
+    let args = vec!["agent-runner-opencode".to_string(), operation.to_string()];
+    let bytes = serde_json::to_vec(request).unwrap();
+    let (stdout, actual_exit) = agent_runner_opencode::handle_invocation(&args, &bytes);
+    println!(
+        "operation={operation} exit={actual_exit} stdout={}",
+        String::from_utf8_lossy(&stdout)
+    );
+    assert_eq!(actual_exit, exit);
+    assert!(!stdout.is_empty());
+    let response: Value =
+        serde_json::from_slice(&stdout).expect("one complete JSON response, no trailing value");
+    assert_eq!(response["contract"], CONTRACT);
+    assert_eq!(response["request_id"], request["request_id"]);
+    response
+}
+
+fn assert_stateless_error(response: &Value, operation: &str, category: &str, code: &str) {
+    agent_provider_contract::validate_error_response(operation, response).unwrap();
+    assert_eq!(response["ok"], false);
+    assert!(response.get("result").is_none());
+    assert_eq!(response["error"]["category"], category);
+    assert_eq!(response["error"]["code"], code);
+}
+
+#[test]
+fn stateless_wire_dispatch_and_serialization() {
+    let describe = stateless_request("describe");
+    let response = actual_stateless_output("describe", &describe, 0);
+    agent_provider_contract::validate_response("describe", &response).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_describe_response(&response);
+    assert_eq!(response["result"]["display_name"], "OpenCode");
+    assert_eq!(response["result"]["contract_versions"], json!([CONTRACT]));
+    assert_eq!(response["result"]["preferred_contract"], CONTRACT);
+    let args = vec!["agent-runner-opencode".to_string(), "describe".to_string()];
+    let bytes = serde_json::to_vec(&describe).unwrap();
+    let expected = agent_runner_opencode::handle_invocation(&args, &bytes);
+    let mut sink = Vec::new();
+    let status = agent_runner_opencode::write_invocation(&args, &bytes, &mut sink);
+    assert_eq!((sink, status), expected);
+    let mut schema = stateless_request("schema");
+    assert_eq!(schema["params"]["schema_id"], "example.settings/v1");
+    let response = actual_stateless_output("schema", &schema, 3);
+    assert_stateless_error(&response, "schema", "unsupported", "unknown_schema");
+    schema["params"]["schema_id"] = json!("opencode.settings/v1");
+    let response = actual_stateless_output("schema", &schema, 0);
+    agent_provider_contract::validate_response("schema", &response).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_settings_schema_response(&response);
+    let compiled = compile_standalone_schema(&response["result"]["schema"]);
+    assert!(!compiled.is_valid(&json!({"model": {"name": "not-a-model"}})));
+    for (operation, params, code) in [
+        ("describe", json!({"extra": 1}), "invalid_describe_params"),
+        ("schema", json!({}), "invalid_schema_params"),
+    ] {
+        let mut request = stateless_request(operation);
+        request["params"] = params;
+        let response = actual_stateless_output(operation, &request, 2);
+        assert_stateless_error(&response, operation, "invalid_request", code);
+    }
+    let mut wrong = describe.clone();
+    wrong["contract"] = json!("oulipoly.provider/v0");
+    let response = actual_stateless_output("describe", &wrong, 2);
+    assert_stateless_error(
+        &response,
+        "describe",
+        "invalid_request",
+        "unsupported_contract",
+    );
+    let response = actual_stateless_output("unknown", &describe, 3);
+    assert_error_envelope(&response, "unsupported", "unknown_subcommand");
+}
+
+#[test]
+fn stateless_cli_stdin_and_framing() {
+    let describe = serde_json::to_vec(&stateless_request("describe")).unwrap();
+    let schema = serde_json::to_vec(&stateless_request("schema")).unwrap();
+    for (operation, bytes) in [
+        ("describe", describe.as_slice()),
+        ("schema", schema.as_slice()),
+        ("describe", b"{bad".as_slice()),
+        ("describe", b"{} {}".as_slice()),
+    ] {
+        assert_owned_stateless_cli(operation, bytes);
+    }
+}
+
+fn assert_owned_stateless_cli(operation: &str, bytes: &[u8]) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let root = tempfile::tempdir().unwrap();
+    for name in ["home", "config", "data", "cache", "state", "bin"] {
+        let path = root.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
+    }
+    // No PATH executable exists. The only participant is Cargo's exact binary;
+    // no inherited native executable, HOME, XDG, credentials or host config.
+    let stdout_path = root.path().join("stdout");
+    let stderr_path = root.path().join("stderr");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-runner-opencode"))
+        .arg(operation)
+        .env_clear()
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("PATH", root.path().join("bin"))
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let status = owned_cli_status(&mut child, child_timeout());
+    let stdout = std::fs::read(stdout_path).unwrap();
+    let stderr = std::fs::read(stderr_path).unwrap();
+    println!(
+        "cli operation={operation} status={status} stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(stdout.len() + stderr.len() <= 1024 * 1024);
+    assert!(stderr.is_empty());
+    let args = vec!["agent-runner-opencode".to_string(), operation.to_string()];
+    let (expected, exit) = agent_runner_opencode::handle_invocation(&args, bytes);
+    assert_eq!(stdout, expected);
+    assert_eq!(status.code(), Some(exit));
+    let response: Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(response["contract"], CONTRACT);
+    for name in ["home", "config", "data", "cache", "state", "bin"] {
+        assert_eq!(
+            std::fs::read_dir(root.path().join(name)).unwrap().count(),
+            0
+        );
+    }
+}
+
+fn child_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
+fn owned_cli_status(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> std::process::ExitStatus {
+    use wait_timeout::ChildExt;
+    if let Some(status) = child.wait_timeout(timeout).unwrap() {
+        return status;
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    panic!("owned stateless provider timed out");
+}

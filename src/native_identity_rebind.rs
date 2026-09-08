@@ -1266,7 +1266,7 @@ fn acquire_native_identity_rebind_lock(
         .open(lock_path)
         .map_err(|error| native_identity_rebind_state_failure(request_id, error))?;
     let timeout = operation_bounds::remaining_timeout(
-        host.deadline_unix_ms,
+        host.deadline_unix_ms.as_ref(),
         NATIVE_IDENTITY_REBIND_LOCK_TIMEOUT,
     )
     .ok_or_else(|| native_identity_rebind_lock_timeout(request_id))?;

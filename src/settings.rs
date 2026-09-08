@@ -377,8 +377,9 @@ pub(crate) fn acquire_store_lock(
         .write(true)
         .open(&lock_path)
         .map_err(|err| store_io_failure(request_id, "settings_store_lock_open_failed", err))?;
-    let timeout = operation_bounds::remaining_timeout(host.deadline_unix_ms, SETTINGS_LOCK_TIMEOUT)
-        .ok_or_else(|| settings_lock_timeout(request_id))?;
+    let timeout =
+        operation_bounds::remaining_timeout(host.deadline_unix_ms.as_ref(), SETTINGS_LOCK_TIMEOUT)
+            .ok_or_else(|| settings_lock_timeout(request_id))?;
     if !operation_bounds::lock_exclusive_for(&lock, timeout)
         .map_err(|err| store_io_failure(request_id, "settings_store_lock_failed", err))?
     {
