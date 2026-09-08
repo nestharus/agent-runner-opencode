@@ -452,13 +452,34 @@ fn parse_json_object(
     raw: &serde_json::value::RawValue,
     remaining_depth: usize,
 ) -> Result<Value, serde_json::Error> {
-    let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
-        serde_json::from_str(raw.get())?;
-    fields
-        .into_iter()
-        .map(|(key, value)| parse_json_value(value, remaining_depth).map(|value| (key, value)))
-        .collect::<Result<serde_json::Map<_, _>, _>>()
-        .map(Value::Object)
+    serde::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_str(raw.get()),
+        JsonObjectVisitor { remaining_depth },
+    )
+}
+
+struct JsonObjectVisitor {
+    remaining_depth: usize,
+}
+
+impl<'de> serde::de::Visitor<'de> for JsonObjectVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut fields = serde_json::Map::new();
+        // Parse even shadowed duplicate values before last-key-wins insertion,
+        // preserving the original parser's depth admission for the whole input.
+        while let Some((key, raw)) = map.next_entry::<String, &serde_json::value::RawValue>()? {
+            let value =
+                parse_json_value(raw, self.remaining_depth).map_err(serde::de::Error::custom)?;
+            fields.insert(key, value);
+        }
+        Ok(Value::Object(fields))
+    }
 }
 
 fn parse_json_array(
@@ -1140,5 +1161,20 @@ mod tests {
                 "container depth={depth}"
             );
         }
+    }
+    #[test]
+    fn common_envelope_checks_shadowed_json_values() {
+        let nested = format!("{}0{}", "[".repeat(128), "]".repeat(128));
+        let raw = format!(r#"{{"params":{nested},"params":0}}"#);
+        assert!(serde_json::from_str::<Value>(&raw).is_err());
+        let failure = decode_request(raw.as_bytes()).unwrap_err();
+        println!(
+            "shadowed overdepth code={} id={}",
+            failure.code, failure.request_id
+        );
+        assert_eq!(
+            (failure.code, failure.request_id.as_str()),
+            ("invalid_json", "unknown")
+        );
     }
 }
