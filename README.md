@@ -1097,7 +1097,50 @@ provider must not invent that authority.
 
 ## Contract provenance
 
-The CLI implements the versioned JSON schemas in `contract/v1` directly and
-does not link the host-side `oulipoly-provider` crate. The directory is an exact
-commit-pinned snapshot of Agent Runner; see `contract/v1/UPSTREAM.md`. The old
-`.s9b-step6a-contract.md` is retained only as historical design evidence.
+The provider consumes `oulipoly.provider/v1` from the shared
+`agent-provider-contract` SDK crate and keeps no copied base schemas. It does
+not link the host-side `oulipoly-provider` crate. The manifest names the SDK
+repository without a revision constraint; `Cargo.lock` records the resolved
+build as build evidence, not as runtime admission. Runtime compatibility is
+the served contract version and the advertised capabilities below, never an
+SDK source revision or executable identity. The old `.s9b-step6a-contract.md`
+is retained only as historical design evidence.
+
+- **Admission.** Every routed subcommand is admitted with the SDK's
+  operation-bound `decode_request` for that operation: the embedded schema
+  registry validates the whole envelope and params and the generated request
+  DTO must accept it. Refusals use `invalid_request/contract_schema_violation`
+  with the schema definition and bounded errors. Provider-native envelope size
+  bounds and each handler's native parameter meaning (settings, routes,
+  paging, nonces, session modes) still apply after admission.
+- **Encoding.** Envelopes are built from the SDK's generated DTOs. A success
+  response is written only after the SDK admits it as that operation's
+  response; otherwise the provider returns `failed/response_contract_violation`.
+  Error envelopes are admitted against the operation's error definition. Every
+  launch NDJSON event is admitted by the SDK registry for its event kind before
+  it is written.
+- **Versions.** Only `oulipoly.provider/v1` is served and advertised, because
+  that is the base version current hosts can select. Any other `contract` is
+  refused as `invalid_request/unsupported_contract` with the served versions in
+  `details`.
+- **Extensions.** Selection uses the SDK `VersionFamily` vocabulary from the
+  request's own `host.env`. The provider advertises `launch_output_v1` and
+  `session_turn_pages_v1` only when the request offers them. It implements and
+  never advertises `prompt_acceptance`, `resident_session`, `tool_mediation` or
+  `exploration`. An actual request for one is refused rather than ignored:
+  - `params.prompt_acceptance` on launch → `unsupported/prompt_acceptance_unsupported`
+    before any effect;
+  - `resident.prepare` → `unsupported/resident_session_unsupported`;
+  - a `OULIPOLY_TOOL_MEDIATION_V1` or `OULIPOLY_EXPLORATION_V1` launch-env offer
+    → a rejected policy decision with `unsupported_tool_mediation` or
+    `unsupported_exploration`.
+
+  Offers in `host.env` alone are not demands and are not refused.
+- **Shared oracles.** Tests read the SDK `contract-test-fixtures`
+  host-extension specimens. They check describe selection against the shared
+  selection oracle, admit every complete launch stream with the SDK stream
+  validator, and refuse the shared prompt-acceptance launch specimen. Those
+  specimens are shape oracles. OpenCode's native semantic controls stay
+  separate and still catch what the shared validator admits: output
+  accounting, nonce shape, paging consistency and recovery. Examples are
+  false accounting and premature or missing completion markers.

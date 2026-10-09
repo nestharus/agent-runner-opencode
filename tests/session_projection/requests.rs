@@ -153,13 +153,23 @@ pub fn removed_evidence_capture_params(session_id: &str) -> Value {
     })
 }
 
+/// A schema-admitted provider/v1 `session.replace` request; OpenCode refuses
+/// it as unsupported after shared operation admission.
 pub fn session_replace_params(session_id: &str) -> Value {
     json!({
         "settings_id": "opencode1",
         "session_id": session_id,
+        "model_name": "gpt-5.5",
+        "provider_name": "opencode",
+        "replace_protocol": "oulipoly.provider_owned_replace/v1",
+        "operation_id": "replace-operation-1",
         "canonical_format": CANONICAL_FORMAT,
-        "data_base64": encode_base64(replacement_record_bytes()),
-        "sha256": sha256_hex(replacement_record_bytes()),
-        "turn_count": 1
+        "canonical_transcript": {
+            "kind": "bytes",
+            "data_base64": encode_base64(replacement_record_bytes()),
+            "sha256": sha256_hex(replacement_record_bytes()),
+            "turn_count": 1
+        },
+        "host_apply_capability": "replace_session_turns_from_canonical_v1"
     })
 }

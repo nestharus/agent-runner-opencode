@@ -38,6 +38,7 @@ path = "tests/contract_control_plane_lifecycle.rs"
 required-features = ["contract-test-fixtures"]
 
 [dependencies]
+agent-provider-contract = { git = "https://github.com/nestharus/agent-provider-sdk.git" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -54,5 +55,6 @@ wait-timeout = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
+agent-provider-contract = { git = "https://github.com/nestharus/agent-provider-sdk.git", features = ["contract-test-fixtures"] }
 base64 = "0.22"
-jsonschema = { version = "0.18", features = ["draft202012"] }
+jsonschema = { version = "0.46", default-features = false }

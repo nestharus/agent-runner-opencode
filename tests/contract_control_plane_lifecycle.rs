@@ -5,7 +5,6 @@ mod control_plane_lifecycle;
 mod support;
 
 use control_plane_lifecycle::*;
-use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Value};
 use std::fs;
 use std::fs::OpenOptions;
@@ -2822,17 +2821,16 @@ fn write_native_runtime_identity(
 fn assert_native_identity_rebind_schema(schema: &Value, definition: &str, value: &Value) {
     let mut root = schema.clone();
     root["$ref"] = json!(format!("#/$defs/{definition}"));
-    let compiled = JSONSchema::options()
-        .with_draft(Draft::Draft202012)
-        .compile(&root)
-        .expect("compile native identity rebind schema");
-    if let Err(errors) = compiled.validate(value) {
+    let compiled =
+        jsonschema::draft202012::new(&root).expect("compile native identity rebind schema");
+    let errors = compiled
+        .iter_errors(value)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
         panic!(
             "native identity rebind {definition} failed its advertised schema: {}; value={value}",
-            errors
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            errors.join("; ")
         );
     };
 }
@@ -3210,17 +3208,15 @@ fn assert_rotation_decision_protocol(materialized: &Value) -> Value {
         "schema.schema.json#/$defs/SchemaResult",
     )["schema"]
         .clone();
-    let compiled = JSONSchema::options()
-        .with_draft(Draft::Draft202012)
-        .compile(&schema)
-        .expect("compile rotation decision schema");
-    if let Err(errors) = compiled.validate(&decision) {
+    let compiled = jsonschema::draft202012::new(&schema).expect("compile rotation decision schema");
+    let errors = compiled
+        .iter_errors(&decision)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
         panic!(
             "rotation decision failed its advertised schema: {}; decision={decision}",
-            errors
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            errors.join("; ")
         );
     }
     decision

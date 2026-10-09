@@ -931,7 +931,7 @@ mod identity_readiness_tests {
             working_directory: None,
             config_root: None,
             data_root: Some(data_root.clone()),
-            env: None,
+            env: Default::default(),
             deadline_unix_ms: None,
         };
         let ambient_ready = json!({
@@ -1010,7 +1010,7 @@ mod identity_readiness_tests {
                     .into_owned(),
             ),
             data_root: Some(data_root),
-            env: None,
+            env: Default::default(),
             deadline_unix_ms: None,
         };
 
