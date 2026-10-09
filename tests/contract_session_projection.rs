@@ -700,9 +700,15 @@ fn contract_session_read_turns_enforces_projection_specific_delivery_nonce_shape
         selected_host.clone(),
         &[("PATH", path.as_str())],
     ));
+    // The shared session schema requires the nonce for user observation, so
+    // operation-bound admission refuses it before the native page reader.
     assert_eq!(
         missing_response["error"]["code"],
-        "invalid_session_read_turns_params"
+        "contract_schema_violation"
+    );
+    assert_eq!(
+        missing_response["error"]["details"]["definition"],
+        "SessionReadTurnsRequest"
     );
 
     let mut forbidden = session_turn_page_beginning_params(session_id, "canonical_ingest", None);
@@ -715,8 +721,10 @@ fn contract_session_read_turns_enforces_projection_specific_delivery_nonce_shape
     ));
     assert_eq!(
         forbidden_response["error"]["code"],
-        "invalid_session_read_turns_params"
+        "contract_schema_violation"
     );
+    // The native page reader keeps its own nonce-shape control behind shared
+    // admission; see the session_turn_pages unit tests.
 }
 
 #[test]

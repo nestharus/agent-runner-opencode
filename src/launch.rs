@@ -3,7 +3,7 @@
 //!   - component: src/launch.rs
 //!     role: adapter
 //!     Translates:
-//!       - opencode process lifecycle to contract/v1 launch NDJSON
+//!       - opencode process lifecycle to provider/v1 launch NDJSON
 //!       - opencode stdout/stderr bytes to LaunchStdoutEvent/LaunchStderrEvent
 //!       - opencode sessionID metadata to LaunchMarkerEvent
 //!       - declared params.env entries and host-linkage env to env-cleared child env
@@ -46,6 +46,12 @@ use crate::resume_observation::{
     RouteIdentity as ResumeRouteIdentity,
 };
 use crate::terminal::{classify, exit_code_for_status, process_status_json, ProcessStatus};
+use agent_provider_contract::generated::{
+    BytePayload, BytePayloadEncoding, LaunchOutputChannelSummaryV1,
+    LaunchOutputCompleteMarkerValueV1, LaunchOutputRequestV1 as LaunchOutputRequest, LaunchParams,
+    LaunchSessionStartMode,
+};
+use agent_provider_contract::host_extensions::{launch_output, prompt_acceptance};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -74,8 +80,8 @@ const PRODUCED_ASSISTANT_RESPONSE_MARKER: &str = "oulipoly.produced_assistant_re
 const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
 const RESUME_COMPLETION_UNRESOLVED_MARKER: &str = "oulipoly.resume_completion_unresolved";
 const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
-const LAUNCH_OUTPUT_COMPLETE_MARKER: &str = "oulipoly.launch_output_complete/v1";
-const LAUNCH_OUTPUT_PROTOCOL: &str = "oulipoly.launch_output/v1";
+const LAUNCH_OUTPUT_COMPLETE_MARKER: &str = launch_output::MARKER_NAME;
+const LAUNCH_OUTPUT_PROTOCOL: &str = launch_output::PROTOCOL;
 const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 const LAUNCH_STATE_DIR: &str = "provider-state/opencode/launch/requests";
 const LAUNCH_ORPHAN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -86,39 +92,6 @@ const PREDECESSOR_ACTIVE_LAUNCH_REQUEST_SLOTS: usize = 64;
 const MAX_LAUNCH_REPLAY_RECORDS: usize = 4096;
 const MAX_LAUNCH_STATE_BYTES: usize = 256 * 1024;
 pub const OPENCODE_PROMPT_ARG_BYTE_CEILING: usize = 64 * 1024;
-
-#[derive(Deserialize)]
-struct LaunchParams {
-    settings_id: String,
-    mode: String,
-    model: policy::PolicyModelRequest,
-    argv: Vec<String>,
-    working_directory: String,
-    env: Option<BTreeMap<String, String>>,
-    stdin: Option<BytePayload>,
-    session: Option<LaunchSession>,
-    output_delivery: Option<LaunchOutputRequest>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchOutputRequest {
-    protocol: String,
-}
-
-#[derive(Deserialize)]
-struct LaunchSession {
-    known_provider_session_id: Option<String>,
-    start_mode: Option<String>,
-    #[serde(flatten)]
-    _extra: serde_json::Map<String, Value>,
-}
-
-#[derive(Deserialize)]
-struct BytePayload {
-    encoding: String,
-    data: String,
-}
 
 enum DrainMessage {
     Stdout(Vec<u8>),
@@ -328,18 +301,19 @@ impl LaunchOutputSummary {
     }
 
     fn marker_value(&self) -> Value {
-        json!({
-            "protocol": LAUNCH_OUTPUT_PROTOCOL,
-            "stdout": {
-                "bytes": self.stdout.bytes,
-                "sha256": self.stdout.sha256(),
+        serde_json::to_value(LaunchOutputCompleteMarkerValueV1 {
+            protocol: LAUNCH_OUTPUT_PROTOCOL.to_string(),
+            stdout: LaunchOutputChannelSummaryV1 {
+                bytes: self.stdout.bytes,
+                sha256: self.stdout.sha256(),
             },
-            "stderr": {
-                "bytes": self.stderr.bytes,
-                "sha256": self.stderr.sha256(),
+            stderr: LaunchOutputChannelSummaryV1 {
+                bytes: self.stderr.bytes,
+                sha256: self.stderr.sha256(),
             },
-            "data_event_count": self.data_event_count,
+            data_event_count: self.data_event_count,
         })
+        .expect("SDK launch-output marker DTO serializes")
     }
 }
 
@@ -484,9 +458,22 @@ pub(crate) fn stream<W: Write>(
 ) -> Result<LaunchOutcome, ProviderFailure> {
     let raw_params = params.clone();
     let params = parse_launch_params(params, request_id)?;
+    refuse_prompt_acceptance(&params, request_id)?;
     let launch_output_requested =
         validate_launch_output_request(params.output_delivery.as_ref(), host, request_id)?;
     validate_launch_authority(&params, request_id)?;
+    // Exact-retry preflight can reconcile actors and native session state.
+    // Refuse unsupported boundaries before entering that effectful path.
+    let diagnostics = policy::unsupported_launch_extension_diagnostics(host, params.env.as_ref());
+    if !diagnostics.is_empty() {
+        let reason = policy_rejection_reason(json!(diagnostics));
+        return stream_policy_rejection(request_id, writer, reason, launch_output_requested).map(
+            |exit_code| LaunchOutcome {
+                exit_code,
+                activity_targets: ActivityTargets::default(),
+            },
+        );
+    }
     let new_session = known_provider_session_id(&params).is_none();
     let request_identity_sha256 = launch_request_identity_sha256(host, &raw_params);
     let declared_env = params.env.clone().unwrap_or_default();
@@ -694,6 +681,27 @@ fn parse_launch_params(params: Value, request_id: &str) -> Result<LaunchParams, 
     serde_json::from_value(params).map_err(|err| invalid_launch_params_failure(request_id, err))
 }
 
+/// This provider implements no `oulipoly.prompt_acceptance` version and never
+/// advertises it, so a launch requesting submission attestation is refused
+/// before any effect instead of running without the requested evidence.
+fn refuse_prompt_acceptance(
+    params: &LaunchParams,
+    request_id: &str,
+) -> Result<(), ProviderFailure> {
+    let Some(request) = params.prompt_acceptance.as_ref() else {
+        return Ok(());
+    };
+    Err(ProviderFailure::unsupported(
+        request_id,
+        "prompt_acceptance_unsupported",
+        format!(
+            "OpenCode does not implement {} (requested {}); params.prompt_acceptance is refused",
+            prompt_acceptance::PROTOCOL,
+            request.protocol
+        ),
+    ))
+}
+
 fn validate_launch_output_request(
     request: Option<&LaunchOutputRequest>,
     host: &HostContext,
@@ -702,20 +710,14 @@ fn validate_launch_output_request(
     let Some(request) = request else {
         return Ok(false);
     };
-    if host
-        .env
-        .as_ref()
-        .and_then(|env| env.get(crate::schema::HOST_LAUNCH_OUTPUT_V1_ENV))
-        .map(String::as_str)
-        != Some("1")
-    {
+    if !crate::schema::launch_output_selected(host) {
         return Err(ProviderFailure::unsupported(
             request_id,
             "launch_output_not_selected",
             "params.output_delivery is accepted only when host.env.OULIPOLY_HOST_LAUNCH_OUTPUT_V1=1 selected the capability",
         ));
     }
-    if request.protocol == crate::schema::LAUNCH_OUTPUT_V1 {
+    if request.protocol == launch_output::PROTOCOL {
         return Ok(true);
     }
     Err(ProviderFailure::unsupported(
@@ -765,9 +767,9 @@ fn launch_argv(
         policy::PolicyDecision::Accepted(plan) => Ok(PolicyLaunch::Accepted(Box::new(
             effective_launch(params, plan, host, request_id, request_identity_sha256)?,
         ))),
-        policy::PolicyDecision::Rejected(plan) => {
-            Ok(PolicyLaunch::Rejected(policy_rejection_reason(&plan)))
-        }
+        policy::PolicyDecision::Rejected(plan) => Ok(PolicyLaunch::Rejected(
+            policy_rejection_reason(plan.diagnostics_json()),
+        )),
     }
 }
 
@@ -954,11 +956,11 @@ fn validate_launch_authority(
             .known_provider_session_id
             .as_deref()
             .filter(|session_id| !session_id.trim().is_empty()),
-        session.start_mode.as_deref(),
+        session.start_mode.as_ref(),
     ) {
         (None, None) => Ok(()),
-        (Some(_), Some("resume")) => Ok(()),
-        (Some(_), Some("create")) => Err(ProviderFailure::unsupported(
+        (Some(_), Some(LaunchSessionStartMode::Resume)) => Ok(()),
+        (Some(_), Some(LaunchSessionStartMode::Create)) => Err(ProviderFailure::unsupported(
             request_id,
             "launch_session_create_unsupported",
             "OpenCode cannot start a new session with a caller-selected provider session id",
@@ -1143,8 +1145,7 @@ fn empty_resume_payload_failure(request_id: &str) -> ProviderFailure {
     )
 }
 
-fn policy_rejection_reason(plan: &policy::PolicyRejection) -> String {
-    let diagnostics = plan.diagnostics_json();
+fn policy_rejection_reason(diagnostics: Value) -> String {
     format!("policy.evaluate rejected launch params; diagnostics={diagnostics}")
 }
 
@@ -1175,10 +1176,9 @@ fn decode_byte_payload(
     payload: &BytePayload,
     request_id: &str,
 ) -> Result<Vec<u8>, ProviderFailure> {
-    match payload.encoding.as_str() {
-        "base64" => decode_base64_payload(payload, request_id),
-        "utf8" => Ok(utf8_payload_bytes(payload)),
-        other => Err(invalid_stdin_encoding_failure(request_id, other)),
+    match payload.encoding {
+        BytePayloadEncoding::Base64 => decode_base64_payload(payload, request_id),
+        BytePayloadEncoding::Utf8 => Ok(utf8_payload_bytes(payload)),
     }
 }
 
@@ -3943,14 +3943,6 @@ fn invalid_stdin_base64_failure(request_id: &str, err: String) -> ProviderFailur
     )
 }
 
-fn invalid_stdin_encoding_failure(request_id: &str, encoding: &str) -> ProviderFailure {
-    ProviderFailure::invalid_request(
-        request_id,
-        "invalid_stdin_encoding",
-        format!("unsupported launch stdin encoding: {encoding}"),
-    )
-}
-
 fn session_marker_name(session_id: &str) -> String {
     format!("opencode.sessionID.{session_id}")
 }
@@ -3964,9 +3956,27 @@ fn write_ndjson_event<W: Write>(
     writer: &mut W,
     event: &Value,
 ) -> Result<(), ProviderFailure> {
+    admit_launch_event(request_id, event)?;
     write_json_event(request_id, writer, event)?;
     write_event_newline(request_id, writer)?;
     flush_event_writer(request_id, writer)
+}
+
+/// Operation-bound launch encoding: every NDJSON event is admitted by the SDK
+/// schema registry for its event kind before it reaches the host.
+fn admit_launch_event(request_id: &str, event: &Value) -> Result<(), ProviderFailure> {
+    let kind = event
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    agent_provider_contract::validate_launch_event(kind, event).map_err(|error| {
+        eprintln!("provider launch event failed contract admission: {error}");
+        ProviderFailure::internal(
+            request_id,
+            "launch_event_contract_violation",
+            format!("provider launch {kind} event failed shared contract admission"),
+        )
+    })
 }
 
 fn write_json_event<W: Write>(
@@ -4480,7 +4490,7 @@ mod custody_tests {
                         working_directory: None,
                         config_root: None,
                         data_root: None,
-                        env: None,
+                        env: Default::default(),
                         deadline_unix_ms: None,
                     };
                     let binding = format!("{index:064x}");
@@ -4612,7 +4622,7 @@ mod custody_tests {
             working_directory: None,
             config_root: None,
             data_root: None,
-            env: None,
+            env: Default::default(),
             deadline_unix_ms: None,
         };
         let lock = acquire_launch_request_lock(

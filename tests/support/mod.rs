@@ -1,6 +1,5 @@
 //! Declared roles: orchestration, validator, parser, formatter, accessor, mapper, filter, predicate
 
-use jsonschema::{Draft, JSONSchema};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -324,7 +323,7 @@ pub fn assert_stderr_diagnostics_only(output: &Output) {
     );
 }
 
-pub fn compile_contract_ref(schema_file: &str, def_name: &str) -> JSONSchema {
+pub fn compile_contract_ref(schema_file: &str, def_name: &str) -> jsonschema::Validator {
     let common = common_schema_doc();
     let schema_doc = contract_schema_doc(schema_file);
     let mut root = bundled_contract_schema(common, schema_doc, def_name);
@@ -412,8 +411,9 @@ fn local_def_ref(def_path: &str) -> String {
 pub fn assert_valid(value: &Value, schema_id: &str) {
     let (schema_file, def_name) = schema_file_and_def(schema_id);
     let schema = compile_contract_ref(schema_file, def_name);
-    if let Err(errors) = schema.validate(value) {
-        contract_validation_failed(schema_id, validation_error_details(errors), value);
+    let errors = validation_error_details(schema.iter_errors(value));
+    if !errors.is_empty() {
+        contract_validation_failed(schema_id, errors, value);
     };
 }
 
@@ -464,37 +464,25 @@ fn parse_stdout_json(stdout: &[u8]) -> Value {
 }
 
 fn common_schema_doc() -> Value {
-    serde_json::from_str(include_str!("../../contract/v1/common.schema.json")).unwrap()
+    contract_schema_doc("common.schema.json")
 }
 
 fn contract_schema_doc(schema_file: &str) -> Value {
     serde_json::from_str(contract_schema_text(schema_file)).unwrap()
 }
 
+/// The shared SDK's embedded provider/v1 schemas are the only contract copy.
 fn contract_schema_text(schema_file: &str) -> &'static str {
-    match schema_file {
-        "common.schema.json" => include_str!("../../contract/v1/common.schema.json"),
-        "describe.schema.json" => include_str!("../../contract/v1/describe.schema.json"),
-        "schema.schema.json" => include_str!("../../contract/v1/schema.schema.json"),
-        "discovery.schema.json" => include_str!("../../contract/v1/discovery.schema.json"),
-        "settings.schema.json" => include_str!("../../contract/v1/settings.schema.json"),
-        "setup.schema.json" => include_str!("../../contract/v1/setup.schema.json"),
-        "policy.schema.json" => include_str!("../../contract/v1/policy.schema.json"),
-        "terminal.schema.json" => include_str!("../../contract/v1/terminal.schema.json"),
-        "launch.schema.json" => include_str!("../../contract/v1/launch.schema.json"),
-        "quota.schema.json" => include_str!("../../contract/v1/quota.schema.json"),
-        "session.schema.json" => include_str!("../../contract/v1/session.schema.json"),
-        "rotation.schema.json" => include_str!("../../contract/v1/rotation.schema.json"),
-        "migration.schema.json" => include_str!("../../contract/v1/migration.schema.json"),
-        other => panic!("unhandled schema file: {other}"),
-    }
+    schema_text(schema_file).unwrap_or_else(|| panic!("unhandled schema file: {schema_file}"))
 }
 
-fn compile_json_schema(root: &Value) -> JSONSchema {
-    JSONSchema::options()
-        .with_draft(Draft::Draft202012)
-        .compile(root)
-        .unwrap()
+#[allow(dead_code)]
+pub fn schema_text(schema_file: &str) -> Option<&'static str> {
+    agent_provider_contract::schemas::schema_by_file(schema_file)
+}
+
+fn compile_json_schema(root: &Value) -> jsonschema::Validator {
+    jsonschema::draft202012::new(root).unwrap()
 }
 
 fn schema_file_and_def(schema_id: &str) -> (&str, &str) {

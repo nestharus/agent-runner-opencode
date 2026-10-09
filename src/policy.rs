@@ -5,31 +5,16 @@ use crate::activity::ActivityTargets;
 use crate::envelope::{HostContext, ProviderFailure};
 use crate::models::{model_alias, provider_args_match, ModelAlias};
 use crate::runtime_selection::{resolve_runtime_selection, RuntimeSelection};
+use agent_provider_contract::{exploration, tool_mediation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-#[derive(Deserialize)]
-struct PolicyEvaluateWireParams {
-    settings_id: String,
-    mode: String,
-    model: PolicyModelRequest,
-    launch: PolicyLaunchInput,
-}
+/// The SDK `policy.evaluate` params DTO; `launch` stays an open object whose
+/// native meaning this provider interprets below.
+type PolicyEvaluateWireParams = agent_provider_contract::generated::PolicyEvaluateParams;
 
-#[derive(Clone, Deserialize)]
-pub(crate) struct PolicyModelRequest {
-    name: String,
-    provider_args: Vec<String>,
-    inputs: ModelInputs,
-}
-
-#[derive(Clone, Deserialize)]
-struct ModelInputs {
-    prompt: Option<String>,
-    #[serde(rename = "named")]
-    _named: BTreeMap<String, Vec<String>>,
-}
+pub(crate) type PolicyModelRequest = agent_provider_contract::generated::ProviderModelRequest;
 
 #[derive(Deserialize)]
 struct PolicyLaunchInput {
@@ -149,8 +134,8 @@ pub(crate) fn evaluate_params_with_activity(
     params: Value,
     request_id: &str,
 ) -> Result<(Value, ActivityTargets), ProviderFailure> {
-    let wire = parse_policy_params(params, request_id)?;
-    let decision = evaluate(host, wire.into(), request_id)?;
+    let input = parse_policy_params(params, request_id)?;
+    let decision = evaluate(host, input, request_id)?;
     let targets = decision.activity_targets();
     Ok((project_policy_result(decision), targets))
 }
@@ -207,7 +192,7 @@ fn evaluate(
 ) -> Result<PolicyDecision, ProviderFailure> {
     let selection = resolve_runtime_selection(host, &params.settings_id, request_id)?;
     let model = resolved_model(&params);
-    let diagnostics = diagnostics_for_policy(&params, &selection, model);
+    let diagnostics = diagnostics_for_policy(host, &params, &selection, model);
     let plan = policy_plan_candidate(&params, &selection, model, diagnostics);
     match model {
         Some(model) if policy_accepted(&plan.diagnostics) => Ok(PolicyDecision::Accepted(
@@ -241,22 +226,17 @@ fn policy_accepted(diagnostics: &[PolicyDiagnostic]) -> bool {
     !diagnostics.iter().any(PolicyDiagnostic::is_error)
 }
 
-fn parse_policy_params(
-    params: Value,
-    request_id: &str,
-) -> Result<PolicyEvaluateWireParams, ProviderFailure> {
-    serde_json::from_value(params).map_err(|err| invalid_policy_params_failure(request_id, err))
-}
-
-impl From<PolicyEvaluateWireParams> for PolicyInput {
-    fn from(wire: PolicyEvaluateWireParams) -> Self {
-        Self {
-            settings_id: wire.settings_id,
-            mode: wire.mode,
-            model: wire.model,
-            launch: wire.launch,
-        }
-    }
+fn parse_policy_params(params: Value, request_id: &str) -> Result<PolicyInput, ProviderFailure> {
+    let wire: PolicyEvaluateWireParams = serde_json::from_value(params)
+        .map_err(|err| invalid_policy_params_failure(request_id, err))?;
+    let launch = serde_json::from_value(Value::Object(wire.launch.into_iter().collect()))
+        .map_err(|err| invalid_policy_params_failure(request_id, err))?;
+    Ok(PolicyInput {
+        settings_id: wire.settings_id,
+        mode: wire.mode,
+        model: wire.model,
+        launch,
+    })
 }
 
 impl PolicyDiagnostic {
@@ -436,6 +416,7 @@ fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, S
 }
 
 fn diagnostics_for_policy(
+    host: &HostContext,
     params: &PolicyInput,
     selection: &RuntimeSelection,
     model: Option<&ModelAlias>,
@@ -455,6 +436,10 @@ fn diagnostics_for_policy(
     if params.launch.tool_restrictions.is_some() {
         diagnostics.push(unsupported_tool_restrictions_diagnostic());
     }
+    diagnostics.extend(unsupported_launch_extension_diagnostics(
+        host,
+        params.launch.env.as_ref(),
+    ));
     // A malformed command prefix cannot be stripped from the host candidate
     // safely. Treating the whole argv as caller-owned in that case produces a
     // cascade of misleading forbidden-flag diagnostics for provider-managed
@@ -484,6 +469,42 @@ fn unsupported_tool_restrictions_diagnostic() -> PolicyDiagnostic {
         "OpenCode cannot faithfully enforce the configured tool_restrictions; refusing unrestricted launch"
             .to_string(),
     )
+}
+
+/// The SDK owns each family's selection/carrier meaning. Mediation requires
+/// a policy when selected; exploration without an offer is only negotiation.
+pub(crate) fn unsupported_launch_extension_diagnostics(
+    host: &HostContext,
+    env: Option<&BTreeMap<String, String>>,
+) -> Vec<PolicyDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let mediation = tool_mediation::required_by_host(Some(&host.env), env);
+    if !matches!(mediation, Ok(None)) {
+        let refusal = mediation
+            .err()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
+        diagnostics.push(diagnostic(
+            "error",
+            "unsupported_tool_mediation",
+            format!(
+                "OpenCode does not implement {}; refusing unmediated native tools{refusal}",
+                tool_mediation::PROTOCOL,
+            ),
+        ));
+    }
+    if env.is_some_and(|env| env.contains_key(exploration::ENV)) {
+        diagnostics.push(diagnostic(
+            "error",
+            "unsupported_exploration",
+            format!(
+                "OpenCode does not implement {}; refusing a launch that carries a {} offer",
+                exploration::PROTOCOL,
+                exploration::ENV
+            ),
+        ));
+    }
+    diagnostics
 }
 
 fn model_account_ineligible_diagnostic(

@@ -2,7 +2,11 @@
 
 mod support;
 
-use jsonschema::{Draft, JSONSchema};
+use agent_provider_contract::host_extensions::{
+    launch_output, prompt_acceptance, session_turn_pages,
+};
+use agent_provider_contract::negotiation::VersionFamily;
+use agent_provider_contract::{exploration, operations, resident_session, tool_mediation};
 use serde_json::{json, Value};
 use std::process::Command;
 use support::{
@@ -110,40 +114,14 @@ fn schema_response_exposes_rotation_decision_protocol() {
 }
 
 #[test]
-fn pinned_contract_snapshot_matches_every_recorded_upstream_digest() {
-    let mut checked = 0;
-    for line in include_str!("../contract/v1/UPSTREAM.md").lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 2 || !fields[1].ends_with(".schema.json") {
-            continue;
-        }
-        let bytes = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("contract/v1")
-                .join(fields[1]),
-        )
-        .expect("read pinned contract schema");
-        assert_eq!(
-            agent_runner_opencode::encoding::sha256_hex(&bytes),
-            fields[0],
-            "{} diverged from the recorded Agent Runner snapshot",
-            fields[1]
-        );
-        checked += 1;
+fn provider_carries_no_copied_base_contract_schemas() {
+    // provider/v1 schemas, DTOs and admission come from the shared SDK
+    // registry; a local snapshot would reintroduce copy drift.
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(!manifest_dir.join("contract/v1").exists());
+    for file in agent_provider_contract::schemas::SCHEMA_FILES {
+        assert!(support::schema_text(file.filename).is_some_and(|text| text == file.contents));
     }
-    assert_eq!(checked, 13, "all pinned contract schemas must be checked");
-    let schema_count =
-        std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("contract/v1"))
-            .expect("read pinned contract directory")
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.ends_with(".schema.json"))
-            })
-            .count();
-    assert_eq!(schema_count, checked, "unrecorded contract schema found");
 }
 
 #[test]
@@ -348,11 +326,8 @@ fn assert_embedded_schema_id_absolute(schema: &Value) {
     }
 }
 
-fn compile_standalone_schema(schema: &Value) -> JSONSchema {
-    JSONSchema::options()
-        .with_draft(Draft::Draft202012)
-        .compile(schema)
-        .unwrap()
+fn compile_standalone_schema(schema: &Value) -> jsonschema::Validator {
+    jsonschema::draft202012::new(schema).unwrap()
 }
 
 fn assert_settings_schema_catalog(schema: &Value) {
@@ -661,4 +636,161 @@ fn assert_account_mapping(
     assert_eq!(quota_source["probe"], "native_chatgpt_usage");
     assert_eq!(quota_source["account_tag"], tag);
     assert_eq!(quota_source["account_hash"], hash);
+}
+
+/// OpenCode's own extension support, read against the shared oracle's
+/// hypothetical provider declarations.
+fn opencode_extension(name: &str) -> (VersionFamily, &'static [u32]) {
+    match name {
+        "prompt_acceptance" => (prompt_acceptance::FAMILY, &[]),
+        "launch_output" => (launch_output::FAMILY, &[1]),
+        "session_turn_pages" => (session_turn_pages::FAMILY, &[1]),
+        other => panic!("unknown shared oracle extension {other}"),
+    }
+}
+
+fn describe_with_host_env(host_env: &Value) -> Value {
+    let mut host = host_context(json!({}));
+    if host_env.is_null() {
+        host.as_object_mut().expect("host object").remove("env");
+    } else {
+        host["env"] = host_env.clone();
+    }
+    let request = json!({
+        "contract": CONTRACT,
+        "request_id": "req-describe-shared-oracle",
+        "provider_instance_id": "opencode-primary",
+        "host": host,
+        "params": {}
+    });
+    let output = invoke_with_request("describe", request);
+    assert_success(&output, "describe under shared oracle selection");
+    agent_provider_contract::decode_response::<operations::Describe>(&output.stdout)
+        .expect("describe response is admitted by the shared SDK registry");
+    json_stdout(&output)
+}
+
+#[test]
+fn describe_advertisement_matches_the_shared_host_extension_selection_oracle() {
+    let oracle: Value =
+        serde_json::from_str(agent_provider_contract::fixtures::HOST_EXTENSIONS_V1_JSON)
+            .expect("shared host extension oracle");
+    let mut exercised = std::collections::BTreeMap::<String, usize>::new();
+    for case in oracle["selection"].as_array().expect("selection cases") {
+        let extension = case["extension"].as_str().expect("extension");
+        let name = case["name"].as_str().expect("case name");
+        let (family, opencode_supported) = opencode_extension(extension);
+        let response = describe_with_host_env(&case["host_env"]);
+        let capabilities = response["result"]["capabilities"]
+            .as_object()
+            .expect("capabilities");
+        let advertised = capabilities.get(&family.capability(1)) == Some(&json!(true));
+        assert!(
+            advertised || !capabilities.contains_key(&family.capability(1)),
+            "{extension}/{name}: a capability is advertised true or omitted"
+        );
+        let host_selected = family.select(&[1], capabilities).is_ok();
+        assert_eq!(
+            host_selected, advertised,
+            "{extension}/{name}: host selection follows the actual advertisement"
+        );
+        let oracle_supported = case["provider_supported"]
+            .as_array()
+            .expect("provider_supported")
+            .iter()
+            .map(|version| version.as_u64().expect("version") as u32)
+            .collect::<Vec<_>>();
+        if oracle_supported == opencode_supported {
+            assert_eq!(
+                advertised,
+                case["expect_advertised"] == true,
+                "{extension}/{name}: OpenCode advertisement matches the shared oracle"
+            );
+            *exercised.entry(extension.to_string()).or_default() += 1;
+        } else if opencode_supported.is_empty() {
+            assert!(
+                !advertised,
+                "{extension}/{name}: unsupported is never advertised"
+            );
+        }
+    }
+    assert!(exercised["launch_output"] >= 8);
+    assert!(exercised["session_turn_pages"] >= 8);
+    assert!(exercised["prompt_acceptance"] >= 1);
+}
+
+#[test]
+fn describe_never_advertises_unimplemented_extensions_even_when_offered() {
+    let offered = json!({
+        "OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1": "1",
+        "OULIPOLY_HOST_RESIDENT_SESSION_V1": "1",
+        "OULIPOLY_HOST_TOOL_MEDIATION_V1": "1",
+        "OULIPOLY_HOST_EXPLORATION_V1": "1",
+        "OULIPOLY_HOST_LAUNCH_OUTPUT_V1": "1",
+        "OULIPOLY_HOST_SESSION_TURN_PAGES_V1": "1",
+        "OULIPOLY_HOST_LAUNCH_OUTPUT_V2": "1"
+    });
+    let response = describe_with_host_env(&offered);
+    let result = &response["result"];
+    assert_eq!(result["contract_versions"], json!([CONTRACT]));
+    assert_eq!(result["preferred_contract"], CONTRACT);
+    let capabilities = result["capabilities"].as_object().expect("capabilities");
+    for family in [
+        prompt_acceptance::FAMILY,
+        resident_session::FAMILY,
+        tool_mediation::FAMILY,
+        exploration::FAMILY,
+    ] {
+        assert!(
+            family.select(&[1, 2, 3], capabilities).is_err(),
+            "{} must not be advertised",
+            family.capability_prefix
+        );
+    }
+    assert_eq!(launch_output::FAMILY.select(&[1, 2], capabilities), Ok(1));
+    assert_eq!(session_turn_pages::FAMILY.select(&[1], capabilities), Ok(1));
+}
+
+#[test]
+fn resident_prepare_is_refused_rather_than_served() {
+    let output = invoke("resident.prepare", json!({}));
+    let response = assert_error_response(output, "unsupported", "resident_session_unsupported");
+    assert_eq!(
+        response["request_id"].as_str().map(str::is_empty),
+        Some(false)
+    );
+}
+
+#[test]
+fn unserved_contract_version_is_refused_with_the_served_versions() {
+    let request = json!({
+        "contract": "oulipoly.provider/v2",
+        "request_id": "req-contract-v2",
+        "provider_instance_id": "opencode-primary",
+        "host": host_context(json!({})),
+        "params": {}
+    });
+    let response = assert_error_response(
+        invoke_with_request("describe", request),
+        "invalid_request",
+        "unsupported_contract",
+    );
+    assert_eq!(
+        response["error"]["details"]["supported_contract_versions"],
+        json!([CONTRACT])
+    );
+}
+
+#[test]
+fn operation_schema_admission_refuses_params_outside_the_routed_operation() {
+    let output = invoke("describe", json!({"schema_id": "opencode.settings/v1"}));
+    let response = assert_error_response(output, "invalid_request", "contract_schema_violation");
+    assert_eq!(
+        response["error"]["details"]["definition"],
+        "DescribeRequest"
+    );
+    assert_eq!(
+        response["error"]["details"]["schema_file"],
+        "describe.schema.json"
+    );
 }

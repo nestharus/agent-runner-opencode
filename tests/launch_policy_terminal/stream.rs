@@ -26,6 +26,30 @@ pub fn expected_provider_exit_code(final_event: &Value) -> Option<i32> {
 }
 
 pub fn parse_launch_events(stdout: &[u8]) -> Vec<Value> {
+    let events = parse_launch_event_lines(stdout);
+    assert_shared_launch_stream_admission(stdout, &events);
+    events
+}
+
+/// Every complete OpenCode launch stream is also admitted by the shared SDK
+/// stream validator (wire shape, identity, contiguous sequence, one final
+/// exit). That validator is a shape oracle; native accounting stays separate.
+fn assert_shared_launch_stream_admission(stdout: &[u8], events: &[Value]) {
+    let Some(request_id) = events
+        .first()
+        .and_then(|event| event["request_id"].as_str())
+    else {
+        return;
+    };
+    if events.last().map(|event| &event["kind"]) != Some(&json!("exit")) {
+        return;
+    }
+    if let Err(error) = agent_provider_contract::validate_launch_ndjson(stdout, request_id) {
+        panic!("OpenCode launch stream failed shared SDK stream admission: {error}");
+    }
+}
+
+fn parse_launch_event_lines(stdout: &[u8]) -> Vec<Value> {
     std::str::from_utf8(stdout)
         .expect("launch stdout should be UTF-8 NDJSON")
         .lines()

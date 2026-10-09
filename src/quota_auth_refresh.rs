@@ -1370,7 +1370,7 @@ mod custody_tests {
             working_directory: None,
             config_root: None,
             data_root: Some(directory.path().to_string_lossy().into_owned()),
-            env: None,
+            env: Default::default(),
             deadline_unix_ms: None,
         };
         let request_id = "request-exact-retry";
@@ -1491,7 +1491,7 @@ mod custody_tests {
             working_directory: None,
             config_root: None,
             data_root: Some(data_root),
-            env: None,
+            env: Default::default(),
             deadline_unix_ms: None,
         };
         let root = quota_refresh_state_root(&host, "request-test").expect("quota state root");

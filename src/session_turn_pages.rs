@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-const READ_PROTOCOL: &str = "oulipoly.session_turn_pages/v1";
+const READ_PROTOCOL: &str = agent_provider_contract::host_extensions::session_turn_pages::PROTOCOL;
 const SOURCE_SCHEMA: &str = "opencode.sqlite.message-part/v1";
 const TOKEN_VERSION: u8 = 2;
 const TOKEN_PREFIX: &str = "stp2";
@@ -408,13 +408,7 @@ pub(crate) fn capture_live_session(
 }
 
 fn require_selected_protocol(host: &HostContext, request_id: &str) -> Result<(), ProviderFailure> {
-    if host
-        .env
-        .as_ref()
-        .and_then(|env| env.get(crate::schema::HOST_SESSION_TURN_PAGES_V1_ENV))
-        .map(String::as_str)
-        == Some("1")
-    {
+    if crate::schema::session_turn_pages_selected(host) {
         return Ok(());
     }
     Err(ProviderFailure::unsupported(
@@ -2659,4 +2653,49 @@ fn capture_params_failure(request_id: &str, message: impl std::fmt::Display) -> 
         "invalid_session_capture_params",
         format!("session.capture params are invalid: {message}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paging_params(projection: &str, nonce: Option<&str>) -> Value {
+        json!({
+            "settings_id": "opencode1",
+            "session_id": "ses_native_nonce",
+            "read_protocol": READ_PROTOCOL,
+            "turn_projection": projection,
+            "expected_delivery_nonce": nonce,
+            "start_mode": "beginning",
+            "after_token": null,
+            "snapshot_id": null,
+            "page_token": null,
+            "max_turns": 1,
+            "max_response_bytes": MAX_RESPONSE_BYTES,
+            "max_source_bytes": MAX_SOURCE_BYTES,
+            "max_inline_body_bytes": 0,
+        })
+    }
+
+    fn native_admission(projection: &str, nonce: Option<&str>) -> Result<(), ProviderFailure> {
+        let params = parse_params(paging_params(projection, nonce), "request-native-nonce")?;
+        validate_params(&params, "request-native-nonce")
+    }
+
+    #[test]
+    fn native_nonce_shape_control_holds_independently_of_shared_schema_admission() {
+        let nonce = "a".repeat(64);
+        assert!(native_admission("user_observation", Some(&nonce)).is_ok());
+        assert!(native_admission("canonical_ingest", None).is_ok());
+        for (projection, nonce) in [
+            ("user_observation", None),
+            ("user_observation", Some("A".repeat(64))),
+            ("user_observation", Some("a".repeat(63))),
+            ("canonical_ingest", Some("a".repeat(64))),
+        ] {
+            let failure = native_admission(projection, nonce.as_deref())
+                .expect_err("native nonce shape violation must be refused");
+            assert_eq!(failure.code, "invalid_session_read_turns_params");
+        }
+    }
 }

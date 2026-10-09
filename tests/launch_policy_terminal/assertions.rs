@@ -216,6 +216,20 @@ pub fn assert_provider_session_marker(events: &[Value], fixture_session_id: &str
 }
 
 pub fn assert_launch_output_completion(events: &[Value], stdout: &[u8], stderr: &[u8]) {
+    if let Some(violation) = launch_output_completion_violation(events, stdout, stderr) {
+        panic!("{violation}; events={events:?}");
+    }
+}
+
+/// OpenCode's native output-accounting control: the one completion marker
+/// immediately precedes the final exit and accounts for the bytes the native
+/// process produced and every projected data event. The shared stream
+/// validator checks shape only and admits violations of each of these.
+pub fn launch_output_completion_violation(
+    events: &[Value],
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<String> {
     let markers = events
         .iter()
         .enumerate()
@@ -223,30 +237,32 @@ pub fn assert_launch_output_completion(events: &[Value], stdout: &[u8], stderr: 
             event["kind"] == "marker" && event["name"] == "oulipoly.launch_output_complete/v1"
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        markers.len(),
-        1,
-        "launch must emit exactly one output completion marker; events={events:?}"
-    );
+    if markers.len() != 1 {
+        return Some(format!(
+            "launch must emit exactly one output completion marker, found {}",
+            markers.len()
+        ));
+    }
     let (marker_index, marker) = markers[0];
-    assert_eq!(
-        marker_index + 1,
-        events.len() - 1,
-        "output completion must immediately precede the final exit"
-    );
-    assert_eq!(marker["value"]["protocol"], "oulipoly.launch_output/v1");
-    assert_eq!(marker["value"]["stdout"]["bytes"], stdout.len() as u64);
-    assert_eq!(marker["value"]["stdout"]["sha256"], sha256_hex(stdout));
-    assert_eq!(marker["value"]["stderr"]["bytes"], stderr.len() as u64);
-    assert_eq!(marker["value"]["stderr"]["sha256"], sha256_hex(stderr));
+    if marker_index + 1 != events.len() - 1 {
+        return Some("output completion must immediately precede the final exit".to_string());
+    }
     let data_event_count = events
         .iter()
         .filter(|event| event["kind"] == "stdout" || event["kind"] == "stderr")
         .count() as u64;
-    assert_eq!(
-        marker["value"]["data_event_count"], data_event_count,
-        "completion marker must account for every projected data event"
-    );
+    let expected = json!({
+        "protocol": "oulipoly.launch_output/v1",
+        "stdout": {"bytes": stdout.len() as u64, "sha256": sha256_hex(stdout)},
+        "stderr": {"bytes": stderr.len() as u64, "sha256": sha256_hex(stderr)},
+        "data_event_count": data_event_count,
+    });
+    (marker["value"] != expected).then(|| {
+        format!(
+            "completion marker {} does not account for the native output {expected}",
+            marker["value"]
+        )
+    })
 }
 
 pub fn assert_status_derived_terminal_signal(final_event: &Value) {
