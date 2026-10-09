@@ -2771,6 +2771,169 @@ fn contract_policy_evaluate_refuses_unimplemented_tool_mediation_and_exploration
     }
 }
 
+#[test]
+fn contract_policy_evaluate_distinguishes_mediation_selection_from_exploration() {
+    use agent_provider_contract::{exploration, tool_mediation};
+
+    for (selector, selected, accepted) in [
+        (tool_mediation::FAMILY.selector(1), "1", false),
+        (tool_mediation::FAMILY.selector(1), "0", true),
+        (exploration::FAMILY.selector(1), "1", true),
+    ] {
+        // Both an absent launch env and an empty one lack a policy carrier.
+        for launch_env in [None, Some(json!({}))] {
+            let settings = IsolatedLaunchSettings::new();
+            let mut params = policy_evaluate_params_with_host_candidate_argv();
+            if let Some(env) = launch_env {
+                params["launch"]["env"] = env;
+            }
+            let mut host = settings.host_overrides();
+            host["env"] = json!({ selector.clone(): selected });
+            let request = support::validated_request_envelope(
+                "policy.evaluate",
+                params,
+                host,
+                "policy.schema.json#/$defs/PolicyEvaluateRequest",
+            );
+            let (stdout, status) = agent_runner_opencode::handle_invocation(
+                &["agent-runner-opencode".into(), "policy.evaluate".into()],
+                &serde_json::to_vec(&request).unwrap(),
+            );
+            assert_eq!(status, 0);
+            let response: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_policy_response_shape(&response);
+            let result = policy_result(&response);
+            assert_eq!(
+                result["accepted"], accepted,
+                "{selector}={selected}: {response}"
+            );
+            if !accepted {
+                assert_policy_diagnostic(
+                    policy_diagnostics(result),
+                    "unsupported_tool_mediation",
+                    "supplied no",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn contract_launch_refuses_unsupported_extensions_before_retry_or_native_effects() {
+    use agent_provider_contract::{exploration, tool_mediation};
+
+    let mediation: Value =
+        serde_json::from_str(agent_provider_contract::fixtures::TOOL_MEDIATION_V1_JSON).unwrap();
+    let exploration_offer: Value =
+        serde_json::from_str(agent_provider_contract::fixtures::EXPLORATION_V1_JSON).unwrap();
+    for (host_env, launch_env, code) in [
+        (
+            json!({ tool_mediation::FAMILY.selector(1): "1" }),
+            json!({}),
+            Some("unsupported_tool_mediation"),
+        ),
+        (
+            json!({ tool_mediation::FAMILY.selector(1): "1" }),
+            json!({ tool_mediation::ENV: mediation["valid"]["ToolMediation"][0].to_string() }),
+            Some("unsupported_tool_mediation"),
+        ),
+        (
+            json!({}),
+            json!({ tool_mediation::ENV: mediation["valid"]["ToolMediation"][0].to_string() }),
+            Some("unsupported_tool_mediation"),
+        ),
+        (
+            json!({ exploration::FAMILY.selector(1): "1" }),
+            json!({ exploration::ENV: exploration_offer["valid"]["Exploration"][0].to_string() }),
+            Some("unsupported_exploration"),
+        ),
+        (
+            json!({ exploration::FAMILY.selector(1): "1" }),
+            json!({}),
+            None,
+        ),
+    ] {
+        let settings = IsolatedLaunchSettings::new();
+        let mut host = settings.host_overrides();
+        host["env"] = host_env;
+        let mut params = launch_params("low");
+        params["env"] = launch_env;
+        let request = support::validated_request_envelope(
+            "launch",
+            params,
+            host,
+            "launch.schema.json#/$defs/LaunchRequest",
+        );
+        let state_root = settings
+            .data_root()
+            .join("provider-state/opencode/launch/requests");
+        fs::create_dir_all(&state_root).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(
+            &state_root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let state_path = state_root.join(format!(
+            "{}.json",
+            agent_runner_opencode::encoding::sha256_hex(
+                request["request_id"].as_str().unwrap().as_bytes()
+            )
+        ));
+        fs::write(&state_path, b"retry preflight must not read this").unwrap();
+
+        let (stdout, status) = agent_runner_opencode::handle_invocation(
+            &["agent-runner-opencode".into(), "launch".into()],
+            &serde_json::to_vec(&request).unwrap(),
+        );
+        assert_eq!(status, 1);
+        if code.is_none() {
+            // Exploration selection alone must reach the existing retry
+            // preflight, whose poisoned state prevents any native invocation.
+            let response: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(
+                response["error"]["code"], "launch_state_invalid",
+                "{response}"
+            );
+            #[cfg(unix)]
+            assert_eq!(fs::metadata(&state_root).unwrap().mode() & 0o777, 0o700);
+            continue;
+        }
+        let code = code.unwrap();
+        agent_provider_contract::validate_launch_ndjson(
+            &stdout,
+            request["request_id"].as_str().unwrap(),
+        )
+        .expect("schema-valid refusal stream");
+        let events = parse_launch_events(&stdout);
+        let exit = final_launch_event(&events);
+        assert_eq!(exit["status"]["kind"], "spawn_error", "{exit}");
+        assert!(
+            exit["status"]["reason"].as_str().unwrap().contains(code),
+            "{exit}"
+        );
+        assert_eq!(
+            fs::read(&state_path).unwrap(),
+            b"retry preflight must not read this"
+        );
+        assert_eq!(
+            fs::read_dir(&state_root).unwrap().count(),
+            1,
+            "no retry lock created"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&state_root).unwrap().mode() & 0o777,
+            0o755,
+            "no preflight chmod"
+        );
+        assert!(!settings
+            .data_root()
+            .join("provider-state/opencode/native-runtimes")
+            .exists());
+    }
+}
+
 fn shared_host_extension_oracle() -> Value {
     serde_json::from_str(agent_provider_contract::fixtures::HOST_EXTENSIONS_V1_JSON)
         .expect("shared host extension oracle")

@@ -1135,7 +1135,12 @@ is retained only as historical design evidence.
     → a rejected policy decision with `unsupported_tool_mediation` or
     `unsupported_exploration`.
 
-  Offers in `host.env` alone are not demands and are not refused.
+  Tool mediation follows the SDK's `required_by_host`: selecting
+  `host.env.OULIPOLY_HOST_TOOL_MEDIATION_V1=1` without the policy carrier also
+  rejects with `unsupported_tool_mediation`. Launch refuses these unsupported
+  boundaries before retry reconciliation or native runtime resolution.
+  Exploration selection without its launch-env offer remains negotiation and
+  does not reject an otherwise accepted policy.
 - **Shared oracles.** Tests read the SDK `contract-test-fixtures`
   host-extension specimens. They check describe selection against the shared
   selection oracle, admit every complete launch stream with the SDK stream

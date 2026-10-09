@@ -462,6 +462,18 @@ pub(crate) fn stream<W: Write>(
     let launch_output_requested =
         validate_launch_output_request(params.output_delivery.as_ref(), host, request_id)?;
     validate_launch_authority(&params, request_id)?;
+    // Exact-retry preflight can reconcile actors and native session state.
+    // Refuse unsupported boundaries before entering that effectful path.
+    let diagnostics = policy::unsupported_launch_extension_diagnostics(host, params.env.as_ref());
+    if !diagnostics.is_empty() {
+        let reason = policy_rejection_reason(json!(diagnostics));
+        return stream_policy_rejection(request_id, writer, reason, launch_output_requested).map(
+            |exit_code| LaunchOutcome {
+                exit_code,
+                activity_targets: ActivityTargets::default(),
+            },
+        );
+    }
     let new_session = known_provider_session_id(&params).is_none();
     let request_identity_sha256 = launch_request_identity_sha256(host, &raw_params);
     let declared_env = params.env.clone().unwrap_or_default();
@@ -755,9 +767,9 @@ fn launch_argv(
         policy::PolicyDecision::Accepted(plan) => Ok(PolicyLaunch::Accepted(Box::new(
             effective_launch(params, plan, host, request_id, request_identity_sha256)?,
         ))),
-        policy::PolicyDecision::Rejected(plan) => {
-            Ok(PolicyLaunch::Rejected(policy_rejection_reason(&plan)))
-        }
+        policy::PolicyDecision::Rejected(plan) => Ok(PolicyLaunch::Rejected(
+            policy_rejection_reason(plan.diagnostics_json()),
+        )),
     }
 }
 
@@ -1133,8 +1145,7 @@ fn empty_resume_payload_failure(request_id: &str) -> ProviderFailure {
     )
 }
 
-fn policy_rejection_reason(plan: &policy::PolicyRejection) -> String {
-    let diagnostics = plan.diagnostics_json();
+fn policy_rejection_reason(diagnostics: Value) -> String {
     format!("policy.evaluate rejected launch params; diagnostics={diagnostics}")
 }
 

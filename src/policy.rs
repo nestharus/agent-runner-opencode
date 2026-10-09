@@ -192,7 +192,7 @@ fn evaluate(
 ) -> Result<PolicyDecision, ProviderFailure> {
     let selection = resolve_runtime_selection(host, &params.settings_id, request_id)?;
     let model = resolved_model(&params);
-    let diagnostics = diagnostics_for_policy(&params, &selection, model);
+    let diagnostics = diagnostics_for_policy(host, &params, &selection, model);
     let plan = policy_plan_candidate(&params, &selection, model, diagnostics);
     match model {
         Some(model) if policy_accepted(&plan.diagnostics) => Ok(PolicyDecision::Accepted(
@@ -416,6 +416,7 @@ fn effective_env(input: Option<&BTreeMap<String, String>>) -> BTreeMap<String, S
 }
 
 fn diagnostics_for_policy(
+    host: &HostContext,
     params: &PolicyInput,
     selection: &RuntimeSelection,
     model: Option<&ModelAlias>,
@@ -435,7 +436,8 @@ fn diagnostics_for_policy(
     if params.launch.tool_restrictions.is_some() {
         diagnostics.push(unsupported_tool_restrictions_diagnostic());
     }
-    diagnostics.extend(unsupported_extension_offer_diagnostics(
+    diagnostics.extend(unsupported_launch_extension_diagnostics(
+        host,
         params.launch.env.as_ref(),
     ));
     // A malformed command prefix cannot be stripped from the host candidate
@@ -469,28 +471,29 @@ fn unsupported_tool_restrictions_diagnostic() -> PolicyDiagnostic {
     )
 }
 
-/// Host-selected launch extensions whose offer travels in the launch env.
-/// This provider implements neither, so an offer is refused rather than the
-/// requested boundary being ignored or served unmediated.
-fn unsupported_extension_offer_diagnostics(
+/// The SDK owns each family's selection/carrier meaning. Mediation requires
+/// a policy when selected; exploration without an offer is only negotiation.
+pub(crate) fn unsupported_launch_extension_diagnostics(
+    host: &HostContext,
     env: Option<&BTreeMap<String, String>>,
 ) -> Vec<PolicyDiagnostic> {
-    let Some(env) = env else {
-        return Vec::new();
-    };
     let mut diagnostics = Vec::new();
-    if env.contains_key(tool_mediation::ENV) {
+    let mediation = tool_mediation::required_by_host(Some(&host.env), env);
+    if !matches!(mediation, Ok(None)) {
+        let refusal = mediation
+            .err()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
         diagnostics.push(diagnostic(
             "error",
             "unsupported_tool_mediation",
             format!(
-                "OpenCode does not implement {}; refusing a launch that carries a {} policy instead of running native tools unmediated",
+                "OpenCode does not implement {}; refusing unmediated native tools{refusal}",
                 tool_mediation::PROTOCOL,
-                tool_mediation::ENV
             ),
         ));
     }
-    if env.contains_key(exploration::ENV) {
+    if env.is_some_and(|env| env.contains_key(exploration::ENV)) {
         diagnostics.push(diagnostic(
             "error",
             "unsupported_exploration",
