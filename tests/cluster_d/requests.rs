@@ -128,7 +128,7 @@ pub fn opencode_settings_values(secret: Option<&str>) -> Value {
         "wrapper": "opencode1",
         "model": {
             "name": "gpt-high",
-            "provider_model": "openai/gpt-5.5",
+            "provider_model": "openai/gpt-5.6-sol",
             "variant": "high"
         },
         "quota": {

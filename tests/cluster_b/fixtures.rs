@@ -64,7 +64,7 @@ pub fn live_opencode_args() -> [&'static str; 8] {
         "--format",
         "json",
         "-m",
-        "openai/gpt-5.5",
+        "openai/gpt-5.6-sol",
         "--variant",
         "low",
         "reply with the single word: ok",

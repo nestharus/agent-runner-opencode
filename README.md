@@ -5,7 +5,7 @@ provider contract.
 
 One CLI, two underlying tools:
 
-- **opencode** owns the model lifecycle — `launch` (`opencode run --pure -m openai/gpt-5.5
+- **opencode** owns the model lifecycle — `launch` (`opencode run --pure -m openai/gpt-5.6-sol
   --variant <effort>`), `session` (read_turns/capture/export/replace/locate), `terminal`
   classification, and `policy` application.
 - **codex** owns **only** `quota` — ChatGPT plan-window usage via `chatgpt-usage
@@ -24,6 +24,13 @@ agent-runner-opencode <subcommand>
 Each subcommand reads one JSON request envelope on stdin. Non-launch commands write one JSON
 response envelope on stdout. `launch` writes newline-delimited JSON events and finishes with
 an `exit` event.
+
+The installed provider can also be used as the account command for fresh TTY sessions:
+`agent-runner-opencode interactive opencodeN`. With no passthrough arguments it reads that
+account's provider settings and launches the configured default model. Explicit arguments are
+passed through unchanged, keeping resume and model-specific launches independent of the fresh
+default. Fresh TTY model/variant state is materialized under the provider's isolated
+`XDG_STATE_HOME`; the user's global OpenCode model state is not modified.
 
 The CLI never links the host-side `oulipoly-provider` crate; it implements the versioned JSON
 Schema contract in `contract/v1/` directly. `provider_id = "opencode"`, settings schema

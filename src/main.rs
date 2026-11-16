@@ -3,8 +3,15 @@
 use std::io::Read;
 
 fn main() {
-    let stdin = read_stdin_or_exit();
     let args = std::env::args().collect::<Vec<_>>();
+    if agent_runner_opencode::interactive::is_interactive_invocation(&args) {
+        let exit_code = agent_runner_opencode::interactive::run(&args).unwrap_or_else(|message| {
+            eprintln!("{message}");
+            2
+        });
+        std::process::exit(exit_code);
+    }
+    let stdin = read_stdin_or_exit();
     let exit_code = agent_runner_opencode::write_invocation(&args, &stdin, &mut std::io::stdout());
     std::process::exit(exit_code);
 }

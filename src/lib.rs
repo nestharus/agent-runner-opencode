@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod dispatch;
 pub mod encoding;
 pub mod envelope;
+pub mod interactive;
 pub mod launch;
 pub mod migration;
 pub mod models;

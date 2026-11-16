@@ -11,7 +11,9 @@
 use crate::account::ACCOUNTS;
 use crate::encoding::{now_unix_ms, sha256_hex};
 use crate::envelope::{HostContext, ProviderFailure, RequestEnvelope, CATEGORY_CONFLICT};
-use crate::models::{default_model_effort, effort_values, DEFAULT_MODEL_ALIAS, PROVIDER_MODEL};
+use crate::models::{
+    default_model_effort, effort_values, model_alias, DEFAULT_MODEL_ALIAS, PROVIDER_MODEL,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -86,6 +88,80 @@ struct SettingsRecord {
     display_name: String,
     version: String,
     values: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveModelSelection {
+    pub alias: String,
+    pub provider_model: String,
+    pub variant: String,
+}
+
+pub fn interactive_model_for_wrapper(
+    config_root: &Path,
+    wrapper: &str,
+) -> Result<InteractiveModelSelection, String> {
+    let path = store_path_from_root(config_root);
+    if !path.exists() {
+        return Ok(default_interactive_model());
+    }
+    let bytes = fs::read(&path)
+        .map_err(|err| format!("failed to read provider settings {}: {err}", path.display()))?;
+    let store: SettingsStore = serde_json::from_slice(&bytes).map_err(|err| {
+        format!(
+            "failed to parse provider settings {}: {err}",
+            path.display()
+        )
+    })?;
+    let Some(record) = store
+        .records
+        .iter()
+        .rev()
+        .find(|record| record.values.get("wrapper").and_then(Value::as_str) == Some(wrapper))
+    else {
+        return Ok(default_interactive_model());
+    };
+    interactive_model_from_values(&record.values)
+}
+
+fn default_interactive_model() -> InteractiveModelSelection {
+    InteractiveModelSelection {
+        alias: DEFAULT_MODEL_ALIAS.to_string(),
+        provider_model: PROVIDER_MODEL.to_string(),
+        variant: default_model_effort().to_string(),
+    }
+}
+
+fn interactive_model_from_values(values: &Value) -> Result<InteractiveModelSelection, String> {
+    let alias = values
+        .pointer("/model/name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "provider settings model.name is missing".to_string())?;
+    let configured_provider_model = values
+        .pointer("/model/provider_model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "provider settings model.provider_model is missing".to_string())?;
+    let configured_variant = values
+        .pointer("/model/variant")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "provider settings model.variant is missing".to_string())?;
+    let model = model_alias(alias)
+        .ok_or_else(|| format!("provider settings model.name is unsupported: {alias}"))?;
+    if configured_provider_model != PROVIDER_MODEL {
+        return Err(format!(
+            "provider settings model.provider_model must be {PROVIDER_MODEL}"
+        ));
+    }
+    if configured_variant != model.effort {
+        return Err(format!(
+            "provider settings model.variant {configured_variant} does not match alias {alias}"
+        ));
+    }
+    Ok(InteractiveModelSelection {
+        alias: alias.to_string(),
+        provider_model: PROVIDER_MODEL.to_string(),
+        variant: model.effort.to_string(),
+    })
 }
 
 pub fn list_params(host: &HostContext, request_id: &str) -> Result<Value, ProviderFailure> {
@@ -664,7 +740,7 @@ fn invalid_provider_model_diagnostic() -> Value {
     diagnostic(
         "error",
         "values.model.provider_model",
-        "provider_model must be openai/gpt-5.5",
+        "provider_model must be openai/gpt-5.6-sol",
         "invalid_provider_model",
     )
 }
@@ -689,7 +765,7 @@ fn invalid_model_variant_diagnostic() -> Value {
     diagnostic(
         "error",
         "values.model.variant",
-        "variant must be none, low, medium, high, or xhigh",
+        "variant must be low, medium, high, xhigh, or max",
         "invalid_model_variant",
     )
 }
@@ -1160,4 +1236,37 @@ fn legacy_providers_toml_text(legacy: &Value) -> Option<&str> {
 
 fn parse_legacy_providers_toml(providers_toml: &str) -> Option<toml::Value> {
     providers_toml.parse::<toml::Value>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_model_selection_accepts_sol_xhigh_alias() {
+        let selection = interactive_model_from_values(&json!({
+            "model": {
+                "name": "gpt-xhigh",
+                "provider_model": "openai/gpt-5.6-sol",
+                "variant": "xhigh"
+            }
+        }))
+        .expect("valid interactive model");
+        assert_eq!(selection.alias, "gpt-xhigh");
+        assert_eq!(selection.provider_model, "openai/gpt-5.6-sol");
+        assert_eq!(selection.variant, "xhigh");
+    }
+
+    #[test]
+    fn interactive_model_selection_rejects_alias_variant_mismatch() {
+        let error = interactive_model_from_values(&json!({
+            "model": {
+                "name": "gpt-xhigh",
+                "provider_model": "openai/gpt-5.6-sol",
+                "variant": "max"
+            }
+        }))
+        .expect_err("mismatched variant must fail");
+        assert!(error.contains("does not match alias gpt-xhigh"), "{error}");
+    }
 }

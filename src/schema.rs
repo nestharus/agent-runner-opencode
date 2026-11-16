@@ -2,7 +2,9 @@
 
 use crate::account::{AccountProfile, ACCOUNTS};
 use crate::envelope::{ProviderFailure, CONTRACT};
-use crate::models::{alias_names, DEFAULT_MODEL_ALIAS};
+use crate::models::{
+    alias_names, default_model_effort, effort_values, DEFAULT_MODEL_ALIAS, PROVIDER_MODEL,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -109,10 +111,32 @@ pub fn opencode_settings_schema() -> Value {
                 "description": "Stable short fingerprint for the paired codex account."
             },
             "model": {
-                "type": "string",
-                "enum": alias_names(),
-                "default": DEFAULT_MODEL_ALIAS,
-                "description": "Provider model alias mapped to openai/gpt-5.5 with the matching effort variant."
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "enum": alias_names(),
+                        "default": DEFAULT_MODEL_ALIAS
+                    },
+                    "provider_model": {
+                        "type": "string",
+                        "const": PROVIDER_MODEL,
+                        "default": PROVIDER_MODEL
+                    },
+                    "variant": {
+                        "type": "string",
+                        "enum": effort_values(),
+                        "default": default_model_effort()
+                    }
+                },
+                "required": ["name", "provider_model", "variant"],
+                "default": {
+                    "name": DEFAULT_MODEL_ALIAS,
+                    "provider_model": PROVIDER_MODEL,
+                    "variant": default_model_effort()
+                },
+                "description": "Provider-owned OpenCode launch model. Runner aliases remain gpt-<effort> while the provider model is GPT-5.6 Sol."
             },
             "working_directory": {
                 "type": "string",

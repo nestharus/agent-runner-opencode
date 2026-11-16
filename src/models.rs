@@ -1,7 +1,7 @@
 //! Declared roles: accessor, mapper
 
-pub const PROVIDER_MODEL: &str = "openai/gpt-5.5";
-pub const DEFAULT_MODEL_ALIAS: &str = "gpt-high";
+pub const PROVIDER_MODEL: &str = "openai/gpt-5.6-sol";
+pub const DEFAULT_MODEL_ALIAS: &str = "gpt-xhigh";
 
 pub struct ModelAlias {
     pub name: &'static str,
@@ -9,10 +9,6 @@ pub struct ModelAlias {
 }
 
 pub const MODEL_ALIASES: &[ModelAlias] = &[
-    ModelAlias {
-        name: "gpt-none",
-        effort: "none",
-    },
     ModelAlias {
         name: "gpt-low",
         effort: "low",
@@ -29,6 +25,10 @@ pub const MODEL_ALIASES: &[ModelAlias] = &[
         name: "gpt-xhigh",
         effort: "xhigh",
     },
+    ModelAlias {
+        name: "gpt-max",
+        effort: "max",
+    },
 ];
 
 pub fn alias_names() -> Vec<&'static str> {
@@ -40,9 +40,11 @@ pub fn effort_values() -> Vec<&'static str> {
 }
 
 pub fn default_model_effort() -> &'static str {
-    MODEL_ALIASES
-        .iter()
-        .find(|model| model.name == DEFAULT_MODEL_ALIAS)
+    model_alias(DEFAULT_MODEL_ALIAS)
         .expect("default model alias must exist in model catalogue")
         .effort
+}
+
+pub fn model_alias(name: &str) -> Option<&'static ModelAlias> {
+    MODEL_ALIASES.iter().find(|model| model.name == name)
 }

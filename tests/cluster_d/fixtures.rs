@@ -30,7 +30,7 @@ refresh_auth_command = "/bin/false"
 pub const MODEL_TOML: &str = r#"
 name = "gpt-high"
 provider = "opencode"
-model = "openai/gpt-5.5"
+model = "openai/gpt-5.6-sol"
 args = ["--variant", "high"]
 "#;
 

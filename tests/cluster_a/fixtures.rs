@@ -289,7 +289,7 @@ pub fn expected_policy_argv_subsequence() -> &'static [&'static str] {
         "json",
         "--dangerously-skip-permissions",
         "-m",
-        "openai/gpt-5.5",
+        "openai/gpt-5.6-sol",
         "--variant",
         "low",
     ]

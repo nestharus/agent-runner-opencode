@@ -177,11 +177,25 @@ fn stripped_policy_launch_args<'a>(
 }
 
 fn strip_host_candidate_prefix<'a>(argv: &'a [String], effort: &str) -> Option<&'a [String]> {
-    strip_intrinsic_launch_prefix(argv, &host_candidate_args(effort))
+    strip_intrinsic_launch_prefix(argv, &host_candidate_args(effort)).or_else(|| {
+        strip_interactive_adapter_prefix(argv)
+            .and_then(|argv| strip_intrinsic_launch_prefix(argv, &host_candidate_args(effort)))
+    })
 }
 
 fn strip_policy_effective_prefix<'a>(argv: &'a [String], effort: &str) -> Option<&'a [String]> {
-    strip_intrinsic_launch_prefix(argv, &policy_effective_args(effort))
+    strip_intrinsic_launch_prefix(argv, &policy_effective_args(effort)).or_else(|| {
+        strip_interactive_adapter_prefix(argv)
+            .and_then(|argv| strip_intrinsic_launch_prefix(argv, &policy_effective_args(effort)))
+    })
+}
+
+fn strip_interactive_adapter_prefix(argv: &[String]) -> Option<&[String]> {
+    let [command, subcommand, _wrapper, ..] = argv else {
+        return None;
+    };
+    (command_basename(command) == "agent-runner-opencode" && subcommand == "interactive")
+        .then_some(&argv[2..])
 }
 
 fn strip_intrinsic_launch_prefix<'a>(
