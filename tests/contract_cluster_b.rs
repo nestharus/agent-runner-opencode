@@ -30,6 +30,17 @@ fn contract_session_read_turns() {
 }
 
 #[test]
+fn contract_session_read_turns_uses_regular_file_for_export_stdout() {
+    let session_id = fixture_session_id();
+    let fake_opencode = FakeOpencodeExport::pipe_truncating(session_id);
+    let path = prepend_path(fake_opencode.dir());
+
+    let result = read_turns_result(session_params(session_id), &path);
+
+    assert_first_read_turns_result(&result);
+}
+
+#[test]
 fn contract_session_export_canonical() {
     let session_id = fixture_session_id();
     let fake_opencode = FakeOpencodeExport::new(session_id);
